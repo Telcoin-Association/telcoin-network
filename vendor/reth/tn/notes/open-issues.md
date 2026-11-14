@@ -163,6 +163,14 @@ resolves the registry crate instead of the patch (TN-0085), and the nested test 
 against the patch (TN-0080). `patches/revm-inspectors/PATCH.md` has the
 details.
 
+## WebSocket calls run to their end after the client leaves
+
+jsonrpsee 0.26's WebSocket server spawns each call on a detached task, so when a client
+disconnects its request future is not dropped and TN-0049's cancellation does not fire: the call
+keeps its blocking thread and permits until it ends. HTTP drops the request, and IPC aborts it
+since TN-0177. The work stays bounded by the gas cap, the trace cap and the permits. A fix
+belongs in jsonrpsee (or a TN wrapper around its WebSocket service).
+
 ## CI build time with the vendored crates
 
 rust-cache does not save path packages inside the repository, so every test lane rebuilds the 57

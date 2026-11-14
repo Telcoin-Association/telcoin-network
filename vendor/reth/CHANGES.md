@@ -591,8 +591,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `crates/rpc/rpc-eth-api/src/helpers/{blocking_task.rs, call.rs, estimate.rs, trace.rs,
   pending_block.rs}`, `crates/rpc/rpc-eth-types/src/simulate.rs`,
   `crates/rpc/rpc/src/{debug.rs, trace.rs}`, `crates/rpc/rpc/src/eth/{bundle.rs, core.rs}`.
-  *Why*: a client that disconnects drops its request, but the blocking task it started ran to
-  the end: a long `eth_call`, `eth_callMany`, `eth_estimateGas`, `eth_simulateV1`, bundle, block
+  *Why*: a client that disconnects drops its request (over HTTP; over IPC since TN-0177; not
+  over WebSocket, where jsonrpsee runs each call to its end), but the blocking task it started
+  ran to the end: a long `eth_call`, `eth_callMany`, `eth_estimateGas`, `eth_simulateV1`, bundle, block
   replay or trace kept its thread (and, since TN-0019 and TN-0036 to TN-0038, its permit) for
   work nobody would read. 13a59de4b runs each `spawn_blocking_io` task inside a `CancelOnDrop`
   scope that the request's drop cancels, and the long loops check `is_cancelled()` between
@@ -2731,3 +2732,19 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   storage*: no; tests.
   *Tests*: the three above. Mutation-checked: each site's `charge` removed (each test fails).
   *Upstream*: n/a.
+
+- **TN-0177** — An IPC call whose client disconnects is aborted. *Kind*: fix.
+  *Files*: `crates/rpc/ipc/src/server/mod.rs` (`AbortOnDrop` around the spawned call; test
+  `a_disconnected_clients_call_is_dropped`).
+  *Why*: the IPC server spawns each call on its own task, for concurrency, and the connection
+  awaited the task's `JoinHandle`. When the client went away the connection dropped the handle,
+  which does not cancel a task, so the request future was never dropped: TN-0049's
+  cancellation never fired and the call kept its blocking thread and permits until it ended. The
+  handle is now aborted when the connection drops it, so the request future is dropped and its
+  blocking work sees `is_cancelled()` at its next check. A call that already ended is
+  unaffected. jsonrpsee's WebSocket transport also spawns each call and does not cancel it; that
+  is the library's, outside this copy (`tn/notes/open-issues.md`). *Can reach execution or
+  storage*: no. RPC only.
+  *Tests*: `a_disconnected_clients_call_is_dropped` (a call that never ends is dropped once its
+  client disconnects). Mutation-checked: no abort (the call keeps running).
+  *Upstream*: no; upstream has the same shape.
