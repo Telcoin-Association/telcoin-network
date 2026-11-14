@@ -206,6 +206,26 @@ fn the_cache_answers_before_memory_batches() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A persist's hand-over (`remember`, which the env's cache fill calls) adds its batches to
+/// memory batches persists fill, never to ones their caller fills; the caller's own insert lands
+/// in either, and resolves.
+#[test]
+fn a_caller_filled_memory_batches_is_not_filled_by_persists() -> eyre::Result<()> {
+    let b = batch(2, &[]);
+    for (memory, persists_fill) in
+        [(MemoryBatches::default(), true), (MemoryBatches::filled_by_caller(), false)]
+    {
+        let memory = Arc::new(memory);
+        let source = TxBodySource::new(0).with_memory_batches(memory.clone());
+        source.remember([(b.digest(), &b)]);
+        assert_eq!(memory.len(), usize::from(persists_fill), "persists fill: {persists_fill}");
+        memory.insert(b.digest(), &b);
+        assert_eq!(memory.len(), 1);
+        assert_eq!(resolve(&source, 1, &b, &[1, 0])?, expected(&b, &[1, 0]));
+    }
+    Ok(())
+}
+
 // --- the resolver with a fake pack source --------------------------------------------------
 
 /// A scripted open failure.

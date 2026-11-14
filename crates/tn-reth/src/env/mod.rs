@@ -69,6 +69,8 @@ mod output_overlay;
 mod persist_bench;
 mod rpc;
 pub(crate) mod tx_bodies;
+#[cfg(test)]
+mod tx_body_read_bench;
 
 pub use exec_cache::ExecutionCacheStats;
 #[cfg(any(feature = "test-utils", test))]

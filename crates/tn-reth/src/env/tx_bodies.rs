@@ -192,10 +192,15 @@ impl BatchSource {
 ///
 /// Temp chains that store transactions by position share [`MemoryBatches::global`], so a datadir
 /// reopened in the same process still resolves. A batch is remembered when a persist stores its
-/// transactions by position ([`TxBodyCacheFill`]), before the persist's caller goes on.
+/// transactions by position ([`TxBodyCacheFill`]), before the persist's caller goes on, unless
+/// the instance is [`MemoryBatches::filled_by_caller`].
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Default)]
-pub struct MemoryBatches(parking_lot::Mutex<std::collections::HashMap<B256, Arc<CachedBatch>>>);
+pub struct MemoryBatches {
+    batches: parking_lot::Mutex<std::collections::HashMap<B256, Arc<CachedBatch>>>,
+    /// Whether only [`MemoryBatches::insert`] adds batches: persists do not.
+    caller_fills: bool,
+}
 
 #[cfg(any(test, feature = "test-utils"))]
 impl MemoryBatches {
@@ -206,16 +211,34 @@ impl MemoryBatches {
         GLOBAL.clone()
     }
 
+    /// An instance its owner fills with [`Self::insert`], each batch before the persist that
+    /// stores it by position: persists add nothing to it, so they do only what a node's persist
+    /// does (the cache fill on a blocking task). The execution bench holds its outputs' batches
+    /// here, so its timed outputs do not pay the copy a remembering persist makes.
+    pub fn filled_by_caller() -> Self {
+        Self { caller_fills: true, ..Self::default() }
+    }
+
     /// Remember `batch` under `digest`.
     pub fn insert(&self, digest: B256, batch: &Batch) {
         if let Some(cached) = CachedBatch::of(batch) {
-            self.0.lock().insert(digest, Arc::new(cached));
+            self.batches.lock().insert(digest, Arc::new(cached));
         }
+    }
+
+    /// How many batches it holds.
+    pub fn len(&self) -> usize {
+        self.batches.lock().len()
+    }
+
+    /// Whether it holds no batch.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// The batch remembered under `digest`.
     fn get(&self, digest: &B256) -> Option<Arc<CachedBatch>> {
-        self.0.lock().get(digest).cloned()
+        self.batches.lock().get(digest).cloned()
     }
 }
 
@@ -272,10 +295,11 @@ impl TxBodySource {
         }
     }
 
-    /// Test builds: remember `batches` in this source's [`MemoryBatches`], if it has one.
+    /// Test builds: remember `batches` in this source's [`MemoryBatches`], if it has one that
+    /// persists fill (not [`MemoryBatches::filled_by_caller`]).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn remember<'a>(&self, batches: impl IntoIterator<Item = (B256, &'a Batch)>) {
-        if let Some(memory) = &self.memory {
+        if let Some(memory) = self.memory.as_ref().filter(|memory| !memory.caller_fills) {
             for (digest, batch) in batches {
                 memory.insert(digest, batch);
             }
