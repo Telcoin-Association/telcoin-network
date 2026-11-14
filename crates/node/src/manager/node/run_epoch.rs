@@ -933,7 +933,9 @@ async fn adjust_base_fees(
     };
 
     let block_height = epoch_info.blockHeight;
-    if tip.number + 1 != block_height {
+    let identity_holds = tip.number + 1 == block_height;
+    EpochMetrics::record_close_identity_check(identity_holds);
+    if !identity_holds {
         error!(
             target: "epoch-manager",
             tip_number = tip.number,
@@ -3037,6 +3039,84 @@ pub(super) mod tests {
     }
 
     // ---- bench7 epoch-record-closing-block-check ----
+
+    /// The close-time identity check is counted: `mismatch` when the canonical tip is not a
+    /// closing block (genesis), `ok` once epoch 0's closing block executed. A chain-global failure
+    /// of the epoch-info read behind it compares nothing and counts nothing. What the check does
+    /// on a mismatch is unchanged: the close still errors.
+    ///
+    /// The recorder installs a thread-local, so the closes run on a current-thread runtime driven
+    /// from inside `metrics::with_local_recorder`.
+    #[test]
+    fn the_close_time_identity_check_is_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let closes = async {
+            let task_manager = TaskManager::new("close identity counter");
+            let chain: Arc<RethChainSpec> =
+                Arc::new(test_genesis_with_consensus_registry(4).into());
+            let tmp_dir = TempDir::with_prefix("close_identity_counter")?;
+            let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+            let acc = GasAccumulator::new(1);
+            let err = adjust_base_fees(&reth_env, &acc)
+                .await
+                .expect_err("genesis is not a closing block");
+            eyre::ensure!(
+                err.to_string().contains("close-time base-fee identity violated"),
+                "unexpected error: {err}"
+            );
+            let genesis = reth_env
+                .sealed_header_by_number(0)?
+                .ok_or_else(|| eyre::eyre!("the genesis header"))?;
+            execute_worker_block(
+                &reth_env,
+                &acc,
+                genesis,
+                &consensus_output_for_tests(1, 0, 1, true),
+                MIN_PROTOCOL_BASE_FEE,
+                0,
+                vec![],
+            )?;
+            adjust_base_fees(&reth_env, &acc).await?;
+
+            // both contracts stripped: the identity read fails chain-globally and is not counted
+            let mut genesis = test_genesis_with_consensus_registry(4);
+            genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+            genesis.alloc.remove(&CONSENSUS_REGISTRY_ADDRESS);
+            let stripped_dir = TempDir::with_prefix("close_identity_counter_stripped")?;
+            let stripped = RethEnv::new_for_temp_chain(
+                Arc::new(genesis.into()),
+                stripped_dir.path(),
+                &task_manager,
+                None,
+            )?;
+            adjust_base_fees(&stripped, &GasAccumulator::new(1)).await?;
+            Ok::<_, eyre::Report>(())
+        };
+        metrics::with_local_recorder(&recorder, || rt.block_on(closes)).expect("the closes");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = |result: &str| {
+            snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    key.key().name() == "tn_epoch.epoch_close_identity_check_total"
+                        && key.key().labels().any(|l| l.key() == "result" && l.value() == result)
+                })
+                .and_then(|(_, _, _, value)| match value {
+                    DebugValue::Counter(n) => Some(*n),
+                    _ => None,
+                })
+        };
+        assert_eq!(count("mismatch"), Some(1));
+        assert_eq!(count("ok"), Some(1));
+    }
 
     /// The epoch entry accepts a record built the way the close builds it against the pin the
     /// entry reads from the registry: epoch 0's closing block executed from a closing output with
