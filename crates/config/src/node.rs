@@ -379,6 +379,21 @@ pub struct Parameters {
     // "Parameters::switch_at_default")]`, whose type's default is the behaviour from before the
     // switch existed; every field here also gets its default in `Default for Parameters` and an
     // entry in `runtime_switches!`
+    /// Keep vote requests queued on the voter's per-author lock from each waiting out the
+    /// execution wait in turn.
+    ///
+    /// When `true`, the voter refuses at once, with a recoverable answer, a request older than the
+    /// newest it has received from the same author, and does its bounded wait for execution
+    /// before it takes the per-author lock; under the lock it only checks execution, without
+    /// waiting again. The default `false` keeps the previous behaviour: each request takes the
+    /// lock in turn and waits for execution while holding it. Issue #1804.
+    ///
+    /// The other waits under the lock stay where they are: a request already being evaluated
+    /// there, for example one waiting for a pending parent certificate its author attached, holds
+    /// the lock for up to `vote_timeout`, and a newer request from the same author waits behind
+    /// it.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub vote_queue_fix: bool,
     // ---- runtime switches: end ----
 }
 
@@ -482,6 +497,7 @@ impl Default for Parameters {
                 Parameters::default_parallel_fetch_request_delay_interval(),
             allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
             // ---- runtime switches: begin ----
+            vote_queue_fix: false,
             // ---- runtime switches: end ----
         }
     }
@@ -681,6 +697,7 @@ macro_rules! runtime_switches {
 runtime_switches! {
     // ---- runtime switches: begin ----
     // one entry per switch field, in the order the node lists them
+    vote_queue_fix,
     // ---- runtime switches: end ----
 }
 
