@@ -1167,7 +1167,8 @@ else
 fi
 case "${EXEC_SHARED_BASE:-}" in
     "") ;;
-    1) [ "$mode" = commit ] || die "EXEC_SHARED_BASE=1 is for commit mode; $mode mode already shares one base" ;;
+    1) [ "$mode" = commit ] \
+        || die "EXEC_SHARED_BASE=1 is for commit mode: $mode mode's sides already share one cache dir, and their bases differ by what they compare" ;;
     *) die "EXEC_SHARED_BASE must be 1 or unset, not '$EXEC_SHARED_BASE'" ;;
 esac
 
