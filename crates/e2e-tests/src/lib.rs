@@ -40,7 +40,7 @@ use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig, Parameters};
 use tn_node::launch_node;
 use tn_reth::init_reth_defaults;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 // unused deps warnings
 
 /// A telcoin-network binary for the e2e tests.
@@ -539,19 +539,28 @@ impl NodeOverrides {
     /// checks, for one, run when the node enters an epoch it can vote in, so a duration of the
     /// right type that those checks refuse still fails there.
     ///
+    /// A start that drops or changes entries the previous start of the same datadir merged (a
+    /// restart through a helper without overrides, or with other ones) says so in one line on
+    /// stderr and in the test's tracing, naming the datadir and the keys; it still writes the
+    /// file as described above.
+    ///
     /// The start helpers reach this through [`NodeOverrides::apply_with_e2e_parameters`].
     pub fn apply_parameters(&self, node_dir: &Path) -> eyre::Result<()> {
         let path = node_dir.join("parameters.yaml");
         let harness_base = node_dir.join("parameters.yaml.harness-base");
+        let had_base = harness_base.exists();
         if self.parameters.is_empty() {
-            if harness_base.exists() {
+            if had_base {
+                if let Ok(base) = std::fs::read_to_string(&harness_base) {
+                    report_dropped_entries(node_dir, &base);
+                }
                 std::fs::rename(&harness_base, &path).wrap_err_with(|| {
                     format!("restoring {} from {}", path.display(), harness_base.display())
                 })?;
             }
             return Ok(());
         }
-        if !harness_base.exists() {
+        if !had_base {
             std::fs::copy(&path, &harness_base).wrap_err_with(|| {
                 format!("keeping {} as {}", path.display(), harness_base.display())
             })?;
@@ -560,7 +569,7 @@ impl NodeOverrides {
             .wrap_err_with(|| format!("reading {} to merge overrides", harness_base.display()))?;
         let merged = merge_parameters_yaml(&base, &self.parameters)?;
         let staged = node_dir.join("parameters.yaml.merging");
-        std::fs::write(&staged, merged)
+        std::fs::write(&staged, &merged)
             .wrap_err_with(|| format!("writing merged overrides to {}", staged.display()))?;
         Config::load_from_path::<Parameters>(&staged, ConfigFmt::YAML).wrap_err_with(|| {
             format!(
@@ -569,6 +578,9 @@ impl NodeOverrides {
                 self.parameters
             )
         })?;
+        if had_base {
+            report_dropped_entries(node_dir, &merged);
+        }
         std::fs::rename(&staged, &path)
             .wrap_err_with(|| format!("moving {} to {}", staged.display(), path.display()))?;
         Ok(())
@@ -749,6 +761,74 @@ fn starts_top_level_entry(line: &str, key: &str) -> bool {
 /// key's sequence unindented). The next top-level key or a document marker ends the value.
 fn continues_block_value(line: &str) -> bool {
     line.trim().is_empty() || line.starts_with([' ', '\t']) || line == "-" || line.starts_with("- ")
+}
+
+/// Print [`dropped_entries_notice`] for the start about to write `next` as
+/// `<node_dir>/parameters.yaml`, on stderr and to the test's tracing, when it drops or changes an
+/// entry of the file there now. Nothing is printed when it keeps every entry or the current file
+/// cannot be read: the notice is a diagnostic and never fails a start.
+fn report_dropped_entries(node_dir: &Path, next: &str) {
+    let Ok(current) = std::fs::read_to_string(node_dir.join("parameters.yaml")) else {
+        return;
+    };
+    if let Some(notice) = dropped_entries_notice(node_dir, &current, next) {
+        eprintln!("{notice}");
+        warn!("{notice}");
+    }
+}
+
+/// The line a start prints when `next`, the `parameters.yaml` it is about to write in `node_dir`,
+/// drops or changes top-level entries of `current`, the file the previous start left there:
+/// it names the datadir and the keys, in `current`'s order. `None` when `next` holds every entry
+/// of `current` as it was (it may add entries).
+fn dropped_entries_notice(node_dir: &Path, current: &str, next: &str) -> Option<String> {
+    let next = top_level_entries(next);
+    let dropped: Vec<&str> = top_level_entries(current)
+        .into_iter()
+        .filter(|entry| !next.contains(entry))
+        .map(|(key, _)| key)
+        .collect();
+    (!dropped.is_empty()).then(|| {
+        format!(
+            "e2e: {} starts without the parameters.yaml entries {dropped:?} of its previous start: \
+             each start writes the harness's file plus its own entries, so restart it with the same \
+             overrides to keep them",
+            node_dir.display()
+        )
+    })
+}
+
+/// The top-level entries of a `parameters.yaml` text, in order, as `(key, entry)`: the entry is
+/// the `key:` line and the lines of its block value (see [`continues_block_value`]), without
+/// trailing whitespace. Lines outside any entry, such as a document marker, are skipped.
+fn top_level_entries(text: &str) -> Vec<(&str, String)> {
+    let mut entries: Vec<(&str, String)> = Vec::new();
+    let mut in_entry = false;
+    for line in text.lines() {
+        if let Some(key) = top_level_key(line) {
+            entries.push((key, line.to_owned()));
+            in_entry = true;
+        } else if in_entry && continues_block_value(line) {
+            if let Some((_, entry)) = entries.last_mut() {
+                entry.push('\n');
+                entry.push_str(line);
+            }
+        } else {
+            in_entry = false;
+        }
+    }
+    for (_, entry) in &mut entries {
+        entry.truncate(entry.trim_end().len());
+    }
+    entries
+}
+
+/// The key of the top-level mapping entry `line` opens, if it opens one: a plain key (ASCII
+/// letters, digits and `_`) at column 0, then `:` and the end of the line or whitespace.
+fn top_level_key(line: &str) -> Option<&str> {
+    let (key, rest) = line.split_once(':')?;
+    let plain = !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (plain && (rest.is_empty() || rest.starts_with([' ', '\t']))).then_some(key)
 }
 
 /// The environment variable whose `parameters.yaml` entries every start helper merges into every
@@ -1112,8 +1192,8 @@ pub async fn ensure_account_balance_infinite_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_parameters_yaml, parse_e2e_parameters, FleetOverrides, NodeOverrides,
-        E2E_PARAMETERS_VAR,
+        dropped_entries_notice, merge_parameters_yaml, parse_e2e_parameters, FleetOverrides,
+        NodeOverrides, E2E_PARAMETERS_VAR,
     };
     use std::time::Duration;
     use tn_config::{Config, ConfigFmt, ConfigTrait as _, Parameters};
@@ -1414,5 +1494,44 @@ mod tests {
                 std::fs::read_to_string(dir.path().join(node).join("parameters.yaml")).unwrap();
             assert!(merged.ends_with("\nunknown_switch: true\n"), "{node}: {merged}");
         }
+    }
+
+    /// A start that drops or changes entries the previous start merged names the datadir and the
+    /// keys; one that writes the same file, or only adds entries, says nothing.
+    #[test]
+    fn dropped_entries_notice_names_the_datadir_and_the_dropped_keys() {
+        let node_dir = std::path::Path::new("/tmp/e2e-test/validator-2");
+        let previous =
+            merge_parameters_yaml(BASE, &pairs(&[("example_switch", "true"), ("first", "9")]))
+                .unwrap();
+
+        // a restart without overrides: the harness's file comes back
+        assert_eq!(
+            dropped_entries_notice(node_dir, &previous, BASE).as_deref(),
+            Some(
+                "e2e: /tmp/e2e-test/validator-2 starts without the parameters.yaml entries \
+                 [\"example_switch\", \"first\"] of its previous start: each start writes the \
+                 harness's file plus its own entries, so restart it with the same overrides to \
+                 keep them"
+            )
+        );
+
+        // a restart with other overrides: a changed value counts, a kept entry does not
+        let other =
+            merge_parameters_yaml(BASE, &pairs(&[("first", "9"), ("example_switch", "false")]))
+                .unwrap();
+        let notice = dropped_entries_notice(node_dir, &previous, &other).unwrap();
+        assert!(notice.contains(" [\"example_switch\"] "), "{notice}");
+
+        // a block value replaced by the harness's is a change too
+        let flat = merge_parameters_yaml(BASE, &pairs(&[("nested", "{}")])).unwrap();
+        let notice = dropped_entries_notice(node_dir, &flat, BASE).unwrap();
+        assert!(notice.contains(" [\"nested\"] "), "{notice}");
+
+        // the same file, or one that only adds entries, says nothing
+        assert_eq!(dropped_entries_notice(node_dir, &previous, &previous), None);
+        let more = merge_parameters_yaml(&previous, &pairs(&[("other_switch", "4")])).unwrap();
+        assert_eq!(dropped_entries_notice(node_dir, &previous, &more), None);
+        assert_eq!(dropped_entries_notice(node_dir, BASE, BASE), None);
     }
 }
