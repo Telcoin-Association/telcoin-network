@@ -373,8 +373,10 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             block_range.start(),
             None,
         ) {
+            // TN(TN-0135, TN-0160): through `load_jar`'s checks, also when the jar was cached
+            // before its configuration changed on disk.
             Ok(provider) => (
-                NippyJar::load(provider.data_path()).map_err(ProviderError::other)?,
+                static_file_provider.load_jar(segment, provider.data_path())?,
                 provider.data_path().into(),
             ),
             Err(ProviderError::MissingStaticFileBlock(_, _)) => {

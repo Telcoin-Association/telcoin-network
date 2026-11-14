@@ -2133,17 +2133,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
 - **TN-0135** — A storage-v2 datadir refuses a jar of a checksummed segment without checksums.
   *Kind*: fix (static-file integrity, policy).
   *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs,
-  tn_checksum_tests.rs}` (`StaticFileProviderInner::load_jar`, `UncheckedJarError`, at every jar
-  load: the cache fill and its reload, `prepare_index_update`, `update_index`,
-  `check_segment_consistency`; tests), `crates/storage/provider/src/providers/mod.rs`.
+  tn_checksum_tests.rs}` (`StaticFileProviderInner::load_jar`, `UncheckedJarError`, at the loads
+  that read a jar's values or heal it: the cache fill and its reload, `prepare_index_update`,
+  `update_index`, `check_segment_consistency`, and since TN-0151 and TN-0165 the changeset counts
+  and the writer's open; tests), `crates/storage/provider/src/providers/mod.rs`.
   *Why*: the format is the configuration's version (TN-0120), and two flipped bits turn version 2
   into version 1. A checksummed jar read as version 1 hands out its values with the checksum
   appended (a storage changeset's `U256` reads wrong without an error) and its 20-byte `.csoff`
   records at a 16-byte stride. A byte pattern cannot tell that from a real version-1 jar, but the
   datadir's layout can: under storage v2 (the provider's `jar_checksums`, set from the stored
   settings before any read, TN-0122) every new jar of a checksummed segment is version 2, so a
-  version-1 jar there is refused (`UncheckedJarError`) wherever a jar loads for reading, writing or
-  the startup check. Storage-v2 datadirs written before TN-0120 hold unchecked jars and no longer
+  version-1 jar there is refused (`UncheckedJarError`) at each of those loads. The loads that use
+  only the header keep `NippyJar::load`, since a version-1 header decodes as the version-2 one:
+  `iter_static_files` (the index, the contiguity check, metrics; TN-0160 checks its names) and
+  the deletions (`delete_jar`, `delete_current_and_open_previous`). Storage-v2 datadirs written before TN-0120 hold unchecked jars and no longer
   open: accepted, as storage v2 was never released and development datadirs are recreated.
   Version-1 datadirs are unaffected (checksums off). Read-only providers opened without a
   `ProviderFactory` do not know the layout and keep reading a jar in its own format. It cannot
@@ -2430,14 +2433,14 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `crates/storage/provider/src/providers/static_file/{manager.rs, tn_checksum_tests.rs}`
   (`account_changeset_count`, `storage_changeset_count`; test).
   *Why*: the two counts loaded a jar's configuration with `NippyJar::load`, outside `load_jar`,
-  so in a storage-v2 datadir a jar without checksums, which TN-0135 refuses at every other load,
-  was counted with its own record size instead of refused. They also named each file by the
+  so in a storage-v2 datadir a jar without checksums, which TN-0135 refuses at the loads that read
+  values, was counted with its own record size instead of refused. They also named each file by the
   blocks its configuration holds (the range `iter_static_files` lists), not by its fixed range,
   so a segment's last file, which holds fewer blocks than its range until it fills, was never
   found and its changes were left out of the count (upstream's line). *Can reach execution or
-  storage*: no. They only read and count, and no TN crate calls them (they back reth's
-  `StatsReader::count_entries` and the `*_changeset_count` provider methods); no byte written or
-  read for a block changes. *Tests*: `storage_v2_refuses_jars_without_checksums` (both counts
+  storage*: no. They only read and count, and no TN crate calls them (they back the
+  `*_changeset_count` methods of reth's database and consistent providers;
+  `StatsReader::count_entries` does not reach them); no byte written or read for a block changes. *Tests*: `storage_v2_refuses_jars_without_checksums` (both counts
   refuse an unchecked jar under v2, and count every block, the last file's too, with checksums
   off and for the segment still checked; it fails without either change). *Upstream*: the file
   name, yes; the format check, no (TN-0135 is TN's).
@@ -2689,3 +2692,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   storage: one `fsync` more per changeset prune, no byte changes. *Tests*: none new (a sync's
   ordering against a crash is not observable in a test); the TN-0130 crash tests unchanged.
   *Upstream*: maybe.
+
+- **TN-0165** — The static-file writer's open loads the jar through TN-0135's and TN-0160's
+  checks. *Kind*: fix (static-file integrity). *Files*:
+  `crates/storage/provider/src/providers/static_file/{writer.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderRW::open`; test).
+  *Why*: the open loaded the configuration of a jar the cache already held with `NippyJar::load`.
+  A checksummed jar's configuration turned into version 1 on disk while the node ran (two flipped
+  bits) then ran the version-1 heal, which can cut committed rows, and its commit rewrote the
+  configuration, before the index update's `load_jar` refused the jar. A jar the cache does not
+  hold was already loaded through `load_jar` on the cache fill. Now the open loads through
+  `load_jar` in both cases, so the refusal comes before the heal. *Can reach execution or
+  storage*: storage, by refusing: a jar that passes the checks opens as before. *Tests*:
+  `storage_v2_refuses_jars_without_checksums` (a cached jar's configuration turned into version 1
+  with its offsets file one offset short: the writer's open is refused and both files are left as
+  they are; it fails without the change). *Upstream*: no (TN-0135 is TN's).

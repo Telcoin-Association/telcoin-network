@@ -460,10 +460,11 @@ fn is_unchecked_jar(err: &ProviderError) -> bool {
 }
 
 /// TN(TN-0135): a provider with checksums on (storage v2) refuses a jar of a checksummed segment
-/// that has none, at every load: one written without checksums (a storage-v2 datadir from before
-/// them), and a checksummed jar whose configuration's version became 1 (its trailer dropped), which
-/// would otherwise read its values with their checksums appended. A provider with checksums off
-/// reads the unchecked jars. TN(TN-0151): the changeset counts (`db stats`) refuse them too.
+/// that has none, at every load that reads or opens it: one written without checksums (a
+/// storage-v2 datadir from before them), and a checksummed jar whose configuration's version became
+/// 1 (its trailer dropped), which would otherwise read its values with their checksums appended. A
+/// provider with checksums off reads the unchecked jars. TN(TN-0151): the changeset counts refuse
+/// them too. TN(TN-0165): so does the writer's open of a jar the cache holds.
 #[test]
 fn storage_v2_refuses_jars_without_checksums() {
     // Written without checksums, opened with them.
@@ -506,6 +507,29 @@ fn storage_v2_refuses_jars_without_checksums() {
     assert!(is_unchecked_jar(&reopened.storage_changeset_count().unwrap_err()));
     assert_eq!(reopened.account_block_changeset(1).unwrap(), account_changes(1));
     assert_eq!(reopened.account_changeset_count().unwrap() as u64, 3 * CHANGES);
+    drop(reopened);
+
+    // TN-0165: turned into version 1 after the jar was cached, its offsets file one offset short;
+    // the writer's open, a cache hit, is refused and leaves both files as they are. It ran the
+    // version-1 heal, which cut a row and rewrote the configuration, before a later load refused.
+    let (dir, _) = create_test_static_files_dir();
+    write_changesets(&provider(dir.path(), true, 1_000), 0..3);
+    let checked = provider(dir.path(), true, 1_000);
+    let path = jar_path(&checked, StaticFileSegment::AccountChangeSets, 0);
+    assert_eq!(checked.account_block_changeset(2).unwrap(), account_changes(2));
+    let config = path.with_extension("conf");
+    let mut bytes = std::fs::read(&config).unwrap();
+    bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+    bytes.truncate(bytes.len() - 4);
+    std::fs::write(&config, &bytes).unwrap();
+    let offsets = path.with_extension("off");
+    let mut short = std::fs::read(&offsets).unwrap();
+    short.truncate(short.len() - 8);
+    std::fs::write(&offsets, &short).unwrap();
+    let err = checked.latest_writer(StaticFileSegment::AccountChangeSets).map(drop).unwrap_err();
+    assert!(is_unchecked_jar(&err), "{err}");
+    assert_eq!(std::fs::read(&config).unwrap(), bytes);
+    assert_eq!(std::fs::read(&offsets).unwrap(), short);
 }
 
 /// A range read that meets a row missing inside a jar's own range is an error, not a shorter
