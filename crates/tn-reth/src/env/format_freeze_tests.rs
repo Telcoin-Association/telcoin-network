@@ -43,7 +43,10 @@
 //! the crate README, "On-disk format versions". It refuses to rewrite a fixture whose `version`
 //! lines differ from the build's.
 
-use super::{database::TN_LMDB_DB_VERSION, layout::TN_LAYOUT_VERSION};
+use super::{
+    database::TN_LMDB_DB_VERSION,
+    layout::{stored_marker, TN_LAYOUT_KEY},
+};
 use crate::{
     init_reth_defaults,
     payload::TNPayload,
@@ -72,7 +75,7 @@ use reth_db::{
 use reth_node_core::{args::DatadirArgs, node_config::NodeConfig};
 use reth_provider::{
     AccountReader as _, BlockBodyIndicesProvider as _, ChangeSetReader as _,
-    DatabaseProviderFactory as _, HeaderProvider as _, ReceiptProvider as _,
+    DatabaseProviderFactory as _, HeaderProvider as _, MetadataProvider as _, ReceiptProvider as _,
     StateProviderFactory as _, StaticFileProviderFactory as _, StaticFileSegment,
     StorageChangeSetReader as _, StorageSettingsCache as _, TransactionsProvider as _,
 };
@@ -452,7 +455,8 @@ struct Opened {
 }
 
 impl Opened {
-    /// Open the datadir at `dir` with `chain`; a new datadir takes `layout`.
+    /// Open the datadir at `dir` with `chain`; a new datadir takes `layout` and stores its
+    /// transactions inline, as every fixture does.
     fn open(dir: &Path, chain: Arc<RethChainSpec>, layout: StorageLayout) -> eyre::Result<Self> {
         init_reth_defaults();
         let node_config = NodeConfig {
@@ -465,7 +469,9 @@ impl Opened {
             chain,
             ..NodeConfig::default()
         };
-        let config = RethConfig::from_node_config(node_config).with_new_datadir_layout(layout);
+        let config = RethConfig::from_node_config(node_config)
+            .with_new_datadir_layout(layout)
+            .with_new_datadir_tx_bodies(crate::TxBodies::Inline);
         let tasks = TaskManager::new("format freeze");
         // where the node keeps it (`TelcoinDirs::reth_db_path`)
         let db = RethEnv::new_database(&config, dir.join("db"))?;
@@ -624,7 +630,13 @@ fn relative(root: &Path, path: &Path) -> eyre::Result<String> {
 
 /// The `version` lines: each marker's value as `env`'s datadir and the running build hold it.
 fn versions(env: &RethEnv, db_dir: &Path, lines: &mut Lines) -> eyre::Result<()> {
-    lines.insert("version tn_layout".into(), TN_LAYOUT_VERSION.to_string());
+    // the datadir's marker, not this build's newest version: a datadir keeps the version it was
+    // created with
+    let provider = env.blockchain_provider().database_provider_ro()?;
+    let marker = stored_marker(provider.get_metadata(TN_LAYOUT_KEY)?)?
+        .ok_or_else(|| eyre::eyre!("the datadir has no {TN_LAYOUT_KEY} marker"))?;
+    drop(provider);
+    lines.insert("version tn_layout".into(), marker.version.to_string());
     lines.insert("version db_version_file".into(), TN_LMDB_DB_VERSION.to_string());
     lines.insert("version exec_state_pack".into(), EXEC_STATE_PACK_VERSION.to_string());
     // the meta record's format version and page size (crates/tn-lmdb/src/meta.rs)

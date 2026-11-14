@@ -58,7 +58,7 @@ use crate::{
     dirs::path_to_datadir,
     rpc_server_args::{RpcServerArgs, DEFAULT_IPC_ENDPOINT},
     rpc_tx_forward::TxForwardConfig,
-    StorageLayout,
+    DatadirFormat, StorageLayout, TxBodies, TX_BODY_CACHE_BYTES,
 };
 
 /// A wrapper abstraction around a Reth node config.
@@ -67,14 +67,43 @@ use crate::{
 /// `--sanitize-txs`), which reth's `NodeConfig` has no place for. The third is the storage layout
 /// a new datadir gets ([`RethConfig::new_datadir_layout`]). The fourth is tn-lmdb's gap fill,
 /// `--db.gap-fill` (off, a width in pages, or auto; [`RethConfig::db_gap_fill`]), which reth's
-/// `DatabaseArgs` has no place for.
+/// `DatabaseArgs` has no place for. The fifth is where a new datadir keeps its transactions and
+/// the decoded-batch cache's budget ([`RethConfig::new_datadir_tx_bodies`],
+/// [`RethConfig::tx_body_cache_bytes`]).
 #[derive(Clone, Debug)]
 pub struct RethConfig(
     pub(crate) NodeConfig<RethChainSpec>,
     pub(crate) TxForwardConfig,
     pub(crate) StorageLayout,
     pub(crate) GapFill,
+    pub(crate) TxBodiesConfig,
 );
+
+/// Where a new datadir keeps its transactions, and how the env reads those a datadir stores by
+/// position (`env::tx_bodies`).
+#[derive(Clone, Debug)]
+pub(crate) struct TxBodiesConfig {
+    /// What a new datadir is asked for ([`TxBodies::for_new_datadirs`] unless chosen).
+    new_datadirs: TxBodies,
+    /// The decoded-batch cache's budget in bytes ([`TX_BODY_CACHE_BYTES`] unless chosen; 0: none).
+    cache_bytes: usize,
+    /// Test builds: read batches from the process-wide `MemoryBatches` before any consensus pack,
+    /// and remember there every batch a persist stores by position (temp chains that store
+    /// transactions by position).
+    #[cfg(any(test, feature = "test-utils"))]
+    memory_batches: bool,
+}
+
+impl Default for TxBodiesConfig {
+    fn default() -> Self {
+        Self {
+            new_datadirs: TxBodies::for_new_datadirs(),
+            cache_bytes: TX_BODY_CACHE_BYTES,
+            #[cfg(any(test, feature = "test-utils"))]
+            memory_batches: false,
+        }
+    }
+}
 
 /// Reth specific command line args.
 #[derive(Debug, Parser, Clone)]
@@ -488,6 +517,7 @@ impl RethConfig {
             tx_forward,
             StorageLayout::for_new_datadirs(),
             db_gap_fill.unwrap_or(DEFAULT_DB_GAP_FILL),
+            TxBodiesConfig::default(),
         )
     }
 
@@ -499,6 +529,7 @@ impl RethConfig {
             TxForwardConfig::default(),
             StorageLayout::for_new_datadirs(),
             GapFill::OFF,
+            TxBodiesConfig::default(),
         )
     }
 
@@ -513,6 +544,55 @@ impl RethConfig {
     /// layouts. The MDBX build refuses v2 when it creates the datadir.
     pub fn with_new_datadir_layout(mut self, layout: StorageLayout) -> Self {
         self.2 = layout;
+        self
+    }
+
+    /// Where a new datadir keeps its transactions: [`TxBodies::for_new_datadirs`] unless
+    /// [`Self::with_new_datadir_tx_bodies`] chose otherwise. Pointers need layout v2: a new v1
+    /// datadir stores them inline whatever this says. An existing datadir keeps its own
+    /// (`env::layout`).
+    pub fn new_datadir_tx_bodies(&self) -> TxBodies {
+        self.4.new_datadirs
+    }
+
+    /// This config, asking a new datadir for `tx_bodies`: for benches and tests that compare the
+    /// formats.
+    pub fn with_new_datadir_tx_bodies(mut self, tx_bodies: TxBodies) -> Self {
+        self.4.new_datadirs = tx_bodies;
+        self
+    }
+
+    /// The format a new datadir is asked for: [`Self::new_datadir_layout`] and
+    /// [`Self::new_datadir_tx_bodies`].
+    pub fn new_datadir_format(&self) -> DatadirFormat {
+        DatadirFormat { layout: self.2, tx_bodies: self.4.new_datadirs }
+    }
+
+    /// The decoded-batch cache's budget in bytes: [`TX_BODY_CACHE_BYTES`] unless
+    /// [`Self::with_tx_body_cache_bytes`] chose otherwise.
+    pub fn tx_body_cache_bytes(&self) -> usize {
+        self.4.cache_bytes
+    }
+
+    /// This config, with a decoded-batch cache of `bytes` (0: none, so every read of a
+    /// transaction stored by position reads its pack): for tests and benches.
+    pub fn with_tx_body_cache_bytes(mut self, bytes: usize) -> Self {
+        self.4.cache_bytes = bytes;
+        self
+    }
+
+    /// Test builds: whether the env reads batches from the process-wide `MemoryBatches`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn memory_batches(&self) -> bool {
+        self.4.memory_batches
+    }
+
+    /// Test builds: this config, with the env reading batches from the process-wide
+    /// `MemoryBatches` before any consensus pack and remembering there every batch a persist
+    /// stores by position, as temp chains that store transactions by position do.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_memory_batches(mut self, enabled: bool) -> Self {
+        self.4.memory_batches = enabled;
         self
     }
 

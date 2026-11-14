@@ -108,6 +108,7 @@ use crate::{
 use super::{
     exec_cache::{CachedStateProvider, ExecutionCache},
     output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
+    tx_bodies::TxBodyCacheFill,
     RethEnv,
 };
 
@@ -752,22 +753,34 @@ impl RethEnv {
     }
 
     /// Hand the batches whose transactions a just-persisted output stored by position to the
-    /// installed [`PersistedBatchSink`], which fills the decoded-batch cache from them.
+    /// env's own decoded-batch cache fill ([`TxBodyCacheFill`], in a datadir that stores
+    /// transactions by position once its batches have a source), then to the installed
+    /// [`PersistedBatchSink`], if any.
     ///
     /// The engine calls it once per output, after [`Self::persist_executed_output`] returned `Ok`
     /// and before the output is announced, with the output and the `tx_positions` it persisted:
     /// `tx_positions[i]` belongs to the block built from the output's `i`-th flattened batch. With
-    /// no sink installed, or no block stored by position, it does nothing. Otherwise its cost here
-    /// is one `Arc` clone of the output and a pass over its batch list: the sink copies the batches
-    /// off this thread.
+    /// neither receiver, or no block stored by position, it does nothing. Otherwise its cost here
+    /// is one `Arc` clone of the output and a pass over its batch list per receiver: they copy the
+    /// batches off this thread.
     pub fn cache_persisted_batches(
         &self,
         output: &ConsensusOutput,
         tx_positions: &[Option<Arc<[u32]>>],
     ) {
-        let Some(sink) = self.inner.persisted_batch_sink.get() else { return };
+        let fill = self.inner.tx_body_cache_fill.get();
+        let sink = self.inner.persisted_batch_sink.get();
+        if fill.is_none() && sink.is_none() {
+            return;
+        }
         let batches = PersistedBatches::new(output, tx_positions);
-        if !batches.is_empty() {
+        if batches.is_empty() {
+            return;
+        }
+        if let Some(fill) = fill {
+            fill.batches_persisted(batches.clone());
+        }
+        if let Some(sink) = sink {
             sink.batches_persisted(batches);
         }
     }
@@ -1380,13 +1393,19 @@ mod tests {
         )
     }
 
-    /// A temp chain whose genesis funds the senders of `batches`.
-    fn funded_env(batches: &[&Batch]) -> eyre::Result<(RethEnv, TempDir, TaskManager)> {
+    /// A temp chain whose genesis funds the senders of `batches`, storing transactions inline: no
+    /// pointer jars, and no cache fill installed.
+    fn funded_inline_env(batches: &[&Batch]) -> eyre::Result<(RethEnv, TempDir, TaskManager)> {
         let (genesis, ..) = seeded_genesis_from_random_batches(test_genesis(), batches.to_vec());
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::new("tx positions");
-        let env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+        let format = crate::DatadirFormat {
+            layout: crate::env::genesis::temp_chain_new_datadir_layout()?,
+            tx_bodies: crate::TxBodies::Inline,
+        };
+        let env =
+            RethEnv::new_for_temp_chain_with_format(chain, tmp_dir.path(), &task_manager, format)?;
         Ok((env, tmp_dir, task_manager))
     }
 
@@ -1464,7 +1483,7 @@ mod tests {
     async fn test_inline_rows_counted_only_in_a_pointer_datadir() -> eyre::Result<()> {
         let chain = test_chain_spec_arc();
         let [x, y, z, w] = [3, 2, 1, 2].map(|txs| batch_with_transactions(chain.clone(), txs, 0));
-        let (env, _tmp_dir, _task_manager) = funded_env(&[&x, &y, &z, &w])?;
+        let (env, _tmp_dir, _task_manager) = funded_inline_env(&[&x, &y, &z, &w])?;
         let static_files = env.inner.blockchain_provider.static_file_provider();
         let mut parent = env.canonical_tip();
         let recorder = DebuggingRecorder::new();
@@ -1560,7 +1579,7 @@ mod tests {
         let tx_positions =
             [positions(&[0]), positions(&[0]), positions(&[]), None, positions(&[0, 1])];
 
-        let (env, _tmp_dir, _task_manager) = funded_env(&[])?;
+        let (env, _tmp_dir, _task_manager) = funded_inline_env(&[])?;
         env.cache_persisted_batches(&output, &tx_positions); // no sink: nothing to do
         let sink = Arc::new(RecordingSink::default());
         env.set_persisted_batch_sink(sink.clone())?;

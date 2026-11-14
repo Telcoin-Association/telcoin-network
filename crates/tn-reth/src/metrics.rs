@@ -25,6 +25,14 @@
 //! transactions by batch position stored inline instead (expected zero; see
 //! [`record_tx_body_inline_rows`]).
 //!
+//! Transaction reads of such a datadir (`env::tx_bodies`): `tn_reth.tx_body_resolves_total`
+//! (labeled by `source`: `recent`, `cold`, `live_pack`, `closed_pack`, `memory`) counts the blocks
+//! whose position rows were resolved, `tn_reth.tx_body_resolve_failures_total` (labeled by
+//! `reason`, alertable) those that failed, `tn_reth.tx_body_pack_opens_total` the closed-epoch
+//! packs the resolver opened, the gauge `tn_reth.tx_body_cache_bytes` (labeled by `part`: `recent`,
+//! `cold`) the decoded-batch cache's size, and the histogram `tn_reth.tx_body_resolve_seconds` the
+//! resolves that read a pack. See [`register_tx_body_series`].
+//!
 //! Six histograms in the same group time the stages of each block built, one sample per block
 //! each: `tn_reth.block_signer_recovery_seconds` (per batch, ahead of the build: in the bytes
 //! build before the builder is set up, in `recover_output_signers` concurrently across the
@@ -149,6 +157,7 @@ pub(crate) fn init() {
     register_storage_walk_fallback_series();
     register_parallel_root_task_failure_series();
     register_retired_pool_handoff_series();
+    register_tx_body_series();
 }
 
 /// Metrics for the execution environment: block building from certified batch payloads, plus
@@ -1254,6 +1263,68 @@ pub(crate) fn record_epoch_close_gas(gas: &EpochCloseGas) {
             );
         }
     }
+}
+
+/// Counter of the blocks whose transactions, stored by batch position, were resolved, labeled by
+/// where the batch was found (`source`).
+const TX_BODY_RESOLVES: &str = "tn_reth.tx_body_resolves_total";
+
+/// Counter of the blocks whose transactions, stored by batch position, could not be resolved,
+/// labeled by why (`reason`). Alert on any nonzero value: the read returned an error, and every
+/// later read of those transactions will until the packs are restored.
+const TX_BODY_RESOLVE_FAILURES: &str = "tn_reth.tx_body_resolve_failures_total";
+
+/// Counter of the closed epochs' consensus packs the transaction resolver opened. Each open reads
+/// about 4 MiB of bloom filters; a steady rate means history reads keep moving between more than
+/// four epochs.
+const TX_BODY_PACK_OPENS: &str = "tn_reth.tx_body_pack_opens_total";
+
+/// Gauge of the bytes the decoded-batch cache holds, labeled by `part` (`recent`, `cold`).
+const TX_BODY_CACHE_BYTES: &str = "tn_reth.tx_body_cache_bytes";
+
+/// Histogram of the resolves that read a consensus pack, in seconds.
+const TX_BODY_RESOLVE_SECONDS: &str = "tn_reth.tx_body_resolve_seconds";
+
+/// Register the transaction resolver's series at zero, every label value of each labeled one.
+/// Called from [`init`].
+fn register_tx_body_series() {
+    use crate::env::tx_bodies::{BatchSource, TxBodyErrorKind};
+
+    for source in BatchSource::LABELS {
+        metrics::counter!(TX_BODY_RESOLVES, "source" => source).increment(0);
+    }
+    for reason in TxBodyErrorKind::LABELS {
+        metrics::counter!(TX_BODY_RESOLVE_FAILURES, "reason" => reason).increment(0);
+    }
+    metrics::counter!(TX_BODY_PACK_OPENS).increment(0);
+    for part in ["recent", "cold"] {
+        metrics::gauge!(TX_BODY_CACHE_BYTES, "part" => part).set(0.0);
+    }
+}
+
+/// Count one block whose position rows were resolved from `source`.
+pub(crate) fn record_tx_body_resolve(source: &'static str) {
+    metrics::counter!(TX_BODY_RESOLVES, "source" => source).increment(1);
+}
+
+/// Count one block whose position rows failed to resolve, for `reason`.
+pub(crate) fn record_tx_body_resolve_failure(reason: &'static str) {
+    metrics::counter!(TX_BODY_RESOLVE_FAILURES, "reason" => reason).increment(1);
+}
+
+/// Count one closed-epoch pack the resolver opened.
+pub(crate) fn record_tx_body_pack_open() {
+    metrics::counter!(TX_BODY_PACK_OPENS).increment(1);
+}
+
+/// Set the bytes the decoded-batch cache's `part` holds.
+pub(crate) fn set_tx_body_cache_bytes(part: &'static str, bytes: usize) {
+    metrics::gauge!(TX_BODY_CACHE_BYTES, "part" => part).set(bytes as f64);
+}
+
+/// Record the time of one resolve that read a pack.
+pub(crate) fn record_tx_body_resolve_seconds(elapsed: std::time::Duration) {
+    metrics::histogram!(TX_BODY_RESOLVE_SECONDS).record(elapsed);
 }
 
 #[cfg(test)]
