@@ -19,6 +19,8 @@ use tn_storage::{
 use tn_types::{ConsensusHeaderDigest, Epoch, Noticer, TaskError, TaskSpawner};
 use tracing::{debug, error, info};
 
+use crate::metrics::{StateSyncMetrics, STATE_SYNC_METRICS};
+
 /// How long to wait before retrying a failed epoch record collection.
 const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
 
@@ -97,18 +99,35 @@ pub async fn sync_epoch_records_to_tip(
     consensus_bus: &ConsensusBusApp,
     node_shutdown: Noticer,
 ) -> eyre::Result<()> {
+    sync_epoch_records_to_tip_with(
+        consensus_chain,
+        primary_handle,
+        consensus_bus,
+        node_shutdown,
+        &STATE_SYNC_METRICS,
+    )
+    .await
+}
+
+/// [`sync_epoch_records_to_tip`], reporting to `metrics`.
+///
+/// The certified prefix is read from the store before the first pass, so a restarted node
+/// reports the certificates it already holds before any peer answers, and again around every
+/// pass (see [`certified_prefix_end`]).
+async fn sync_epoch_records_to_tip_with(
+    consensus_chain: &ConsensusChain,
+    primary_handle: &PrimaryNetworkHandle,
+    consensus_bus: &ConsensusBusApp,
+    node_shutdown: Noticer,
+    metrics: &StateSyncMetrics,
+) -> eyre::Result<()> {
+    certified_prefix_end(consensus_chain, metrics).await;
     drive_epoch_record_sync(
         || async { primary_handle.inner_handle().established_peer_count().await.unwrap_or(0) },
         |epoch| collect_epoch_records(epoch, consensus_chain, primary_handle, consensus_bus),
-        || async {
-            // This cached scan also detects certificate backfill below the latest stored record,
-            // including replacement of the dummy epoch 0 with a certified record.
-            consensus_chain
-                .epochs()
-                .first_missing_historical_cert(Epoch::MAX)
-                .await
-                .unwrap_or(Epoch::MAX)
-        },
+        // This cached scan also detects certificate backfill below the latest stored record,
+        // including replacement of the dummy epoch 0 with a certified record.
+        || certified_prefix_end(consensus_chain, metrics),
         node_shutdown,
     )
     .await
@@ -412,6 +431,30 @@ pub async fn spawn_epoch_record_collector(
     node_task_spawner: TaskSpawner,
     node_shutdown: Noticer,
 ) -> eyre::Result<()> {
+    spawn_epoch_record_collector_with(
+        consensus_chain,
+        primary_handle,
+        consensus_bus,
+        node_task_spawner,
+        node_shutdown,
+        STATE_SYNC_METRICS.clone(),
+    )
+    .await
+}
+
+/// [`spawn_epoch_record_collector`], reporting to `metrics`.
+///
+/// After every pass the certified prefix is read from the store, not from the pass, so a
+/// certificate stored by another path (this node's own vote round, the startup sync) shows on the
+/// next wake-up too (see [`certified_prefix_end`]).
+async fn spawn_epoch_record_collector_with(
+    consensus_chain: ConsensusChain,
+    primary_handle: PrimaryNetworkHandle,
+    consensus_bus: ConsensusBusApp,
+    node_task_spawner: TaskSpawner,
+    node_shutdown: Noticer,
+    metrics: StateSyncMetrics,
+) -> eyre::Result<()> {
     let mut epoch_rx = consensus_bus.requested_missing_epoch().subscribe();
     node_task_spawner.spawn_critical_task("Epoch Record Collector", async move {
         // Always start from epoch 0 so any gaps (epochs whose certs were never
@@ -438,6 +481,7 @@ pub async fn spawn_epoch_record_collector(
             .await
             .map_err(|e| TaskError::from_message(format!("{e:#}")))?
             .epoch;
+            certified_prefix_end(&consensus_chain, &metrics).await;
             // Wait until the watch is updated or a retry timer fires.
             // The retry timer ensures that a failed collection attempt (e.g. peers not yet
             // connected at startup) is re-attempted automatically without requiring a new
@@ -452,6 +496,26 @@ pub async fn spawn_epoch_record_collector(
         }
     });
     Ok(())
+}
+
+/// Read the end of the certified prefix of stored epoch records and set
+/// `tn_state_sync.epoch_records_certified_through` from it.
+///
+/// Returns the first epoch without a stored record and certificate
+/// (`EpochRecordDb::first_missing_historical_cert` over every epoch, cheap: the store resumes from
+/// its watermark); the gauge is that epoch minus one, `-1` when epoch 0 has no certificate. A dead
+/// store answers epoch 0 as missing, so its answer leaves the gauge at the last real reading.
+async fn certified_prefix_end(
+    consensus_chain: &ConsensusChain,
+    metrics: &StateSyncMetrics,
+) -> Epoch {
+    let epochs = consensus_chain.epochs();
+    let first_missing =
+        epochs.first_missing_historical_cert(Epoch::MAX).await.unwrap_or(Epoch::MAX);
+    if epochs.is_alive() {
+        metrics.epoch_records_certified_through.set(f64::from(first_missing) - 1.0);
+    }
+    first_missing
 }
 
 #[cfg(test)]
@@ -1024,6 +1088,185 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("no retrieved line in {lines:?}"))?;
         assert!(line.contains(&format!(" peer={peer}")), "{line}");
         assert!(line.contains(" signers=3"), "{line}");
+        Ok(())
+    }
+
+    /// A [`StateSyncMetrics`] registered on a local recorder, and the snapshotter that reads it.
+    fn local_metrics() -> (StateSyncMetrics, metrics_util::debugging::Snapshotter) {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = ::metrics::with_local_recorder(&recorder, || {
+            StateSyncMetrics::new_with_labels(Vec::<::metrics::Label>::new())
+        });
+        (metrics, snapshotter)
+    }
+
+    /// `tn_state_sync.epoch_records_certified_through`, once set.
+    fn certified_through(snapshotter: &metrics_util::debugging::Snapshotter) -> Option<f64> {
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, .., value)| match value {
+            metrics_util::debugging::DebugValue::Gauge(gauge)
+                if key.key().name() == "tn_state_sync.epoch_records_certified_through" =>
+            {
+                Some(gauge.0)
+            }
+            _ => None,
+        })
+    }
+
+    /// The gauge stops at the first epoch without a certificate: a certificate stored past the
+    /// gap does not move it. Epochs 0, 1 and 3 certified, epoch 2 stored without one: 1.
+    #[tokio::test]
+    async fn test_certified_through_stops_at_a_gap() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authorities: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<_> =
+            authorities.iter().map(|authority| authority.primary_public_key()).collect();
+        let signers: Vec<_> = authorities.iter().map(|authority| authority.keypair()).collect();
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        for (record, cert) in certified_chain(&keys, &signers, 3) {
+            if record.epoch == 2 {
+                chain.epochs().save_record(record).await?;
+            } else {
+                chain.epochs().save(record, cert).await?;
+            }
+        }
+        let (metrics, snapshotter) = local_metrics();
+        assert_eq!(certified_prefix_end(&chain, &metrics).await, 2);
+        assert_eq!(certified_through(&snapshotter), Some(1.0));
+        Ok(())
+    }
+
+    /// The startup sync sets the gauge from what it downloads: from the unsigned genesis anchor,
+    /// which reads as none (-1), to epoch 1.
+    #[tokio::test]
+    async fn test_startup_sync_sets_certified_through() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authorities: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<_> =
+            authorities.iter().map(|authority| authority.primary_public_key()).collect();
+        let signers: Vec<_> = authorities.iter().map(|authority| authority.keypair()).collect();
+        let records = certified_chain(&keys, &signers, 1);
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        let record0 = records.first().map(|(record, _)| record.clone());
+        chain
+            .epochs()
+            .save_dummy_epoch0(record0.ok_or_else(|| eyre::eyre!("no record 0"))?)
+            .await?;
+        let handle = mock_epoch_record_network(
+            records.into_iter().enumerate().map(|(epoch, pair)| (epoch as Epoch, pair)).collect(),
+            keys[0],
+            1,
+        );
+        let bus = ConsensusBus::new();
+        let shutdown = tn_types::ShutdownNotifier::new();
+        let (metrics, snapshotter) = local_metrics();
+
+        assert_eq!(certified_prefix_end(&chain, &metrics).await, 0);
+        assert_eq!(
+            certified_through(&snapshotter),
+            Some(-1.0),
+            "the dummy anchor is not certified"
+        );
+        sync_epoch_records_to_tip_with(&chain, &handle, bus.app(), shutdown.subscribe(), &metrics)
+            .await?;
+        assert_eq!(certified_through(&snapshotter), Some(1.0));
+        Ok(())
+    }
+
+    /// After a restart the gauge reports the certificates the store already holds before any peer
+    /// answers: the startup sync reads the store before its first pass (here shutdown ends the
+    /// sync before any pass runs).
+    #[tokio::test]
+    async fn test_certified_through_is_read_from_the_store_after_a_restart() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authorities: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<_> =
+            authorities.iter().map(|authority| authority.primary_public_key()).collect();
+        let signers: Vec<_> = authorities.iter().map(|authority| authority.keypair()).collect();
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        for (record, cert) in certified_chain(&keys, &signers, 1) {
+            chain.epochs().save(record, cert).await?;
+        }
+        chain.epochs().persist().await?;
+        chain.close().await;
+
+        let chain = ConsensusChain::new(directory.path().to_owned(), fixture.committee())?;
+        let handle = mock_epoch_record_network(HashMap::new(), keys[0], 1);
+        let bus = ConsensusBus::new();
+        let shutdown = tn_types::ShutdownNotifier::new();
+        shutdown.notify();
+        let (metrics, snapshotter) = local_metrics();
+        sync_epoch_records_to_tip_with(&chain, &handle, bus.app(), shutdown.subscribe(), &metrics)
+            .await?;
+        assert_eq!(certified_through(&snapshotter), Some(1.0));
+        Ok(())
+    }
+
+    /// The record collector sets the gauge after each pass: first from the certificate the pass
+    /// downloads, then from one stored by another path while it waited, as this node's own vote
+    /// round stores a certificate on reaching quorum (`save_certificate`), after the next wake-up.
+    #[tokio::test]
+    async fn test_record_collector_sets_certified_through() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authorities: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<_> =
+            authorities.iter().map(|authority| authority.primary_public_key()).collect();
+        let signers: Vec<_> = authorities.iter().map(|authority| authority.keypair()).collect();
+        let records = certified_chain(&keys, &signers, 2);
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        // epoch 0 certified; our own records 1 and 2 stored without certificates
+        for (record, cert) in records.iter().cloned() {
+            if record.epoch == 0 {
+                chain.epochs().save(record, cert).await?;
+            } else {
+                chain.epochs().save_record(record).await?;
+            }
+        }
+        // a peer serves only epoch 1's certificate
+        let handle = mock_epoch_record_network(
+            records
+                .iter()
+                .filter(|(record, _)| record.epoch == 1)
+                .map(|pair| (1, pair.clone()))
+                .collect(),
+            keys[0],
+            1,
+        );
+        let bus = ConsensusBus::new();
+        let shutdown = tn_types::ShutdownNotifier::new();
+        let task_manager = tn_types::TaskManager::default();
+        let (metrics, snapshotter) = local_metrics();
+        spawn_epoch_record_collector_with(
+            chain.clone(),
+            handle,
+            bus.app().clone(),
+            task_manager.get_spawner(),
+            shutdown.subscribe(),
+            metrics,
+        )
+        .await?;
+        let reads = |expected: f64| {
+            let snapshotter = &snapshotter;
+            move || async move { Ok(certified_through(snapshotter) == Some(expected)) }
+        };
+        tn_test_utils::wait_until(Duration::from_secs(10), "the downloaded epoch 1", reads(1.0))
+            .await?;
+
+        let (record2, cert2) =
+            records.into_iter().last().ok_or_else(|| eyre::eyre!("no record 2"))?;
+        chain.epochs().save_certificate(record2.digest(), cert2).await?;
+        bus.app().requested_missing_epoch().send_replace(2);
+        tn_test_utils::wait_until(Duration::from_secs(10), "the own-quorum epoch 2", reads(2.0))
+            .await?;
+        shutdown.notify();
         Ok(())
     }
 }
