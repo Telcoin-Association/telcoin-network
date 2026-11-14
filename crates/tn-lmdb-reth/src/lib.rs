@@ -198,8 +198,9 @@
 //!   panic hook still runs first, at every read of the row: the default hook prints the panic's
 //!   message and where it panicked (in reth's decoder) to stderr, and a backtrace under
 //!   `RUST_BACKTRACE`, naming neither the table nor the key. The catch then logs an `error` naming
-//!   the table, the stored key in hex and the panic's message. This crate installs no hook; a build
-//!   with `panic = "abort"` would abort at the panic instead.
+//!   the table, the stored key in hex and the panic's message, at most once a minute in the process
+//!   (the log counts the failures since the last one). This crate installs no hook; a build with
+//!   `panic = "abort"` would abort at the panic instead.
 //!
 //! The data:
 //! - a dup-sort table holds one value per subkey: a put, `upsert` or `append` of a second value for

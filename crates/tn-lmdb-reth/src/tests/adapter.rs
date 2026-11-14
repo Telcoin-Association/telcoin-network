@@ -743,20 +743,15 @@ fn a_file_whose_recorded_layout_differs_is_refused_at_open() {
 /// A damaged value (a truncated `Bytecode`, put through the raw table) is `DatabaseError::Decode`
 /// at a typed `get` and at a typed cursor's reads, in a read-only and a write transaction, where
 /// reth's `Decompress` panics on it (`Bytecode::from_compact` expects its length prefix): the
-/// crate docs' differences from MDBX, whose backend lets the panic through. Each read logs one
-/// error naming the table, the key in hex and the panic's message (the panic hook names neither).
-/// The row stays, raw, and the transaction goes on.
+/// crate docs' differences from MDBX, whose backend lets the panic through. The first read logs
+/// one error naming the table, the key in hex and the panic's message (the panic hook names
+/// neither); the later reads, within the minute, log none. The row stays, raw, and the
+/// transaction goes on.
 #[test]
 fn a_damaged_value_is_a_decode_error_not_a_panic() {
     type Logged = parking_lot::Mutex<Vec<String>>;
-    fn decode<V: std::fmt::Debug>(errors: &Logged, result: Result<Option<V>, DatabaseError>) {
+    fn decode<V: std::fmt::Debug>(result: Result<Option<V>, DatabaseError>) {
         assert!(matches!(result, Err(DatabaseError::Decode)), "{result:?}");
-        let logged = std::mem::take(&mut *errors.lock());
-        assert_eq!(logged.len(), 1, "one error per read: {logged:?}");
-        let key: String = KEY.iter().map(|byte| format!("{byte:02x}")).collect();
-        for names in ["table=\"Bytecodes\"".to_string(), format!("key={key}"), "panic=".into()] {
-            assert!(logged[0].contains(&names), "names {names}: {logged:?}");
-        }
     }
     const KEY: [u8; 32] = {
         let mut key = [0; 32];
@@ -773,20 +768,26 @@ fn a_damaged_value_is_a_decode_error_not_a_panic() {
     let capture = LogCapture(tracing::Level::ERROR, Arc::clone(&errors));
     tracing::subscriber::with_default(capture, || {
         let tx = db.tx().unwrap();
-        decode(&errors, tx.get::<Bytecodes>(key));
+        decode(tx.get::<Bytecodes>(key));
         let mut c = tx.cursor_read::<Bytecodes>().unwrap();
-        decode(&errors, c.first());
-        decode(&errors, c.seek_exact(key));
-        decode(&errors, c.walk(None).unwrap().next().transpose());
+        decode(c.first());
+        decode(c.seek_exact(key));
+        decode(c.walk(None).unwrap().next().transpose());
         drop(c);
         drop(tx);
         let tx = db.tx_mut().unwrap();
-        decode(&errors, tx.get::<Bytecodes>(key));
-        decode(&errors, tx.cursor_write::<Bytecodes>().unwrap().last());
+        decode(tx.get::<Bytecodes>(key));
+        decode(tx.cursor_write::<Bytecodes>().unwrap().last());
         assert_eq!(tx.entries::<Bytecodes>().unwrap(), 1);
         raw(&tx).unwrap();
         tx.commit().unwrap();
     });
+    let logged = std::mem::take(&mut *errors.lock());
+    assert_eq!(logged.len(), 1, "one error for six reads within the minute: {logged:?}");
+    let key: String = KEY.iter().map(|byte| format!("{byte:02x}")).collect();
+    for names in ["table=\"Bytecodes\"".to_string(), format!("key={key}"), "panic=".into()] {
+        assert!(logged[0].contains(&names), "names {names}: {logged:?}");
+    }
 }
 
 #[test]
