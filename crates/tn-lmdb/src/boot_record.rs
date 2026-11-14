@@ -1,8 +1,8 @@
 //! The boot record: a small file beside the database file, `<path>.boot`, that tells a writer
 //! open whether the page cache may hold a page of the file the device lacks. Open step 4 drops
 //! the file's cached pages (`sys::drop_cached_pages`) only then, so a reopen after a clean close,
-//! and the first open after a reboot, keep the cache and do not read every page again from the
-//! device (README, "Open and recovery", step 4).
+//! in the same boot or after a reboot, keeps the cache and does not read every page again from
+//! the device (README, "Open and recovery", step 4).
 //!
 //! **Why the drop.** A page whose writeback failed can stay in the cache, clean, its bytes never
 //! on the device, the error reported to the writer that is gone. A later open in the same boot
@@ -10,23 +10,36 @@
 //! the device does not hold, and the next sync would write a steady meta naming them. The drop
 //! makes every read of the open the device's.
 //!
-//! **When the cache can be stale.** Only a writer can leave such a page, and only in the boot it
-//! ran in: a new boot's page cache holds nothing of the file but what this boot read from the
-//! device. A writer whose clean close synced everything (its final sync and the trim succeeded)
-//! left a cache equal to the device: a failed writeback would have failed that sync, and a
-//! latched or failed close never writes "clean". So the record says which boot last had a writer
-//! on the file, and whether that writer closed cleanly. Each writer open writes "open" with its
-//! boot id, durably, before its writer can commit; its clean close writes "clean". At the next
-//! writer open ([`decide`]):
+//! **When the cache can be stale.** Any write to the file whose writeback failed can leave such
+//! a page, in the boot it ran in: a writer's, and a write in place that keeps no record of its
+//! own (a copy over the file, a writer that reaches it through another path name, whose record is
+//! another file). A writer whose clean close synced everything (its final sync and the trim
+//! succeeded) left a cache equal to the device: a failed writeback would have failed that sync,
+//! and a latched or failed close never writes "clean". Its record keeps the file's ctime, which
+//! any later write moves. So each writer open writes "open" with its boot id, durably, before its
+//! writer can commit; its clean close writes "clean" with the ctime. At the next writer open
+//! ([`decide`]):
 //!
 //! | record | decision |
 //! |---|---|
 //! | missing, unreadable, torn, another version, another file's | drop ([`Cache::NoRecord`]) |
 //! | this boot's id, or the record's, unknown | drop ([`Cache::UnknownBoot`]) |
 //! | "clean", but the file changed since (its ctime moved) | drop ([`Cache::Changed`]) |
-//! | another boot's | keep ([`Cache::OtherBoot`]) |
-//! | this boot, "open": the writer crashed or was killed | drop ([`Cache::Unclean`]) |
-//! | this boot, "clean" | keep ([`Cache::Clean`]) |
+//! | "open", of any boot: its writer crashed, was killed or closed latched | drop ([`Cache::Unclean`]) |
+//! | another boot's "clean" | keep ([`Cache::OtherBoot`]) |
+//! | this boot's "clean" | keep ([`Cache::Clean`]) |
+//!
+//! "Open" drops whichever boot wrote it, since it holds no ctime: a write in place since it was
+//! written goes unseen. A file restored over its own inode after a crash, whose writeback failed,
+//! is the case: the first open's `fsync` reports the error and fails, leaving the record as it
+//! was, and the next open's `fsync` has nothing left to report. The drop costs little in a new
+//! boot, whose cache holds only what that boot read or wrote of the file.
+//!
+//! **Two path names.** The record is kept beside the path the open was given, so a file reached
+//! through two names (a hard link, or a symbolic link to it) has a record per name. A writer
+//! through one name writes the file, which moves the ctime the other name's "clean" holds, and
+//! the other name's "open" drops anyway, so neither keeps a cache the other's writer left stale
+//! (within the ctime's resolution, below).
 //!
 //! **Another file's record.** The record names the data file by its device and inode. A record
 //! whose file is not the one open locked (a datadir copied to another host or beside itself, a
@@ -35,22 +48,19 @@
 //! small pages, as at any first open. A rename of the directory keeps both. A device number that
 //! changes across a reboot (some volume managers number devices at mount) costs a drop in a new
 //! boot, whose cache holds nothing of the file anyway. A record a removed file left, whose inode
-//! number a new file reuses, is caught too: a "clean" one by the ctime, an "open" one of this boot
-//! drops anyway, and one of another boot keeps a cache this boot filled only with what it read
-//! or what a create wrote and synced (an unsynced write's failed writeback is reported to the
-//! open's own `fsync`, as the kernel reports an error no one has seen to the next one).
+//! number a new file reuses, is caught too: a "clean" one by the ctime, an "open" one drops
+//! anyway.
 //!
 //! **Crash safety.** The record is advisory: every way it can go wrong drops the cache, which
-//! costs time, never data, except a record that says "clean" (or "another boot") wrongly, which
-//! nothing can write:
+//! costs time, never data, except a record that says "clean" wrongly, which nothing can write:
 //! - "open" is written and synced (the directory too when the record is created) before the writer
 //!   can commit, and a failure there fails the open. Were it only in the cache, a failed writeback
 //!   of the record could put the device's older "clean" of this boot back.
 //! - A crash after "open" and before the first commit leaves "open": the next open drops, which
 //!   costs only its reads.
 //! - "clean" is written after the close's final sync and trim, with no sync of its own: a power
-//!   loss before its writeback leaves "open" of a boot that is over, and the new boot keeps its
-//!   cache either way; a failed writeback of it leaves the device's "open", which drops.
+//!   loss before its writeback, or a failed writeback of it, leaves the device's "open", which
+//!   drops.
 //! - A record torn by a crash fails its CRC (a write of [`RECORD_LEN`] bytes at offset 0 lands
 //!   whole or not in the cache; a torn sector on the device has the old or the new bytes): no
 //!   record, a drop.
@@ -61,9 +71,10 @@
 //!   the same in every container on the host, which shares its page cache. An unreadable id is
 //!   unknown: zeros in the record, and a drop at every open.
 //! - The "clean" record also holds the file's ctime as the close left it: a write to the file since
-//!   (a build that keeps no record, a copy over the file, a `truncate`) moves it, and the open
-//!   drops. A file system whose timestamps are coarser than a write could fall inside would miss a
-//!   write within one tick of the close; this build's writers never rely on it.
+//!   (a build that keeps no record, a copy over the file, a `truncate`, a writer through another
+//!   path name) moves it, and the open drops. A file system whose timestamps are coarser than a
+//!   write could fall inside would miss a write within one tick of the close; this build's writers
+//!   rely on it only for a file reached through two path names.
 //!
 //! **Read-only opens** leave the record alone and drop nothing: they write nothing and build
 //! nothing on what they read, so a stale cached page can mislead only their own readers (the
@@ -202,9 +213,10 @@ pub(crate) enum Cache {
     UnknownBoot,
     /// Drop: the record is a clean close's, but the file changed since.
     Changed,
-    /// Drop: a writer of this boot ended without its clean close.
+    /// Drop: the record is "open", of this boot or another: its writer ended without its clean
+    /// close, and a write in place since would go unseen (no ctime).
     Unclean,
-    /// Keep: another boot wrote the record, so this boot's cache holds only what it read.
+    /// Keep: a clean close of another boot, the file unchanged since.
     OtherBoot,
     /// Keep: a clean close of this boot synced everything, and the file is unchanged since.
     Clean,
@@ -229,10 +241,10 @@ pub(crate) fn decide(found: Option<BootRecord>, meta: &Metadata, boot_id: Option
     if record.state == State::Clean && record.ctime != (meta.ctime(), meta.ctime_nsec() as u32) {
         return Cache::Changed;
     }
-    match (record.boot_id == boot_id, record.state) {
-        (false, _) => Cache::OtherBoot,
-        (true, State::Open) => Cache::Unclean,
-        (true, State::Clean) => Cache::Clean,
+    match (record.state, record.boot_id == boot_id) {
+        (State::Open, _) => Cache::Unclean,
+        (State::Clean, false) => Cache::OtherBoot,
+        (State::Clean, true) => Cache::Clean,
     }
 }
 
@@ -464,7 +476,7 @@ pub(crate) mod tests {
         assert_eq!(decide(record(State::Clean, [0; 16]), &meta, this), Cache::UnknownBoot);
         assert_eq!(decide(record(State::Open, [1; 16]), &meta, this), Cache::Unclean);
         assert_eq!(decide(record(State::Clean, [1; 16]), &meta, this), Cache::Clean);
-        assert_eq!(decide(record(State::Open, other), &meta, this), Cache::OtherBoot);
+        assert_eq!(decide(record(State::Open, other), &meta, this), Cache::Unclean);
         assert_eq!(decide(record(State::Clean, other), &meta, this), Cache::OtherBoot);
         let mut touched = BootRecord::new(State::Clean, [1; 16], &meta);
         touched.ctime.1 ^= 1;

@@ -1263,18 +1263,28 @@ checks as `Cursor`'s.
    `<path>.boot`: a magic, a version, the state ("open" or "clean"), the boot id of the writer
    that wrote it (`sys::boot_id`), the data file's device and inode, the file's ctime at a clean
    close, and a CRC. It is advisory: the data file's format and `FORMAT_VERSION` are unchanged, and
-   every way the record can go wrong costs a drop, never data. Only a writer leaves a stale page,
-   and only in its boot (a new boot's cache holds only what that boot read from the device), and
-   a clean close leaves none (its final sync would have failed). So at a writer open:
+   every way the record can go wrong costs a drop, never data. Any write whose writeback failed
+   can leave a stale page, in its boot: a writer's, or a write in place that keeps no record (a
+   copy over the file, a writer through another path name). A clean close leaves none (its final
+   sync would have failed), and its "clean" holds the file's ctime, which a write since moves.
+   So at a writer open:
 
    | the record | the cache |
    |---|---|
-   | missing, unreadable, torn, of another version, or naming another device or inode (a datadir copied to another host or beside itself, a file restored from a backup) | dropped |
+   | missing, unreadable, torn, of another version, or naming another device or inode (a datadir copied to another host or beside itself, a file restored from a backup to a new file) | dropped |
    | this boot's id or the record's unknown (zeros) | dropped |
    | "clean", but the file's ctime moved since (something wrote the file after the close) | dropped |
-   | another boot's | kept |
-   | this boot's, "open": its writer crashed, was killed, or closed latched | dropped |
-   | this boot's, "clean" | kept |
+   | "open", of any boot: its writer crashed, was killed, or closed latched | dropped |
+   | another boot's "clean" | kept |
+   | this boot's "clean" | kept |
+
+   "Open" holds no ctime, so it drops whichever boot wrote it: a file restored over its own inode
+   after a crash, whose writeback failed, fails the first open's `fsync` and leaves the record as
+   it was, and the next open's `fsync` has nothing left to report. A new boot's cache holds only
+   what that boot read or wrote of the file, so the drop costs little there. The record sits
+   beside the path the open was given: a file reached through two names (a hard link, a symbolic
+   link to it) has one per name, and a writer through either name moves the ctime the other's
+   "clean" holds.
 
    A copied file is another inode, so its first open drops the cache the copy filled (in large
    folios, perhaps: [Platform notes](#platform-notes)) whatever record came with it
@@ -1562,13 +1572,13 @@ in order:
    only keeps its tail. The mapping stays until the file drops: every snapshot reads at most its
    own `page_count × P` bytes, all below the new length.
 6. **The boot record says "clean"** (`env::mark_clean`), once the sync and the trim both
-   succeeded (any earlier stop leaves "open", so the next writer open in this boot drops the
-   cache: `a_failed_close_leaves_the_record_open`). The writer's state drops first, so the
+   succeeded (any earlier stop leaves "open", so the next writer open drops the cache:
+   `a_failed_close_leaves_the_record_open`). The writer's state drops first, so the
    mappings are gone (an unmap can move the file's times: macOS's file systems update them for
    pages written through a mapping), while a second descriptor of the file (`dup`) keeps the
    lock; then the record takes the file's ctime and is written, with no sync. A power loss before
-   its writeback leaves "open" of a boot that is over, and the next boot keeps its cache either
-   way; a failed writeback of it leaves the device's "open", which drops. A failure is logged
+   its writeback, or a failed writeback of it, leaves the device's "open", which drops: a cost in
+   a new boot, whose cache holds only what that boot read. A failure is logged
    (`tracing::warn!`) and changes nothing else.
 
 ---
