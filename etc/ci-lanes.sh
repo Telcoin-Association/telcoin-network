@@ -284,10 +284,14 @@ lane_test_adiri() {
     # tests failed under the adiri features. They pass now, so it is back. tn-engine
     # joined for #1247: with the mix-hash oracle dispatching on the fork gate, this lane
     # is the only one that runs its pre-fork legacy arm.
-    run cargo nextest run --locked \
-        -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-engine -p tn-config \
-        --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-engine/adiri,tn-config/adiri \
-        "${run_mode[@]}"
+    local packages=(-p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-engine -p tn-config)
+    local features=tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-engine/adiri,tn-config/adiri
+    run cargo nextest run --locked "${packages[@]}" --features "$features" "${run_mode[@]}"
+    # The adiri-gated suites of tn-reth and tn-engine on temp chains in layout v1, as
+    # lane_test_default reruns its own (every adiri datadir is v1 until it is rebuilt). The same
+    # packages and features, filtered, so the binaries above are reused.
+    run env TN_TEST_NEW_DATADIR_LAYOUT=v1 cargo nextest run --locked "${packages[@]}" \
+        --features "$features" -E 'package(tn-reth) | package(tn-engine)' "${run_mode[@]}"
 }
 
 lane_test_mdbx() {
