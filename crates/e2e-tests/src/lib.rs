@@ -23,6 +23,16 @@
 //! not a list of entries, or that the node's loader cannot read as `Parameters`, fails the start
 //! with an error naming the variable. As with any [`NodeOverrides`] entry, a key the node does not
 //! know is ignored by the node, so check the setting in the node itself, not the merge.
+//!
+//! The merge is checked with the `Parameters` this crate is built with (the tree under test), not
+//! by the binary that will read the file. The entries also reach the `TN_BIN_PATH_PREV` nodes that
+//! `upgrade.rs`, `reth_db_migration.rs` and `resync.rs` start through the same helpers (see
+//! [`get_previous_telcoin_network_binary`]). When that binary was built at another commit, as
+//! `upgrade.rs` requires, it ignores a key its `Parameters` lacks without a word, so a lane that
+//! sets the variable runs the test as a mixed fleet with the setting on the current nodes only;
+//! the migration lane's previous binary is this tree's MDBX build, which reads the same keys. A
+//! test that relies on a setting asserts it on each node's `node switches` line, which an older
+//! release does not print.
 
 // ignore for IT test
 #![allow(unused_crate_dependencies)]
