@@ -1270,7 +1270,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   limit. Every pending-transaction filter and every `newPendingTransactions` subscription also
   registered a pool listener that every pool insertion walks with a `try_send`, with no bound on
   their number. The node now refuses the filter past `--rpc.max-active-filters`
-  (node-wide; filters are not tied to connections) and the pool refuses an RPC listener past
+  (per RPC server, which TN runs one of per worker, and first come across its clients; filters are not tied to connections) and the pool refuses an RPC listener past
   `max_rpc_tx_listeners` of each kind. The pool's unconditional listener methods are unchanged, so
   TN's own listener (`tn-reth/src/txn_pool.rs`) and reth's internal ones are never refused; they
   are counted, so they take slots of the cap. TN's `RpcServerArgs` exposes the filter flag; the listener bound is a pool
