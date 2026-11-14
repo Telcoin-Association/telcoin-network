@@ -2681,3 +2681,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   messages over an endless stream: the stream is dropped once a send waits the timeout).
   Mutation-checked: a plain `send` (the stream is never dropped).
   *Upstream*: no; upstream has the same shape.
+
+- **TN-0174** — A refused `newPendingTransactions` subscription gets the error, not an id.
+  *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/eth/pubsub.rs` (`subscribe` takes the pool listener through
+  `pending_transactions_listener` before it accepts the subscription; `handle_accepted` shares it
+  and `pipe_pending_transactions`; test
+  `a_refused_pending_transactions_subscription_gets_the_error`).
+  *Why*: TN-0056 says these subscriptions fail with the server-busy error when the pool refuses
+  another RPC listener, but `subscribe` accepted the subscription first and the error was dropped
+  in the spawned task: the client got a subscription id and then nothing. The listener (and the
+  params check) now come before the acceptance, and a refusal rejects the subscription with
+  -32009 (`too many pending transaction listeners`), as the pending-transaction filters do.
+  Accepted subscriptions behave as before. *Can reach execution or storage*: no. RPC only.
+  *Tests*: `a_refused_pending_transactions_subscription_gets_the_error` (with every RPC listener
+  slot held, the hash and the full subscription are refused with -32009; once the slots are
+  freed both are accepted). Mutation-checked: acceptance before the listener (the subscription
+  is accepted).
+  *Upstream*: n/a (TN-0056's cap is TN's).
