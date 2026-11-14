@@ -1288,6 +1288,7 @@ where
             primary_network_handle.clone(),
             node_task_manager.get_spawner(),
             self.node_shutdown.clone(),
+            self.builder.tn_config.parameters.epoch_record_recertify,
         );
 
         // Re-vote from durable storage on restart (issue #1198): the collector above is armed
@@ -1297,6 +1298,7 @@ where
         revote_uncertified_epoch_record_on_startup(
             self.consensus_chain.epochs(),
             self.consensus_bus.epoch_record_watch(),
+            self.builder.tn_config.parameters.epoch_record_recertify,
         )
         .await;
 
