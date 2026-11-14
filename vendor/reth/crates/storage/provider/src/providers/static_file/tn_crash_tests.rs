@@ -1,8 +1,9 @@
 //! TN(TN-0130 to TN-0133): the crash points of the static-file prune, rotation and deletion paths
 //! through `StaticFileProvider`, in both jar formats: every state a stopped operation leaves opens
 //! as the state before it or after it, and files shorter than their committed configuration, or
-//! a jar missing between two others, are refused. TN(TN-0138): a failed sync of a segment commit
-//! writes no configuration. TN(TN-0150): a rotation stopped before the next jar has its files.
+//! a jar missing between two others, are refused. TN(TN-0138, TN-0161): a failed sync of a segment
+//! commit writes no configuration, then or later. TN(TN-0150): a rotation stopped before the next
+//! jar has its files.
 
 use super::{
     manager::StaticFileWriter,
@@ -495,19 +496,26 @@ fn is_injected(err: &ProviderError, phase: SyncPhase) -> bool {
 }
 
 /// TN(TN-0138): a segment commit's `.csoff`, data and offsets syncs run at once, and its
-/// configuration is written only when all three succeeded. With any one of them failed,
-/// `sync_and_freeze` returns that error once all three ended (each file holds the new blocks),
-/// and the configuration on disk is still the last commit's. A reopen heals the files back to it
-/// (the new blocks gone, the committed ones read back, the blocks append again); the same writer,
-/// its sync retried, commits them all. Both formats. Fails if the configuration is written after
-/// a failed sync, or if the call returns before the other syncs ended.
+/// configuration is written only when all three succeeded. With any one of them failed, after its
+/// write and `fsync` or without running at all, `sync_and_freeze` returns that error and the
+/// configuration on disk is still the last commit's; failed after the write, every file holds the
+/// new blocks (the other syncs ran too). TN(TN-0161): the writer then writes no configuration: a
+/// retried sync and a finalize are refused. A reopen heals the files back to the last
+/// configuration (the new blocks gone, the committed ones read back, the blocks append again).
+/// Both formats. Fails if the configuration is written after a failed sync, by the call or by a
+/// retry on the same writer.
 #[test]
 fn a_failed_sync_leaves_the_configuration_unwritten() {
+    use reth_nippy_jar::NippyJarError;
+
     let tip = 3;
+    let is_refused = |err: &ProviderError| {
+        matches!(err.downcast_other_ref::<NippyJarError>(), Some(NippyJarError::WriterFailed(_)))
+    };
     for checksums in [false, true] {
         for phase in [SyncPhase::Csoff, SyncPhase::Data, SyncPhase::Offsets] {
-            for retry in [false, true] {
-                let case = format!("checksums {checksums}, {phase:?}, retry {retry}");
+            for unrun in [false, true] {
+                let case = format!("checksums {checksums}, {phase:?}, unrun {unrun}");
                 let (dir, _) = create_test_static_files_dir();
                 let static_files = provider(dir.path(), checksums, 1_000);
                 write_accounts(&static_files, 0..tip + 1, tip + 1);
@@ -519,38 +527,41 @@ fn a_failed_sync_leaves_the_configuration_unwritten() {
                 for block in tip + 1..tip + 3 {
                     writer.append_account_changeset(account_changes(block), block).unwrap();
                 }
-                writer.fail_syncs = vec![phase];
+                if unrun {
+                    writer.fail_syncs_unrun = vec![phase];
+                } else {
+                    writer.fail_syncs = vec![phase];
+                }
                 let err = writer.sync_and_freeze().unwrap_err();
                 assert!(is_injected(&err, phase), "{case}: {err}");
                 assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{case}");
-                let after = synced_file_lens(&path);
-                for (file, (before, after)) in
-                    ["data", "off", "csoff"].iter().zip(before.iter().zip(after))
-                {
-                    assert!(after > *before, "{case}: {file} not written");
+                if !unrun {
+                    let after = synced_file_lens(&path);
+                    for (file, (before, after)) in
+                        ["data", "off", "csoff"].iter().zip(before.iter().zip(after))
+                    {
+                        assert!(after > *before, "{case}: {file} not written");
+                    }
                 }
 
-                if retry {
-                    writer.fail_syncs.clear();
-                    writer.sync_and_freeze().unwrap();
-                    writer.finalize().unwrap();
-                    drop(writer);
-                    assert_accounts(&static_files, tip + 2, tip + 3);
-                    drop(static_files);
-                    let static_files = provider(dir.path(), checksums, 1_000);
-                    drop(static_files.latest_writer(ACCOUNTS).unwrap());
-                    assert_accounts(&static_files, tip + 2, tip + 3);
-                } else {
-                    drop(writer);
-                    drop(static_files);
-                    let static_files = provider(dir.path(), checksums, 1_000);
-                    drop(static_files.latest_writer(ACCOUNTS).unwrap());
-                    assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config);
-                    assert_eq!(synced_file_lens(&path), before, "{case}");
-                    assert_accounts(&static_files, tip, tip + 1);
-                    write_accounts(&static_files, tip + 1..tip + 3, tip + 3);
-                    assert_accounts(&static_files, tip + 2, tip + 3);
-                }
+                // The same writer, its syncs no longer failing, writes no configuration.
+                writer.fail_syncs.clear();
+                writer.fail_syncs_unrun.clear();
+                let err = writer.sync_and_freeze().unwrap_err();
+                assert!(is_refused(&err), "{case}: {err}");
+                let err = writer.finalize().unwrap_err();
+                assert!(is_refused(&err), "{case}: {err}");
+                assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config, "{case}");
+                drop(writer);
+                drop(static_files);
+
+                let static_files = provider(dir.path(), checksums, 1_000);
+                drop(static_files.latest_writer(ACCOUNTS).unwrap());
+                assert_eq!(std::fs::read(path.with_extension("conf")).unwrap(), config);
+                assert_eq!(synced_file_lens(&path), before, "{case}");
+                assert_accounts(&static_files, tip, tip + 1);
+                write_accounts(&static_files, tip + 1..tip + 3, tip + 3);
+                assert_accounts(&static_files, tip + 2, tip + 3);
             }
         }
     }

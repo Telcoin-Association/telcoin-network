@@ -2211,14 +2211,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   So no `.conf` is written after a failed sync, as before; a thread that cannot start is its
   sync's error, and a panic is resumed once the others ended. The `.csoff` length goes into the
   header only after its sync succeeded, as before. A failed call has run the other syncs too (the
-  serial code stopped at the first failure), which leaves only bytes past the configuration that
-  the heal or a retried sync already handles. `commit` (prune, unwind, rotation) keeps its serial
+  serial code stopped at the first failure), which leaves only bytes past the configuration. A
+  failed sync is not retried on the same writer: it writes no configuration again (TN-0161), the
+  persist's retry fails at its first `increment_block`, which the engine treats as terminal, and
+  the next start's heal cuts those bytes. `commit` (prune, unwind, rotation) keeps its serial
   syncs. The per-file timings now overlap, so `files_sync` times the span of the three, and TN's
   persist bench reads `sf_sync` from it. It cannot reach execution: the bytes written and the
   `.conf` rule are unchanged; only when the three syncs run changes. *Tests*:
   `a_failed_sync_leaves_the_configuration_unwritten` (each of the three syncs failed, both
-  formats: the call returns that error after every file was written, the `.conf` is the last
-  commit's, a reopen heals back to it and the blocks append again, a retried sync commits them)
+  formats: the call returns that error, after every file was written when the sync failed after
+  its write, and the `.conf` is the last commit's; TN-0161 adds a sync that fails without running,
+  and a retried sync and a finalize on the same writer refused; a reopen heals back to the `.conf`
+  and the blocks append again)
   and `failed_syncs_return_the_first_in_the_serial_order` (a changeset and a block segment), both
   through the fault hook; `sync_stats_record_each_phase_per_segment` (the span holds each sync);
   the TN-0130 to TN-0137 crash and checksum tests unchanged. Mutation-checked: the error dropped
@@ -2600,3 +2604,32 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `.conf`, at startup and at a load after it; another jar's data file and offsets file under a
   full jar: refused, other jars still read). *Upstream*: maybe (the name check; the length check
   needs TN-0120's version).
+
+- **TN-0161** — A static-file writer whose sync, offsets write or prune failed writes no
+  configuration again. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/nippy-jar/src/{writer.rs, error.rs, lib.rs}`
+  (`NippyJarWriter::{mark_failed, has_failed}`, `NippyJarError::WriterFailed`; test),
+  `crates/storage/provider/src/providers/static_file/{writer.rs, tn_crash_tests.rs}`
+  (`StaticFileProviderRW::{sync_all, commit, increment_block, flush_current_changeset_offset,
+  truncate_changesets}`; the test-only `fail_syncs_unrun` hook; test).
+  *Why*: after a failure the writer's memory and its files can disagree, and its next commit
+  wrote a configuration over them. A failed offsets write drained the offsets it had not written,
+  so a later sync wrote none and the `.conf` counted rows without offsets; a `prune_rows` whose
+  configuration write or cut failed had already cut its rows and offsets in memory, so the next
+  append took its offset from the uncut data end and its seed from the cut row count, and the
+  pruned rows' values verified as the new rows; a failed `.csoff` append dropped the block's
+  record; and on Linux a retried `fsync` can report success for pages the failed one lost. The
+  writer now keeps a `failed` flag, set by its own failed data or offsets sync or offsets write
+  and by a failed `prune_rows`, and by the provider (`mark_failed`) when one of `sync_all`'s
+  concurrent syncs (TN-0138), a `.csoff` append, sync or truncation fails. A failed writer's
+  `finalize` and `prune_rows`, the only writes of its configuration, return `WriterFailed`, so a
+  retried persist or commit on it writes nothing; the next start opens a new writer, whose heal
+  cuts the files back to the last configuration. Not reachable in TN today: a failed persist's
+  retry already fails at its first `increment_block` (`UnexpectedStaticFileBlockNumber`, terminal),
+  and the only prunes are the startup heal's, on writers it just opened, which abort the start on
+  any error. *Can reach execution or storage*: storage, on the failure path only: a writer that
+  never failed writes what it wrote before. *Tests*: `test_interrupted_prune_heals_at_every_point`
+  (after a failed prune the same writer's commit and prune are refused; the files are unchanged),
+  `a_failed_sync_leaves_the_configuration_unwritten` (TN-0138's, now with a retried sync and a
+  finalize refused, and each sync also failed without running). Mutation-checked: no refusal in
+  `finalize` (both tests fail). *Upstream*: maybe (the drain and the prune order are upstream's).

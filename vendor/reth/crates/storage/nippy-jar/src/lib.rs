@@ -1894,8 +1894,11 @@ mod tests {
                 let blocker = path.with_extension("tmp");
                 std::fs::create_dir(&blocker).unwrap();
                 assert!(writer.prune_rows(prune).is_err());
-                drop(writer);
+                // TN(TN-0161): the writer, its rows cut in memory only, writes no configuration.
                 std::fs::remove_dir(&blocker).unwrap();
+                assert!(matches!(writer.commit(), Err(NippyJarError::WriterFailed(_))));
+                assert!(matches!(writer.prune_rows(1), Err(NippyJarError::WriterFailed(_))));
+                drop(writer);
                 drop(NippyJarWriter::new(NippyJar::load_without_header(path).unwrap()).unwrap());
                 assert_eq!(jar_files(path), before, "checksums {checksums}, prune {prune}");
 

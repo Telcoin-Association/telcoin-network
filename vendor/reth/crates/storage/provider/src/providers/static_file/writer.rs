@@ -236,6 +236,26 @@ fn sync_at_once(jobs: Vec<SyncJob<'_>>) -> Vec<(SyncPhase, ProviderResult<Durati
     })
 }
 
+/// TN(TN-0161): test-only: `jobs` with each one of a phase in `failed` replaced by one that
+/// returns an injected fault without running its sync.
+#[cfg(test)]
+fn fail_jobs_unrun<'a>(failed: &[SyncPhase], jobs: Vec<SyncJob<'a>>) -> Vec<SyncJob<'a>> {
+    jobs.into_iter()
+        .map(|(phase, job)| {
+            if !failed.contains(&phase) {
+                return (phase, job)
+            }
+            drop(job);
+            let fault: Box<dyn FnOnce() -> ProviderResult<()> + Send + 'a> = Box::new(move || {
+                Err(ProviderError::other(std::io::Error::other(format!(
+                    "injected {phase:?} sync fault"
+                ))))
+            });
+            (phase, fault)
+        })
+        .collect()
+}
+
 /// Mutable reference to a [`StaticFileProviderRW`] behind a [`RwLockWriteGuard`].
 #[derive(Debug)]
 pub struct StaticFileProviderRWRefMut<'a, N>(
@@ -288,6 +308,10 @@ pub struct StaticFileProviderRW<N> {
     /// TN(TN-0138): test-only fault injection, the syncs of [`Self::sync_all`] that fail.
     #[cfg(test)]
     pub(crate) fail_syncs: Vec<SyncPhase>,
+    /// TN(TN-0161): test-only fault injection, the syncs of [`Self::sync_all`] that fail without
+    /// running.
+    #[cfg(test)]
+    pub(crate) fail_syncs_unrun: Vec<SyncPhase>,
 }
 
 impl<N: NodePrimitives> StaticFileProviderRW<N> {
@@ -317,6 +341,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             current_changeset_offset: None,
             #[cfg(test)]
             fail_syncs: Vec::new(),
+            #[cfg(test)]
+            fail_syncs_unrun: Vec::new(),
         };
 
         // Run NippyJar healing BEFORE setting up changeset sidecar
@@ -612,9 +638,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
 
         if let Some(offset) = self.current_changeset_offset.take() &&
-            let Some(writer) = &mut self.changeset_offsets
+            let Some(writer) = &mut self.changeset_offsets &&
+            let Err(err) = writer.append(&offset)
         {
-            writer.append(&offset).map_err(ProviderError::other)?;
+            // TN(TN-0161): the record is gone from memory; no configuration may count its block.
+            self.writer.mark_failed();
+            return Err(ProviderError::other(err))
         }
         Ok(())
     }
@@ -661,6 +690,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             ));
         }
         let ran = !jobs.is_empty();
+        #[cfg(test)]
+        let jobs = fail_jobs_unrun(&self.fail_syncs_unrun, jobs);
         let start = Instant::now();
         let results = sync_at_once(jobs);
         let files = start.elapsed();
@@ -685,6 +716,9 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             }
         }
         if let Some(err) = first_error {
+            // TN(TN-0161): no configuration is written after a failed sync, by this call or a
+            // later one on this writer: the next start heals the files back to the last one.
+            self.writer.mark_failed();
             return Err(err);
         }
         if ran {
@@ -823,7 +857,11 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         // This ensures crash consistency: the sidecar is durable before the header references it.
         self.flush_current_changeset_offset()?;
         if let Some(writer) = &mut self.changeset_offsets {
-            writer.sync().map_err(ProviderError::other)?;
+            if let Err(err) = writer.sync() {
+                // TN(TN-0161): as a failed sync in `sync_all`.
+                self.writer.mark_failed();
+                return Err(ProviderError::other(err))
+            }
             // Update the header with the actual number of offsets written
             self.writer.user_header_mut().set_changeset_offsets_len(writer.len());
         }
@@ -1012,9 +1050,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         if segment.is_change_based() {
             // Write previous block's offset if we have one
             if let Some(offset) = self.current_changeset_offset.take() &&
-                let Some(writer) = &mut self.changeset_offsets
+                let Some(writer) = &mut self.changeset_offsets &&
+                let Err(err) = writer.append(&offset)
             {
-                writer.append(&offset).map_err(ProviderError::other)?;
+                // TN(TN-0161): as in `flush_current_changeset_offset`.
+                self.writer.mark_failed();
+                return Err(ProviderError::other(err))
             }
             // Start tracking new block's offset
             let new_offset = self.writer.rows() as u64;
@@ -1171,8 +1212,13 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.writer.commit().map_err(ProviderError::other)?;
 
         // Truncate the sidecar file to match the new block count
-        if let Some(writer) = &mut self.changeset_offsets {
-            writer.truncate(blocks_to_keep).map_err(ProviderError::other)?;
+        if let Some(writer) = &mut self.changeset_offsets &&
+            let Err(err) = writer.truncate(blocks_to_keep)
+        {
+            // TN(TN-0161): the sidecar writer's record count is the uncut one; the next start
+            // cuts the records past the configuration.
+            self.writer.mark_failed();
+            return Err(ProviderError::other(err))
         }
 
         self.update_index()?;

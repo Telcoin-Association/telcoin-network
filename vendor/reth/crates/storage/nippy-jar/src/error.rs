@@ -148,6 +148,14 @@ pub enum NippyJarError {
         file: &'static str,
     },
 
+    /// TN(TN-0161): a writer whose sync, offsets write or prune failed writes no configuration
+    /// again; a new writer of the jar heals its files back to the last one.
+    #[error(
+        "static file {} writer failed an earlier sync or prune; reopen it to heal the files",
+        .0.display()
+    )]
+    WriterFailed(PathBuf),
+
     /// TN(TN-0131): a jar's offsets file is empty, without even its offset size byte.
     #[error("static file offsets file {} is empty", .0.display())]
     EmptyOffsetsFile(PathBuf),
