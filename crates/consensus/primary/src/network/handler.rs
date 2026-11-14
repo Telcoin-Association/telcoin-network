@@ -967,6 +967,7 @@ where
     ) {
         let total = timing.finish_at(Instant::now());
         let outcome = VoteOutcome::of(res, &timing);
+        self.vote_metrics.record_outcome(outcome);
         match outcome {
             VoteOutcome::Created => self.vote_metrics.record_created(),
             VoteOutcome::Recast => self.vote_metrics.record_recast(),
@@ -2428,9 +2429,10 @@ impl VoteTiming {
     }
 }
 
-/// How a vote request ended: the `outcome` field of the `vote path timing` line.
+/// How a vote request ended: the `outcome` field of the `vote path timing` line and the
+/// `outcome` label of `tn_primary_vote_outcomes_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VoteOutcome {
+pub(crate) enum VoteOutcome {
     /// A new vote was signed, made durable and returned.
     Created,
     /// A vote signed earlier for this header was returned again.
@@ -2458,6 +2460,41 @@ enum VoteOutcome {
 }
 
 impl VoteOutcome {
+    /// The number of outcomes.
+    pub(crate) const COUNT: usize = 10;
+
+    /// Every outcome. An outcome's position here is its [`Self::index`].
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Created,
+        Self::Recast,
+        Self::MissingParents,
+        Self::Deferred,
+        Self::TooNew,
+        Self::Behind,
+        Self::Superseded,
+        Self::Rejected,
+        Self::Timeout,
+        Self::Error,
+    ];
+
+    /// The position of this outcome in [`Self::ALL`], for per-outcome arrays.
+    ///
+    /// The match is exhaustive, so a new outcome does not build until it gets a position here.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Created => 0,
+            Self::Recast => 1,
+            Self::MissingParents => 2,
+            Self::Deferred => 3,
+            Self::TooNew => 4,
+            Self::Behind => 5,
+            Self::Superseded => 6,
+            Self::Rejected => 7,
+            Self::Timeout => 8,
+            Self::Error => 9,
+        }
+    }
+
     /// Classify a finished vote request from its result and stage stamps.
     fn of(res: &PrimaryNetworkResult<PrimaryResponse>, timing: &VoteTiming) -> Self {
         if timing.timed_out.is_some() {
@@ -2496,8 +2533,8 @@ impl VoteOutcome {
         }
     }
 
-    /// The static `outcome` field value.
-    const fn as_str(self) -> &'static str {
+    /// The static `outcome` field value and metric label.
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
             Self::Recast => "recast",
@@ -2512,6 +2549,15 @@ impl VoteOutcome {
         }
     }
 }
+
+// compile-time check that `ALL` holds each outcome at its `index`, as for `VoteStage::ALL`
+const _: () = {
+    let mut position = 0;
+    while position < VoteOutcome::COUNT {
+        assert!(VoteOutcome::ALL[position].index() == position, "VoteOutcome::ALL out of order");
+        position += 1;
+    }
+};
 
 /// Rate limit for the `behind the gc window inside the rejoin grace; holding demotion` line: one
 /// line per [`REJOIN_GRACE_LOG_INTERVAL`] at most, carrying the holds counted since the previous
