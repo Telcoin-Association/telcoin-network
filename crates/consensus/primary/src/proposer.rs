@@ -1526,11 +1526,21 @@ fn duration_ms(duration: Duration) -> u64 {
 }
 
 /// How far below its own tip the quorum rule may name a block, in entries of the recent-blocks
-/// ring (executed outputs, not block numbers).
+/// ring (executed outputs that produced a block, not block numbers).
 ///
 /// The ring's capacity is `gc_depth`, so the floor is its own constant. Under the `always` policy
 /// every proposer of an in-step fleet settles exactly here: the blocks its parents name are earlier
 /// picks of the same rule, not tips, so the quorum value can only rise through the floor.
+///
+/// An output without transactions produces no block and adds no ring entry, so the floor has no
+/// bound in rounds or in time: under the `always` policy with light traffic the named block can be
+/// arbitrarily old. What that delays is an honest node noticing its own execution fork. If its
+/// execution diverges at block N and the next outputs are empty, it keeps naming a block below N,
+/// and neither a voter's check of the header's block (`Fork`) nor the subscriber's or state
+/// sync's check of a leader's block sees the divergence until up to eight more outputs have
+/// produced blocks. With the switch off its next header names the forked tip, and voters refuse
+/// it at once. A faulty author gains nothing from this: a voter already accepts any canonical
+/// block above its restore floor.
 pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
 
 /// The bound on the adaptive policy's window, in headers built under the quorum rule (the switch
@@ -1711,7 +1721,11 @@ impl ExecBlockPolicy {
     /// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`] is lowered to it by [`Self::new`]. Neither stops
     /// the node: the first is a valid configuration of the switch-off behaviour, and the second
     /// still runs the adaptive policy. The proposer logs the warning when it starts, once per
-    /// epoch, so the mistake shows in the node's log instead of passing silently.
+    /// epoch, so the mistake shows in the node's log instead of passing silently. An upstream
+    /// default may want `Parameters::validate` to refuse a window above the bound, where the other
+    /// protocol ceilings are refused, and keep only the switch-off case a warning, since setting
+    /// the window before turning the switch on is a valid rollout step; this build warns because a
+    /// refusal would keep a node down in the middle of a rolling restart.
     pub(crate) fn starved_rounds_warning(
         enabled: bool,
         starved_rounds: u32,
@@ -1925,7 +1939,8 @@ pub(crate) struct ExecBlockChoice {
 ///   rule's gain, not more: every voter that holds the own tip holds the choice, so a header under
 ///   the rule certifies whenever the same header naming the tip would have;
 /// - it is floored at the ring entry [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip (the
-///   oldest entry of a shorter ring);
+///   oldest entry of a shorter ring). Entries count outputs that produced a block, so the floor
+///   has no bound in time (the constant's doc says what that delays);
 /// - the block is the newest own ring entry at or below the value, so the number and the hash are
 ///   always this node's own execution, never a parent's hash;
 /// - nothing is named below the block the header's epoch opened on, the previous epoch's closing
