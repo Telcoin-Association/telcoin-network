@@ -11,7 +11,8 @@
 //!   - the reads (`with_consensus_header_by_digest` and the recent-header cache,
 //!     `consensus_output_by_number`, `get_batches`);
 //!   - the static-pack cache and its read-side heal (`get_static`, `heal_static`).
-//! - `ReadSideHeal`, the `ConsensusChainReader`/`ConsensusChainWriter` impls, `ConsensusChainError`
+//! - `LiveBatches` (the live-epoch reads of `live_batches`, holding the chain weakly),
+//!   `ReadSideHeal`, the `ConsensusChainReader`/`ConsensusChainWriter` impls, `ConsensusChainError`
 //!   and `ImportPath`, then `mod test`.
 
 use std::{
@@ -49,7 +50,7 @@ use crate::{
     archive::data_file::{fsync_directory, fsync_file},
     consensus_pack::{
         install_dir_rename_aside, pack_is_sealed, BatchReadError, ConsensusPack, DeclaredBatches,
-        PackError, DATA_NAME,
+        PackError, PackReader, DATA_NAME,
     },
     epoch_records::{EpochDbError, EpochRecordDb},
 };
@@ -2125,6 +2126,18 @@ impl ConsensusChain {
         self.install_generation.load(Ordering::Acquire)
     }
 
+    /// [`Self::live_batch`] and [`Self::install_generation`] for a reader that lives as long as
+    /// the process, such as the execution database's transaction resolver: it holds the live pack
+    /// only weakly, so it never keeps the chain from reaching sole ownership
+    /// ([`Self::wait_until_sole_owner`]) at shutdown.
+    pub fn live_batches(&self) -> LiveBatches {
+        LiveBatches {
+            current_pack: Arc::downgrade(&self.current_pack),
+            install_generation: self.install_generation.clone(),
+            pack_install: self.pack_install.clone(),
+        }
+    }
+
     /// Return a vector of batches matching the provided digests (if found).
     pub async fn get_batches(
         &self,
@@ -2488,6 +2501,68 @@ impl ConsensusChain {
             .map(Some)
             .or_else(|error| error.is_missing_static_files().then_some(None).ok_or(error))
             .map_err(Into::into)
+    }
+}
+
+/// The reads of a [`ConsensusChain`]'s batches ([`ConsensusChain::live_batches`]) for a reader
+/// that keeps its own handles on past epochs and must not keep the chain open: the live pack is
+/// held weakly, so a holder never counts as an owner of the chain, and once every handle of the
+/// chain is gone [`Self::live_batch`] answers `None` for every epoch (the past epochs still open
+/// through [`Self::open_past`]).
+#[derive(Debug, Clone)]
+pub struct LiveBatches {
+    current_pack: Weak<Mutex<ConsensusPack>>,
+    install_generation: Arc<AtomicU64>,
+    pack_install: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl LiveBatches {
+    /// [`ConsensusChain::live_batch`], or `None` once the chain is gone. The clone of the live pack
+    /// it reads through is dropped before it returns, and the chain is held only while the clone
+    /// is taken.
+    ///
+    /// Runs on the caller's thread: call it from a blocking thread, never a tokio worker.
+    pub fn live_batch(
+        &self,
+        epoch: Epoch,
+        digest: BlockHash,
+    ) -> Option<Result<Option<Batch>, BatchReadError>> {
+        let pack = {
+            let current_pack = self.current_pack.upgrade()?;
+            let current = current_pack.lock();
+            (current.epoch() == epoch).then(|| current.clone())
+        }?;
+        let batch = pack.batch_now(digest);
+        drop(pack);
+        Some(batch)
+    }
+
+    /// [`ConsensusChain::install_generation`].
+    pub fn install_generation(&self) -> u64 {
+        self.install_generation.load(Ordering::Acquire)
+    }
+
+    /// A [`PackReader`] of past epoch `epoch` under `epochs_dir` (the chain's directory), told
+    /// apart from a seal in progress. An epoch handoff seals the previous epoch's data log, then
+    /// its indexes, and an open between the two fails as a damaged pack's would. So an open that
+    /// fails for any reason but a missing, legacy or unsealed pack or the environment is answered
+    /// [`BatchReadError::Unsealed`] (retry shortly) while the chain is handing off or installing
+    /// an epoch (`pack_install` is held), as `get_static` waits one out; otherwise the epoch is
+    /// opened once more with no handoff able to start, and that answer stands.
+    ///
+    /// Blocking (see [`PackReader::open`]): call it from a blocking thread.
+    pub fn open_past(&self, epochs_dir: &Path, epoch: Epoch) -> Result<PackReader, BatchReadError> {
+        match PackReader::open(epochs_dir, epoch) {
+            Err(BatchReadError::Open(e))
+                if !e.is_missing_static_files() && !e.is_environmental() =>
+            {
+                let Ok(_install) = self.pack_install.try_lock() else {
+                    return Err(BatchReadError::Unsealed);
+                };
+                PackReader::open(epochs_dir, epoch)
+            }
+            read => read,
+        }
     }
 }
 
@@ -4781,6 +4856,84 @@ mod test {
             assert_eq!(sealed.batch(batch.digest()).expect("read").as_ref(), Some(batch));
         }
         drop(sealed);
+        consensus_chain.close().await;
+    }
+
+    /// `LiveBatches` reads the live epoch as `live_batch` does and follows the install generation,
+    /// but never owns the chain: the chain reaches sole ownership with one alive (a shutdown is not
+    /// held up by the resolver that keeps it), and once the chain is closed it answers `None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_live_batches_read_the_live_epoch_without_owning_the_chain() {
+        let temp_dir = TempDir::with_prefix("test_live_batches").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, _) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        let output = consensus_chain.get_consensus_output_current(1).await.expect("output 1");
+        let batch = output.batches()[0].batches[0].clone();
+
+        let live = consensus_chain.live_batches();
+        assert_eq!(
+            live.live_batch(0, batch.digest()).map(|read| read.ok()),
+            Some(Some(Some(batch.clone())))
+        );
+        assert!(live.live_batch(1, batch.digest()).is_none(), "epoch 1 is not live");
+        assert_eq!(live.install_generation(), consensus_chain.install_generation());
+        assert!(
+            consensus_chain.wait_until_sole_owner(Duration::from_millis(100)).await,
+            "a LiveBatches handle must not count as an owner of the chain"
+        );
+
+        consensus_chain.new_epoch(record0, committee.advance_epoch_for_test(1)).await.unwrap();
+        assert_eq!(live.install_generation(), consensus_chain.install_generation());
+        assert!(live.live_batch(0, batch.digest()).is_none(), "epoch 0 is sealed");
+        assert!(matches!(live.live_batch(1, batch.digest()), Some(Ok(None))), "the new live epoch");
+
+        consensus_chain.close().await;
+        assert!(live.live_batch(1, batch.digest()).is_none(), "the chain is gone");
+    }
+
+    /// `LiveBatches::open_past` opens a sealed past epoch. A pack that fails its open as damaged
+    /// while the chain holds `pack_install` (a handoff sealing the previous epoch's log, then its
+    /// indexes, looks damaged in between) is unsealed, to retry; with the lock free the failure
+    /// stands. A missing epoch is missing either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_live_batches_tell_a_seal_in_progress_from_a_damaged_past_epoch() {
+        use crate::consensus_pack::BatchReadError;
+        use std::fs::OpenOptions;
+
+        let temp_dir = TempDir::with_prefix("test_live_batches_open_past").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, _) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        let output = consensus_chain.get_consensus_output_current(1).await.expect("output 1");
+        let batch = output.batches()[0].batches[0].clone();
+        consensus_chain.new_epoch(record0, committee.advance_epoch_for_test(1)).await.unwrap();
+        let live = consensus_chain.live_batches();
+        let reader = live.open_past(temp_dir.path(), 0).expect("a sealed past epoch opens");
+        assert_eq!(reader.batch(batch.digest()).expect("read"), Some(batch));
+        drop(reader);
+
+        let pdx = temp_dir.path().join("epoch-0").join("idx").join("index_pos.pdx");
+        OpenOptions::new().write(true).open(&pdx).expect("open").set_len(4).expect("truncate");
+        {
+            let _install = consensus_chain.pack_install.lock().await;
+            let read = live.open_past(temp_dir.path(), 0);
+            assert!(matches!(read, Err(BatchReadError::Unsealed)), "mid-handoff, got {read:?}");
+            let read = live.open_past(temp_dir.path(), 7);
+            assert!(
+                matches!(&read, Err(BatchReadError::Open(e)) if e.is_missing_static_files()),
+                "a missing epoch is missing, got {read:?}"
+            );
+        }
+        let read = live.open_past(temp_dir.path(), 0);
+        assert!(
+            matches!(read, Err(BatchReadError::Open(PackError::CorruptPack(_)))),
+            "with no handoff a damaged pack is damaged, got {read:?}"
+        );
         consensus_chain.close().await;
     }
 

@@ -193,6 +193,10 @@ no thread of its own.
     drops before returning (`None` for any other epoch): an epoch handoff waits up to
     `HANDOFF_SEAL_GRACE` for the clones of the pack it seals, so nothing may keep one. A batch is
     visible there once its output is appended, before the persist.
+  - `ConsensusChain::live_batches` gives the same read (and `install_generation`) to a reader that
+    lives as long as the process: `LiveBatches` holds the live pack weakly, so it never keeps the
+    chain from reaching sole ownership at shutdown (`wait_until_sole_owner`), and it answers `None`
+    once the chain is gone.
   - `ConsensusChain::install_generation` moves at every install of an epoch's files (an import, a
     read-side heal) and every swap of the current pack. A handle opened before an install keeps
     reading the copy it opened (the replaced files stay readable while it holds them), so a reader
