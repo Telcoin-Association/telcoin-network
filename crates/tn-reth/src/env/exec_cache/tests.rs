@@ -5,11 +5,13 @@
 
 use super::*;
 use crate::{
+    error::TnRethResult,
     payload::TNPayload,
     test_utils::{
         consensus_output_for_tests_at, test_genesis_with_consensus_registry, TransactionFactory,
     },
-    ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, StorageLayout,
+    ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RecoveredBatch, RethChainSpec,
+    StorageLayout,
 };
 use alloy::{
     consensus::{SignableTransaction as _, TxEip7702},
@@ -899,7 +901,7 @@ async fn persist_fail_then_retry_then_continue() -> eyre::Result<()> {
     let tx = chain.call(COUNTER_ADDRESS);
     let second = chain.build(vec![tx], &mut overlay)?;
     chain.env.inject_persist_provider_faults(1);
-    chain.env.persist_executed_output(&[first.clone(), second.clone()]).expect_err("injected");
+    chain.env.persist_executed_output(&[first.clone(), second.clone()], &[]).expect_err("injected");
     assert!(chain.env.execution_cache_stats().is_none());
     assert!(chain.kept_code());
 
@@ -946,6 +948,73 @@ async fn stale_checked_hit_rebuilds_the_block_without_the_cache() -> eyre::Resul
         assert_eq!(chain.env.execution_cache_rebuilds(), 1, "one rebuild");
     }
     assert_eq!(chain.slot(COUNTER_ADDRESS, 0)?, U256::from(3));
+    Ok(())
+}
+
+/// A block built again after a stale hit carries its final attempt's batch positions, not the
+/// discarded attempt's, nor both.
+///
+/// The saved cache is cut down to two planted accounts: the sender `a`, with a wrong balance, and
+/// a second sender `b`, with its nonce one ahead. `a`'s transaction comes first, so `a` is the
+/// first account hit, which is checked: it is found stale and served from the parent state, and
+/// the block is marked for a rebuild. `b` is the second hit, unchecked, so the discarded attempt
+/// sees its stale nonce and skips its transaction as invalid, keeping position 0 only. The rebuild,
+/// without the cache, keeps both transactions: positions 0 and 2 (the batch's position 1 stands
+/// for a transaction dropped at signer recovery).
+#[tokio::test]
+async fn stale_rebuild_keeps_the_final_attempts_positions() -> eyre::Result<()> {
+    let mut b = TransactionFactory::new_random();
+    let funded = GenesisAccount::default().with_balance(U256::from(10u128.pow(24)));
+    let mut chain = TestChain::on(genesis().extend_accounts([(b.address(), funded)]), None)?;
+    let (a, b_address) = (chain.sender.address(), b.address());
+    let mut b_tx = |chain: &TestChain| {
+        b.create_eip1559_encoded(
+            chain.chain.clone(),
+            Some(21_000),
+            MIN_PROTOCOL_BASE_FEE.into(),
+            Some(EMPTY_ADDRESS),
+            U256::from(1),
+            Bytes::new(),
+        )
+    };
+    let a_tx = chain.tx(EMPTY_ADDRESS, 1, 21_000);
+    let warm = b_tx(&chain);
+    chain.output(vec![vec![a_tx, warm]])?;
+
+    let (a_state, b_state) = (chain.account(a)?.expect("a"), chain.account(b_address)?.expect("b"));
+    {
+        let mut slot = chain.env.inner.execution_cache.lock();
+        let cache = &mut slot.saved.as_mut().expect("a saved cache").cache;
+        cache.shadow = false;
+        cache.accounts = FixedCache::new(1 << 16, TopBitHash::default());
+        cache.counters.account_hits.store(0, Ordering::Relaxed);
+        cache
+            .accounts
+            .insert(a, Some(Account { balance: a_state.balance + U256::from(1), ..a_state }));
+        cache.accounts.insert(b_address, Some(Account { nonce: b_state.nonce + 1, ..b_state }));
+    }
+
+    let txs = [chain.tx(EMPTY_ADDRESS, 1, 21_000), b_tx(&chain)]
+        .iter()
+        .map(|bytes| crate::recover_raw_transaction(bytes))
+        .collect::<TnRethResult<Vec<_>>>()?;
+    let output = consensus_output_for_tests_at(2, 0, 2, false, GENESIS_TIMESTAMP + 2);
+    let payload = TNPayload::new_for_test_with(
+        chain.head.clone(),
+        &output,
+        Address::repeat_byte(0xbe),
+        B256::repeat_byte(2),
+        B256::repeat_byte(2),
+    );
+    let built = chain.env.build_block_from_recovered_payload(
+        payload,
+        RecoveredBatch::positioned(txs, vec![0, 2]),
+        &mut crate::OutputBuildScope::new(),
+    )?;
+
+    assert_eq!(chain.env.execution_cache_rebuilds(), 1, "the stale hit forced one rebuild");
+    assert_eq!(built.block.recovered_block.body().transactions.len(), 2, "the rebuild keeps both");
+    assert_eq!(built.tx_positions.as_deref(), Some(&[0, 2][..]), "the final attempt's positions");
     Ok(())
 }
 
@@ -1163,7 +1232,7 @@ async fn failed_persist_drops_the_cache() -> eyre::Result<()> {
     let block = chain.build(vec![tx], &mut OutputTrieOverlay::new())?;
     assert!(chain.env.execution_cache_stats().is_some());
     chain.env.inject_persist_provider_faults(1);
-    chain.env.persist_executed_output(&[block]).expect_err("injected fault");
+    chain.env.persist_executed_output(&[block], &[]).expect_err("injected fault");
     assert!(chain.env.execution_cache_stats().is_none());
     assert!(chain.kept_code());
     Ok(())

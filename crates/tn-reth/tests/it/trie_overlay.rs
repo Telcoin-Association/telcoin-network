@@ -390,7 +390,7 @@ fn test_recovered_build_matches_bytes_build() -> eyre::Result<()> {
     // per batch and in batch order: every decodable copy survives recovery, duplicates included
     // (only execution skips them)
     let recovered_hashes: Vec<Vec<B256>> =
-        signers.iter().map(|batch| batch.iter().map(|tx| *tx.tx_hash()).collect()).collect();
+        signers.iter().map(|batch| batch.txs().iter().map(|tx| *tx.tx_hash()).collect()).collect();
     let decoded_hashes: Vec<Vec<B256>> = batch_bytes
         .iter()
         .map(|batch| {
@@ -420,11 +420,12 @@ fn test_recovered_build_matches_bytes_build() -> eyre::Result<()> {
         };
         let from_bytes =
             env.reth_env.build_block_from_batch_payload(payload(), bytes, &mut bytes_overlay)?;
-        let (from_recovered, timings) = env.reth_env.build_block_from_recovered_payload(
+        let built = env.reth_env.build_block_from_recovered_payload(
             payload(),
             recovered,
             &mut recovered_scope,
         )?;
+        let (from_recovered, timings) = (built.block, built.timings);
 
         let header = from_bytes.recovered_block.clone_sealed_header();
         let recovered_header = from_recovered.recovered_block.clone_sealed_header();
@@ -593,7 +594,7 @@ fn test_scope_rejects_payload_on_another_parent() -> eyre::Result<()> {
     let stale = TNPayload::new_for_test(genesis.clone(), &output);
     let err = env
         .reth_env
-        .build_block_from_recovered_payload(stale, Vec::new(), &mut scope)
+        .build_block_from_recovered_payload(stale, Default::default(), &mut scope)
         .expect_err("a payload off the scope's tip must fail closed");
     assert!(
         matches!(err, TnRethError::ScopeParentMismatch { expected, got }

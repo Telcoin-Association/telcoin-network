@@ -8,16 +8,19 @@ use crate::{
     metrics::ENGINE_METRICS,
     recovery::{output_tx_count, recover_signers, RecoveryHandle},
 };
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tn_reth::{
     error::TnRethError,
     payload::{BuildArguments, TNPayload},
-    BlockBuildTimings, CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, OutputBuildScope,
-    ProviderError, RethEnv,
+    BlockBuildTimings, BuiltBlock, CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain,
+    OutputBuildScope, ProviderError, RecoveredBatch, RethEnv,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor, ConsensusOutput,
-    EngineUpdate, Hash as _, Recovered, SealedHeader, TransactionSigned, B256,
+    EngineUpdate, Hash as _, SealedHeader, B256,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, field, info, info_span, trace, warn};
@@ -38,6 +41,12 @@ use tracing::{debug, error, field, info, info_span, trace, warn};
 /// rest of it (payload construction, in-memory chain updates, logging); `max_block_root_ms` and
 /// `max_block_evm_ms` are the slowest block's laps and `txs` counts the transactions handed to
 /// the builder. The skipped empty path does not log it.
+///
+/// Each block's transactions are persisted with their positions in the batch the block executed
+/// ([`tn_reth::BuiltBlock::tx_positions`]: `None` for the empty closing block and for a block
+/// whose batch does not hash to its digest), one entry per block, the same on every persist
+/// attempt. After the persist the batches stored by position go to the decoded-batch cache
+/// ([`RethEnv::cache_persisted_batches`]).
 ///
 /// This entry point recovers the output's signers inline, on the calling thread, before the
 /// first block. No production code calls it: the engine's run loop starts that recovery on a
@@ -161,6 +170,9 @@ pub(crate) fn execute_consensus_output_with_signers(
 
     // ensure at least 1 block for empty output when close_epoch is true
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
+    // the batch positions of each block's transactions, parallel to `executed_blocks`: the persist
+    // stores them in place of the transactions (an argument, so every retry writes the same rows)
+    let mut tx_positions: Vec<Option<Arc<[u32]>>> = Vec::with_capacity(batches.len().max(1));
     // observability only: the block builds' laps, summed for the `output executed` line
     let mut timings = OutputTimings::default();
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
@@ -246,8 +258,10 @@ pub(crate) fn execute_consensus_output_with_signers(
         // execute the payload and update the current canonical header
         let executed = execute_payload(
             payload,
-            Vec::new(),
+            // no batch: no transactions and no positions
+            RecoveredBatch::default(),
             &mut executed_blocks,
+            &mut tx_positions,
             &reth_env,
             &canonical_in_memory_state,
             &mut build_scope,
@@ -351,6 +365,7 @@ pub(crate) fn execute_consensus_output_with_signers(
                 payload,
                 recovered,
                 &mut executed_blocks,
+                &mut tx_positions,
                 &reth_env,
                 &canonical_in_memory_state,
                 &mut build_scope,
@@ -398,7 +413,7 @@ pub(crate) fn execute_consensus_output_with_signers(
     // reward accounting stays in place on every path; see the note at the top of this
     // function.
     let persist_start = Instant::now();
-    let persisted = persist_output_with_retry(&reth_env, &executed_blocks);
+    let persisted = persist_output_with_retry(&reth_env, &executed_blocks, &tx_positions);
     let persist_elapsed = persist_start.elapsed();
     crate::metrics::ENGINE_METRICS.persist_duration_seconds.record(persist_elapsed);
     persisted.inspect_err(|e| {
@@ -411,6 +426,9 @@ pub(crate) fn execute_consensus_output_with_signers(
         crate::metrics::ENGINE_METRICS.persist_failures_total.increment(1);
         rollback_in_memory_output(&canonical_in_memory_state, &anchor_header, &executed_blocks)
     })?;
+    // committed: hand the batches stored by position to the decoded-batch cache, whose sink
+    // copies them off this thread
+    reth_env.cache_persisted_batches(&output, &tx_positions);
     let announce_start = Instant::now();
     reth_env.announce_executed_output(
         executed_blocks,
@@ -496,16 +514,18 @@ impl OutputTimings {
 /// `build_scope` is the consensus output's shared [`OutputBuildScope`]: the build computes this
 /// block's state root layered over its trie overlay (#1301), then advances the scope to this
 /// block's post-state for the NEXT block of the output. `recovered` is the batch's entry of the
-/// output's recovered signers. The build's phase laps are added to `timings`. `consensus_number`
-/// only labels the `next block executed` line, together with the payload's batch index and digest,
-/// so each block joins back to its consensus output and batch.
+/// output's recovered signers. The block goes to `executed_blocks` and its transactions' batch
+/// positions to `tx_positions`, at the same index. The build's phase laps are added to `timings`.
+/// `consensus_number` only labels the `next block executed` line, together with the payload's
+/// batch index and digest, so each block joins back to its consensus output and batch.
 // the per-output accumulators and the log context are separate on purpose; bundling them into a
-// struct would only rename the same eight values
+// struct would only rename the same nine values
 #[allow(clippy::too_many_arguments)]
 fn execute_payload(
     payload: TNPayload,
-    recovered: Vec<Recovered<TransactionSigned>>,
+    recovered: RecoveredBatch,
     executed_blocks: &mut Vec<ExecutedBlock>,
+    tx_positions: &mut Vec<Option<Arc<[u32]>>>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
     build_scope: &mut OutputBuildScope,
@@ -516,7 +536,7 @@ fn execute_payload(
     let batch_index = payload.batch_index;
     let batch_digest = payload.batch_digest;
     // execute
-    let (next_canonical_block, block_timings) =
+    let BuiltBlock { block: next_canonical_block, timings: block_timings, tx_positions: positions } =
         reth_env.build_block_from_recovered_payload(payload, recovered, build_scope)?;
     timings.add(&block_timings);
     trace!(target: "engine::dump", ?next_canonical_block, "block executed");
@@ -546,8 +566,9 @@ fn execute_payload(
         .update_chain(NewCanonicalChain::Commit { new: vec![next_canonical_block.clone()] });
     canonical_in_memory_state.set_canonical_head(canonical_header.clone());
 
-    // collect all executed blocks for this output
+    // collect all executed blocks for this output, each with its transactions' batch positions
     executed_blocks.push(next_canonical_block);
+    tx_positions.push(positions);
 
     Ok(canonical_header)
 }
@@ -592,7 +613,8 @@ const PERSIST_OUTPUT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::f
 
 /// Run [`RethEnv::persist_executed_output`] up to [`PERSIST_OUTPUT_ATTEMPTS`] times, sleeping
 /// [`PERSIST_OUTPUT_RETRY_BACKOFF`] between tries, retrying ONLY on a retryable
-/// [`TnRethError::Provider`] fault (see [`retryable_persist_fault`]).
+/// [`TnRethError::Provider`] fault (see [`retryable_persist_fault`]). Every attempt is given the
+/// same `blocks` and `tx_positions`, so a retry writes the rows the failed attempt would have.
 ///
 /// Provider faults on the durable write are node-local (disk pressure, an MDBX I/O error) and
 /// often transient, so a bounded retry preserves liveness before the caller escalates to a halt
@@ -616,9 +638,10 @@ const PERSIST_OUTPUT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::f
 fn persist_output_with_retry(
     reth_env: &RethEnv,
     blocks: &[ExecutedBlock],
+    tx_positions: &[Option<Arc<[u32]>>],
 ) -> Result<(), TnRethError> {
     (1..PERSIST_OUTPUT_ATTEMPTS)
-        .find_map(|attempt| match reth_env.persist_executed_output(blocks) {
+        .find_map(|attempt| match reth_env.persist_executed_output(blocks, tx_positions) {
             Err(TnRethError::Provider(err)) if retryable_persist_fault(&err) => {
                 warn!(
                     target: "engine",
@@ -633,7 +656,7 @@ fn persist_output_with_retry(
             }
             other => Some(other),
         })
-        .unwrap_or_else(|| reth_env.persist_executed_output(blocks))
+        .unwrap_or_else(|| reth_env.persist_executed_output(blocks, tx_positions))
 }
 
 /// Whether an attempt of [`RethEnv::persist_executed_output`] that failed with this
