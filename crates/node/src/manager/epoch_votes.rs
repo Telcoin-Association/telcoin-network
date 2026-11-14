@@ -815,6 +815,8 @@ async fn recertify_older_record(
         "epoch record re-certify round",
     );
     retained.mark_recertify(record.epoch);
+    // a pick whose vote the test hook withholds keeps its line and its mark, so a round that
+    // other members start for the record still counts as a re-certify round
     if withhold_own_epoch_vote(record.epoch) {
         return;
     }
@@ -3743,7 +3745,7 @@ mod epoch_vote_collector_tests {
 
     thread_local! {
         /// The withhold hook a test installed on this thread with [`WithholdOnThisThread`]. The
-        /// tests run on current-thread runtimes, so the rounds they spawn consult it too.
+        /// tests run on current-thread runtimes, so the collector they spawn consults it too.
         static WITHHOLD: std::cell::RefCell<Option<tn_types::test_hooks::WithholdEpochVote>> =
             const { std::cell::RefCell::new(None) };
     }
