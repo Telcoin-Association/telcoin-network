@@ -497,7 +497,9 @@ the gap. Such a node restores `consensus-db/` from a backup, or rebuilds as a ne
 `consensus-db/` moved aside first; a validator rebuilt that way stays stopped until the network has
 closed the last epoch it took part in, because its votes and proposals for that epoch leave with
 `consensus-db/`. `--for-swap` skips this refusal for the side-observer swap, which copies a synced
-observer's execution database in and keeps `consensus-db/`. While a reset is unfinished (an `execution-reset-*.partial`
+observer's execution database in and keeps `consensus-db/`. Both modes refuse a datadir an
+unfinished `db load-state` left (its `load-state-in-progress` marker), with the node's message:
+rerun `db load-state` with the same bundle instead. While a reset is unfinished (an `execution-reset-*.partial`
 directory holding an entry), the node, `db load-state`, `db stats`, `db check` and `db
 migrate-execution` refuse the datadir, and running the reset again finishes it. An empty one (left
 when the entries are moved back to undo an unfinished reset) blocks nothing. The layouts, the

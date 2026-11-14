@@ -125,8 +125,9 @@ enum DbSubcommand {
     /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database lacks
     /// the pack of an epoch below its latest one (one bootstrapped with `db load-state` lacks
     /// every epoch below the restored one): the rebuild re-executes every epoch from 0 from
-    /// the node's own packs. `--for-swap` skips that refusal for the side-observer swap.
-    /// Dry-run by default; pass `--force` to apply.
+    /// the node's own packs. `--for-swap` skips that refusal for the side-observer swap. Refuses,
+    /// in both modes, a datadir an unfinished `db load-state` left, as the node does. Dry-run by
+    /// default; pass `--force` to apply.
     ///
     /// The default build's new datadirs store each transaction once: their rows hold its position
     /// in a batch of the consensus packs, so a rebuild is how an existing datadir moves to that

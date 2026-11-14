@@ -20,7 +20,9 @@
 //! ([`refuse_missing_packs`]): a datadir bootstrapped with `db load-state` (no pack below the
 //! restored epoch), or one that lost a pack. The side-observer swap moves the execution database
 //! aside to copy in a synced observer's, which replays nothing below the copy's tip, so it skips
-//! that check ([`ResetMode::Swap`]).
+//! that check ([`ResetMode::Swap`]). Both refuse a datadir an unfinished `db load-state` left, as
+//! the node does ([`refuse_interrupted_load_state`]): what they would move aside is half a restore,
+//! and the datadir would stay refused.
 
 use eyre::{bail, eyre, WrapErr as _};
 use std::{
@@ -34,6 +36,8 @@ use tn_storage::{
     disk::{available_bytes, fsync_directory},
 };
 use tn_types::Epoch;
+
+use super::load_state_marker::refuse_interrupted_load_state;
 
 /// The prefix of the directories a reset moves the execution database into.
 const RESET_DIR_PREFIX: &str = "execution-reset-";
@@ -299,9 +303,10 @@ fn refuse_open_execution_database(datadir: &Path) -> eyre::Result<()> {
 }
 
 /// Move `datadir`'s execution database aside (with `force`), or report what would move (without
-/// it). Holds the datadir lock for the whole run, so it refuses while a node runs. For
-/// [`ResetMode::Rebuild`], refuses, before anything moves, a datadir whose rebuild would stop at a
-/// missing pack ([`refuse_missing_packs`]).
+/// it). Holds the datadir lock for the whole run, so it refuses while a node runs. Refuses, before
+/// anything moves, a datadir the node refuses for an unfinished `db load-state`
+/// ([`refuse_interrupted_load_state`]), and for [`ResetMode::Rebuild`] one whose rebuild would stop
+/// at a missing pack ([`refuse_missing_packs`]).
 pub(crate) fn reset_execution(
     datadir: &Path,
     force: bool,
@@ -311,6 +316,8 @@ pub(crate) fn reset_execution(
         bail!("datadir {} does not exist", datadir.display());
     }
     let _pid_lock = PidLock::acquire(&datadir.to_path_buf())?;
+    // the node refuses this datadir until `db load-state` is rerun, which redoes the restore
+    refuse_interrupted_load_state(datadir)?;
     if mode == ResetMode::Rebuild {
         refuse_missing_packs(datadir)?;
     }
@@ -643,6 +650,39 @@ mod tests {
         assert_eq!(names(root), ["consensus-db", target_name.as_str(), "node-keys", "telcoin.pid"]);
         assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
         assert_eq!(names(&root.join("consensus-db/epochs")), ["epoch-1"]);
+    }
+
+    /// A datadir an unfinished `db load-state` left is refused with the node's own message, in
+    /// both modes and by the dry run too, and nothing moves; once the restore is finished (its
+    /// marker gone) the reset runs.
+    #[test]
+    fn a_reset_refuses_an_unfinished_load_state() {
+        let dir = datadir();
+        let root = dir.path();
+        super::super::load_state_marker::write(root, &[]).unwrap();
+        let node = format!("{:#}", refuse_interrupted_load_state(root).unwrap_err());
+        for mode in [ResetMode::Rebuild, ResetMode::Swap] {
+            for force in [false, true] {
+                let err = format!("{:#}", reset_execution(root, force, mode).unwrap_err());
+                assert_eq!(err, node, "the node's refusal");
+                assert!(err.contains("Run `telcoin-network db load-state` again"), "{err}");
+                assert_eq!(
+                    names(root),
+                    [
+                        "consensus-db",
+                        "db",
+                        "load-state-in-progress",
+                        "node-keys",
+                        "restored-state-floor",
+                        "static_files",
+                        "telcoin.pid"
+                    ],
+                    "nothing moved"
+                );
+            }
+        }
+        super::super::load_state_marker::remove(root).unwrap();
+        reset_execution(root, true, ResetMode::Rebuild).unwrap();
     }
 
     /// A datadir without a floor marker moves what it has.
