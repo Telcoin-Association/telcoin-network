@@ -2822,3 +2822,90 @@ async fn own_cert_hold_after_store_lets_the_next_header_through() {
     assert!(took >= HOLD, "the held certificate is released only after the hold: {took:?}");
     drop(tx_headers);
 }
+
+/// The drop counts `report_canceled` recorded under `snapshotter`'s recorder, by `reason`, sorted.
+fn dropped_reports(snapshotter: &metrics_util::debugging::Snapshotter) -> Vec<(String, u64)> {
+    use metrics_util::debugging::DebugValue;
+
+    let mut counts: Vec<_> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, ..)| key.key().name() == "tn_primary.uncertified_report_dropped_total")
+        .filter_map(|(key, _, _, value)| {
+            let reason = key.key().labels().find(|label| label.key() == "reason")?;
+            match value {
+                DebugValue::Counter(count) => Some((reason.value().to_owned(), count)),
+                _ => None,
+            }
+        })
+        .collect();
+    counts.sort();
+    counts
+}
+
+/// Report the cancel of `header` from `certifier` under a fresh metrics recorder, and return the
+/// drop counts the report recorded.
+fn report_and_count(certifier: &Certifier<MemDatabase>, header: &Header) -> Vec<(String, u64)> {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        certifier.report_canceled(header.round(), header.epoch(), header.digest())
+    });
+    dropped_reports(&snapshotter)
+}
+
+/// A report the proposer can read counts nothing. One dropped because no proposer is subscribed,
+/// which plain `try_send` reports as a success, or because the queue is full, counts under that
+/// reason, with one debug line naming it.
+///
+/// Catches: an uncounted drop, a queued report counted as dropped, and a no-subscriber drop
+/// counted as delivered.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn dropped_cancel_reports_are_counted_by_reason() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("primary::certifier");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let (cx, certifier) = CertifierContext::unspawned(4);
+    let header = cx.proposer_header();
+    let report = (header.round(), header.digest());
+
+    assert_eq!(report_and_count(&certifier, &header), [("unsubscribed".to_owned(), 1)]);
+
+    let mut rx_uncertified = cx.consensus_bus.subscribe_uncertified_own_headers();
+    assert!(report_and_count(&certifier, &header).is_empty(), "a queued report is not a drop");
+    assert_eq!(rx_uncertified.try_recv().ok(), Some(report), "the queued report");
+
+    for _ in 0..crate::consensus_bus::UNCERTIFIED_OWN_HEADERS_CHANNEL_CAPACITY {
+        cx.consensus_bus.uncertified_own_headers().try_send(report).expect("room for the filler");
+    }
+    assert_eq!(report_and_count(&certifier, &header), [("full".to_owned(), 1)]);
+
+    let lines = capture.events("uncertified own header report dropped");
+    let reasons: Vec<_> = lines.iter().map(|line| line.field("reason")).collect();
+    assert_eq!(reasons, [Some("unsubscribed"), Some("full")], "one line per dropped report");
+    assert_eq!(lines[1].u64_field("round"), Some(u64::from(header.round())));
+}
+
+/// Once shutdown is signalled a cancel is not reported: the report is dropped, counted under
+/// `shutdown`, and logged with one debug line.
+///
+/// Catches: a shutdown drop that is silent, or a report sent to a proposer that is stopping.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shutdown_drops_the_cancel_report_and_counts_it() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("primary::certifier");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let (cx, certifier) = CertifierContext::unspawned(4);
+    let header = cx.proposer_header();
+    let mut rx_uncertified = cx.consensus_bus.subscribe_uncertified_own_headers();
+    cx.proposer().consensus_config().shutdown().notify();
+
+    assert_eq!(report_and_count(&certifier, &header), [("shutdown".to_owned(), 1)]);
+    assert!(rx_uncertified.try_recv().is_err(), "a shutdown cancel is never reported");
+    let lines = capture.events("uncertified own header report dropped");
+    assert_eq!(lines.len(), 1, "one line for the dropped report");
+    assert_eq!(lines[0].field("reason"), Some("shutdown"));
+}

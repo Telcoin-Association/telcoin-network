@@ -19,7 +19,7 @@ use tn_types::{
     test_hooks::{OwnCertDelay, OwnCertDelayStage},
     AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Epoch, Header,
     HeaderDigest, Noticer, Notifier, Round, TaskError, TaskManager, TaskResult, TaskSpawner,
-    TnReceiver, TnSender, Vote,
+    TnReceiver, TnSender, TrySendError, TrySendOutcome, Vote,
 };
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, enabled, error, info, instrument, warn};
@@ -807,13 +807,23 @@ impl<DB: Database> Certifier<DB> {
     ///
     /// Called only where `new_proposal` ends the proposal of a header without a stored certificate,
     /// never where a proposal ends without a certificate: the identical header re-sent on the
-    /// max-delay tick may still be certified then. A shutdown also fires `new_proposal`; nothing
-    /// is logged or reported once it has.
+    /// max-delay tick may still be certified then. A shutdown also fires `new_proposal`; once it
+    /// has, the `header uncertified` line is not written and the report is dropped.
     ///
-    /// Never waits: a full queue drops the report with a debug line, and the digests then wait for
-    /// the proposer's next own commit, which re-queues every uncommitted header below it.
+    /// Never waits. A report that does not reach the proposer is dropped with the debug line
+    /// `uncertified own header report dropped` and counted in
+    /// `tn_primary.uncertified_report_dropped_total{reason}`, and the digests then wait for the
+    /// proposer's next own commit, which re-queues every uncommitted header below it, or, at an
+    /// epoch's end, for the orphan re-pool. The reasons are:
+    /// - `shutdown`: the shutdown guard above. A proposal in flight at an epoch's end lands here,
+    ///   so a count of about one per epoch is expected;
+    /// - `full`: the queue holds [`crate::consensus_bus::UNCERTIFIED_OWN_HEADERS_CHANNEL_CAPACITY`]
+    ///   reports the proposer has not read;
+    /// - `unsubscribed`: no proposer is subscribed to the queue (its task has ended, or never
+    ///   started), or the channel closed. Plain `try_send` reports this case as a success.
     fn report_canceled(&self, round: Round, epoch: Epoch, digest: HeaderDigest) {
         if self.config.shutdown().is_notified() {
+            Self::report_dropped(round, digest, "shutdown");
             return;
         }
         info!(
@@ -823,15 +833,33 @@ impl<DB: Database> Certifier<DB> {
             reason = "canceled",
             "header uncertified"
         );
-        if let Err(e) = self.consensus_bus.uncertified_own_headers().try_send((round, digest)) {
-            debug!(
-                target: "primary::certifier",
-                round,
-                %digest,
-                %e,
-                "uncertified own header report dropped"
-            );
+        let dropped =
+            match self.consensus_bus.uncertified_own_headers().try_send_outcome((round, digest)) {
+                Ok(TrySendOutcome::Queued) => None,
+                Ok(TrySendOutcome::Unsubscribed | TrySendOutcome::OverBudget) => {
+                    Some("unsubscribed")
+                }
+                Err(TrySendError::Full(_)) => Some("full"),
+                // a closed channel has lost its receiver, as an unsubscribed one has none
+                Err(TrySendError::Closed(_) | TrySendError::Broadcast(_)) => Some("unsubscribed"),
+            };
+        if let Some(reason) = dropped {
+            Self::report_dropped(round, digest, reason);
         }
+    }
+
+    /// Log and count an uncertified own header report that [`Self::report_canceled`] dropped for
+    /// `reason`, one of the static reasons its doc lists.
+    fn report_dropped(round: Round, digest: HeaderDigest, reason: &'static str) {
+        debug!(
+            target: "primary::certifier",
+            round,
+            %digest,
+            reason,
+            "uncertified own header report dropped"
+        );
+        metrics::counter!("tn_primary.uncertified_report_dropped_total", "reason" => reason)
+            .increment(1);
     }
 
     /// How long the test hook holds the own certificate of the header at `round` at `stage`, or
