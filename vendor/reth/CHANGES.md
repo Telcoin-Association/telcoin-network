@@ -2010,8 +2010,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   cuts nothing; stopped after the `.conf`, or after the offsets cut, heals to the finished prune
   byte for byte), `changeset_prune_commits_the_header_before_it_cuts` (the same for a changeset
   prune through the provider, of rows and of blocks without changes, so the sidecar alone
-  shrinks), `checksummed_changesets_shorter_than_the_header_are_refused` (rows cut by an older
-  build's order, a sidecar one record short, a sidecar gone). Mutation-checked: the `.conf`
+  shrinks), `checksummed_changesets_shorter_than_the_header_are_refused` (an older build's
+  changeset prune stopped after its `prune_rows`, before its header commit: the rows and their
+  count cut, the block range and records not, built with `prune_rows` on the jar alone; a sidecar
+  one record short; a sidecar gone). Mutation-checked: the `.conf`
   written after the cuts, the sidecar cut before the commit, each of the three refusals removed.
   *Upstream*: maybe (the order is an upstream bug; the refusal needs TN-0120's versions).
 
@@ -2426,7 +2428,11 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   changesets, both versions: a rotation whose configuration write fails leaves no file of the
   next jar, and one stopped after the configuration, or after the data file too, opens; the next
   persist writes the jar and every block reads; it fails with the old order, on the stray data
-  file). *Upstream*: yes (upstream's order).
+  file); TN-0167 adds `creation_at_genesis_stopped_before_the_jar_has_its_files` (the first jar of
+  a segment). A leftover configuration of a stopped deletion that the new jar replaces is
+  TN-0132's `deletion_stopped_at_any_file`. A data file without a configuration that an older
+  build's creation left (files first) still fails every start in `iter_static_files`, as before:
+  remove that jar's files by hand. *Upstream*: yes (upstream's order).
 
 - **TN-0151** — The changeset counts load each jar through TN-0135's format check and count a
   segment's last file. *Kind*: fix. *Files*:
@@ -2728,3 +2734,22 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   succeeds and its blocks read back, also after a reopen, both formats; it failed before). The
   release warning has no test (a log line after a one-second wait). *Upstream*: no (TN-0138 and
   TN-0148 are TN's).
+
+- **TN-0167** — Tests: crash states of block-segment prunes and of a creation at genesis, the
+  offsets-only cut of a changeset prune, and two tests' descriptions. *Kind*: test.
+  *Files*: `crates/storage/provider/src/providers/static_file/{tn_crash_tests.rs,
+  tn_checksum_tests.rs}`.
+  *Why*: TN-0130's provider crash tests covered changeset prunes only, and the state a prune
+  stopped between its offsets cut and its data cut only at the jar level; TN-0150's covered
+  rotation only. `block_segment_prune_stopped_after_the_configuration_heals` (headers and
+  transactions, both formats: `prune_rows`'s configuration with nothing cut, or the offsets alone
+  cut, heals at the next open to the finished `prune_rows`'s files, and the kept rows read; for
+  transactions the block range is left to `check_consistency`, not run there),
+  `changeset_prune_commits_the_header_before_it_cuts` (now also the offsets cut without the data),
+  `creation_at_genesis_stopped_before_the_jar_has_its_files` (a segment's first jar stopped after
+  its configuration, or after its data file too: the next start opens and the next persist writes
+  the jar, headers and account changesets, both formats). The descriptions of
+  `checksummed_changesets_shorter_than_the_header_are_refused` and of a case of
+  `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` now say which state they build: an
+  older build's prune stopped between `prune_rows` and its header commit. *Can reach execution or
+  storage*: no; tests only. *Upstream*: n/a.

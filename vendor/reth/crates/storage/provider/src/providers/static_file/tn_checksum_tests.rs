@@ -397,7 +397,8 @@ fn sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap() {
     assert_eq!(std::fs::read(&csoff).unwrap(), gap);
     drop(provider);
 
-    // An interrupted prune of blocks 2 and 3: the rows went, the records and header did not.
+    // An older build's prune of blocks 2 and 3 stopped between `prune_rows` and its header
+    // commit: the rows and their count went, the block range and records did not.
     std::fs::write(&csoff, &clean).unwrap();
     let mut writer = NippyJarWriter::new(load(&path)).unwrap();
     writer.prune_rows(2 * CHANGES as usize).unwrap();

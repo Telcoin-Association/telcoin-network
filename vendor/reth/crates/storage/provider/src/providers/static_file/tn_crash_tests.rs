@@ -67,7 +67,8 @@ fn assert_accounts(provider: &StaticFileProvider<EthPrimitives>, tip: u64, empty
 /// A changeset prune commits its header before it cuts the rows or the sidecar. A prune whose
 /// configuration cannot be written (a directory where its temporary file goes) has cut nothing:
 /// the next open reads every block. Stopped after the configuration, with the rows, the offsets
-/// or the sidecar not cut yet, the next open heals to the finished prune, byte for byte. Both
+/// the offsets alone, or the sidecar not cut yet, the next open heals to the finished prune, byte
+/// for byte. Both
 /// formats, a prune of rows and one of blocks without changes (only the sidecar shrinks). Fails
 /// if the rows or the sidecar are cut before the header is committed.
 #[test]
@@ -105,10 +106,12 @@ fn changeset_prune_commits_the_header_before_it_cuts() {
             drop(provider);
             let after = changeset_files(&path);
 
-            // Stopped after the configuration: nothing cut, then the rows cut but not the sidecar.
+            // Stopped after the configuration: nothing cut, the offsets cut but not the data, then
+            // the rows cut but not the sidecar.
             let [data, offsets, config, _] = after.clone();
             for stopped in [
                 [before[0].clone(), before[1].clone(), config.clone(), before[3].clone()],
+                [before[0].clone(), offsets.clone(), config.clone(), before[3].clone()],
                 [data.clone(), offsets.clone(), config.clone(), before[3].clone()],
             ] {
                 write_changeset_files(&path, &stopped);
@@ -121,10 +124,13 @@ fn changeset_prune_commits_the_header_before_it_cuts() {
     }
 }
 
-/// The state a prune that cut the rows before its header left (an older build's order): the rows
-/// of blocks 2 and 3 gone, their records and the header still there. A plain jar heals it as
-/// before (`sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap`); a checksummed jar refuses it
-/// as damage and cuts nothing, as it refuses a sidecar shorter than its header.
+/// The state an older build's changeset prune left when stopped between its `prune_rows` and its
+/// header commit (it gave the header its final form only after `prune_rows`): the rows of blocks
+/// 2 and 3 cut and the configuration's row count with them, the block range, the `.csoff` length
+/// and the records not. Built here with `prune_rows` on the jar alone, which writes those files.
+/// A plain jar heals it as before (`sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap`); a
+/// checksummed jar refuses it as damage and cuts nothing, as it refuses a sidecar shorter than its
+/// header.
 #[test]
 fn checksummed_changesets_shorter_than_the_header_are_refused() {
     let (dir, _) = create_test_static_files_dir();
@@ -638,4 +644,132 @@ fn syncs_run_here_when_their_threads_cannot_start() {
         assert_accounts(&static_files, 2, 3);
     }
     FAIL_SYNC_THREADS.with(|fail| fail.set(false));
+}
+
+/// The data, offsets and configuration files of the jar at `path`.
+fn jar_files(path: &Path) -> [Vec<u8>; 3] {
+    ["", "off", "conf"].map(|ext| {
+        let file = if ext.is_empty() { path.to_path_buf() } else { path.with_extension(ext) };
+        std::fs::read(file).unwrap()
+    })
+}
+
+/// Writes `files` ([`jar_files`]) as the jar at `path`.
+fn write_jar_files(path: &Path, files: &[Vec<u8>; 3]) {
+    for (ext, bytes) in ["", "off", "conf"].iter().zip(files) {
+        let file: PathBuf =
+            if ext.is_empty() { path.to_path_buf() } else { path.with_extension(ext) };
+        std::fs::write(file, bytes).unwrap();
+    }
+}
+
+/// TN(TN-0130): a block-segment prune (headers, and transactions, a transaction segment) stopped
+/// after `prune_rows` wrote its configuration, with nothing cut or with only the offsets cut, heals
+/// at the next open to the files of the finished `prune_rows`, and the rows it keeps read. Both
+/// formats. For transactions that configuration has the transaction range cut but not yet the
+/// block range, which the truncation's own commit sets; at a start, `check_consistency` sets it
+/// from the database (not run here).
+#[test]
+fn block_segment_prune_stopped_after_the_configuration_heals() {
+    use alloy_consensus::{Header, Transaction};
+    use reth_static_file_types::SegmentHeader;
+    use reth_storage_api::{HeaderProvider, TransactionsProvider};
+
+    const PRUNED: u64 = 2;
+    for checksums in [false, true] {
+        for segment in [StaticFileSegment::Headers, StaticFileSegment::Transactions] {
+            let case = format!("checksums {checksums}, {segment}");
+            let (dir, _) = create_test_static_files_dir();
+            let static_files = provider(dir.path(), checksums, 1_000);
+            write_block_segments(&static_files, 6);
+            let path = jar_path(&static_files, segment, 0);
+            drop(static_files);
+            let before = jar_files(&path);
+
+            // The configuration `prune_rows` writes, and the files it leaves.
+            let mut writer = NippyJarWriter::<SegmentHeader>::new(load(&path)).unwrap();
+            writer.user_header_mut().prune(PRUNED);
+            writer.prune_rows(PRUNED as usize).unwrap();
+            drop(writer);
+            let [data, offsets, config] = jar_files(&path);
+
+            for stopped in [
+                [before[0].clone(), before[1].clone(), config.clone()],
+                [before[0].clone(), offsets.clone(), config.clone()],
+            ] {
+                write_jar_files(&path, &stopped);
+                let static_files = provider(dir.path(), checksums, 1_000);
+                drop(static_files.latest_writer(segment).unwrap());
+                assert_eq!(jar_files(&path), [data.clone(), offsets.clone(), config.clone()]);
+                let kept = 6 - PRUNED;
+                if segment == StaticFileSegment::Headers {
+                    for number in 0..kept {
+                        let header = static_files.header_by_number(number).unwrap().unwrap();
+                        assert_eq!(
+                            header,
+                            Header { number, gas_limit: 30_000_000 + number, ..Default::default() },
+                            "{case}"
+                        );
+                    }
+                    assert_eq!(static_files.get_highest_static_file_block(segment), Some(kept - 1));
+                } else {
+                    for tx in 0..kept {
+                        let found = static_files.transaction_by_id(tx).unwrap().unwrap();
+                        assert_eq!(found.nonce(), tx, "{case}");
+                    }
+                    assert_eq!(static_files.get_highest_static_file_tx(segment), Some(kept - 1));
+                    assert_eq!(static_files.get_highest_static_file_block(segment), Some(5));
+                }
+            }
+        }
+    }
+}
+
+/// TN(TN-0150): at genesis the first jar of a segment is created too, configuration first. A
+/// creation stopped after the configuration, or after the data file as well, leaves a jar without
+/// a block range, which the next start does not list; the next persist writes the jar, and its
+/// block reads. Both formats, a block segment and a changeset segment.
+#[test]
+fn creation_at_genesis_stopped_before_the_jar_has_its_files() {
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+    use reth_storage_api::HeaderProvider;
+
+    for checksums in [false, true] {
+        for kept in [&["conf"][..], &["conf", ""]] {
+            let case = format!("checksums {checksums}, kept {kept:?}");
+            let (dir, _) = create_test_static_files_dir();
+            let static_files = provider(dir.path(), checksums, 2);
+            let first = [StaticFileSegment::Headers, ACCOUNTS].map(|segment| {
+                drop(static_files.latest_writer(segment).unwrap());
+                jar_path(&static_files, segment, 0)
+            });
+            drop(static_files);
+            for path in &first {
+                for ext in ["", "off", "csoff"] {
+                    let file = if ext.is_empty() { path.clone() } else { path.with_extension(ext) };
+                    if !kept.contains(&ext) && file.exists() {
+                        std::fs::remove_file(file).unwrap();
+                    }
+                }
+            }
+
+            let static_files = provider(dir.path(), checksums, 2);
+            assert_eq!(
+                static_files.get_highest_static_file_block(StaticFileSegment::Headers),
+                None
+            );
+            let mut headers = static_files.latest_writer(StaticFileSegment::Headers).unwrap();
+            headers.append_header(&Header::default(), &B256::with_last_byte(1)).unwrap();
+            headers.commit().unwrap();
+            drop(headers);
+            write_accounts(&static_files, 0..1, 1);
+            assert_eq!(
+                static_files.header_by_number(0).unwrap(),
+                Some(Header::default()),
+                "{case}"
+            );
+            assert_accounts(&static_files, 0, 1);
+        }
+    }
 }
