@@ -609,7 +609,9 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   holds the datadir lock). Damage is an error naming the directory and what failed, and the file
   is never changed. The MDBX build refuses it: MDBX keeps no page checksums. Run it after a
   migration (which runs the same check itself), after a disk or memory scare, and before trusting
-  a restored file.
+  a restored file. Its read-only open reads through the page cache and drops none of it
+  (tn-lmdb's README, "Read-only open"), so after a write error (`EIO`) reboot the host first:
+  until then the cache can hold pages the device never took, and a pass proves only the cache.
 - **Table stats** (`db_table_stats`, behind `telcoin-network db stats`): each of reth's tables the
   database has, sorted by name, with its rows, branch, leaf and overflow pages, and size (the page
   size times its pages, `DbTableStat`). A table the database lacks is skipped. The MDBX build

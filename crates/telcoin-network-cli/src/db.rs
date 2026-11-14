@@ -75,8 +75,10 @@ enum DbSubcommand {
     /// check of its newest committed state, every page's checksum and structure, every tree and
     /// overflow run, each table's counts and the file's page accounting, which reads do not run.
     /// Read-only (changes no file); the node MUST be stopped: it refuses while a node holds the
-    /// datadir, and holds the datadir while it runs. Damage is an error naming what failed. A
-    /// build with the `mdbx` feature refuses: MDBX keeps no page checksums.
+    /// datadir, and holds the datadir while it runs. Damage is an error naming what failed. It
+    /// reads through the OS page cache: after a write error, reboot the host before it, or it may
+    /// check cached pages the device never took. A build with the `mdbx` feature refuses: MDBX
+    /// keeps no page checksums.
     Check,
 
     /// Migrate the reth execution database from MDBX to tn-lmdb now, with the node stopped,
