@@ -48,6 +48,20 @@ set -euo pipefail
 # so anchor at the workspace root and work from any cwd.
 cd "$(dirname "$0")/.."
 
+# Cleared, so a caller's environment cannot weaken the lane the flags below set:
+# CARGO_ENCODED_RUSTFLAGS takes precedence over RUSTFLAGS, a CARGO_PROFILE_DEV_* or
+# CARGO_PROFILE_TEST_* variable overrides the test profile (debug assertions, overflow checks),
+# NEXTEST_RETRIES the profile's retries, and RUSTUP_TOOLCHAIN the pin in rust-toolchain.toml.
+unset CARGO_ENCODED_RUSTFLAGS NEXTEST_RETRIES RUSTUP_TOOLCHAIN
+for name in $(compgen -e); do
+    case "$name" in CARGO_PROFILE_DEV_* | CARGO_PROFILE_TEST_*) unset "$name" ;; esac
+done
+# The two nextest profiles the lanes run (see above); any other could change retries or timeouts.
+case "${NEXTEST_PROFILE:-default}" in
+    default | ci) ;;
+    *) echo "NEXTEST_PROFILE=$NEXTEST_PROFILE: the lanes run profile default or ci only" >&2; exit 2 ;;
+esac
+
 # Set, not defaulted. A caller cannot silently weaken a lane by exporting something
 # different: these flags are part of what the attestation attests to.
 export CARGO_INCREMENTAL=0
