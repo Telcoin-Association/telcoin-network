@@ -94,7 +94,7 @@ pub const MIN_GROWTH: u64 = 1 << 20;
 
 /// The default largest growth step (1 GiB), `EnvOptions::max_growth`'s default: past it a large
 /// file grows linearly, not by doubling.
-pub(crate) const MAX_GROWTH: u64 = 1 << 30;
+pub const MAX_GROWTH: u64 = 1 << 30;
 
 /// What [`PageFile::read_resident`] read.
 #[derive(Debug)]

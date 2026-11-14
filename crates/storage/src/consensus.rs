@@ -480,6 +480,10 @@ pub struct ConsensusChain {
     /// Stream serving refuses the replaced handle meanwhile (its data log is not the one at the
     /// path).
     pending_swap: Arc<Mutex<Option<Epoch>>>,
+    /// The free space a peer import leaves on the filesystem
+    /// ([`import_min_free`](crate::consensus_pack::import_min_free) of the execution database's
+    /// growth step; [`Self::with_execution_growth_step`]).
+    import_min_free: u64,
 }
 
 /// A header [`ConsensusChain`] remembers, with the epoch and digest it is looked up by, computed
@@ -560,7 +564,24 @@ impl ConsensusChain {
             staging_import: Arc::new(tokio::sync::Mutex::new(())),
             recent_headers: Arc::new(Mutex::new(VecDeque::new())),
             pending_swap: Arc::new(Mutex::new(None)),
+            import_min_free: crate::consensus_pack::IMPORT_MIN_FREE_BYTES,
         })
+    }
+
+    /// Size the free-space floor of this chain's peer imports for an execution database whose
+    /// largest single growth step is `step` bytes (the node's `--db.growth-step`, or its backend's
+    /// default): the floor keeps that step free beside the consensus stores' own
+    /// ([`import_min_free`](crate::consensus_pack::import_min_free)). Without it the floor is
+    /// sized for tn-lmdb's default step
+    /// ([`DEFAULT_EXECUTION_GROWTH_STEP`](crate::consensus_pack::DEFAULT_EXECUTION_GROWTH_STEP)).
+    pub fn with_execution_growth_step(mut self, step: u64) -> Self {
+        self.import_min_free = crate::consensus_pack::import_min_free(step);
+        self
+    }
+
+    /// The free space a peer import leaves on the filesystem.
+    pub fn import_min_free(&self) -> u64 {
+        self.import_min_free
     }
 
     /// Remember `header`, just read from a pack (see `recent_headers`).
@@ -953,7 +974,7 @@ impl ConsensusChain {
             previous_epoch,
             epoch_record.final_consensus,
             timeout,
-            crate::consensus_pack::IMPORT_MIN_FREE_BYTES,
+            self.import_min_free,
             import_path,
         )
         .await?;
@@ -1352,13 +1373,14 @@ impl ConsensusChain {
         std::fs::create_dir_all(&staging_base)?;
         // The import authenticates the prefix's final output against `epoch_record`, and every
         // earlier one through the parent links back from it, so the staged data is trustworthy.
-        let pack = match ConsensusPack::stream_import(
+        let pack = match ConsensusPack::stream_import_with_floor(
             &staging_base,
             stream,
             epoch,
             previous_epoch,
             epoch_record.final_consensus,
             timeout,
+            self.import_min_free,
         )
         .await
         {
@@ -6206,6 +6228,65 @@ mod test {
         // The chain is still usable (the error path did not poison a lock or leave the dest
         // wedged).
         assert!(dest.get_consensus_output_current(1).await.is_err());
+    }
+
+    /// A staging import whose stream stops making progress in what it writes is stopped as
+    /// `ImportStalled` (charged to the peer by the fetcher), leaves nothing staged, and removes its
+    /// staging directory only after the import stopped writing into it. The chain's imports keep
+    /// the execution database's growth step free (`with_execution_growth_step`).
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_staging_import_is_stopped_and_cleaned_up() {
+        use crate::consensus_pack::{
+            import_min_free,
+            test::{drip_into, fabricated_chain, peer_stream_bytes, test_previous_epoch},
+            IMPORT_MIN_FREE_BYTES,
+        };
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let (records, last) = fabricated_chain(&committee, 3, 8, |_, _| vec![0_u8; 999_000]);
+        let src_dir = TempDir::with_prefix("test_staging_stall_src").expect("temp dir");
+        let bytes = peer_stream_bytes(src_dir.path(), &committee, &previous_epoch, &records);
+        let mut record = previous_epoch.clone();
+        record.final_consensus = last;
+
+        let dst_dir = TempDir::with_prefix("test_staging_stall_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned(), committee.clone()).unwrap();
+        assert_eq!(dest.import_min_free(), IMPORT_MIN_FREE_BYTES);
+        let dest = dest.with_execution_growth_step(4 << 30);
+        assert_eq!(dest.import_min_free(), import_min_free(4 << 30));
+        dest.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let (peer, stream) = tokio::io::duplex(64 << 10);
+        let importer = dest.clone();
+        let import = tokio::spawn(async move {
+            importer
+                .import_partial_to_staging(
+                    stream,
+                    &record,
+                    &previous_epoch,
+                    Duration::from_secs(3600),
+                )
+                .await
+        });
+        let err = drip_into(peer, &bytes, 64, Duration::from_secs(10), import)
+            .await
+            .expect_err("a stalled staging import is stopped");
+        assert!(
+            matches!(
+                err,
+                ConsensusChainError::PackError(
+                    crate::consensus_pack::PackError::ImportStalled { .. }
+                )
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(dest.staging_final(), None, "a stopped import must not leave a staged pack");
+        assert!(
+            staging_dirs(dst_dir.path(), 0).is_empty(),
+            "a stopped import must remove its staging dir"
+        );
     }
 
     /// With the in-progress epoch open as `current_pack` but only built up to `k`, reads for
