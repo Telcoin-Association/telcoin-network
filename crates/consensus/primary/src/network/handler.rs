@@ -1198,9 +1198,12 @@ where
                 }
             }
             // put the entry back while the request is evaluated: the network layer drops this
-            // future when the requester cancels the request, and a dropped request must leave the
-            // guard as it found it. an empty entry would let another header from this author at
-            // the same round past the check above and into `check_for_missing_parents`
+            // future on an inbound failure (the transport's request timeout, a closed connection)
+            // or at shutdown, and a dropped request must leave the guard as it found it. a
+            // requester's cancel does not reach this node: the request runs on until it is
+            // answered or the transport times it out. an empty entry would let another header
+            // from this author at the same round past the check above and into
+            // `check_for_missing_parents`
             *auth_last_vote = previous_vote.clone();
             let epoch = header.epoch();
             let round = header.round();
