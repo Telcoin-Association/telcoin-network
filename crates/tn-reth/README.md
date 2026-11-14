@@ -810,6 +810,10 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   | a v2 datadir whose static files hold headers but no senders segment, which v2 writes from genesis | a v1 datadir's static files: the other half-done swap; v2's consistency check would prune them to this database |
   | static files holding headers beside a database without a chain | `db/` was removed or replaced; reth's consistency check would prune the static files down to it |
 
+  To restore `db/` after such a refusal, replace the directory whole: a backup copied into the
+  `db/` the refused open created lands beside the new `tn-lmdb.dat`, and an MDBX `mdbx.dat`
+  beside it is refused as the files of two engines (Migrating from MDBX, "Refusals").
+
   One state beside a database without a chain is healed instead: a creation stopped inside
   genesis's commit. Genesis finalizes its static files before it commits the database, so a stop
   between the two leaves TN's marker (committed first) and no `storage_settings` row in the
