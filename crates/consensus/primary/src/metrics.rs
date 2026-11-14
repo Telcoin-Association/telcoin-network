@@ -344,6 +344,10 @@ pub(crate) struct VoteStageHandles {
     /// Vote timeouts by the stage in progress when the timeout fired, indexed by
     /// [`VoteStage::index`] (`tn_primary_vote_timeouts_total{stage}`).
     timeouts: [Counter; VoteStage::COUNT],
+    /// Finished vote requests by outcome, indexed by
+    /// [`VoteOutcome::index`](crate::network::handler::VoteOutcome::index)
+    /// (`tn_primary_vote_outcomes_total{outcome}`).
+    outcomes: [Counter; crate::network::handler::VoteOutcome::COUNT],
 }
 
 impl VoteStageHandles {
@@ -360,6 +364,9 @@ impl VoteStageHandles {
             }),
             timeouts: VoteStage::ALL.map(|stage| {
                 metrics::counter!("tn_primary.vote_timeouts_total", "stage" => stage.as_str())
+            }),
+            outcomes: crate::network::handler::VoteOutcome::ALL.map(|outcome| {
+                metrics::counter!("tn_primary.vote_outcomes_total", "outcome" => outcome.as_str())
             }),
         }
     }
@@ -397,6 +404,13 @@ impl VoteStageHandles {
     /// Count a vote timeout that fired while `stage` was in progress.
     pub(crate) fn record_timeout(&self, stage: VoteStage) {
         self.timeouts[stage.index()].increment(1);
+    }
+
+    /// Count a finished vote request under its outcome.
+    pub(crate) fn record_outcome(&self, outcome: crate::network::handler::VoteOutcome) {
+        if let Some(counter) = self.outcomes.get(outcome.index()) {
+            counter.increment(1);
+        }
     }
 }
 
@@ -929,6 +943,59 @@ mod tests {
             panic!("lock stage series is not a histogram");
         };
         assert_eq!(lock.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0.004]);
+    }
+
+    // ---- bench7 voter-lock ----
+
+    /// The vote path handles register one outcome counter per vote outcome, labelled with the
+    /// outcome's `vote path timing` value, and count each finished request under its outcome.
+    #[test]
+    fn test_vote_outcome_handles_register_every_outcome() {
+        use crate::network::handler::VoteOutcome;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let handles = VoteStageHandles::new();
+            handles.record_outcome(VoteOutcome::Superseded);
+            handles.record_outcome(VoteOutcome::Superseded);
+            handles.record_outcome(VoteOutcome::Created);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let labels = [
+            "created",
+            "recast",
+            "missing_parents",
+            "deferred",
+            "too_new",
+            "behind",
+            "superseded",
+            "rejected",
+            "timeout",
+            "error",
+        ];
+        assert_eq!(VoteOutcome::ALL.map(VoteOutcome::as_str), labels);
+        for (index, outcome) in VoteOutcome::ALL.into_iter().enumerate() {
+            assert_eq!(outcome.index(), index);
+            let value = snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    let key = key.key();
+                    key.name() == "tn_primary.vote_outcomes_total"
+                        && key
+                            .labels()
+                            .any(|l| l.key() == "outcome" && l.value() == outcome.as_str())
+                })
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("outcome {} not registered", outcome.as_str()));
+            let counted = match outcome {
+                VoteOutcome::Superseded => 2,
+                VoteOutcome::Created => 1,
+                _ => 0,
+            };
+            assert_eq!(value, &DebugValue::Counter(counted), "{}", outcome.as_str());
+        }
     }
 
     /// Every mode change counts once under its `to` and `reason` labels, and a change to the mode
