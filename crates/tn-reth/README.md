@@ -302,7 +302,9 @@ fire until the spend reached the whole 100M, which is the halt it exists to pred
 
 Every node records these as it executes the closing block, so the series is fleet-wide rather than
 proposer-only, and it covers closing blocks re-executed during a sync — a replayed value is still a
-true observation of what that epoch cost.
+true observation of what that epoch cost. RPC re-execution of a closing block (`debug_executionWitness`,
+block traces) records nothing and logs no registry events (`TNBlockExecutionCtx::replay`), so an RPC
+client cannot overwrite these gauges.
 
 Dashboard — worst epoch close seen in the last 30 days, per call:
 
