@@ -1066,9 +1066,15 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   code (upstream added it in 40015a821, 2025-04, spelled this way since 34fe4c7c5, 2025-06). A
   node with this fix and one without compute different roots, and so different block hashes, on
   any block where the case occurs, and an epoch record commits to the block hash. Mainnet takes it
-  at genesis; a chain already built by an older binary (adiri) is replayed with the fix and its
-  block hashes compared before the fix is deployed there, and a block that differs needs an
-  activation epoch. It is rare on hashed keys: a random-trie probe (base tries of 1k to 49k
+  at genesis. Adiri takes it with no activation epoch: on 2026-11-14 an observer built with the
+  fix synced adiri from genesis, and every certified epoch record's closing block (epochs 0 to
+  751, up to block 529,583) matched the observer's own block and the public RPC's, so the case
+  did not occur in that history. A block an older binary builds later can still differ on this
+  one, so adiri validators upgrade from `v0.17.0-adiri` all at once, never rolling (a committee
+  mixing the two binaries splits on such a block), and later history is checked the same way: a
+  node with the fix that replays adiri stops at the first epoch whose certified closing block it
+  does not reproduce (`check_stored_record`, `crates/node/src/manager/node/close_epoch.rs`), and
+  such a block would need an activation epoch. It is rare on hashed keys: a random-trie probe (base tries of 1k to 49k
   accounts, about 155k inserted keys, the incremental root with the old condition against the
   fixed one) found no wrong root, while it flags upstream's crafted shape. The cost is a few extra
   hashed seeks when the walker lands deeper than the prefix.
