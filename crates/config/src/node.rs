@@ -502,16 +502,21 @@ pub struct Parameters {
     /// own header with digests that the new header's parents do not prove to be on its own chain
     /// (the own certificate of the previous round is missing, or the chain below it was already
     /// unproven). The lane is released when that header commits, is canceled, or is re-queued by
-    /// an own commit, and at the epoch's end. What peers vote for does not change, and the rules
-    /// for when a header is built do not either, but held digests still count toward
-    /// `header_num_of_batches_threshold`, so a held backlog can make a header skip the min delay.
-    /// The cost is latency on a held lane: its digests wait until the older header is settled,
-    /// usually one commit, and while the own chain stays broken the lane drains at most one
-    /// header's worth per own commit. Nothing is held while the own chain is intact. A
-    /// garbage-collection cut below the leader can still reorder a lane;
-    /// `tn_primary.requeued_out_of_order_total` counts it. The default `false` keeps the previous
-    /// behaviour: every header drains every lane, and a re-queued older digest can execute after a
-    /// newer one of its lane. Issue #1807.
+    /// an own commit, and at the epoch's end. What peers vote for does not change, but header
+    /// timing can: held digests still count toward `header_num_of_batches_threshold`, so a held
+    /// backlog of at least that many builds the next header without waiting for the min delay, and
+    /// that header can carry none of them. Under load the trigger fires as with the switch off,
+    /// because the queue is above the threshold either way; at light load a held backlog builds a
+    /// header earlier. The cost is latency on a held lane: its digests wait until the older header
+    /// is settled, usually one commit, and while the own chain stays broken the lane drains at
+    /// most one header's worth per own commit. A held digest keeps its slot in each peer's
+    /// bound of uncommitted stored batches per committee key (issue #1794) until it commits;
+    /// peers count each batch report they refuse at that bound on
+    /// `tn_worker.batch_reports_over_quota_total`, the sign that a held backlog reached the
+    /// bound. Nothing is held while the own chain is intact. A garbage-collection cut below
+    /// the leader can still reorder a lane; `tn_primary.requeued_out_of_order_total` counts
+    /// it. The default `false` keeps the previous behaviour: every header drains every lane,
+    /// and a re-queued older digest can execute after a newer one of its lane. Issue #1807.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub digest_order_hold: bool,
     // ---- runtime switches: end ----
