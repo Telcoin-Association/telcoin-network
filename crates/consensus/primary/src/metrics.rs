@@ -647,6 +647,29 @@ impl RequeuedOrderUnknownHandles {
     }
 }
 
+/// The order hold's metrics (issue #1807, the `digest_order_hold` switch), resolved once when a
+/// proposer is built. The handles are `Arc`-backed. With the switch off neither moves from 0.
+#[derive(Clone, Debug)]
+pub(crate) struct OrderHoldHandles {
+    /// `tn_primary.headers_held_total`: new own headers that left at least one batch digest
+    /// queued because the hold kept its worker's lane back.
+    pub(crate) headers_held: Counter,
+    /// `tn_primary.digests_held`: the batch digests the newest own header left queued in held
+    /// lanes. Set at each new header, so it reads 0 from the first header built after the last
+    /// blocker left, and set to 0 when the proposer stops.
+    pub(crate) digests_held: Gauge,
+}
+
+impl OrderHoldHandles {
+    /// Resolve both handles against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            headers_held: metrics::counter!("tn_primary.headers_held_total"),
+            digests_held: metrics::gauge!("tn_primary.digests_held"),
+        }
+    }
+}
+
 /// Why this node changed its mode: the `reason` label of `tn_node_mode_transitions_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModeTransitionReason {
