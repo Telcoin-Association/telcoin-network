@@ -947,8 +947,14 @@ datadirs get. It moves `db/`, `static_files/` and `restored-state-floor` (the fl
 restored from a snapshot, which would refuse the rebuilt chain's old blocks if it stayed) into
 `<datadir>/execution-reset-<UTC time>/`. It renames and never deletes; the consensus database, keys
 and config stay, and so does reth's transaction-pool blob store (`blobstore/`), which holds pool
-state, not chain data. It refuses while a node holds the datadir, and is a dry run without `--force`. The
-moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
+state, not chain data. It refuses while a node holds the datadir or a process holds
+`db/tn-lmdb.dat` open, and is a dry run without `--force`. It refuses a `db/` or `static_files/`
+that is a mount point or on another filesystem, which a rename cannot move, before anything moves.
+One that is a link moves as a link: the next start creates a new one in the datadir, on the
+datadir's filesystem, and the command prints a warning naming the link. It prints the size of what
+it moves and the space free on the datadir's filesystem: the moved-aside database keeps its space
+until `execution-reset-*` is deleted, and the rebuild (or the swap's copy) needs about as much
+again. The moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
 refuses to start while a `.partial` directory holding an entry is there, and running the command
 again finishes it. An empty one (left when the entries are moved back to undo it) blocks nothing.
 It refuses, and moves nothing, a datadir whose consensus database holds a later epoch's pack and none

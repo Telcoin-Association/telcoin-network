@@ -27,7 +27,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tn_config::{PidLock, TelcoinDirs as _};
-use tn_storage::disk::fsync_directory;
+use tn_storage::disk::{available_bytes, fsync_directory};
 
 /// The prefix of the directories a reset moves the execution database into.
 const RESET_DIR_PREFIX: &str = "execution-reset-";
@@ -190,6 +190,78 @@ pub(crate) struct ResetPlan {
     pub(crate) target: PathBuf,
     /// An interrupted reset's directory this one finishes, if any.
     pub(crate) resumes: Option<PathBuf>,
+    /// The bytes the execution database being moved aside holds (its files' lengths, links not
+    /// followed). It keeps them until the reset directory is deleted, while the rebuild (or the
+    /// swap's copy) writes a new database of about that size on the datadir's filesystem.
+    pub(crate) moved_bytes: u64,
+    /// The bytes free on the datadir's filesystem, when the system reports them.
+    pub(crate) available_bytes: Option<u64>,
+    /// Moved entries that are links: the reset moves the link, not what it points to, and the
+    /// next start creates a new entry in the datadir, on the datadir's filesystem.
+    pub(crate) links: Vec<(PathBuf, PathBuf)>,
+}
+
+/// The bytes the files under `path` hold (their lengths), not following links.
+fn bytes_under(path: &Path) -> eyre::Result<u64> {
+    let meta = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to check {}", path.display()))?;
+    if !meta.is_dir() {
+        return Ok(if meta.is_file() { meta.len() } else { 0 });
+    }
+    let mut total = 0;
+    for entry in
+        fs::read_dir(path).wrap_err_with(|| format!("failed to list {}", path.display()))?
+    {
+        let entry = entry.wrap_err_with(|| format!("failed to list {}", path.display()))?;
+        total += bytes_under(&entry.path())?;
+    }
+    Ok(total)
+}
+
+/// Refuse a move the reset's rename cannot make: an entry that is a mount point, or on another
+/// filesystem than the datadir (`rename(2)` fails there, `EBUSY` or `EXDEV`). Checked before
+/// anything moves.
+#[cfg(unix)]
+fn refuse_other_filesystem(datadir: &Path, entry: &Path) -> eyre::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = datadir.join(entry);
+    let meta = fs::symlink_metadata(&path)
+        .wrap_err_with(|| format!("failed to check {}", path.display()))?;
+    let datadir_meta =
+        fs::metadata(datadir).wrap_err_with(|| format!("failed to check {}", datadir.display()))?;
+    if meta.dev() != datadir_meta.dev() {
+        bail!(
+            "{} is a mount point, or on another filesystem than the datadir: the reset moves the \
+             execution database aside by renaming it within the datadir and cannot move it. Move \
+             its contents aside by hand, or unmount it and run the reset again",
+            path.display(),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse while a process holds the execution database open: tn-lmdb holds an exclusive `flock` on
+/// `db/tn-lmdb.dat` for as long as it is open. This backs up the datadir lock, which a node no
+/// longer holds once its pid file has been deleted under it. A file without the lock, or no file,
+/// passes.
+fn refuse_open_execution_database(datadir: &Path) -> eyre::Result<()> {
+    let path = datadir.join("db").join("tn-lmdb.dat");
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(eyre!("failed to open {}: {e}", path.display())),
+    };
+    match file.try_lock() {
+        // released when `file` closes, on return
+        Ok(()) => Ok(()),
+        Err(fs::TryLockError::WouldBlock) => bail!(
+            "a process holds the execution database {} open: stop the node before resetting it",
+            path.display(),
+        ),
+        Err(fs::TryLockError::Error(e)) => {
+            Err(eyre!("failed to check whether {} is open: {e}", path.display()))
+        }
+    }
 }
 
 /// Move `datadir`'s execution database aside (with `force`), or report what would move (without
@@ -220,7 +292,13 @@ pub(crate) fn reset_execution(
     }
     let resumes = partials.into_iter().next();
     let mut moves = Vec::new();
+    let mut moved_bytes = 0;
     for entry in &entries {
+        if let Some(partial) = &resumes {
+            if exists(&partial.join(entry))? {
+                moved_bytes += bytes_under(&partial.join(entry))?;
+            }
+        }
         if exists(&datadir.join(entry))? {
             if let Some(partial) = &resumes {
                 if exists(&partial.join(entry))? {
@@ -242,6 +320,23 @@ pub(crate) fn reset_execution(
             entries.iter().map(|e| e.display().to_string()).collect::<Vec<_>>().join(", "),
         );
     }
+    refuse_open_execution_database(datadir)?;
+    let mut links = Vec::new();
+    for entry in &moves {
+        let path = datadir.join(entry);
+        #[cfg(unix)]
+        refuse_other_filesystem(datadir, entry)?;
+        if fs::symlink_metadata(&path)
+            .wrap_err_with(|| format!("failed to check {}", path.display()))?
+            .is_symlink()
+        {
+            let to = fs::read_link(&path)
+                .wrap_err_with(|| format!("failed to read the link {}", path.display()))?;
+            links.push((entry.clone(), to));
+        }
+        moved_bytes += bytes_under(&path)?;
+    }
+    let available_bytes = available_bytes(datadir).ok();
 
     let staging = match &resumes {
         Some(partial) => partial.clone(),
@@ -266,7 +361,7 @@ pub(crate) fn reset_execution(
             );
         }
     }
-    let plan = ResetPlan { moves, target, resumes };
+    let plan = ResetPlan { moves, target, resumes, moved_bytes, available_bytes, links };
     if !force {
         return Ok(plan);
     }
@@ -363,6 +458,9 @@ mod tests {
             ["db", "static_files", "restored-state-floor"].map(PathBuf::from).to_vec()
         );
         assert_eq!(plan.resumes, None);
+        assert_eq!(plan.moved_bytes, (b"database".len() + b"headers".len() + b"42\n".len()) as u64);
+        assert!(plan.available_bytes.is_some());
+        assert!(plan.links.is_empty());
         assert_eq!(
             names(root),
             [
@@ -459,6 +557,38 @@ mod tests {
         let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.moves, [PathBuf::from("db")]);
         assert_eq!(names(&plan.target), ["db"]);
+    }
+
+    /// The command refuses while a process holds the execution database open (tn-lmdb's `flock` on
+    /// `db/tn-lmdb.dat`), as a node does whose pid file was deleted under it, and moves nothing.
+    #[test]
+    fn a_reset_refuses_while_the_execution_database_is_open() {
+        let dir = datadir();
+        let root = dir.path();
+        let held = fs::File::open(root.join("db/tn-lmdb.dat")).unwrap();
+        held.lock().unwrap();
+        for force in [false, true] {
+            let err = reset_execution(root, force, ResetMode::Rebuild).unwrap_err().to_string();
+            assert!(err.contains("holds the execution database"), "{err}");
+            assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
+        }
+        drop(held);
+        reset_execution(root, true, ResetMode::Rebuild).unwrap();
+    }
+
+    /// A linked `db` is reported: the reset moves the link and leaves what it points to.
+    #[cfg(unix)]
+    #[test]
+    fn a_reset_reports_a_linked_entry() {
+        let dir = datadir();
+        let root = dir.path();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::rename(root.join("db"), elsewhere.path().join("db")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("db"), root.join("db")).unwrap();
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
+        assert_eq!(plan.links, [(PathBuf::from("db"), elsewhere.path().join("db"))]);
+        assert!(plan.target.join("db").is_symlink());
+        assert!(elsewhere.path().join("db/tn-lmdb.dat").exists(), "the link's target stays");
     }
 
     /// The command refuses while a node holds the datadir lock, and moves nothing.

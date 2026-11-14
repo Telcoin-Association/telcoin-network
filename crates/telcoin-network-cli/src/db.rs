@@ -172,6 +172,30 @@ impl DbResetExecutionArgs {
                 plan.target.display(),
             );
         }
+        for (link, to) in &plan.links {
+            println!(
+                "warning: {} is a link to {}: the reset moves the link, not what it points to, \
+                 and the next start creates a new {} in the datadir, on the datadir's filesystem",
+                link.display(),
+                to.display(),
+                link.display(),
+            );
+        }
+        let available = plan
+            .available_bytes
+            .map_or_else(|| "an unknown amount".to_owned(), |bytes| human_bytes(bytes as f64));
+        println!(
+            "the moved-aside execution database holds {} until {} is deleted; the new one needs \
+             about as much again, and the datadir's filesystem has {available} free",
+            human_bytes(plan.moved_bytes as f64),
+            plan.target.display(),
+        );
+        if plan.available_bytes.is_some_and(|free| free < plan.moved_bytes) {
+            println!(
+                "warning: less is free than the moved-aside database holds: free space before the \
+                 next start, or the new database may fill the filesystem"
+            );
+        }
         Ok(())
     }
 }
