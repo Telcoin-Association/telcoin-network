@@ -549,7 +549,7 @@ impl<H: NippyJarHeader> NippyJarWriter<H> {
     }
 
     /// TN(TN-0161): `result`, with the writer marked failed if it is an error.
-    fn fail_on<T>(&mut self, result: Result<T, NippyJarError>) -> Result<T, NippyJarError> {
+    const fn fail_on<T>(&mut self, result: Result<T, NippyJarError>) -> Result<T, NippyJarError> {
         if result.is_err() {
             self.failed = true;
         }
