@@ -136,15 +136,16 @@ database on tn-lmdb), migrates its reth database and follows the chain. The targ
 `TN_E2E_TN_LMDB_BIN=1`, the marker that says `TN_BIN_PATH` is the tn-lmdb build.
 `make test-e2e-resync` uses the same two binaries.
 
-Neither runs a real `v0.16.0-adiri` binary as the previous one. Their MDBX binary is this tree
-built with the `mdbx` feature, which keeps the consensus database in tndb and records the storage
-layout marker like the default build, so the consensus-database migration from MDBX and the marker
-recording of a pre-marker datadir, both part of the upgrade from `v0.16.0-adiri`, are covered by
-unit tests only (`tn-storage`'s `test_migrate_from_mdbx_*`, `tn-reth`'s
-`env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`). `make test-e2e-resync
-TN_RESYNC_BIN_PREV=...` takes another previous binary, but `v0.16.0-adiri` and this tree do not
-peer since #1788, so that run fails at the upgrade (see the Makefile comment above
-`TN_RESYNC_BIN_PREV`, and the tn-reth README's "Upgrading a testnet node").
+By default neither runs a real release as the previous one. Their MDBX binary is this tree built
+with the `mdbx` feature, which records the storage layout marker like the default build, so the
+marker recording of a pre-marker datadir, part of the upgrade from `v0.17.0-adiri`, is covered by
+a unit test only (`tn-reth`'s `env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`), as
+is the consensus-database migration from MDBX that a node still on `v0.16.0-adiri` makes
+(`tn-storage`'s `test_migrate_from_mdbx_*`). `make test-e2e-resync TN_RESYNC_BIN_PREV=...` takes
+the real release instead (`make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri`; see the Makefile
+comment above `TN_RESYNC_BIN_PREV`): it peers with this release and writes no marker. Adiri itself
+upgrades all at once, not one validator at a time (the tn-reth README's "Upgrading a testnet
+node").
 
 The node binary of every other e2e target (`make build-e2e-bin`) runs its reth database on
 tn-lmdb, the default backend, so `make test-restarts`, `make test-epochs` and `make test-sigkill`

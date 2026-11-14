@@ -269,11 +269,11 @@ E2E_BIN_MDBX := $(E2E_TARGET_ROOT_MDBX)/e2e/telcoin-network
 # The commit the mixed-binary (rolling upgrade) e2e tests run as the PREVIOUS node version: the old
 # half of an in-place upgrade, or a validator still on the old binary when the rest of the network
 # has moved on. Defaults to ba7654d8a, the main commit #1453 was merged onto, so the old binary is
-# the last one built without the sub-second timestamp change. Any commit-ish works; the last
-# release is
-#   make build-e2e-bin-prev TN_PREV_REF=v0.15.0-adiri
-# which also lacks the commits merged between that tag and ba7654d8a, so the two binaries then
-# differ by more than one change.
+# the last one built without the sub-second timestamp change. Any commit-ish works; the release
+# this one upgrades from is
+#   make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri
+# which peers with this tree. Adiri itself upgrades from it all at once, not one validator at a
+# time (crates/tn-reth/README.md, "Upgrading a testnet node").
 TN_PREV_REF ?= ba7654d8a
 
 # Source checkout and target root for the previous binary. Both are NESTED in E2E_TARGET_ROOT, like
@@ -503,10 +503,10 @@ test-e2e-reth-migration: build-e2e-bin build-e2e-bin-mdbx
 # declares TN_BIN_PATH the tn-lmdb build (see test-e2e-reth-migration).
 #
 # TN_RESYNC_BIN_PREV defaults to this tree's MDBX e2e binary. The release the network runs is the
-# real PREV (make build-e2e-bin-prev TN_PREV_REF=v0.16.0-adiri, then
-# make test-e2e-resync TN_RESYNC_BIN_PREV=$(E2E_BIN_PREV)), but v0.16.0-adiri and this tree do not
-# peer since #1788 changed node records: the upgraded validator migrates both databases and then
-# cannot resolve its peers, so that run fails at the upgrade, before the reset.
+# real PREV: make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri, then
+# make test-e2e-resync TN_RESYNC_BIN_PREV=$(E2E_BIN_PREV). It peers with this tree, keeps its
+# consensus database in tndb already, and writes no storage layout marker, so the upgraded
+# validator migrates its reth database and records the marker.
 TN_RESYNC_BIN_PREV ?= $(E2E_BIN_MDBX)
 
 .PHONY: test-e2e-resync
