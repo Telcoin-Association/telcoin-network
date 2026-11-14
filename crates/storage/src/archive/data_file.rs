@@ -1141,6 +1141,16 @@ impl MmapDataFile {
         };
         df.sync_view();
         df.advise_backing();
+        // On macOS the fsync above does not write pages dirtied through a mapping: only an msync
+        // does (device-tested), and the crashed writer wrote through its mapping. `flushed_end`
+        // vouches for `[0, logical_end)` from here on and later barriers flush only past it, so
+        // msync the existing content once as well.
+        #[cfg(target_os = "macos")]
+        if !read_only && opened_unclean && !opts.derived {
+            df.sync_range(0, df.end)?;
+            #[cfg(test)]
+            df.open_syncs.fetch_add(1, Ordering::Relaxed);
+        }
         #[cfg(test)]
         df.view.ino.store(
             df.file.metadata().map(|meta| std::os::unix::fs::MetadataExt::ino(&meta)).unwrap_or(0),
@@ -2626,7 +2636,8 @@ mod tests {
 
     /// A writable open of an unclean file fsyncs it once before `flushed_end` vouches for its
     /// existing bytes: the crashed writer may never have msynced them, and later barriers flush
-    /// only from `flushed_end` on. With `drop_cache_on_unclean_open` it then drops the file's
+    /// only from `flushed_end` on. On macOS, whose fsync leaves pages dirtied through a mapping
+    /// unwritten, it also msyncs them. With `drop_cache_on_unclean_open` it then drops the file's
     /// cached pages once; without it, never.
     #[test]
     fn unclean_writable_open_syncs_existing_bytes_once() {
@@ -2636,7 +2647,8 @@ mod tests {
             write_and_crash(&path, opts, 200);
             let df = MmapDataFile::open_with(&path, false, opts).expect("unclean reopen");
             assert!(df.opened_unclean(), "precondition: opened unclean");
-            assert_eq!(open_syncs(&df), 1, "an unclean writable open syncs the file once");
+            let syncs = if cfg!(target_os = "macos") { 2 } else { 1 };
+            assert_eq!(open_syncs(&df), syncs, "an unclean writable open syncs the file once");
             let evictions = usize::from(opts.drop_cache_on_unclean_open);
             assert_eq!(open_evictions(&df), evictions, "cache drops with {opts:?}");
             assert_eq!(df.synced_end(), df.len(), "the synced bytes are the durable watermark");

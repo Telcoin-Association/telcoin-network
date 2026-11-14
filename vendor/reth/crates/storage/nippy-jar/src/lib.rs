@@ -58,6 +58,13 @@ const NIPPY_JAR_VERSION: usize = 1;
 /// [`value_checksum`], and its `.csoff` sidecar uses checksummed records
 /// (`reth_static_file_types::ChangesetOffsetReader`).
 const NIPPY_JAR_VERSION_CHECKSUMS: usize = 2;
+/// The version of a checksummed jar whose every value starts with a tag byte.
+///
+/// TN(TN-0200): version 2 in every respect (the configuration's CRC32, each value's checksum,
+/// offsets that include it, the `.csoff` records), and each stored value's first byte is a tag
+/// that the segment owning the jar interprets; the jar itself never reads it. Only the
+/// `Transactions` segment writes it.
+const NIPPY_JAR_VERSION_TAGGED: usize = 3;
 /// Size in bytes of the checksum that follows each value of a checksummed jar.
 pub const CHECKSUM_SIZE: usize = 4;
 /// The file extension used for index files.
@@ -248,9 +255,27 @@ impl<H: NippyJarHeader> NippyJar<H> {
         self
     }
 
+    /// Makes this a jar with tagged values (format version 3): a checksummed jar
+    /// ([`Self::with_checksums`]) whose every value starts with a tag byte that the jar's owner
+    /// interprets.
+    ///
+    /// TN(TN-0200): only for a jar that has no data yet, as [`Self::with_checksums`].
+    pub const fn with_tagged_values(mut self) -> Self {
+        self.version = NIPPY_JAR_VERSION_TAGGED;
+        self
+    }
+
     /// Whether the jar's values, configuration and changeset offsets carry checksums.
+    ///
+    /// TN(TN-0200): a jar with tagged values (version 3) is checksummed as version 2 is.
     pub const fn has_checksums(&self) -> bool {
-        self.version == NIPPY_JAR_VERSION_CHECKSUMS
+        matches!(self.version, NIPPY_JAR_VERSION_CHECKSUMS | NIPPY_JAR_VERSION_TAGGED)
+    }
+
+    /// TN(TN-0200): whether every value starts with a tag byte the jar's owner interprets
+    /// (format version 3, [`Self::with_tagged_values`]).
+    pub const fn has_tagged_values(&self) -> bool {
+        self.version == NIPPY_JAR_VERSION_TAGGED
     }
 
     /// Gets a reference to the user header.
@@ -325,20 +350,25 @@ impl<H: NippyJarHeader> NippyJar<H> {
     /// Decodes a configuration file's bytes.
     ///
     /// TN(TN-0120): the first field is the version, a `u64` LE in bincode's encoding. A
-    /// checksummed configuration's trailing CRC32 is verified before the rest is decoded, so a
-    /// damaged length or row count is an error rather than a plausible configuration. A
-    /// version-1 configuration decodes as upstream's does; any other version is refused.
+    /// checksummed configuration's (version 2, and TN(TN-0200) 3) trailing CRC32 is verified
+    /// before the rest is decoded, so a damaged length or row count is an error rather than a
+    /// plausible configuration. A version-1 configuration decodes as upstream's does; any other
+    /// version is refused.
     fn decode_config(bytes: &[u8], config_path: &Path) -> Result<Self, NippyJarError> {
         let version = bytes.get(..8).map(|v| u64::from_le_bytes(v.try_into().expect("8 bytes")));
         // TN(TN-0134): an unknown version is refused before anything is decoded with a layout it
         // may not have.
         if let Some(version) = version &&
             version != NIPPY_JAR_VERSION as u64 &&
-            version != NIPPY_JAR_VERSION_CHECKSUMS as u64
+            version != NIPPY_JAR_VERSION_CHECKSUMS as u64 &&
+            version != NIPPY_JAR_VERSION_TAGGED as u64
         {
             return Err(NippyJarError::UnsupportedVersion(version as usize))
         }
-        let body = if version == Some(NIPPY_JAR_VERSION_CHECKSUMS as u64) {
+        // TN(TN-0200): a version-3 configuration is checksummed as version 2's is.
+        let body = if version == Some(NIPPY_JAR_VERSION_CHECKSUMS as u64) ||
+            version == Some(NIPPY_JAR_VERSION_TAGGED as u64)
+        {
             let checksummed = bytes
                 .len()
                 .checked_sub(CHECKSUM_SIZE)
@@ -353,7 +383,10 @@ impl<H: NippyJarHeader> NippyJar<H> {
         };
 
         let jar: Self = bincode::deserialize(body)?;
-        if jar.version != NIPPY_JAR_VERSION && jar.version != NIPPY_JAR_VERSION_CHECKSUMS {
+        if jar.version != NIPPY_JAR_VERSION &&
+            jar.version != NIPPY_JAR_VERSION_CHECKSUMS &&
+            jar.version != NIPPY_JAR_VERSION_TAGGED
+        {
             return Err(NippyJarError::UnsupportedVersion(jar.version))
         }
         jar.check_compression()?;
@@ -1447,7 +1480,21 @@ mod tests {
 
     /// Freezes `col1` and `col2` into a checksummed jar at `path`, LZ4-compressed if `lz4`.
     fn freeze_checksummed(path: &Path, col1: &ColumnValues, col2: &ColumnValues, lz4: bool) {
+        freeze_checksummed_as(path, col1, col2, lz4, false);
+    }
+
+    /// [`freeze_checksummed`], as a jar with tagged values (version 3) if `tagged`.
+    fn freeze_checksummed_as(
+        path: &Path,
+        col1: &ColumnValues,
+        col2: &ColumnValues,
+        lz4: bool,
+        tagged: bool,
+    ) {
         let mut nippy = NippyJar::new_without_header(2, path).with_checksums();
+        if tagged {
+            nippy = nippy.with_tagged_values();
+        }
         if lz4 {
             nippy = nippy.with_lz4();
         }
@@ -1492,20 +1539,24 @@ mod tests {
 
     /// TN(TN-0120): a checksummed jar reads back exactly what was written, plain and compressed,
     /// whole rows and single columns, and stores four more bytes per value than an unchecked jar
-    /// whose files keep upstream's layout.
+    /// whose files keep upstream's layout. TN(TN-0200): so does a jar with tagged values, whose
+    /// values the jar stores and checks as version 2 does.
     #[test]
     fn test_checksummed_jar_round_trip() {
         let (col1, col2) = test_data(Some(7));
         let values_len = col1.iter().chain(&col2).map(Vec::len).sum::<usize>() as u64;
         let values = (col1.len() * 2) as u64;
 
-        for lz4 in [false, true] {
+        for (lz4, tagged) in [(false, false), (true, false), (false, true), (true, true)] {
             let file = tempfile::NamedTempFile::new().unwrap();
-            freeze_checksummed(file.path(), &col1, &col2, lz4);
+            freeze_checksummed_as(file.path(), &col1, &col2, lz4, tagged);
 
             let nippy = NippyJar::load_without_header(file.path()).unwrap();
             assert!(nippy.has_checksums());
-            assert_eq!(nippy.version, NIPPY_JAR_VERSION_CHECKSUMS);
+            assert_eq!(nippy.has_tagged_values(), tagged);
+            let version =
+                if tagged { NIPPY_JAR_VERSION_TAGGED } else { NIPPY_JAR_VERSION_CHECKSUMS };
+            assert_eq!(nippy.version, version);
             assert_eq!(nippy.max_row_size, col1[0].len() + col2[0].len());
             let mut cursor = NippyJarCursor::new(&nippy).unwrap();
             for row in 0..col1.len() {
@@ -1519,8 +1570,22 @@ mod tests {
             let data_len = std::fs::metadata(file.path()).unwrap().len();
             if !lz4 {
                 assert_eq!(data_len, values_len + CHECKSUM_SIZE as u64 * values);
+                // Each stored value is its bytes, then their checksum seeded by the position.
+                let data = std::fs::read(file.path()).unwrap();
+                let reader = nippy.open_data_reader().unwrap();
+                for row in 0..col1.len() {
+                    for (column, value) in [(0, &col1[row]), (1, &col2[row])] {
+                        let start = reader.offset(row * 2 + column).unwrap() as usize;
+                        let end = start + value.len();
+                        assert_eq!(&data[start..end], value.as_slice());
+                        let checksum =
+                            checksum(value_seed(row as u64, column), value).to_le_bytes();
+                        assert_eq!(data[end..end + CHECKSUM_SIZE], checksum);
+                    }
+                }
             }
         }
+        assert!(!NippyJar::new_without_header(2, Path::new("")).has_tagged_values());
 
         // An unchecked jar: upstream's version, and the data file is the values alone.
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1553,55 +1618,80 @@ mod tests {
         let mut read_jar = NippyJar::load_from_reader(&buf[..]).unwrap();
         read_jar.path = file.path().to_path_buf();
         assert_eq!(jar, read_jar);
+
+        // TN(TN-0200): version 3's configuration differs only in its version (and checksum).
+        let tagged = NippyJar::new_without_header(23, file.path())
+            .with_lz4()
+            .with_checksums()
+            .with_tagged_values();
+        tagged.freeze_config().unwrap();
+        let buf = std::fs::read(tagged.config_path()).unwrap();
+        let mut body = body;
+        body[0] = 3;
+        assert_eq!(buf[..37], body);
+        assert_eq!(buf[37..], crc32fast::hash(&body).to_le_bytes());
+        let mut read_jar = NippyJar::load_from_reader(&buf[..]).unwrap();
+        read_jar.path = file.path().to_path_buf();
+        assert_eq!(tagged, read_jar);
+        assert!(read_jar.has_checksums() && read_jar.has_tagged_values());
     }
 
     /// TN(TN-0120): any byte of a checksummed configuration that changes, or a configuration cut
-    /// short, fails to load; so does an unknown format version.
+    /// short, fails to load; so does an unknown format version. TN(TN-0200): a version-3
+    /// configuration is checked the same way, and one bit turns neither 2 nor 3 into the other.
     #[test]
     fn test_checksummed_config_damage_is_refused() {
         let (col1, col2) = test_data(Some(8));
         let file = tempfile::NamedTempFile::new().unwrap();
-        freeze_checksummed(file.path(), &col1, &col2, true);
         let config_path = file.path().with_extension(CONFIG_FILE_EXTENSION);
-        let config = std::fs::read(&config_path).unwrap();
+        for tagged in [false, true] {
+            freeze_checksummed_as(file.path(), &col1, &col2, true, tagged);
+            let config = std::fs::read(&config_path).unwrap();
+            let stored_version = if tagged { 3 } else { 2 };
 
-        for pos in 0..config.len() {
-            let mut damaged = config.clone();
-            damaged[pos] ^= 0x10;
-            std::fs::write(&config_path, &damaged).unwrap();
-            let err = NippyJar::load_without_header(file.path()).unwrap_err();
-            if pos < 8 {
-                // The version itself, now one this build does not read.
-                let version = 2 ^ (0x10 << (8 * pos));
-                assert!(
-                    matches!(err, NippyJarError::UnsupportedVersion(v) if v == version),
-                    "{pos}: {err}"
-                );
-            } else {
-                assert!(
-                    matches!(&err, NippyJarError::ConfigChecksumMismatch(path) if *path == config_path),
-                    "{pos}: {err}"
-                );
+            for pos in 0..config.len() {
+                for mask in [0x10, 0x01] {
+                    let mut damaged = config.clone();
+                    damaged[pos] ^= mask;
+                    std::fs::write(&config_path, &damaged).unwrap();
+                    let err = NippyJar::load_without_header(file.path()).unwrap_err();
+                    // Version 2 and 3 are one bit apart: the flip of bit 0 turns each into the
+                    // other, which the checksum catches. (3 to 1 is bit 1, which only a storage
+                    // layer that knows the jar's format can catch, TN-0135.)
+                    let version = stored_version ^ ((mask as usize) << (8 * pos.min(7)));
+                    if pos < 8 && version != 2 && version != 3 {
+                        // The version itself, now one this build does not read.
+                        assert!(
+                            matches!(err, NippyJarError::UnsupportedVersion(v) if v == version),
+                            "{tagged} {pos} {mask}: {err}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(&err, NippyJarError::ConfigChecksumMismatch(path) if *path == config_path),
+                            "{tagged} {pos} {mask}: {err}"
+                        );
+                    }
+                }
             }
-        }
 
-        std::fs::write(&config_path, &config[..config.len() - 1]).unwrap();
-        assert!(matches!(
-            NippyJar::load_without_header(file.path()),
-            Err(NippyJarError::ConfigChecksumMismatch(_))
-        ));
+            std::fs::write(&config_path, &config[..config.len() - 1]).unwrap();
+            assert!(matches!(
+                NippyJar::load_without_header(file.path()),
+                Err(NippyJarError::ConfigChecksumMismatch(_))
+            ));
+
+            std::fs::write(&config_path, &config).unwrap();
+            assert!(read_all_rows(file.path()).iter().all(Result::is_ok));
+        }
 
         // An unchecked configuration with an unknown version.
         let mut unchecked = Vec::new();
         NippyJar::new_without_header(2, file.path()).save_to_writer(&mut unchecked).unwrap();
-        unchecked[0] = 3;
+        unchecked[0] = 4;
         assert!(matches!(
             NippyJar::<()>::load_from_reader(&unchecked[..]),
-            Err(NippyJarError::UnsupportedVersion(3))
+            Err(NippyJarError::UnsupportedVersion(4))
         ));
-
-        std::fs::write(&config_path, &config).unwrap();
-        assert!(read_all_rows(file.path()).iter().all(Result::is_ok));
 
         // A checksummed configuration naming dictionary zstd, with a valid checksum: refused at
         // load, before a read could reach the cursor's dictionary `expect`s. Without dictionaries
@@ -1716,12 +1806,19 @@ mod tests {
     /// TN(TN-0120): the heal and prune keep a checksummed jar's framing: after an append that
     /// was never committed, a heal, a prune of committed and uncommitted rows, and appends after
     /// each, every row reads and verifies, including the appended ones at their new row indexes.
+    /// TN(TN-0200): a jar with tagged values heals and prunes the same way and keeps its version.
     #[test]
     fn test_checksummed_jar_heal_and_prune() {
+        for tagged in [false, true] {
+            checksummed_jar_heal_and_prune(tagged);
+        }
+    }
+
+    fn checksummed_jar_heal_and_prune(tagged: bool) {
         let (col1, col2) = test_data(Some(11));
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path();
-        freeze_checksummed(path, &col1, &col2, false);
+        freeze_checksummed_as(path, &col1, &col2, false, tagged);
         let rows = col1.len();
 
         // Rows written but not committed, as a crash leaves them: the heal drops them.
@@ -1750,6 +1847,8 @@ mod tests {
 
         assert!(read_all_rows(path).iter().all(Result::is_ok));
         let nippy = NippyJar::load_without_header(path).unwrap();
+        assert_eq!(nippy.has_tagged_values(), tagged);
+        assert!(nippy.has_checksums());
         NippyJarChecker::new(NippyJar::load_without_header(path).unwrap())
             .check_consistency()
             .unwrap();
@@ -2148,7 +2247,7 @@ mod tests {
     #[test]
     fn test_unknown_version_refused_before_decode() {
         let jar = tempfile::NamedTempFile::new().unwrap();
-        for version in [0u64, 3, u64::MAX] {
+        for version in [0u64, 4, u64::MAX] {
             let mut config = version.to_le_bytes().to_vec();
             config.extend_from_slice(&[0xFF; 5]);
             std::fs::write(jar.path().with_extension(CONFIG_FILE_EXTENSION), config).unwrap();

@@ -21,7 +21,7 @@ use tn_reth::{
     system_calls::PRECOMPILE_GENESIS_BYTECODE,
     test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
     totalSupplyCall, ExecutedBlock, NewCanonicalChain, OutputBuildScope, OutputTrieOverlay,
-    RethChainSpec, RethEnv, TELCOIN_PRECOMPILE_ADDRESS,
+    RecoveredBatch, RethChainSpec, RethEnv, TELCOIN_PRECOMPILE_ADDRESS,
 };
 use tn_types::{
     test_genesis, Address, Batch, BlsSignature, Bytes, Certificate, CertifiedBatch,
@@ -289,7 +289,7 @@ impl PipelineTestEnv {
     /// like [`Self::execute_block`].
     pub(crate) fn execute_recovered_block(
         &mut self,
-        recovered: Vec<Recovered<TransactionSigned>>,
+        recovered: RecoveredBatch,
     ) -> eyre::Result<ExecutedBlock> {
         self.build_and_persist(self.block_timestamp, |reth_env, payload| {
             reth_env
@@ -298,7 +298,7 @@ impl PipelineTestEnv {
                     recovered,
                     &mut OutputBuildScope::new(),
                 )
-                .map(|(block, _timings)| block)
+                .map(|built| built.block)
         })
     }
 
@@ -455,8 +455,10 @@ impl PipelineTestEnv {
             .iter()
             .map(|tx| recover_raw_transaction(tx))
             .collect::<TnRethResult<Vec<Recovered<TransactionSigned>>>>()?;
-        let (shared, _timings) =
-            self.reth_env.build_block_from_recovered_payload(payload(), recovered, scope)?;
+        let shared = self
+            .reth_env
+            .build_block_from_recovered_payload(payload(), recovered.into(), scope)?
+            .block;
 
         let header = fresh.recovered_block.clone_sealed_header();
         let cims = self.reth_env.canonical_in_memory_state();

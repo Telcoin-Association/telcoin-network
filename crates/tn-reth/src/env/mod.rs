@@ -13,8 +13,11 @@
 //! - Opening an env initializes genesis in the database when absent (`init_genesis_with_settings`),
 //!   always from the LOCAL chain spec in the supplied config — genesis is never fetched from the
 //!   network.
-//! - Opening an env settles the datadir's storage layout first (`layout::settle`): a new datadir
-//!   gets the config's layout for new datadirs, an existing one keeps its own.
+//! - Opening an env settles the datadir's storage format first (`layout::settle`): a new datadir
+//!   gets the config's format for new datadirs, an existing one keeps its own.
+//! - Every env installs a [`TxBodySource`] on its static files, which resolves the transactions a
+//!   pointer datadir stores by batch position (`tx_bodies`); it reads consensus packs once
+//!   [`RethEnv::attach_tx_packs`] gives it them.
 //! - [`RethEnv::new`] has two process-global side effects (base-fee address pinning and metrics
 //!   registration) — see its docs.
 //! - Opening an env loads the datadir's restored-state floor marker when one exists (a datadir
@@ -30,8 +33,9 @@ use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_db_common::init::init_genesis_with_settings;
 use reth_node_core::node_config::NodeConfig;
 use reth_provider::{
-    providers::{BlockchainProvider, StaticFileProvider},
+    providers::{BlockchainProvider, StaticFileProvider, TxBodyResolver},
     ProviderError, ProviderFactory, ProviderResult, StateProviderBox, StateProviderFactory as _,
+    StaticFileProviderFactory as _,
 };
 use reth_revm::{database::StateProviderDatabase, State};
 use reth_rpc_builder::config::RethRpcServerConfig as _;
@@ -47,7 +51,7 @@ use crate::{
     evm::TnEvmConfig,
     rpc_tx_forward::{SanitizeRules, TxForwardConfig, TxForwarder},
     traits::TelcoinNode,
-    RethConfig, RethDb, WorkerTxPool, BASEFEE_ADDRESS,
+    RethConfig, RethDb, TNPrimitives, WorkerTxPool, BASEFEE_ADDRESS,
 };
 
 pub(crate) mod database;
@@ -64,11 +68,25 @@ mod output_overlay;
 #[cfg(test)]
 mod persist_bench;
 mod rpc;
+pub(crate) mod tx_bodies;
+#[cfg(test)]
+mod tx_body_read_bench;
 
 pub use exec_cache::ExecutionCacheStats;
-pub use execution::{BlockBuildTimings, OutputBuildScope};
-pub use layout::StorageLayout;
+#[cfg(any(feature = "test-utils", test))]
+pub use execution::SAVED_TX_POSITIONS_KEPT;
+pub use execution::{
+    BlockBuildTimings, BuiltBlock, OutputBuildScope, PersistedBatchSink, PersistedBatches,
+    RecoveredBatch,
+};
+pub use layout::{DatadirFormat, StorageLayout, TxBodies};
 pub use output_overlay::OutputTrieOverlay;
+#[cfg(any(feature = "test-utils", test))]
+pub use tx_bodies::MemoryBatches;
+pub use tx_bodies::{
+    ChainPacks, EpochBatches, PackBatches, PackOpenError, PackSource, TxBodyCacheFill, TxBodyError,
+    TxBodyErrorKind, TxBodySource, TxPackCoverageError, TX_BODY_CACHE_BYTES,
+};
 
 /// This is a wrapped abstraction around Reth.
 ///
@@ -119,6 +137,18 @@ struct RethEnvInner {
     /// by each block build and saved back, anchored at the built block's hash, only when the
     /// build succeeds.
     execution_cache: parking_lot::Mutex<exec_cache::ExecutionCacheSlot>,
+    /// The receiver of the batches each persist stored by position, once installed
+    /// (`RethEnv::set_persisted_batch_sink`, see `env/execution.rs`).
+    persisted_batch_sink: std::sync::OnceLock<Arc<dyn PersistedBatchSink>>,
+    /// The datadir's format, settled at the open (`layout::settle`).
+    datadir_format: DatadirFormat,
+    /// The resolver installed on the static files, which reads the transactions a pointer
+    /// datadir stores by position (`tx_bodies`).
+    tx_bodies: Arc<TxBodySource>,
+    /// The fill of `tx_bodies`'s decoded-batch cache, which every persist that stores batches by
+    /// position feeds (`RethEnv::cache_persisted_batches`), once installed: in a pointer datadir
+    /// once its batches have a source (packs attached, or a test build's memory batches).
+    tx_body_cache_fill: std::sync::OnceLock<TxBodyCacheFill>,
     /// TEST-ONLY: number of pending injected pre-commit persist faults.
     ///
     /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
@@ -143,7 +173,15 @@ struct RethEnvInner {
     /// `RethEnv::persist_attempt_count` (see `env/execution.rs`).
     #[cfg(any(feature = "test-utils", test))]
     persist_attempts: std::sync::atomic::AtomicU32,
+    /// TEST-ONLY: the transaction positions the last persist attempts handed to the block writer,
+    /// oldest first. Read through `RethEnv::saved_tx_positions` (see `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    saved_tx_positions: parking_lot::Mutex<std::collections::VecDeque<SavedTxPositions>>,
 }
+
+/// TEST-ONLY: the transaction positions one persist attempt handed to the block writer.
+#[cfg(any(feature = "test-utils", test))]
+type SavedTxPositions = Vec<Option<Arc<[u32]>>>;
 
 impl std::fmt::Debug for RethEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -211,8 +249,19 @@ impl RethEnv {
 
         let node_config = reth_config.0.clone();
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
-        let provider_factory =
-            Self::init_provider_factory(&node_config, database, reth_config.new_datadir_layout())?;
+        let tx_bodies = TxBodySource::new(reth_config.tx_body_cache_bytes());
+        #[cfg(any(feature = "test-utils", test))]
+        let tx_bodies = match reth_config.memory_batches() {
+            Some(memory) => tx_bodies.with_memory_batches(memory),
+            None => tx_bodies,
+        };
+        let tx_bodies = Arc::new(tx_bodies);
+        let (provider_factory, datadir_format) = Self::init_provider_factory(
+            &node_config,
+            database,
+            reth_config.new_datadir_format(),
+            &tx_bodies,
+        )?;
         let blockchain_provider = BlockchainProvider::new(provider_factory)?;
         let task_spawner = task_manager.get_spawner();
         let restored_state_floor = Self::read_restored_state_floor(&node_config)?;
@@ -223,7 +272,7 @@ impl RethEnv {
         let tx_forwarder = Self::new_tx_forwarder(reth_config.tx_forward(), &node_config)?;
         let execution_cache = exec_cache::ExecutionCacheSlot::new(&node_config.chain.genesis);
 
-        Ok(Self {
+        let env = Self {
             inner: Arc::new(RethEnvInner {
                 node_config,
                 blockchain_provider,
@@ -232,14 +281,71 @@ impl RethEnv {
                 restored_state_floor,
                 tx_forwarder,
                 execution_cache: parking_lot::Mutex::new(execution_cache),
+                persisted_batch_sink: std::sync::OnceLock::new(),
+                datadir_format,
+                tx_bodies,
+                tx_body_cache_fill: std::sync::OnceLock::new(),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_late_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
                 persist_attempts: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(any(feature = "test-utils", test))]
+                saved_tx_positions: Default::default(),
             }),
-        })
+        };
+        // a test build's stand-in for packs remembers each batch as its persist returns
+        #[cfg(any(feature = "test-utils", test))]
+        if env.inner.tx_bodies.has_memory_batches() {
+            env.install_tx_body_cache_fill()?;
+        }
+        Ok(env)
+    }
+
+    /// The datadir's format: its storage layout and where it keeps its transactions.
+    pub fn datadir_format(&self) -> DatadirFormat {
+        self.inner.datadir_format
+    }
+
+    /// Give the transaction resolver the node's consensus packs: `chain` for the live epoch (held
+    /// weakly: the env never keeps the chain open) and `epochs_dir` (the directory holding the
+    /// `epoch-{N}` directories) for the closed ones, and fill its decoded-batch cache with the
+    /// batches each persist stores by position. Once per env, before anything reads transactions;
+    /// a datadir that stores its transactions inline needs neither, and takes nothing.
+    ///
+    /// First it refuses a datadir whose rows can point into a pack `epochs_dir` lacks
+    /// ([`TxPackCoverageError`]): every epoch from the one of the block holding the lowest stored
+    /// transaction to the one of the block holding the highest must have its pack's data log. The
+    /// node calls this at startup, so a lost pack stops it there.
+    pub fn attach_tx_packs(
+        &self,
+        chain: &tn_storage::consensus::ConsensusChain,
+        epochs_dir: PathBuf,
+    ) -> eyre::Result<()> {
+        if self.inner.datadir_format.tx_bodies == TxBodies::Inline {
+            return Ok(());
+        }
+        self.check_tx_pack_coverage(&epochs_dir)?;
+        self.inner.tx_bodies.attach_packs(PackSource::new(ChainPacks::new(chain, epochs_dir)))?;
+        #[cfg(any(feature = "test-utils", test))]
+        if self.inner.tx_bodies.has_memory_batches() {
+            // installed at construction
+            return Ok(());
+        }
+        self.install_tx_body_cache_fill()
+    }
+
+    /// Feed the transaction resolver's cache fill from every persist, in a datadir that stores
+    /// transactions by position. Once.
+    fn install_tx_body_cache_fill(&self) -> eyre::Result<()> {
+        if self.inner.datadir_format.tx_bodies == TxBodies::Pointers {
+            self.inner
+                .tx_body_cache_fill
+                .set(TxBodyCacheFill(self.inner.tx_bodies.clone()))
+                .map_err(|_| eyre::eyre!("the tx-body cache fill is already installed"))?;
+        }
+        Ok(())
     }
 
     /// Build the shared `--forward-txs` relay, or `None` when forwarding is off.
@@ -427,15 +533,18 @@ impl RethEnv {
             .map_or(0, |b| b.saturating_sub(BLOCKHASH_ANCESTORS - 1).max(1))
     }
 
-    /// Initialize the provider factory and related components.
+    /// Initialize the provider factory and related components, and return it with the datadir's
+    /// format.
     ///
-    /// `new_datadir_layout` is the storage layout a new datadir gets; an existing datadir keeps
-    /// its own (`layout::settle`).
+    /// `new_datadir_format` is the format a new datadir is asked for; an existing datadir keeps
+    /// its own (`layout::settle`). `tx_bodies` is installed on the static files as their
+    /// transaction resolver.
     fn init_provider_factory(
         node_config: &NodeConfig<RethChainSpec>,
         database: RethDb,
-        new_datadir_layout: StorageLayout,
-    ) -> eyre::Result<ProviderFactory<TelcoinNode>> {
+        new_datadir_format: DatadirFormat,
+        tx_bodies: &Arc<TxBodySource>,
+    ) -> eyre::Result<(ProviderFactory<TelcoinNode>, DatadirFormat)> {
         // Initialize provider factory with static files
         let datadir = node_config.datadir();
         let rocksdb_provider = reth_provider::providers::RocksDBProvider::new(datadir.data_dir())?;
@@ -451,7 +560,14 @@ impl RethEnv {
         // Settle the datadir's storage layout before anything else reads or writes through the
         // factory: the consistency check below prunes static files by the layout's rules, so a
         // datadir it cannot classify safely is refused first.
-        let layout = layout::settle(&provider_factory, new_datadir_layout)?;
+        let format = layout::settle(&provider_factory, new_datadir_format)?;
+        let layout = format.layout;
+
+        // The resolver of the transactions a pointer datadir stores by position, before anything
+        // reads one. Installing it writes nothing; an inline datadir never calls it.
+        provider_factory
+            .static_file_provider()
+            .set_tx_body_resolver(tx_bodies.clone() as Arc<dyn TxBodyResolver<TNPrimitives>>)?;
 
         // Reconcile the storage backends before anything reads or writes through the factory.
         // `persist_executed_output` (env/execution.rs) commits through reth's non-atomic
@@ -498,7 +614,7 @@ impl RethEnv {
         let genesis_hash = init_genesis_with_settings(&provider_factory, layout.settings())?;
         debug!(target: "tn::execution", chain=%node_config.chain.chain, ?genesis_hash, %layout, "Initialized genesis");
 
-        Ok(provider_factory)
+        Ok((provider_factory, format))
     }
 
     /// Initialize a new transaction pool for worker.
@@ -622,8 +738,8 @@ mod tests {
         },
     };
     use reth_provider::{
-        DatabaseProviderFactory as _, StageCheckpointReader as _, StaticFileProviderFactory as _,
-        StaticFileSegment, StaticFileWriter as _,
+        DatabaseProviderFactory as _, StageCheckpointReader as _, StaticFileSegment,
+        StaticFileWriter as _,
     };
     use reth_stages_types::StageId;
     use tempfile::TempDir;

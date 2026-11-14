@@ -2,9 +2,10 @@
 //! (evicted from the page cache on Linux), the temp-dir guard against memory file systems, and the
 //! on-disk size of the database.
 
-use super::StorageLayout;
+use super::{StorageLayout, TxBodies};
 use crate::{
-    init_reth_defaults, RethChainSpec, RethCommand, RethConfig, RethDb, RethEnv, StaticFileSegment,
+    init_reth_defaults, MemoryBatches, RethChainSpec, RethCommand, RethConfig, RethDb, RethEnv,
+    StaticFileSegment,
 };
 use clap::Parser as _;
 use serde::Serialize;
@@ -64,10 +65,8 @@ pub fn open_production_env_with_db(
     open_env(datadir, chain, db_flags, None, task_manager)
 }
 
-/// [`open_production_env_with_db`] in the storage layout `layout`: a new datadir is created in it
-/// ([`StorageLayout::select`], which refuses a layout the env cannot select yet), and the opened
-/// env's datadir must hold it ([`StorageLayout::of`]), new or not; otherwise the env is dropped
-/// and this is an error.
+/// [`open_production_env_with_db`] in the storage layout `layout`, transactions inline:
+/// [`open_production_env_with_format`] with [`TxBodies::Inline`] and no batches.
 pub fn open_production_env_with_layout(
     datadir: &Path,
     chain: Arc<RethChainSpec>,
@@ -75,7 +74,33 @@ pub fn open_production_env_with_layout(
     layout: StorageLayout,
     task_manager: &TaskManager,
 ) -> eyre::Result<(RethEnv, RethDb)> {
-    let (env, db) = open_env(datadir, chain, db_flags, Some(layout), task_manager)?;
+    open_production_env_with_format(
+        datadir,
+        chain,
+        db_flags,
+        (layout, TxBodies::Inline),
+        None,
+        task_manager,
+    )
+}
+
+/// [`open_production_env_with_db`] in the storage layout and transaction format `format`: a new
+/// datadir is created in them ([`StorageLayout::select`] and [`TxBodies::select`], which refuse
+/// what the env cannot select), and the opened env's datadir must hold them ([`StorageLayout::of`],
+/// [`TxBodies::of`]), new or not; otherwise the env is dropped and this is an error. With
+/// `batches`, the env reads the batches of its transactions stored by position from them (the
+/// test builds' stand-in for consensus packs, `RethConfig::with_memory_batches_from`).
+pub fn open_production_env_with_format(
+    datadir: &Path,
+    chain: Arc<RethChainSpec>,
+    db_flags: &[&str],
+    format: (StorageLayout, TxBodies),
+    batches: Option<Arc<MemoryBatches>>,
+    task_manager: &TaskManager,
+) -> eyre::Result<(RethEnv, RethDb)> {
+    let (layout, tx_bodies) = format;
+    let (env, db) =
+        open_env(datadir, chain, db_flags, Some((layout, tx_bodies, batches)), task_manager)?;
     let held = StorageLayout::of(&env)?;
     eyre::ensure!(
         held == layout,
@@ -84,16 +109,24 @@ pub fn open_production_env_with_layout(
         held.label(),
         layout.label()
     );
+    let held = TxBodies::of(&env);
+    eyre::ensure!(
+        held == tx_bodies,
+        "the datadir {} stores its transactions {}, not the requested {}",
+        datadir.display(),
+        held.label(),
+        tx_bodies.label()
+    );
     Ok((env, db))
 }
 
-/// Open the env as [`open_production_env_with_db`] does, selecting `layout` (if any) for a new
-/// datadir.
+/// Open the env as [`open_production_env_with_db`] does, selecting `format`'s layout and
+/// transaction format (if any) for a new datadir and giving the env its batches.
 fn open_env(
     datadir: &Path,
     chain: Arc<RethChainSpec>,
     db_flags: &[&str],
-    layout: Option<StorageLayout>,
+    format: Option<(StorageLayout, TxBodies, Option<Arc<MemoryBatches>>)>,
     task_manager: &TaskManager,
 ) -> eyre::Result<(RethEnv, RethDb)> {
     if let Some(flag) = db_flags.iter().find(|w| w.starts_with('-') && !w.starts_with("--db.")) {
@@ -105,8 +138,12 @@ fn open_env(
     command.rpc.http = true;
     command.rpc.ipcdisable = true;
     let mut reth_config = RethConfig::new(command, None, datadir, true, chain);
-    if let Some(layout) = layout {
+    if let Some((layout, tx_bodies, batches)) = format {
         layout.select(&mut reth_config)?;
+        tx_bodies.select(layout, &mut reth_config)?;
+        if let Some(batches) = batches {
+            reth_config = reth_config.with_memory_batches_from(batches);
+        }
     }
     let database = RethEnv::new_database(&reth_config, datadir.join("db"))?;
     let env = RethEnv::new(
@@ -605,6 +642,57 @@ mod tests {
         }
         assert_eq!(StorageLayout::parse("v2")?, StorageLayout::V2);
         assert!(StorageLayout::parse("v3").is_err());
+        Ok(())
+    }
+
+    /// A new v2 datadir keeps its transactions as asked, inline unless pointers are asked (never
+    /// the env's default for new datadirs), reopens in that format, and refuses to open as the
+    /// other; pointers on v1 are refused before any datadir is created.
+    #[tokio::test]
+    async fn test_open_with_format_selects_and_checks_it() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let v1 = tmp.path().join("v1-pointers");
+        let tasks = TaskManager::default();
+        let Err(refused) = open_production_env_with_format(
+            &v1,
+            chain.clone(),
+            &DURABLE,
+            (StorageLayout::V1, TxBodies::Pointers),
+            None,
+            &tasks,
+        ) else {
+            panic!("pointers opened on v1");
+        };
+        assert!(refused.to_string().contains("need storage layout v2"), "{refused}");
+        assert!(!v1.join("db").exists(), "refused before the database opens");
+        if cfg!(feature = "mdbx") {
+            return Ok(());
+        }
+        const V2: StorageLayout = StorageLayout::V2;
+        let inline = tmp.path().join("v2-inline");
+        let (env, _db) =
+            open_production_env_with_layout(&inline, chain.clone(), &DURABLE, V2, &tasks)?;
+        assert_eq!(TxBodies::of(&env), TxBodies::Inline, "inline unless asked");
+        let pointers = tmp.path().join("v2-pointers");
+        for run in ["new", "reopened"] {
+            let tasks = TaskManager::new(run);
+            let (env, _db) = open_production_env_with_format(
+                &pointers,
+                chain.clone(),
+                &DURABLE,
+                (V2, TxBodies::Pointers),
+                Some(Arc::new(MemoryBatches::filled_by_caller())),
+                &tasks,
+            )?;
+            assert_eq!(TxBodies::of(&env), TxBodies::Pointers, "{run}");
+        }
+        let tasks = TaskManager::new("asked inline");
+        let Err(refused) = open_production_env_with_layout(&pointers, chain, &DURABLE, V2, &tasks)
+        else {
+            panic!("a pointer datadir opened as inline");
+        };
+        assert!(refused.to_string().contains("stores its transactions pointers"), "{refused}");
         Ok(())
     }
 

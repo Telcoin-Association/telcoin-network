@@ -8,9 +8,11 @@
 //! clone with [`slim_chain`]; nothing writes to the base itself.
 //!
 //! **Layout.** `<cache>/<name>/` is a datadir (`db/`, `static_files/`, ...) plus [`META_FILE`], a
-//! JSON [`BaseMeta`]. The name is [`base_dir_name`]: `base-<backend>[-v2]-pg<page size>-<key>`
-//! (`-v2` for reth's storage layout v2, [`StorageLayout`]; a v1 base keeps the name it had before
-//! the layout was a choice), with
+//! JSON [`BaseMeta`]. The name is [`base_dir_name`]:
+//! `base-<backend>[-v2][-ptr]-pg<page size>-<key>` (`-v2` for reth's storage layout v2,
+//! [`StorageLayout`], and `-ptr` for transactions stored by position, [`TxBodies::Pointers`]; a v1
+//! base keeps the name it had before the layout was a choice, and an inline one the name it had
+//! before the transaction format was), with
 //! `<key>` 16 hex digits of `keccak256` over the JSON of the [`PrefillSpec`] and
 //! [`LAYOUT_VERSION`]. A later step
 //! that derives a datadir from a base (one aged by N outputs, say) names it by passing its own
@@ -25,10 +27,12 @@
 //!
 //! **The storage layout.** It is written with the genesis, so a base is built in one
 //! ([`StorageLayout::select`]) and every clone keeps it; [`BaseMeta::layout`] records the layout
-//! read back from the built env, a meta without one being v1's.
+//! read back from the built env, a meta without one being v1's. Where it keeps its transactions is
+//! likewise fixed ([`TxBodies::select`]) and recorded ([`BaseMeta::tx_bodies`], inline for a meta
+//! without one).
 //!
-//! **What invalidates a base.** A different spec, backend, layout or page size names a different
-//! dir. A
+//! **What invalidates a base.** A different spec, backend, layout, transaction format or page size
+//! names a different dir. A
 //! change to the genesis outside the prefill (the token or router code, the test genesis) changes
 //! the [`BaseMeta::slim_genesis_hash`], and [`build_base`] refuses the stale base. A change that
 //! keeps the genesis but not the datadir (a reth table layout) must bump [`LAYOUT_VERSION`].
@@ -46,8 +50,8 @@
 
 use super::{
     db_page_size,
-    env::{db_file_bytes, dir_bytes, open_production_env_with_layout},
-    PrefillSpec, StorageLayout,
+    env::{db_file_bytes, dir_bytes, open_production_env_with_format},
+    PrefillSpec, StorageLayout, TxBodies,
 };
 use crate::RethChainSpec;
 use serde::{Deserialize, Serialize};
@@ -112,6 +116,10 @@ pub struct BaseMeta {
     /// before the layout was recorded (every base was v1 then).
     #[serde(default)]
     pub layout: StorageLayout,
+    /// Where the base keeps its transactions, read back after it was built; inline for a meta
+    /// written before the format was recorded (every base was inline then).
+    #[serde(default)]
+    pub tx_bodies: TxBodies,
     /// The page size of the base's database in bytes, read back from it ([`db_page_size`]): the
     /// `--db.page-size` it was built with, which its clones keep.
     pub page_size: u32,
@@ -150,11 +158,13 @@ impl BaseMeta {
     }
 
     /// Refuse this meta, read from the base `dir`, unless it describes a base of `spec` in
-    /// `layout` with `page_size`-byte pages built by this code on this backend.
+    /// `layout` keeping its transactions `tx_bodies`, with `page_size`-byte pages, built by this
+    /// code on this backend.
     fn check(
         &self,
         spec: &PrefillSpec,
         layout: StorageLayout,
+        tx_bodies: TxBodies,
         page_size: u32,
         dir: &Path,
     ) -> eyre::Result<()> {
@@ -178,6 +188,13 @@ impl BaseMeta {
                 "storage layout {} (requested: {})",
                 self.layout.label(),
                 layout.label()
+            )));
+        }
+        if self.tx_bodies != tx_bodies {
+            return Err(refuse(format!(
+                "transactions {} (requested: {})",
+                self.tx_bodies.label(),
+                tx_bodies.label()
             )));
         }
         if self.page_size != page_size {
@@ -219,14 +236,17 @@ impl PrefillSpec {
     }
 }
 
-/// The dir name of the base of `spec` in `layout` with `page_size`-byte pages on this backend:
-/// `base-<backend>-pg<page_size>-<key>` for v1 and `base-<backend>-v2-pg<page_size>-<key>` for
-/// v2, with `<key>` the first 8 bytes of `keccak256(json(spec, LAYOUT_VERSION))` in hex, then
-/// `-<extra>` when `extra` is not empty. [`build_base`] passes no `extra`; a datadir derived from
-/// a base passes its own (such as `aged200`), so it caches beside the base under its own name.
+/// The dir name of the base of `spec` in `layout`, keeping its transactions `tx_bodies`, with
+/// `page_size`-byte pages on this backend: `base-<backend>-pg<page_size>-<key>` for v1,
+/// `base-<backend>-v2-pg<page_size>-<key>` for v2 and `base-<backend>-v2-ptr-pg<page_size>-<key>`
+/// for v2 with transactions stored by position, with `<key>` the first 8 bytes of
+/// `keccak256(json(spec, LAYOUT_VERSION))` in hex, then `-<extra>` when `extra` is not empty.
+/// [`build_base`] passes no `extra`; a datadir derived from a base passes its own (such as
+/// `aged200`), so it caches beside the base under its own name.
 pub fn base_dir_name(
     spec: &PrefillSpec,
     layout: StorageLayout,
+    tx_bodies: TxBodies,
     page_size: u32,
     extra: &str,
 ) -> eyre::Result<String> {
@@ -236,7 +256,11 @@ pub fn base_dir_name(
         StorageLayout::V1 => String::new(),
         other => format!("-{}", other.label()),
     };
-    let mut name = format!("base-{BACKEND}{layout_part}-pg{page_size}-{key}");
+    let tx_part = match tx_bodies {
+        TxBodies::Inline => "",
+        TxBodies::Pointers => "-ptr",
+    };
+    let mut name = format!("base-{BACKEND}{layout_part}{tx_part}-pg{page_size}-{key}");
     if !extra.is_empty() {
         name.push('-');
         name.push_str(extra);
@@ -244,28 +268,29 @@ pub fn base_dir_name(
     Ok(name)
 }
 
-/// The cached base datadir of `spec` in `layout` with `page_size`-byte pages in `cache_dir` and
-/// its meta, built first when absent.
+/// The cached base datadir of `spec` in `layout`, keeping its transactions `tx_bodies`, with
+/// `page_size`-byte pages in `cache_dir` and its meta, built first when absent.
 ///
 /// - An existing base `<cache_dir>/<base_dir_name>` is returned when its [`META_FILE`] matches (see
-///   [`BaseMeta`]'s checks: layout version, backend, storage layout, page size, spec, header hash,
-///   slim genesis hash); otherwise this is an error naming the mismatch, and the base is left as it
-///   is.
+///   [`BaseMeta`]'s checks: layout version, backend, storage layout, transaction format, page size,
+///   spec, header hash, slim genesis hash); otherwise this is an error naming the mismatch, and the
+///   base is left as it is.
 /// - Otherwise the base is built in `<name>.building` (a stale one removed first): the env opens in
-///   `layout` ([`open_production_env_with_layout`], which refuses a layout the env cannot select
-///   yet) with production `--db.*`, durable sync and `--db.page-size <page_size>`, writing the
-///   genesis, and closes; a database whose page size ([`db_page_size`]) is not `page_size` is an
-///   error; the meta is written and synced; the dir is renamed to `<name>`.
+///   `layout` and `tx_bodies` ([`open_production_env_with_format`], which refuses what the env
+///   cannot select) with production `--db.*`, durable sync and `--db.page-size <page_size>`,
+///   writing the genesis, and closes; a database whose page size ([`db_page_size`]) is not
+///   `page_size` is an error; the meta is written and synced; the dir is renamed to `<name>`.
 ///
 /// Must run within a tokio runtime ([`open_production_env_with_db`]); with `spec.registry`,
 /// deriving the genesis needs one too. Do not clone or open the base while this builds it.
 pub fn build_base(
     spec: &PrefillSpec,
     layout: StorageLayout,
+    tx_bodies: TxBodies,
     page_size: u32,
     cache_dir: &Path,
 ) -> eyre::Result<(PathBuf, BaseMeta)> {
-    let name = base_dir_name(spec, layout, page_size, "")?;
+    let name = base_dir_name(spec, layout, tx_bodies, page_size, "")?;
     let dir = cache_dir.join(&name);
     if dir.symlink_metadata().is_ok() {
         let meta_path = dir.join(META_FILE);
@@ -279,12 +304,12 @@ pub fn build_base(
         let meta: BaseMeta = serde_json::from_slice(&json).map_err(|e| {
             eyre::eyre!("the cached base meta {} does not parse: {e}", meta_path.display())
         })?;
-        meta.check(spec, layout, page_size, &dir)?;
+        meta.check(spec, layout, tx_bodies, page_size, &dir)?;
         return Ok((dir, meta));
     }
 
-    // refuse a layout the env cannot build before anything is written
-    layout.selectable()?;
+    // refuse a layout or format the env cannot build before anything is written
+    tx_bodies.selectable(layout)?;
     std::fs::create_dir_all(cache_dir)?;
     let building = cache_dir.join(format!("{name}.building"));
     if building.symlink_metadata().is_ok() {
@@ -298,11 +323,12 @@ pub fn build_base(
     let (header, built_page_size) = {
         let task_manager = TaskManager::default();
         let page_text = page_size.to_string();
-        let (env, db) = open_production_env_with_layout(
+        let (env, db) = open_production_env_with_format(
             &building,
             chain.clone(),
             &build_db_flags(&page_text),
-            layout,
+            (layout, tx_bodies),
+            None,
             &task_manager,
         )?;
         let built_page_size = db_page_size(&db)?;
@@ -338,6 +364,7 @@ pub fn build_base(
         layout_version: LAYOUT_VERSION,
         backend: BACKEND.to_owned(),
         layout,
+        tx_bodies,
         page_size: built_page_size,
         spec: *spec,
         slim_genesis_hash: spec.slim_chain().genesis_hash(),
@@ -396,6 +423,7 @@ mod tests {
     use reth_provider::StateProvider as _;
     use tn_types::U256;
     use StorageLayout::{V1, V2};
+    use TxBodies::{Inline, Pointers};
 
     /// A small prefill: 2k accounts, a few senders and pools.
     fn spec() -> PrefillSpec {
@@ -426,13 +454,14 @@ mod tests {
         let cache = tempfile::tempdir()?;
         let spec = spec();
         // an interrupted build's leftovers, which the build removes
-        let stale =
-            cache.path().join(format!("{}.building", base_dir_name(&spec, V1, page(), "")?));
+        let stale = cache
+            .path()
+            .join(format!("{}.building", base_dir_name(&spec, V1, Inline, page(), "")?));
         std::fs::create_dir(&stale)?;
         std::fs::write(stale.join("stale"), b"interrupted")?;
 
-        let (dir, meta) = build_base(&spec, V1, page(), cache.path())?;
-        let name = base_dir_name(&spec, V1, page(), "")?;
+        let (dir, meta) = build_base(&spec, V1, Inline, page(), cache.path())?;
+        let name = base_dir_name(&spec, V1, Inline, page(), "")?;
         assert_eq!(dir, cache.path().join(name), "the base is named by key");
         assert!(!dir.join("stale").exists(), "the stale build is not part of the base");
         assert!(dir.join(META_FILE).is_file(), "the meta is written");
@@ -452,7 +481,7 @@ mod tests {
 
         // a rebuild would replace the dir and its marker, and record another build
         std::fs::write(dir.join("marker"), b"kept")?;
-        let (again, cached) = build_base(&spec, V1, page(), cache.path())?;
+        let (again, cached) = build_base(&spec, V1, Inline, page(), cache.path())?;
         assert_eq!(again, dir);
         assert_eq!(cached, meta, "the second call returns the first build's meta");
         assert!(dir.join("marker").is_file(), "the base dir is the first build's");
@@ -465,8 +494,8 @@ mod tests {
     async fn test_build_base_keys_the_page_size() -> eyre::Result<()> {
         let cache = tempfile::tempdir()?;
         let spec = spec();
-        let (small_dir, small) = build_base(&spec, V1, 4096, cache.path())?;
-        let (large_dir, large) = build_base(&spec, V1, 16_384, cache.path())?;
+        let (small_dir, small) = build_base(&spec, V1, Inline, 4096, cache.path())?;
+        let (large_dir, large) = build_base(&spec, V1, Inline, 16_384, cache.path())?;
         assert_ne!(small_dir, large_dir, "the page size names the base");
         assert_eq!((small.page_size, large.page_size), (4096, 16_384), "each meta records its own");
         assert_eq!(small.genesis_hash, large.genesis_hash, "one genesis");
@@ -494,7 +523,7 @@ mod tests {
     async fn test_clone_opens_with_slim_chain() -> eyre::Result<()> {
         let cache = tempfile::tempdir()?;
         let spec = spec();
-        let (dir, meta) = build_base(&spec, V1, page(), cache.path())?;
+        let (dir, meta) = build_base(&spec, V1, Inline, page(), cache.path())?;
         let clone = cache.path().join("run");
         clone_datadir(&dir, &clone)?;
 
@@ -523,9 +552,9 @@ mod tests {
     #[tokio::test]
     async fn test_slim_chain_with_another_header_is_refused() -> eyre::Result<()> {
         let cache = tempfile::tempdir()?;
-        let (dir, meta) = build_base(&spec(), V1, page(), cache.path())?;
+        let (dir, meta) = build_base(&spec(), V1, Inline, page(), cache.path())?;
         let (other_dir, other) =
-            build_base(&PrefillSpec { seed: 8, ..spec() }, V1, page(), cache.path())?;
+            build_base(&PrefillSpec { seed: 8, ..spec() }, V1, Inline, page(), cache.path())?;
         assert_ne!(dir, other_dir, "the seed keys the base");
         assert_ne!(other.genesis_hash, meta.genesis_hash);
 
@@ -549,15 +578,19 @@ mod tests {
     async fn test_build_base_refuses_a_mismatched_base() -> eyre::Result<()> {
         let cache = tempfile::tempdir()?;
         let spec = spec();
-        let (dir, meta) = build_base(&spec, V1, page(), cache.path())?;
+        let (dir, meta) = build_base(&spec, V1, Inline, page(), cache.path())?;
 
         let mut header = meta.genesis_header.clone();
         header.timestamp += 1;
         let other_page = page() * 2;
-        let tampered: [(&str, BaseMeta); 7] = [
+        let tampered: [(&str, BaseMeta); 8] = [
             ("layout version", BaseMeta { layout_version: LAYOUT_VERSION + 1, ..meta.clone() }),
             ("backend other", BaseMeta { backend: "other".to_owned(), ..meta.clone() }),
             ("storage layout v2 (requested: v1)", BaseMeta { layout: V2, ..meta.clone() }),
+            (
+                "transactions pointers (requested: inline)",
+                BaseMeta { tx_bodies: Pointers, ..meta.clone() },
+            ),
             (
                 &format!("page size {other_page} (requested: {})", page()),
                 BaseMeta { page_size: other_page, ..meta.clone() },
@@ -568,7 +601,7 @@ mod tests {
         ];
         for (named, bad) in tampered {
             write_meta(&dir, &bad)?;
-            let err = build_base(&spec, V1, page(), cache.path())
+            let err = build_base(&spec, V1, Inline, page(), cache.path())
                 .expect_err("a mismatched base is refused");
             assert!(err.to_string().contains(named), "the error names the {named}: {err}");
             let kept: BaseMeta = serde_json::from_slice(&std::fs::read(dir.join(META_FILE))?)?;
@@ -576,7 +609,7 @@ mod tests {
         }
 
         std::fs::remove_file(dir.join(META_FILE))?;
-        let err = build_base(&spec, V1, page(), cache.path())
+        let err = build_base(&spec, V1, Inline, page(), cache.path())
             .expect_err("a base without a meta is refused");
         assert!(err.to_string().contains(META_FILE), "the error names the meta file: {err}");
         assert!(dir.join("db").is_dir(), "the base without a meta is left as it is");
@@ -584,16 +617,17 @@ mod tests {
     }
 
     /// The dir name keys every spec field, the page size and the extra component, and names the
-    /// backend, a v2 layout and the page size; a v2 base is refused before any write while the
-    /// env cannot build one.
+    /// backend, a v2 layout, transactions stored by position and the page size; a v2 base is
+    /// refused before any write while the env cannot build one, and so is a v1 base storing
+    /// transactions by position.
     #[test]
     fn test_base_dir_name_keys_the_spec() -> eyre::Result<()> {
         let spec = spec();
-        let name = base_dir_name(&spec, V1, 4096, "")?;
+        let name = base_dir_name(&spec, V1, Inline, 4096, "")?;
         assert!(name.starts_with(&format!("base-{BACKEND}-pg4096-")), "{name}");
         assert_eq!(name.len(), format!("base-{BACKEND}-pg4096-").len() + 16, "{name}");
-        assert_eq!(name, base_dir_name(&spec, V1, 4096, "")?, "the name is stable");
-        let other_page = base_dir_name(&spec, V1, 16_384, "")?;
+        assert_eq!(name, base_dir_name(&spec, V1, Inline, 4096, "")?, "the name is stable");
+        let other_page = base_dir_name(&spec, V1, Inline, 16_384, "")?;
         assert_eq!(other_page, name.replace("-pg4096-", "-pg16384-"), "the page size names a base");
         let others = [
             PrefillSpec { accounts: spec.accounts + 1, ..spec },
@@ -603,28 +637,41 @@ mod tests {
             PrefillSpec { registry: !spec.registry, ..spec },
         ];
         for other in others {
-            assert_ne!(base_dir_name(&other, V1, 4096, "")?, name, "{other:?} names another base");
+            assert_ne!(
+                base_dir_name(&other, V1, Inline, 4096, "")?,
+                name,
+                "{other:?} names another base"
+            );
         }
-        assert_eq!(base_dir_name(&spec, V1, 4096, "aged200")?, format!("{name}-aged200"));
-        let v2 = base_dir_name(&spec, V2, 4096, "")?;
+        assert_eq!(base_dir_name(&spec, V1, Inline, 4096, "aged200")?, format!("{name}-aged200"));
+        let v2 = base_dir_name(&spec, V2, Inline, 4096, "")?;
         if cfg!(feature = "mdbx") {
             // v2 is tn-lmdb only: the MDBX build refuses it before it writes anything.
             let cache = tempfile::tempdir()?;
-            let refused = build_base(&spec, V2, 4096, cache.path()).expect_err("v2 on MDBX");
+            let refused =
+                build_base(&spec, V2, Inline, 4096, cache.path()).expect_err("v2 on MDBX");
             assert!(refused.to_string().contains("tn-lmdb only"), "{refused}");
             assert_eq!(std::fs::read_dir(cache.path())?.count(), 0, "refused before any write");
         }
         assert_eq!(v2, name.replace(&format!("base-{BACKEND}-"), &format!("base-{BACKEND}-v2-")));
+        let pointers = base_dir_name(&spec, V2, Pointers, 4096, "")?;
+        assert_eq!(pointers, v2.replace("-v2-", "-v2-ptr-"));
+        let cache = tempfile::tempdir()?;
+        let refused = build_base(&spec, V1, Pointers, 4096, cache.path()).expect_err("v1 pointers");
+        assert!(refused.to_string().contains("need storage layout v2"), "{refused}");
+        assert_eq!(std::fs::read_dir(cache.path())?.count(), 0, "refused before any write");
         Ok(())
     }
 
-    /// A meta written before the layout was recorded reads as a v1 base's.
+    /// A meta written before the layout was recorded reads as a v1 base's, and one written before
+    /// the transaction format was as an inline base's.
     #[test]
     fn test_base_meta_without_a_layout_is_v1() -> eyre::Result<()> {
         let meta = BaseMeta {
             layout_version: LAYOUT_VERSION,
             backend: BACKEND.to_owned(),
             layout: V2,
+            tx_bodies: Pointers,
             page_size: 4096,
             spec: spec(),
             slim_genesis_hash: B256::ZERO,
@@ -641,8 +688,9 @@ mod tests {
         };
         let mut json = serde_json::to_value(&meta)?;
         json.as_object_mut().expect("an object").remove("layout");
+        json.as_object_mut().expect("an object").remove("tx_bodies");
         let read: BaseMeta = serde_json::from_value(json)?;
-        assert_eq!(read, BaseMeta { layout: V1, ..meta });
+        assert_eq!(read, BaseMeta { layout: V1, tx_bodies: Inline, ..meta });
         Ok(())
     }
 
@@ -678,7 +726,7 @@ mod tests {
 
         let start = Instant::now();
         let page_size = u32::try_from(knob("TN_EXEC_BENCH_PAGE_SIZE", page() as usize)?)?;
-        let (dir, meta) = build_base(&spec, V1, page_size, &cache)?;
+        let (dir, meta) = build_base(&spec, V1, Inline, page_size, &cache)?;
         let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
         let secs = |ms: u64| ms as f64 / 1000.0;
         println!(

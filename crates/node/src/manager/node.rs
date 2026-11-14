@@ -1859,7 +1859,10 @@ where
     ///
     /// The reth env is wired to the shared `reth_db`, the configured base-fee address, and a clone
     /// of the live gas accumulator so execution, gas/fee accounting, and reward accounting all
-    /// observe the same shared state.
+    /// observe the same shared state. It is given the consensus packs before anything can read a
+    /// transaction (the engine and RPC start after this returns): a datadir that stores its
+    /// transactions by their position in the packs resolves them there, and refuses to start when
+    /// a pack its rows can point into is missing (`RethEnv::attach_tx_packs`).
     fn create_engine(
         &self,
         engine_task_manager: &TaskManager,
@@ -1878,6 +1881,7 @@ where
             Some(basefee_address),
             gas_accumulator.clone(),
         )?;
+        reth_env.attach_tx_packs(&self.consensus_chain, self.tn_datadir.epochs_db_path())?;
         // Give the consensus bus a canonical-DB fallback for `wait_for_execution` (issue #1036):
         // an execution tip evicted from the in-memory `recent_blocks` ring but still persisted as
         // canonical in the DB must not be misread as a fork. The bus is constructed before the

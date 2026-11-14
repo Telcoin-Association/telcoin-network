@@ -1,6 +1,6 @@
 use super::{
     metrics::{StaticFileProviderMetrics, StaticFileProviderOperation},
-    LoadedJarRef,
+    read_inline_tx, read_tx_row, LoadedJarRef, TxRow,
 };
 use crate::{
     to_range, BlockHashReader, BlockNumReader, HeaderProvider, ReceiptProvider,
@@ -274,6 +274,31 @@ impl<N: NodePrimitives> BlockNumReader for StaticFileJarProvider<'_, N> {
     }
 }
 
+impl<N: NodePrimitives<SignedTx: Decompress>> StaticFileJarProvider<'_, N> {
+    /// TN(TN-0202): the `Transactions` row of transaction `num`, `None` if this jar has none: the
+    /// transaction, or its position in its batch ([`TxRow::Ref`]), which only a
+    /// [`DatabaseProvider`](crate::DatabaseProvider) resolves.
+    pub fn tx_row_by_id(&self, num: TxNumber) -> ProviderResult<Option<TxRow<N::SignedTx>>> {
+        read_tx_row(&mut self.cursor()?, num)
+    }
+
+    /// TN(TN-0202): the `Transactions` rows of the transactions in `range` this jar has, in
+    /// order, as [`Self::tx_row_by_id`] reads them.
+    pub fn tx_rows_by_tx_range(
+        &self,
+        range: impl RangeBounds<TxNumber>,
+    ) -> ProviderResult<Vec<TxRow<N::SignedTx>>> {
+        let mut cursor = self.cursor()?;
+        let mut rows = Vec::with_capacity(range_size_hint(&range).unwrap_or(1024));
+        for num in to_range(range) {
+            if let Some(row) = read_tx_row(&mut cursor, num)? {
+                rows.push(row)
+            }
+        }
+        Ok(rows)
+    }
+}
+
 impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsProvider
     for StaticFileJarProvider<'_, N>
 {
@@ -288,14 +313,15 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
     }
 
     fn transaction_by_id(&self, num: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
-        self.cursor()?.get_one::<TransactionMask<Self::Transaction>>(num.into())
+        // TN(TN-0202): a row that stores a position is an error here, never `None`.
+        read_inline_tx(&mut self.cursor()?, num)
     }
 
     fn transaction_by_id_unhashed(
         &self,
         num: TxNumber,
     ) -> ProviderResult<Option<Self::Transaction>> {
-        self.cursor()?.get_one::<TransactionMask<Self::Transaction>>(num.into())
+        read_inline_tx(&mut self.cursor()?, num)
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
@@ -336,7 +362,7 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
         let mut txs = Vec::with_capacity(range_size_hint(&range).unwrap_or(1024));
 
         for num in to_range(range) {
-            if let Some(tx) = cursor.get_one::<TransactionMask<Self::Transaction>>(num.into())? {
+            if let Some(tx) = read_inline_tx(&mut cursor, num)? {
                 txs.push(tx)
             }
         }

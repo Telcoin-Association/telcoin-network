@@ -47,6 +47,8 @@ use tn_types::{
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
 
+mod tx_positions;
+
 /// Limit potential for memory exhaustion via creating to many reth mdbx DBs.
 /// Each DB has a very large memory space allocation (shared memory) so running
 /// all tests in parrellel can exhaust it.
