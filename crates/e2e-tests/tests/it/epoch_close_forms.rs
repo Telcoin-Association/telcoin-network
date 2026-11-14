@@ -27,8 +27,8 @@
 use super::{
     common::{
         acquire_test_permit, address_from_word, call_rpc, current_epoch, epoch_seconds_remaining,
-        get_block, get_block_number, get_node_info, kill_child, log_field, network_advancing,
-        node_log_lines, parse_hex_u64, scrape_metric_value, scrape_metrics,
+        get_block, get_block_number, get_node_info, kill_child, log_field, log_line_matches,
+        network_advancing, node_log_lines, parse_hex_u64, scrape_metric_value, scrape_metrics,
         start_validator_with_overrides, EpochSnapshot, ProcessGuard,
     },
     exec_block::{
@@ -78,9 +78,16 @@ const PASSPHRASE: &str = "restart_test";
 /// execution fork.
 const FORK_ONLY_LOGS: [&str; 3] = ["we have forked", CANARY_LOG, "execution has forked"];
 
-/// Every line of [`FATAL_LOGS`] and [`FORK_ONLY_LOGS`]: no run of any node may log one.
+/// The error lines of an epoch-record conflict that does not stop the node: the collector's (with
+/// `epoch_record_conflict_halt` off, or below its threshold) and a re-certify round's. An honest
+/// fleet logs none.
+const CONFLICT_LOGS: [&str; 2] =
+    ["epoch record conflict:", "own epoch record differs from a certified record"];
+
+/// Every line of [`FATAL_LOGS`], [`FORK_ONLY_LOGS`] and [`CONFLICT_LOGS`]: no run of any node may
+/// log one.
 fn fork_logs() -> impl Iterator<Item = &'static str> {
-    FATAL_LOGS.into_iter().chain(FORK_ONLY_LOGS)
+    FATAL_LOGS.into_iter().chain(FORK_ONLY_LOGS).chain(CONFLICT_LOGS)
 }
 
 /// The info line, with fields `epoch`, `final_state_number`, `final_state_hash`,
@@ -191,6 +198,40 @@ const ROUND_FAILED_LOG: &str = "failed to reach quorum on epoch close";
 /// The error the node-lifetime vote collector logs when a new record arrives while the previous
 /// epoch's record is still uncertified, before it re-signs and republishes that record's vote.
 const REVOTE_LOG: &str = "re-publishing epoch record vote for epoch";
+
+/// The info line, with field `epoch`, of a vote round that reached a quorum and stored the
+/// certificate.
+const QUORUM_LOG: &str = "epoch record quorum";
+
+/// The info line, with field `epoch`, of a vote round that stored the certificate from the votes
+/// earlier rounds for the record kept (`epoch_record_recertify`).
+const KEPT_LOG: &str = "epoch record certified from kept votes";
+
+/// The info line, with field `epoch`, of a re-certify pick (`epoch_record_recertify`): at the close
+/// of epoch N a node re-votes one of its uncertified records of epochs N - 16 to N - 2.
+const RECERTIFY_LOG: &str = "epoch record re-certify round";
+
+/// The info line, with field `epoch`, a vote round logs in place of [`ROUND_FAILED_LOG`] when it
+/// ends without a quorum while the record's certificate is stored.
+const ROUND_ENDED_CERTIFIED_LOG: &str =
+    "epoch vote round ended without a local quorum; the record is already certified";
+
+/// The info line, with fields `epoch` and `gaps`, of the record collector walking past an epoch it
+/// holds uncertified once a certified record after it is stored
+/// (`epoch_record_collect_past_uncertified`).
+const WALK_LOG: &str = "epoch record collector walking past an uncertified epoch";
+
+/// The prometheus counter of [`WALK_LOG`]'s epochs.
+const GAP_WALKS: &str = "tn_state_sync_epoch_record_gap_walks_total";
+
+/// The prometheus counter of the certified records of the network the record collector found to
+/// differ from the node's own stored record.
+const RECORD_CONFLICTS: &str = "tn_state_sync_epoch_record_conflicts_total";
+
+/// The conflicts of [`RECORD_CONFLICTS`] whose certificate's signers fall short of the halt's
+/// threshold.
+const CONFLICTS_BELOW_HALT: &str =
+    "tn_state_sync_epoch_record_conflicts_below_halt_threshold_total";
 
 /// Epoch duration of the missed-round tests.
 ///
@@ -439,10 +480,11 @@ fn check_held_member(
     let checks =
         (0..4).map(|node| assert_close_checks(fleet, node)).collect::<Result<Vec<_>, _>>()?;
     let through = assert_certified_through(fleet)?;
+    let collector = check_collector(fleet)?;
 
     Ok(format!(
-        "certified through (gauge, registry epoch) per node {through:?}; held member {HELD_MEMBER} \
-         trailed the closing block {} of epoch 0 by {lag_outputs} outputs \
+        "{collector}; certified through (gauge, registry epoch) per node {through:?}; held member \
+         {HELD_MEMBER} trailed the closing block {} of epoch 0 by {lag_outputs} outputs \
          ({lag_blocks} blocks); its close {held_close:?}; its checks before the release: \
          {held_checks}; record 0: {}; record 1 (after the release, held index {held_index}): {}; \
          checks at the end {checks:?}",
@@ -453,7 +495,8 @@ fn check_held_member(
 }
 
 /// Two members held out of the first vote round leave record [`MISSED_EPOCH`] uncertified on the
-/// fast members; the chain goes on and the next close certifies it on every node.
+/// fast members; the chain goes on and a later vote round certifies it on every node, at the
+/// latest the one the close of the next epoch starts.
 ///
 /// [`ROUND_HELD`] sleep [`ROUND_DELAY_MS`] before every output with batches and run with
 /// [`EXIT_BEFORE_EPOCH_RECORD_ENV`] set to [`MISSED_EPOCH`], so each stops at its close of that
@@ -465,10 +508,11 @@ fn check_held_member(
 /// members are then restarted without the delay or the hook (the release); they rebuild the record
 /// from their closing block and enter the next epoch.
 ///
-/// While the fleet waits for the next close, no node may serve the record certified before some
-/// node has made that close. After it: at least one node logged the collector's re-vote of the
-/// record ([`REVOTE_LOG`]); the records of epochs 0 to [`MISSED_EPOCH`] + 1 meet every check of
-/// [`check_closed_epoch`] on every node; the next epoch committed outputs beyond its closing one;
+/// The test notes when each node first serves the record certified, and how many nodes had closed
+/// the next epoch then. Once every node closed it and serves the record certified: the records of
+/// epochs 0 to [`MISSED_EPOCH`] + 1 meet every check of [`check_closed_epoch`] on every node; the
+/// paths that certified the record meet [`certification_paths`]; no node counted an epoch-record
+/// conflict ([`check_collector`]); the next epoch committed outputs beyond its closing one;
 /// no node logs a line of [`fork_logs`]; every node's [`CERTIFIED_THROUGH`] is its last closed
 /// epoch.
 fn missed_record_round(form: VoteForm) -> eyre::Result<()> {
@@ -554,49 +598,43 @@ fn check_missed_round(
     }
     let released_at = Instant::now();
 
-    // until some node closes the next epoch, no node may hold a certificate for the missed record
+    // when each node first serves the missed record certified, and how many nodes had closed the
+    // next epoch by then
+    let mut certified_at: [Option<CertifiedAt>; 4] = Default::default();
+    let mut next_close_after = None;
     let deadline = Instant::now() + ROUND_SECOND_CLOSE_TIMEOUT;
     loop {
-        let certified = (0..4)
-            .filter(|&node| certified_record(&urls[node], missed).is_ok())
-            .collect::<Vec<_>>();
         let epochs = urls.iter().map(|url| node_epoch(url).ok()).collect::<Vec<_>>();
-        if epochs.iter().all(Option::is_some) {
-            let closed = epochs.iter().flatten().filter(|e| **e > next).count();
-            eyre::ensure!(
-                certified.is_empty() || closed > 0,
-                "record {missed} is certified on nodes {certified:?} while no node has closed epoch \
-                 {next} (registry epochs {epochs:?}): the first round or the release certified it, \
-                 not the next close"
-            );
-            if closed == 4 {
+        let closed = epochs.iter().flatten().filter(|e| **e > next).count();
+        for (node, at) in certified_at.iter_mut().enumerate() {
+            if at.is_none() && certified_record(&urls[node], missed).is_ok() {
+                let run = fleet.runs[node];
+                let mark = node_log_lines(&test, node, run)?.len();
+                *at = Some(CertifiedAt { after_release: released_at.elapsed(), closed, run, mark });
+            }
+        }
+        if closed == 4 {
+            next_close_after.get_or_insert(released_at.elapsed());
+            if certified_at.iter().all(Option::is_some) {
                 break;
             }
         }
         eyre::ensure!(
             Instant::now() < deadline,
-            "not every node closed epoch {next} within {ROUND_SECOND_CLOSE_TIMEOUT:?} of the \
-             release: registry epochs {epochs:?}"
+            "within {ROUND_SECOND_CLOSE_TIMEOUT:?} of the release not every node closed epoch \
+             {next} and served record {missed} certified: registry epochs {epochs:?}, first \
+             certified {certified_at:?}"
         );
         std::thread::sleep(Duration::from_secs(1));
     }
-    let next_close_after = released_at.elapsed();
+    let next_close_after = next_close_after.unwrap_or_default();
 
     let mut closed = Vec::new();
     for epoch in 0..=next {
         closed.push(check_closed_epoch(fleet, epoch)?);
     }
     let (first, second) = (&closed[missed as usize], &closed[next as usize]);
-    let revote = format!("{REVOTE_LOG} {missed} ");
-    let revoted = (0..4)
-        .filter(|&node| {
-            fleet.lines(node).is_ok_and(|lines| lines.iter().any(|l| l.contains(&revote)))
-        })
-        .collect::<Vec<_>>();
-    eyre::ensure!(
-        !revoted.is_empty(),
-        "no node logged the re-vote of record {missed} at its close of epoch {next}"
-    );
+    let paths = certification_paths(fleet, missed, &certified_at)?;
     let outputs = second.record.final_consensus.number - first.record.final_consensus.number;
     let blocks = second.closing.number - first.closing.number;
     eyre::ensure!(
@@ -609,12 +647,13 @@ fn check_missed_round(
     let checks =
         (0..4).map(|node| assert_close_checks(fleet, node)).collect::<Result<Vec<_>, _>>()?;
     let through = assert_certified_through(fleet)?;
+    let collector = check_collector(fleet)?;
 
     Ok(format!(
-        "certified through (gauge, registry epoch) per node {through:?}; checks at the end \
-         {checks:?}; the first round of record {missed} gave up {:.0} s after the fast members closed epoch \
+        "{paths}; {collector}; certified through (gauge, registry epoch) per node {through:?}; \
+         checks at the end {checks:?}; the first round of record {missed} gave up {:.0} s after the fast members closed epoch \
          {missed}; epoch {next} closed {:.0} s after the release with {outputs} outputs and \
-         {blocks} blocks; nodes {revoted:?} re-voted record {missed}; records: {:?}",
+         {blocks} blocks; records: {:?}",
         gave_up_after.as_secs_f64(),
         next_close_after.as_secs_f64(),
         closed.iter().map(ClosedEpoch::describe).collect::<Vec<_>>()
@@ -979,6 +1018,127 @@ fn assert_certified_through(fleet: &CloseFleet) -> eyre::Result<Vec<(f64, u32)>>
         readings.push(last.get());
     }
     Ok(readings)
+}
+
+/// When the missed-round tests first saw a node serve the missed record certified.
+#[derive(Debug, Clone, Copy)]
+struct CertifiedAt {
+    /// Time since the release.
+    after_release: Duration,
+    /// How many nodes' registries showed the next epoch closed at that poll.
+    closed: usize,
+    /// The node's run then.
+    run: u32,
+    /// The number of lines in that run's log then: every later line was logged while the node held
+    /// the certificate.
+    mark: usize,
+}
+
+/// How the missed record was certified, from every run of every node.
+///
+/// With `epoch_record_recertify` on, the fast members keep their votes from the failed first round,
+/// so a round that a released member's vote starts can reach a quorum before the next close; the
+/// close of the next epoch re-votes a record still uncertified through the previous-record failsafe
+/// on every member. Required: a vote round on some node formed the certificate ([`QUORUM_LOG`] or
+/// [`KEPT_LOG`] for the epoch); when no node served the record certified before some node closed
+/// the next epoch, some node logged the failsafe's re-vote ([`REVOTE_LOG`]); no node picked the
+/// record to re-certify ([`RECERTIFY_LOG`]: the pick at the close of N takes epochs up to N - 2,
+/// and the record is certified on every node before the close after the next); a round for the
+/// record that ended once its node served the record certified logged
+/// [`ROUND_ENDED_CERTIFIED_LOG`], not [`ROUND_FAILED_LOG`].
+fn certification_paths(
+    fleet: &CloseFleet,
+    missed: u32,
+    certified_at: &[Option<CertifiedAt>; 4],
+) -> eyre::Result<String> {
+    let field = [format!("epoch={missed}")];
+    let revote = format!("{REVOTE_LOG} {missed} ");
+    let record_debug = format!("EpochRecord {{ epoch: {missed},");
+    let failed = |line: &str| line.contains(ROUND_FAILED_LOG) && line.contains(&record_debug);
+    let mut counts = Vec::new();
+    for (node, at) in certified_at.iter().enumerate() {
+        let at = at.ok_or_else(|| eyre::eyre!("node {node} never served record {missed}"))?;
+        let lines = fleet.lines(node)?;
+        let count = |text: &str| lines.iter().filter(|l| log_line_matches(l, text, &field)).count();
+        let revotes = lines.iter().filter(|l| l.contains(&revote)).count();
+        let failures = lines.iter().filter(|l| failed(l)).count();
+        eyre::ensure!(
+            count(RECERTIFY_LOG) == 0,
+            "node {node} picked record {missed} to re-certify: {:?}",
+            lines.iter().find(|l| log_line_matches(l, RECERTIFY_LOG, &field))
+        );
+        // the lines logged once the node held the certificate: the rest of that run, later runs
+        let mut held = node_log_lines(&fleet.test, node, at.run)?
+            .into_iter()
+            .skip(at.mark)
+            .collect::<Vec<_>>();
+        for run in at.run + 1..=fleet.runs[node] {
+            held.extend(node_log_lines(&fleet.test, node, run)?);
+        }
+        let late = held.iter().filter(|l| failed(l)).collect::<Vec<_>>();
+        eyre::ensure!(
+            late.is_empty(),
+            "node {node} served record {missed} certified {:.0} s after the release, yet a round \
+             for it then ended with `{ROUND_FAILED_LOG}`: {late:?}",
+            at.after_release.as_secs_f64()
+        );
+        counts.push((
+            count(QUORUM_LOG),
+            count(KEPT_LOG),
+            revotes,
+            count(ROUND_ENDED_CERTIFIED_LOG),
+            failures,
+        ));
+    }
+    let formed = counts.iter().map(|(quorum, kept, ..)| quorum + kept).sum::<usize>();
+    eyre::ensure!(
+        formed > 0,
+        "no node formed record {missed}'s certificate in a vote round (no `{QUORUM_LOG}` or \
+         `{KEPT_LOG}` line for it): per node {counts:?}"
+    );
+    let first = certified_at.iter().flatten().min_by_key(|at| at.after_release);
+    let before_next_close = first.is_some_and(|at| at.closed == 0);
+    let revoted = counts.iter().map(|(_, _, revotes, ..)| revotes).sum::<usize>();
+    eyre::ensure!(
+        before_next_close || revoted > 0,
+        "record {missed} was first served certified after a node closed the next epoch, and no \
+         node logged the failsafe's re-vote of it: first {first:?}"
+    );
+    Ok(format!(
+        "record {missed} first served certified {}; per node (quorum lines, kept-vote lines, \
+         failsafe re-votes, rounds ended certified, rounds failed) {counts:?}; first certified \
+         per node {certified_at:?}",
+        if before_next_close {
+            "before any node closed the next epoch"
+        } else {
+            "at the next close"
+        }
+    ))
+}
+
+/// No node counts an epoch-record conflict since its latest start ([`RECORD_CONFLICTS`] and
+/// [`CONFLICTS_BELOW_HALT`] are zero; the conflict lines of every run are in [`fork_logs`]).
+/// Returns each node's [`GAP_WALKS`] and its [`WALK_LOG`] lines over every run, reported only: a
+/// walk past an uncertified epoch lands only when the next record is certified first, which the
+/// order of rounds across nodes decides.
+fn check_collector(fleet: &CloseFleet) -> eyre::Result<String> {
+    let mut walks = Vec::new();
+    for node in 0..4 {
+        for name in [RECORD_CONFLICTS, CONFLICTS_BELOW_HALT] {
+            let value = scrape_metric_value(&fleet.metrics[node], name)?;
+            eyre::ensure!(
+                value == 0.0,
+                "node {node} run {} counted {value} {name}",
+                fleet.runs[node]
+            );
+        }
+        let lines = fleet.lines(node)?;
+        let walked = lines.iter().filter(|l| l.contains(WALK_LOG)).cloned().collect::<Vec<_>>();
+        walks.push((scrape_metric_value(&fleet.metrics[node], GAP_WALKS)?, walked));
+    }
+    Ok(format!(
+        "no record conflicts; gap walks per node (counter of the latest run, walk lines) {walks:?}"
+    ))
 }
 
 /// The record matches the chain on `url`: its `final_state` is the block in which the registry's
