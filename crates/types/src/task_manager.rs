@@ -196,9 +196,17 @@ impl TaskSpawner {
                 }
             }
         });
-        if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, critical))
-        {
-            tracing::error!(target: "tn::tasks", "Failed to track spawned task {name}: {err}. The task is already spawned but untracked: it can never be joined or aborted, and only its shutdown notice can end it.");
+        match self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, critical)) {
+            Ok(()) => {}
+            // The manager has ended (dropped, which notifies its shutdown): the task subscribed to
+            // that notice above, so it ends at once and nothing is left to track. A spawn racing a
+            // node stop lands here.
+            Err(mpsc::error::TrySendError::Closed(_)) if self.local_shutdown.is_notified() => {
+                tracing::debug!(target: "tn::tasks", "task {name} spawned after its task manager ended; it ends at once");
+            }
+            Err(err) => {
+                tracing::error!(target: "tn::tasks", "Failed to track spawned task {name}: {err}. The task is already spawned but untracked: it can never be joined or aborted, and only its shutdown notice can end it.");
+            }
         }
     }
 
@@ -1069,6 +1077,28 @@ mod test {
             "every task exits within the grace and the join wait: {task_manager}"
         );
         assert!(done_rx.try_recv().is_ok(), "the graceful exit ran");
+    }
+
+    /// A task spawned through a spawner whose manager has ended (a spawn racing a node stop) ends
+    /// at once: the manager's drop notified its shutdown, which the task's select sees, so a
+    /// closed tracker there leaves nothing running and is not an error.
+    #[tokio::test]
+    async fn a_task_spawned_after_its_manager_ended_ends_at_once() {
+        let manager = TaskManager::new("ended");
+        let spawner = manager.get_spawner();
+        drop(manager);
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+        spawner.spawn_task("late", async move {
+            // never resolves on its own; only the shutdown notice ends the task, dropping
+            // `ended_tx`
+            let _ended = ended_tx;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(5), ended_rx)
+            .await
+            .expect("the late task ended on the manager's shutdown")
+            .expect_err("the task ended without finishing its future");
     }
 
     /// Regression: each spawn subscribes to the manager's shutdown notifier (a reth task three
