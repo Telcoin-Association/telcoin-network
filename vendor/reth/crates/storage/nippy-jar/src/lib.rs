@@ -434,6 +434,31 @@ impl<H: NippyJarHeader> NippyJar<H> {
         DataReader::new(self.data_path())
     }
 
+    /// TN(TN-0160): checks that the files `reader` opened hold exactly this configuration's rows:
+    /// an offsets file of one offset per value and the final one, and a final offset at the data
+    /// file's end. Only for a jar that takes no more rows: one still written to holds bytes past
+    /// its configuration until its next commit, which the open-time heal cuts.
+    pub fn check_file_lengths(&self, reader: &DataReader) -> Result<(), NippyJarError> {
+        let values = self.rows * self.columns;
+        let mismatch = |file| {
+            tracing::error!(
+                target: "nippy-jar",
+                path = %self.data_path().display(),
+                rows = self.rows,
+                file,
+                "Static file does not match its configuration"
+            );
+            NippyJarError::FileLengthMismatch { path: self.data_path().to_path_buf(), file }
+        };
+        if reader.offsets_size() != 1 + reader.offset_size() as usize * (values + 1) {
+            return Err(mismatch("offsets"))
+        }
+        if reader.offset(values)? != reader.size() as u64 {
+            return Err(mismatch("data"))
+        }
+        Ok(())
+    }
+
     /// Writes all necessary configuration to file.
     fn freeze_config(&self) -> Result<(), NippyJarError> {
         Ok(reth_fs_util::atomic_write_file(&self.config_path(), |file| self.save_to_writer(file))?)

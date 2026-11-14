@@ -618,3 +618,93 @@ fn compressed_changeset_jar_is_refused_by_the_lookups() {
     assert!(is_compressed_jar(&err), "{err}");
     assert_eq!(provider.account_block_changeset(1).unwrap(), account_changes(1));
 }
+
+/// TN(TN-0160): a jar's configuration must name the segment and block range of its file name: the
+/// name's own range passes, and so does a first jar whose expected start a non-zero genesis moved
+/// past the name's; another range or segment is refused.
+#[test]
+fn a_configuration_must_name_its_own_jar() {
+    use reth_db::static_file::check_static_file_identity;
+
+    let path = Path::new("static_file_account-change-sets_0_499999");
+    let header = |segment| SegmentHeader::new((0..=499_999).into(), None, None, segment);
+    let mut own = header(StaticFileSegment::AccountChangeSets);
+    check_static_file_identity(path, &own).unwrap();
+    own.set_expected_block_start(502);
+    check_static_file_identity(path, &own).unwrap();
+    check_static_file_identity(path, &header(StaticFileSegment::StorageChangeSets)).unwrap_err();
+    let next = SegmentHeader::new(
+        (500_000..=999_999).into(),
+        None,
+        None,
+        StaticFileSegment::AccountChangeSets,
+    );
+    check_static_file_identity(path, &next).unwrap_err();
+    check_static_file_identity(&path.with_extension("conf"), &own).unwrap_err();
+}
+
+/// TN(TN-0160): the checksums bind a value to its row and column, not to its file. A configuration
+/// under another jar's name (another range, or the other changeset segment's) is refused at
+/// startup and, when it changes while the node runs, at the jar's load. A full jar whose data or
+/// offsets file is another jar's, of another length, is refused at its load; reads of the other
+/// jars still answer.
+#[test]
+fn jar_files_under_another_jars_name_are_refused() {
+    const ACCOUNTS: StaticFileSegment = StaticFileSegment::AccountChangeSets;
+    const STORAGE: StaticFileSegment = StaticFileSegment::StorageChangeSets;
+    let is_identity = |err: &str| err.contains("holds the configuration of another jar");
+    let setup = || {
+        let (dir, _) = create_test_static_files_dir();
+        let static_files = provider(dir.path(), true, 2);
+        write_block_segments(&static_files, 6);
+        write_changesets(&static_files, 0..6);
+        let paths = [0, 2, 4].map(|block| jar_path(&static_files, ACCOUNTS, block));
+        (dir, paths, jar_path(&static_files, STORAGE, 0))
+    };
+    let conf = |path: &Path| path.with_extension("conf");
+
+    // The configurations of jars 0..=1 and 2..=3 swapped, or the storage jar's at 0..=1.
+    for other in [false, true] {
+        let (dir, paths, storage) = setup();
+        let donor = if other { conf(&storage) } else { conf(&paths[1]) };
+        let original = std::fs::read(conf(&paths[0])).unwrap();
+        std::fs::copy(&donor, conf(&paths[0])).unwrap();
+        let err = StaticFileProviderBuilder::read_write(dir.path())
+            .with_blocks_per_file(2)
+            .with_jar_checksums(true)
+            .build::<EthPrimitives>()
+            .unwrap_err();
+        assert!(is_identity(&err.to_string()), "{err}");
+
+        // Swapped after the start, before the jar is loaded.
+        std::fs::write(conf(&paths[0]), &original).unwrap();
+        let static_files = provider(dir.path(), true, 2);
+        std::fs::copy(&donor, conf(&paths[0])).unwrap();
+        let err = static_files.account_block_changeset(0).unwrap_err();
+        assert!(is_identity(&err.to_string()), "{err}");
+        assert_eq!(static_files.account_block_changeset(2).unwrap(), account_changes(2));
+    }
+
+    // The full jar 0..=1 with the storage jar's data file, or the headers jar's offsets file.
+    for file in ["data", "offsets"] {
+        let (dir, paths, storage) = setup();
+        let (from, to) = if file == "data" {
+            (storage, paths[0].clone())
+        } else {
+            let static_files = provider_ro(dir.path());
+            let headers = jar_path(&static_files, StaticFileSegment::Headers, 0);
+            (headers.with_extension("off"), paths[0].with_extension("off"))
+        };
+        std::fs::copy(from, to).unwrap();
+        let static_files = provider(dir.path(), true, 2);
+        let err = static_files.account_block_changeset(0).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_other_ref::<NippyJarError>(),
+                Some(NippyJarError::FileLengthMismatch { file: found, .. }) if *found == file
+            ),
+            "{file}: {err}"
+        );
+        assert_eq!(static_files.account_block_changeset(2).unwrap(), account_changes(2));
+    }
+}

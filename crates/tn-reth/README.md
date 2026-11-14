@@ -836,7 +836,17 @@ datadir moves to v2 by a rebuild (below). `src/env/layout.rs` holds the rules.
   its checksum, or when it or its `.csoff` is shorter than its committed configuration (a prune
   commits the configuration before it shrinks a file, so only damage leaves that); older files are
   verified as they are read. Startup also refuses a segment whose files skip blocks between two of
-  them (a file missing: `<segment> static files skip blocks`). **Operator response:** the file is damaged on this node only (disk or memory fault,
+  them (a file missing: `<segment> static files skip blocks`). A checksum binds a value to its row
+  and column, not to its file, so another file's bytes under a jar's name are caught only in part.
+  A `.conf` that names another segment or block range than its file name is refused at startup and
+  at its load (`static file <path> holds the configuration of another jar`). A full file (every
+  file below a segment's latest) whose data or offsets file has another length than its `.conf`
+  gives is refused at its load (`static file <path> is damaged: its data file does not match its
+  configuration`). Not caught: a data, offsets or `.csoff` file of another file of the segment with
+  the same length (every change-set file starts at row 0), or another file's longer data and
+  offsets under a segment's latest file, which startup cuts to the `.conf`; they read as this
+  file's values with no error. Copy or restore whole datadirs, never single static files.
+  **Operator response:** the file is damaged on this node only (disk or memory fault,
   or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
   wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start
   the node, which re-executes the chain from genesis (or restore a snapshot). Check the disk:

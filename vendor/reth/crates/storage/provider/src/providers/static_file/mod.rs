@@ -85,6 +85,14 @@ impl LoadedJar {
     fn new(jar: NippyJar<SegmentHeader>) -> ProviderResult<Self> {
         match jar.open_data_reader() {
             Ok(data_reader) => {
+                // TN(TN-0160): a full checksummed jar (its last block in, as every jar below a
+                // segment's latest is, TN-0133) takes no more rows, so its files must hold
+                // exactly its configuration's: a data or offsets file of another jar, or a damaged
+                // one, of another length is refused here instead of read.
+                let header = jar.user_header();
+                if jar.has_checksums() && header.block_end() == Some(header.expected_block_end()) {
+                    jar.check_file_lengths(&data_reader).map_err(ProviderError::other)?;
+                }
                 let mmap_handle = Arc::new(data_reader);
 
                 let csoff_reader = if jar.user_header().segment().is_change_based() {

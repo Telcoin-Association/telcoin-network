@@ -2566,3 +2566,37 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   pins it. TN's filter docs had the same code and now say -32009. *Can reach execution or
   storage*: no; a doc comment and a test assertion.
   *Tests*: `active_filters_are_bounded` (asserts -32009). *Upstream*: n/a.
+
+- **TN-0160** — A jar's configuration must name its own file, and a full checksummed jar's files
+  must have its configuration's lengths. *Kind*: fix (static-file integrity).
+  *Files*: `crates/storage/db/src/static_file/mod.rs` (`check_static_file_identity`,
+  `StaticFileIdentityError`, called by `iter_static_files`), `crates/storage/nippy-jar/src/{lib.rs,
+  error.rs}` (`NippyJar::check_file_lengths`, `NippyJarError::FileLengthMismatch`),
+  `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs, tn_checksum_tests.rs}`
+  (`StaticFileProviderInner::load_jar`, `LoadedJar::new`; tests).
+  *Why*: TN-0120's checksums seed a value with its row and column and TN-0121's a `.csoff` record
+  with its index, never with the file, and every change-set jar starts at row 0. So another jar's
+  files copied or restored under a jar's name (an operator or tool mistake) verified and served
+  the other range's history with no error. Two cheap checks, no format change: (a) every jar
+  `iter_static_files` lists (each start, `check_contiguity`) and every load through `load_jar`
+  refuses a configuration whose segment differs from its file name's, or whose expected block
+  range does not end where the name's range ends or starts before it (a non-zero genesis moves a
+  first jar's expected start past its name's, `SegmentHeader::set_expected_block_start`); this
+  applies to both jar versions, since no writer names a file other than by its configuration's
+  range. (b) `LoadedJar::new` holds a full checksummed jar (its last block in: every jar below a
+  segment's latest, which TN-0133's contiguity check requires, and the latest once its last block
+  is committed) to its configuration: offsets file `1 + 8 * (rows * columns + 1)` bytes and final
+  offset at the data file's end. A full jar takes no more rows (the next block rotates to a new
+  file) and a prune commits its configuration first (TN-0130), so only damage or another jar's
+  file fails it; a jar still being written is not checked, since it holds bytes past its
+  configuration until the next commit. Not caught: same-length data, offsets or `.csoff` files of
+  another jar of the segment, and another jar's longer files under a segment's latest name, which
+  the open-time heal cuts (`crates/tn-reth/README.md`, "Static-file checksums"). Binding the file
+  into the seeds would catch every swap but changes the format. *Can reach execution or storage*:
+  storage, by refusing: a datadir whose files a writer made passes both checks, and no byte
+  written or value read changes. *Tests*: `a_configuration_must_name_its_own_jar` (the name's
+  range, a moved genesis start, another range, another segment, a name that is no data file),
+  `jar_files_under_another_jars_name_are_refused` (a swapped `.conf` and the other segment's
+  `.conf`, at startup and at a load after it; another jar's data file and offsets file under a
+  full jar: refused, other jars still read). *Upstream*: maybe (the name check; the length check
+  needs TN-0120's version).
