@@ -980,12 +980,17 @@ CHANGES.md TN-0200..0203.
      persist fills with its batches off the execution thread, so recent blocks (receipt polling)
      read from memory, and a cold part (8 MiB) that pack reads fill, so a scan of old history
      evicts only old batches;
-  2. else the live epoch's pack (`ConsensusChain::live_batch`);
+  2. else the live epoch's pack (`LiveBatches::live_batch`; the resolver reaches the packs through
+     `ConsensusChain::live_batches`, which holds the chain weakly, so the env never keeps the
+     chain from closing at shutdown);
   3. else a closed epoch's pack, through a `PackReader` the resolver keeps (at most 4 open, the
      least recently used closed first, all dropped when an install replaces an epoch's files or a
      handoff swaps the live pack).
      Every pack read hashes the batch again against its digest. A pack not sealed yet (the epoch
-     a handoff is sealing) or being replaced is tried again for up to a second.
+     a handoff is sealing) or being replaced is tried again for up to a second; so is one that
+     fails its open while the chain hands off or installs an epoch, since a handoff seals the
+     data log before the indexes and the pack reads as damaged in between
+     (`LiveBatches::open_past`).
 
   At most 4 pack reads run at once. Each position is checked against the batch's length and its
   transaction decoded (EIP-2718). A read by hash checks the resolved transaction's hash too.
@@ -1016,11 +1021,13 @@ CHANGES.md TN-0200..0203.
   of the live epoch persists the pack before its first block (`replay_missed_consensus`).
 - **Startup check.** A version-2 datadir's start checks that the consensus database holds the
   pack of every epoch its rows point into: from the epoch of the block holding the lowest stored
-  transaction to that of the highest, each epoch has its `epoch-{N}/data`, or is the live one. It
-  reads two headers and stats one file an epoch, and opens no pack: a damaged pack shows at its
-  first read. Every executed output was saved to its epoch's pack first, and execution skips no
-  epoch, so a gap means packs were lost. The start is refused, naming the blocks, the epochs they
-  point into and the missing ones.
+  transaction to that of the highest, each epoch has its `epoch-{N}/data` (the live epoch's too:
+  the chain opened it before the check). It reads the first and last `TransactionBlocks` entries
+  and those two blocks' headers, stats one file an epoch, and opens no pack: a damaged pack shows
+  at its first read. Every executed output was saved to its epoch's pack first, and execution
+  skips no epoch, so a gap means packs were lost. The start is refused
+  (`TxPackCoverageError`, from `RethEnv::attach_tx_packs`), naming the blocks, the epochs they
+  point into, the missing ones and the recovery below.
 - **Recovery.**
   - A missing pack (the start refused): restore `consensus-db/` from a backup. The node cannot
     rebuild a lost pack itself: it fetches no pack below the epoch its consensus database is at,
