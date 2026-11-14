@@ -140,8 +140,9 @@ impl Drop for CertificatePack {
         if Arc::strong_count(&self.handle) == 1 {
             // Reaching this with a live handle means shutdown() was not used: a shutdown().await
             // already took the handle, so the block below is skipped. The node's epoch owner
-            // (`run_epoch`) holds an `Arc` of the pack and seals it in `finish_epoch` with
-            // shutdown().await, the path that reports a failed save or final flush
+            // (`EpochManager`) holds an `Arc` of the pack and seals it with shutdown().await at
+            // the epoch's end (`finish_epoch`) or at the node's stop (`finish_stopped_epoch`),
+            // the path that reports a failed save or final flush
             // (`seal_certificate_pack`). This covers only a pack whose last handle drops
             // elsewhere (a test, or a task that outlived that seal). Mirrors ConsensusPack /
             // EpochRecordDb / LatestConsensus so all four actors seal consistently on a dropped

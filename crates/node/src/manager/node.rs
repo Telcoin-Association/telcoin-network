@@ -39,7 +39,10 @@ use tn_primary::{
     ConsensusBusApp, NodeMode, QueChannel,
 };
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
-use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb, open_db, DatabaseType};
+use tn_storage::{
+    certificate_pack::CertificatePack, consensus::ConsensusChain, epoch_records::EpochRecordDb,
+    open_db, DatabaseType,
+};
 use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
@@ -308,6 +311,12 @@ pub(crate) struct EpochManager<P, DB> {
     /// Handle to the epoch pack files that durably store consensus data. Persisted on startup and
     /// at shutdown; read by the fetch tasks that backfill missing epochs.
     consensus_chain: ConsensusChain,
+
+    /// The running epoch's certificate pack while it is open (a proposing node only). Shared with
+    /// the epoch's consensus task, which saves into it. Held here rather than by `run_epoch` so it
+    /// is sealed however the epoch ends: `finish_epoch` seals it at the epoch's end, and
+    /// `finish_stopped_epoch` at a node stop, which drops `run_epoch` wherever it waits.
+    certificate_pack: Option<Arc<CertificatePack>>,
 
     /// The uncommitted batches that each committee key stored on this node through the worker
     /// report path and the gossip prefetch (issue #1794). One ledger for all workers of the node.
@@ -856,6 +865,7 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            certificate_pack: None,
             reported_batches: ReportedBatchLedger::new(),
             primary_sync_ledgers: PrimarySyncLedgers::new(),
             bootstrap_servers,
@@ -1536,7 +1546,11 @@ where
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result,
         };
-        // Persist the current pack, then drain the long-lived tasks REGARDLESS of a persist error.
+        // A node shutdown ends the select by dropping the epoch loop wherever it waits, so the
+        // running epoch never reaches its end (`finish_epoch`). `finish_stopped_epoch` makes the
+        // epoch's writes durable instead: it seals the certificate pack, persists the current
+        // consensus pack and checks the stores, and returns a failure. Then drain the long-lived
+        // tasks REGARDLESS of that error.
         // The node's own tasks exit on the node shutdown and get `NODE_TASK_EXIT_GRACE` for their
         // graceful exits (the engine drains what it holds); then `shutdown_tasks` notifies the
         // manager's `local_shutdown` (every task `select!`s on it), which ends the rest, reth's
@@ -1546,11 +1560,12 @@ where
         // winds down after `engine` drops, which `shutdown()` waits out via
         // `wait_until_sole_owner` before `close()` — and if it outlives that wait,
         // `close()` now force-seals rather than leaving the pack unsealed.) Surfacing the
-        // persist error before draining (a bare `?`) would skip that drain; the `Drop`
-        // fallback is runtime-safe regardless. Persist error still takes precedence over `result`.
-        let persist_result = self.consensus_chain.persist_current().await;
+        // storage error before draining (a bare `?`) would skip that drain; the `Drop`
+        // fallback is runtime-safe regardless. A storage error still takes precedence over
+        // `result`.
+        let stop_result = self.finish_stopped_epoch().await;
         node_task_manager.shutdown_tasks(NODE_TASK_EXIT_GRACE).await;
-        persist_result?;
+        stop_result?;
 
         result
     }
