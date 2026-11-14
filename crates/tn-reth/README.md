@@ -150,7 +150,11 @@ the subtries, then the walk on one thread computed again the storage roots they 
 block the split composed). `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage
 tries the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed
 serially) are expected; `stored_root_node` is an alert, and so is `mismatch` (a sampled check found
-a wrong result on a block with a composed storage root).
+a wrong result on a block with a composed storage root). Read each against its success count:
+`tn_reth_account_walk_splits_total` counts the blocks whose root the split account walk composed,
+and `tn_reth_storage_walk_splits_total` the hot storage tries whose storage root was composed from
+the split's pieces (once per trie and block). A split count flat at zero on a busy chain means the
+split never runs: its trie is still small, or the off switch is set.
 `tn_reth_parallel_state_root_task_failures_total{reason}` counts the pieces of parallel work (a
 storage-root task, a walk helper, an account subtrie, a storage piece) that failed and left their
 part to the serial computation, on this node only; the block also logs the first error. Read it

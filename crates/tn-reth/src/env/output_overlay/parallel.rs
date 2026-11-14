@@ -43,7 +43,8 @@
 //! whose shape the split does not compose (a small trie, as a chain has from genesis) is found
 //! before any subtrie runs, and its blocks walk on the calling thread with the storage-root tasks;
 //! a block whose own changes leave such a shape (rare once the trie passes) pays for the subtries
-//! and then for that walk. Both are counted in `tn_reth.account_walk_fallbacks_total`. A block with
+//! and then for that walk. Both are counted in `tn_reth.account_walk_fallbacks_total`, and a block
+//! whose root the split composed in `tn_reth.account_walk_splits_total`. A block with
 //! no storage-root targets but a split walk takes this path too. Measured on the exec bench
 //! (storage v2, against the walk on one thread with the storage-root tasks): the root fell from 311
 //! to 198 ms an output at peak and from 63 to 41 ms on the busy profile on the Mac, and from 561 to
@@ -60,7 +61,8 @@
 //! contract's leaf only waits for running pieces; it composes the storage root and the union of
 //! the pieces' trie updates through the storage-root source. Other targets stay one task each, and
 //! a split that composes nothing leaves the storage root to the walk, counted in
-//! `tn_reth.storage_walk_fallbacks_total`. Measured on the exec bench (storage v2, against the
+//! `tn_reth.storage_walk_fallbacks_total`; a composed one is counted in
+//! `tn_reth.storage_walk_splits_total`. Measured on the exec bench (storage v2, against the
 //! account split alone): the root fell from 199 to 106 ms an output at peak and from 41 to 22 ms on
 //! the busy profile on the Mac, and from 329 to 135 and from 68 to 30 ms on a 22-thread Linux VM.
 //! `TN_PARALLEL_STORAGE_WALK=0` turns this split off on its own.
@@ -164,8 +166,9 @@ use super::{
     OutputTrieOverlay,
 };
 use crate::metrics::{
-    record_account_walk_fallback, record_parallel_root_task_failure, record_storage_walk_fallback,
-    AccountWalkFallback, ParallelRootTaskFailure, StorageWalkFallback, RETH_METRICS,
+    record_account_walk_fallback, record_account_walk_split, record_parallel_root_task_failure,
+    record_storage_walk_fallback, record_storage_walk_splits, AccountWalkFallback,
+    ParallelRootTaskFailure, StorageWalkFallback, RETH_METRICS,
 };
 use parking_lot::{Condvar, Mutex};
 use reth_db::{tables, transaction::DbTx, DatabaseError};
@@ -501,6 +504,12 @@ impl OutputTrieOverlay {
         });
         tasks.log_failures();
         tasks.splits.record_fallbacks();
+        if let Ok(root) = &root {
+            record_storage_walk_splits(root.storage_composed);
+            if root.composed {
+                record_account_walk_split();
+            }
+        }
         #[cfg(test)]
         {
             let (count, first) = &*tasks.failures.lock();
