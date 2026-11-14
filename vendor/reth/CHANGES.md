@@ -3236,7 +3236,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `transaction_hashes_by_range`. `a_block_read_resolves_its_rows_in_one_call` (and a transaction
   range one call per block, with that block's positions only). Damage, each an error from every
   read through `BlockchainProvider`, never `None`: `a_failing_resolver_fails_every_read`,
-  `a_short_answer_fails_every_read`, `without_a_resolver_every_read_fails` (a v2 chain without
+  `a_short_answer_fails_every_read`, `a_long_answer_fails_every_read`,
+  `without_a_resolver_every_read_fails` (a v2 chain without
   tags needs none), `a_read_by_hash_checks_the_resolved_hash` (the resolver answers each
   position's neighbour: by hash and with meta fail, by number has no hash to check),
   `static_file_reads_refuse_position_rows` (the static-file provider's and the jar's own reads,
@@ -3249,7 +3250,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `an_undecodable_row_fails_every_read` (a stored row given an unknown tag, or a non-canonical
   position, with a valid checksum: `TxBodyReadError::Row` from every read through
   `BlockchainProvider` and the static-file provider's).
-  Mutation-checked, each failing a test: no length check on the resolver's answer, no hash check
+  Mutation-checked, each failing a test: no length check on the resolver's answer (or one that
+  accepts a longer answer), no hash check
   by hash or with meta, a missing resolver read as no transactions, the static-file reads taking
   a position row for a missing one (by number and in `transaction_hashes_by_range`), each of the
   factory's three reads back on the static files, no re-read in `transaction_hashes_by_range`,

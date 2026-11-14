@@ -240,6 +240,8 @@ enum Answer {
     Fail,
     /// One transaction fewer than asked.
     Short,
+    /// One transaction more than asked: the last one twice.
+    Long,
     /// The transaction after each one asked.
     Next,
 }
@@ -287,8 +289,12 @@ impl TxBodyResolver<EthPrimitives> for MockResolver {
                 TransactionSigned::decode_2718(&mut bytes.as_ref()).unwrap()
             })
             .collect();
-        if answer == Answer::Short {
-            txs.pop();
+        match answer {
+            Answer::Short => {
+                txs.pop();
+            }
+            Answer::Long => txs.extend(txs.last().cloned()),
+            Answer::Right | Answer::Fail | Answer::Next => {}
         }
         Ok(txs)
     }
@@ -621,6 +627,19 @@ fn a_short_answer_fails_every_read() {
     *built.resolver.answer.lock() = Answer::Short;
     assert_reads_fail(&built, &chain, |err| {
         matches!(read_error(err), Some(TxBodyReadError::WrongCount { block: FAR, .. }))
+    });
+}
+
+#[test]
+fn a_long_answer_fails_every_read() {
+    let chain = chain();
+    let built = build(&chain, Rows::Positions, true);
+    *built.resolver.answer.lock() = Answer::Long;
+    assert_reads_fail(&built, &chain, |err| {
+        matches!(
+            read_error(err),
+            Some(TxBodyReadError::WrongCount { block: FAR, asked, returned }) if *returned == asked + 1
+        )
     });
 }
 
