@@ -2130,11 +2130,17 @@ impl ConsensusChain {
     /// the process, such as the execution database's transaction resolver: it holds the live pack
     /// only weakly, so it never keeps the chain from reaching sole ownership
     /// ([`Self::wait_until_sole_owner`]) at shutdown.
+    ///
+    /// Taken on a tokio runtime, its [`LiveBatches::open_past`] starts the chain's read-side heal
+    /// of a past epoch it finds damaged, on that runtime.
     pub fn live_batches(&self) -> LiveBatches {
         LiveBatches {
             current_pack: Arc::downgrade(&self.current_pack),
             install_generation: self.install_generation.clone(),
             pack_install: self.pack_install.clone(),
+            heal: tokio::runtime::Handle::try_current()
+                .ok()
+                .map(|runtime| (runtime, self.read_side_heal())),
         }
     }
 
@@ -2470,20 +2476,25 @@ impl ConsensusChain {
     /// build, no staging copy is left behind, and a heal that outlasts any one reader still
     /// completes.
     async fn heal_static(&self, epoch: Epoch) -> Result<(), PackError> {
-        let heal = ReadSideHeal {
-            base_path: self.base_path.clone(),
-            current_pack: Arc::downgrade(&self.current_pack),
-            pack_install: self.pack_install.clone(),
-            install_generation: self.install_generation.clone(),
-            heal_locks: self.heal_locks.clone(),
-            heal_failures: self.heal_failures.clone(),
-        };
+        let heal = self.read_side_heal();
         if let Some(recent) = heal.recent_failure(epoch) {
             return Err(recent);
         }
         tokio::spawn(heal.run(epoch))
             .await
             .map_err(|e| PackError::PersistError(format!("epoch {epoch} heal task failed: {e}")))?
+    }
+
+    /// What a read-side heal of a past epoch works with (see [`Self::heal_static`]).
+    fn read_side_heal(&self) -> ReadSideHeal {
+        ReadSideHeal {
+            base_path: self.base_path.clone(),
+            current_pack: Arc::downgrade(&self.current_pack),
+            pack_install: self.pack_install.clone(),
+            install_generation: self.install_generation.clone(),
+            heal_locks: self.heal_locks.clone(),
+            heal_failures: self.heal_failures.clone(),
+        }
     }
 
     /// Open the sealed static pack for `epoch` if its files exist on disk.
@@ -2514,6 +2525,9 @@ pub struct LiveBatches {
     current_pack: Weak<Mutex<ConsensusPack>>,
     install_generation: Arc<AtomicU64>,
     pack_install: Arc<tokio::sync::Mutex<()>>,
+    /// The chain's read-side heal and the runtime it runs on, if [`ConsensusChain::live_batches`]
+    /// was taken on one.
+    heal: Option<(tokio::runtime::Handle, ReadSideHeal)>,
 }
 
 impl LiveBatches {
@@ -2543,26 +2557,52 @@ impl LiveBatches {
     }
 
     /// A [`PackReader`] of past epoch `epoch` under `epochs_dir` (the chain's directory), told
-    /// apart from a seal in progress. An epoch handoff seals the previous epoch's data log, then
-    /// its indexes, and an open between the two fails as a damaged pack's would. So an open that
-    /// fails for any reason but a missing, legacy or unsealed pack or the environment is answered
-    /// [`BatchReadError::Unsealed`] (retry shortly) while the chain is handing off or installing
-    /// an epoch (`pack_install` is held), as `get_static` waits one out; otherwise the epoch is
-    /// opened once more with no handoff able to start, and that answer stands.
+    /// apart from a seal or install in progress and from damage. An epoch handoff seals the
+    /// previous epoch's data log, then its indexes, and an open between the two fails as a damaged
+    /// pack's would; an install renames an epoch's files in, and an open can find the data log
+    /// without its indexes. So an open that fails with the data log present, for any reason but a
+    /// legacy or unsealed pack or the environment, is answered [`BatchReadError::Unsealed`]
+    /// (retry shortly) while the chain is handing off or installing an epoch (`pack_install` is
+    /// held), as `get_static` waits one out. Otherwise the epoch is opened once more with no
+    /// handoff or install able to start. A failure then is damage to the derived files beside a
+    /// data log, as `get_static` treats it: [`BatchReadError::Damaged`], and the chain's read-side
+    /// heal is started for it (see [`ConsensusChain::live_batches`]).
     ///
     /// Blocking (see [`PackReader::open`]): call it from a blocking thread.
     pub fn open_past(&self, epochs_dir: &Path, epoch: Epoch) -> Result<PackReader, BatchReadError> {
-        match PackReader::open(epochs_dir, epoch) {
-            Err(BatchReadError::Open(e))
-                if !e.is_missing_static_files() && !e.is_environmental() =>
-            {
-                let Ok(_install) = self.pack_install.try_lock() else {
-                    return Err(BatchReadError::Unsealed);
-                };
-                PackReader::open(epochs_dir, epoch)
+        let damage = |read: &Result<PackReader, BatchReadError>| match read {
+            Err(BatchReadError::Open(e)) if !e.is_environmental() => {
+                !e.is_missing_static_files()
+                    || epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME).is_file()
             }
-            read => read,
+            _ => false,
+        };
+        let read = PackReader::open(epochs_dir, epoch);
+        if !damage(&read) {
+            return read;
         }
+        let Ok(_install) = self.pack_install.try_lock() else {
+            return Err(BatchReadError::Unsealed);
+        };
+        let read = PackReader::open(epochs_dir, epoch);
+        if !damage(&read) {
+            return read;
+        }
+        let Err(BatchReadError::Open(e)) = read else { unreachable!("damage is an open error") };
+        self.start_heal(epoch);
+        Err(BatchReadError::Damaged(e))
+    }
+
+    /// Start the chain's read-side heal of past epoch `epoch` on its runtime, unless one is
+    /// running or failed within [`ReadSideHeal::RETRY_BACKOFF`] (then reads fail until the backoff
+    /// ends and a later read starts another).
+    fn start_heal(&self, epoch: Epoch) {
+        let Some((runtime, heal)) = &self.heal else { return };
+        if heal.recent_failure(epoch).is_some() || heal.running(epoch) {
+            return;
+        }
+        warn!(target: "consensus::store", epoch, "a past epoch's pack read as damaged; healing it read-side");
+        drop(runtime.spawn(heal.clone().run(epoch)));
     }
 }
 
@@ -2570,6 +2610,7 @@ impl LiveBatches {
 /// the heal can run as its own task. The live pack is held only weakly, so a heal still running at
 /// shutdown never keeps the chain from reaching sole ownership
 /// ([`ConsensusChain::wait_until_sole_owner`]).
+#[derive(Debug, Clone)]
 struct ReadSideHeal {
     base_path: PathBuf,
     current_pack: Weak<Mutex<ConsensusPack>>,
@@ -2607,6 +2648,11 @@ impl ReadSideHeal {
             locks.remove(&epoch);
         }
         result
+    }
+
+    /// Whether a heal of `epoch` holds its heal lock now.
+    fn running(&self, epoch: Epoch) -> bool {
+        self.heal_locks.lock().get(&epoch).is_some_and(|lock| lock.try_lock().is_err())
     }
 
     /// The failure a heal of `epoch` hit within [`Self::RETRY_BACKOFF`], if any.
@@ -4896,8 +4942,9 @@ mod test {
 
     /// `LiveBatches::open_past` opens a sealed past epoch. A pack that fails its open as damaged
     /// while the chain holds `pack_install` (a handoff sealing the previous epoch's log, then its
-    /// indexes, looks damaged in between) is unsealed, to retry; with the lock free the failure
-    /// stands. A missing epoch is missing either way.
+    /// indexes, looks damaged in between) is unsealed, to retry; with the lock free it is damaged,
+    /// and the read-side heal it starts rebuilds the index from the data log, so the epoch opens
+    /// again. A missing epoch is missing either way.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_live_batches_tell_a_seal_in_progress_from_a_damaged_past_epoch() {
         use crate::consensus_pack::BatchReadError;
@@ -4914,7 +4961,7 @@ mod test {
         consensus_chain.new_epoch(record0, committee.advance_epoch_for_test(1)).await.unwrap();
         let live = consensus_chain.live_batches();
         let reader = live.open_past(temp_dir.path(), 0).expect("a sealed past epoch opens");
-        assert_eq!(reader.batch(batch.digest()).expect("read"), Some(batch));
+        assert_eq!(reader.batch(batch.digest()).expect("read"), Some(batch.clone()));
         drop(reader);
 
         let pdx = temp_dir.path().join("epoch-0").join("idx").join("index_pos.pdx");
@@ -4931,9 +4978,21 @@ mod test {
         }
         let read = live.open_past(temp_dir.path(), 0);
         assert!(
-            matches!(read, Err(BatchReadError::Open(PackError::CorruptPack(_)))),
+            matches!(read, Err(BatchReadError::Damaged(PackError::CorruptPack(_)))),
             "with no handoff a damaged pack is damaged, got {read:?}"
         );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let reader = loop {
+            match live.open_past(temp_dir.path(), 0) {
+                Ok(reader) => break reader,
+                Err(e) => {
+                    assert!(std::time::Instant::now() < deadline, "not healed: {e}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        assert_eq!(reader.batch(batch.digest()).expect("read"), Some(batch), "healed");
+        drop(reader);
         consensus_chain.close().await;
     }
 

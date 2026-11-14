@@ -196,11 +196,15 @@ no thread of its own.
   - `ConsensusChain::live_batches` gives the same read (and `install_generation`) to a reader that
     lives as long as the process: `LiveBatches` holds the live pack weakly, so it never keeps the
     chain from reaching sole ownership at shutdown (`wait_until_sole_owner`), and it answers `None`
-    once the chain is gone. Its `open_past` opens a past epoch's `PackReader` and tells a seal in
-    progress from damage: a handoff seals the data log, then the indexes, and an open in between
-    fails as damage would, so a failure while `pack_install` is held (a handoff or an install) is
-    `Unsealed`, and with the lock free the epoch is opened once more and that answer stands, as
-    `get_static` waits one out.
+    once the chain is gone. Its `open_past` opens a past epoch's `PackReader` and tells a seal or
+    install in progress from damage: a handoff seals the data log, then the indexes, and an open
+    in between fails as damage would, and an install can leave the data log briefly without its
+    indexes. So a failure with the data log present while `pack_install` is held (a handoff or an
+    install) is `Unsealed`; with the lock free the epoch is opened once more, and a failure then is
+    `Damaged`, damage to the derived files beside a data log, as `get_static` treats it. It starts
+    the chain's read-side heal of the epoch on the runtime `live_batches` was taken on (unless one
+    is running or failed within its backoff), so the epoch's reads answer again once the heal is
+    installed.
   - `ConsensusChain::install_generation` moves at every install of an epoch's files (an import, a
     read-side heal) and every swap of the current pack. A handle opened before an install keeps
     reading the copy it opened (the replaced files stay readable while it holds them), so a reader

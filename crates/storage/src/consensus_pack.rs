@@ -6846,6 +6846,11 @@ pub enum BatchReadError {
     /// The epoch's pack failed to open ([`ConsensusPack::open_static`]). An epoch with no pack on
     /// disk is an error whose [`PackError::is_missing_static_files`] is true.
     Open(PackError),
+    /// The epoch's data log is present but its derived files are missing or damaged, with no
+    /// handoff or install in progress (`ConsensusChain`'s `LiveBatches::open_past`). The chain's
+    /// read-side heal was asked to rebuild them from the data log, unless one is running or failed
+    /// within the last minute; reads succeed once it is installed.
+    Damaged(PackError),
 }
 
 impl Error for BatchReadError {}
@@ -6871,6 +6876,11 @@ impl Display for BatchReadError {
             ),
             Self::Unsealed => write!(f, "the epoch's pack is not sealed"),
             Self::Open(e) => write!(f, "the epoch's pack failed to open: {e}"),
+            Self::Damaged(e) => write!(
+                f,
+                "the epoch's pack is damaged beside its data log ({e}); its indexes are rebuilt \
+                 from the data log, retry shortly"
+            ),
         }
     }
 }

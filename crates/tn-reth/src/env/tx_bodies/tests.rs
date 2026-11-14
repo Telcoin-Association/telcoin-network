@@ -234,6 +234,8 @@ enum Scripted {
     Missing,
     Installing,
     Unsealed,
+    /// `Unsealed`, and the epoch becomes the live one meanwhile.
+    UnsealedThenLive,
     Legacy,
 }
 
@@ -294,6 +296,10 @@ impl PackBatches for Arc<FakePacks> {
             Some(Scripted::Missing) => return Err(PackOpenError::Missing),
             Some(Scripted::Installing) => return Err(PackOpenError::Installing),
             Some(Scripted::Unsealed) => return Err(PackOpenError::Unsealed),
+            Some(Scripted::UnsealedThenLive) => {
+                *self.live_epoch.lock() = Some(epoch);
+                return Err(PackOpenError::Unsealed);
+            }
             Some(Scripted::Legacy) => return Err(PackOpenError::Failed(BatchReadError::Legacy)),
             None => {}
         }
@@ -396,6 +402,21 @@ fn an_unsealed_or_installing_pack_is_waited_for() -> eyre::Result<()> {
     let started = Instant::now();
     assert!(matches!(kind(resolve(&source, 5, &b, &[0])), TxBodyErrorKind::HandoffTimeout(_)));
     assert!(started.elapsed() >= PACK_WAIT, "{:?}", started.elapsed());
+    Ok(())
+}
+
+/// An epoch that becomes the live one while its closed pack is waited for (a same-epoch swap, a
+/// restart's first `new_epoch`) is read from the live pack: its log stays unsealed, so waiting for
+/// a closed pack would time out.
+#[test]
+fn an_epoch_that_becomes_live_during_the_wait_is_read_live() -> eyre::Result<()> {
+    let (source, packs) = pack_source(0);
+    let b = batch(1, &[]);
+    packs.live.lock().insert(b.digest(), b.clone());
+    packs.script.lock().push_back(Scripted::UnsealedThenLive);
+    assert_eq!(source.batch(7, b.digest()).expect("live").1, BatchSource::LivePack);
+    assert_eq!(packs.opens.load(Ordering::SeqCst), 1, "one open, then the live pack");
+    assert_eq!(packs.live_reads.load(Ordering::SeqCst), 1);
     Ok(())
 }
 

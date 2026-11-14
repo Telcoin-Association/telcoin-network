@@ -987,10 +987,12 @@ CHANGES.md TN-0200..0203.
      least recently used closed first, all dropped when an install replaces an epoch's files or a
      handoff swaps the live pack).
      Every pack read hashes the batch again against its digest. A pack not sealed yet (the epoch
-     a handoff is sealing) or being replaced is tried again for up to a second; so is one that
-     fails its open while the chain hands off or installs an epoch, since a handoff seals the
-     data log before the indexes and the pack reads as damaged in between
-     (`LiveBatches::open_past`).
+     a handoff is sealing) or being replaced is tried again for up to a second, asking the live
+     pack again each time (the epoch may have become the live one); so is one that fails its
+     open while the chain hands off or installs an epoch, since a handoff seals the data log
+     before the indexes and the pack reads as damaged in between (`LiveBatches::open_past`). A
+     past pack that still fails its open with no handoff or install in progress is damaged: the
+     read fails at once, and the chain's read-side heal rebuilds its indexes in the background.
 
   At most 4 pack reads run at once. Each position is checked against the batch's length and its
   transaction decoded (EIP-2718). A read by hash checks the resolved transaction's hash too.
@@ -1040,12 +1042,15 @@ CHANGES.md TN-0200..0203.
     missing epoch or a later one).
   - A damaged pack, a missing batch or a failed read (the failure counter's `pack_missing`,
     `batch_missing` or `read`): reads of the blocks it holds fail, other reads answer, and the
-    node runs on. With the node stopped, `telcoin-network db validate` reports the pack's damage
-    and `db repair` fixes what it can (crates/storage/README.md); otherwise restore
-    `consensus-db/` from a backup, or start over as above.
+    node runs on. A past epoch's pack whose indexes are missing or damaged beside its sealed data
+    log is rebuilt from the data log in the background, as a consensus read of the epoch rebuilds
+    it, and its reads answer again once that is done. With the node stopped, `telcoin-network db
+    validate` reports the pack's damage and `db repair` fixes what it can
+    (crates/storage/README.md); otherwise restore `consensus-db/` from a backup, or start over as
+    above.
   - `handoff_timeout`: a closed epoch's pack stayed unsealed or mid-install for a second. During
-    an epoch handoff it passes; if it stays, a past epoch's pack was left unsealed or lacks files
-    beside its data log: `db validate`.
+    an epoch handoff it passes; if it stays, a past epoch's pack was left unsealed: `db
+    validate`.
 - **Moving between formats.** An inline datadir becomes a version-2 one only by a rebuild: `db
   reset-execution`, then a start that re-executes from the node's own packs. `db load-state`
   creates a version-2 datadir: the restored blocks hold no transaction rows, and the rows after

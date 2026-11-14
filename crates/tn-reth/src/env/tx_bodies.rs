@@ -118,12 +118,8 @@ pub enum TxBodyErrorKind {
     #[error("the batch's transactions exceed 4 GiB")]
     BatchTooLarge,
     /// The epoch's pack stayed unsealed, or its replacement unfinished, for [`PACK_WAIT`]: an
-    /// epoch handoff that did not finish, a past epoch left unsealed, or a pack missing files
-    /// beside its data log (`db validate`).
-    #[error(
-        "the epoch's consensus pack stayed unsealed, mid-install or without all its files for \
-         {0:?}"
-    )]
+    /// epoch handoff that did not finish, or a past epoch left unsealed (`db validate`).
+    #[error("the epoch's consensus pack stayed unsealed or mid-install for {0:?}")]
     HandoffTimeout(Duration),
 }
 
@@ -380,21 +376,17 @@ impl TxBodySource {
 /// pack's, waiting up to [`PACK_WAIT`] while the pack is being sealed or replaced. A reader kept
 /// from an earlier read that misses the batch is opened again once: an install may have replaced
 /// a partial copy of the epoch since it was opened.
+///
+/// The live pack is asked again on each wait: the epoch can become the live one meanwhile (a
+/// same-epoch swap of an imported pack for a writable one, or the first `new_epoch` after a
+/// restart), and its log is then unsealed for good, so only the live pack answers.
 fn read_packs(
     packs: &PackSource,
     epoch: Epoch,
     digest: B256,
 ) -> Result<(Batch, BatchSource), TxBodyErrorKind> {
-    let live = {
-        let _permit = packs.permit();
-        packs.live_batch(epoch, digest)
-    };
-    match live {
-        Some(Ok(Some(batch))) => return Ok((batch, BatchSource::LivePack)),
-        Some(Ok(None)) => return Err(TxBodyErrorKind::BatchMissing),
-        // sealed under the read: read it as a closed epoch
-        Some(Err(BatchReadError::Closed)) | None => {}
-        Some(Err(e)) => return Err(TxBodyErrorKind::Read(Box::new(e))),
+    if let Some(live) = read_live(packs, epoch, digest) {
+        return live;
     }
     let deadline = Instant::now() + PACK_WAIT;
     let mut reopened = false;
@@ -414,12 +406,34 @@ fn read_packs(
             Err(PackOpenError::Missing) => return Err(TxBodyErrorKind::PackMissing),
             Err(PackOpenError::Failed(e)) => return Err(TxBodyErrorKind::Read(Box::new(e))),
             Err(PackOpenError::Unsealed | PackOpenError::Installing) => {
+                if let Some(live) = read_live(packs, epoch, digest) {
+                    return live;
+                }
                 if Instant::now() >= deadline {
                     return Err(TxBodyErrorKind::HandoffTimeout(PACK_WAIT));
                 }
                 std::thread::sleep(PACK_RETRY);
             }
         }
+    }
+}
+
+/// Batch `digest` from the live pack, if `epoch` is live and the pack was not sealed under the
+/// read (then the epoch is read as a closed one: `None`).
+fn read_live(
+    packs: &PackSource,
+    epoch: Epoch,
+    digest: B256,
+) -> Option<Result<(Batch, BatchSource), TxBodyErrorKind>> {
+    let live = {
+        let _permit = packs.permit();
+        packs.live_batch(epoch, digest)
+    };
+    match live? {
+        Ok(Some(batch)) => Some(Ok((batch, BatchSource::LivePack))),
+        Ok(None) => Some(Err(TxBodyErrorKind::BatchMissing)),
+        Err(BatchReadError::Closed) => None,
+        Err(e) => Some(Err(TxBodyErrorKind::Read(Box::new(e)))),
     }
 }
 

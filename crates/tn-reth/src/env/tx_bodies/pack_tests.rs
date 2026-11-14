@@ -40,7 +40,7 @@ use tempfile::TempDir;
 use tn_storage::{
     archive::pack_iter::PackIter,
     consensus::ConsensusChain,
-    consensus_pack::{BatchReadError, PackRecord, DATA_NAME},
+    consensus_pack::{BatchReadError, PackRecord, BATCH_DIGEST_NAME, DATA_NAME},
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, BlockNumber, Committee, ConsensusNumHash,
@@ -501,13 +501,14 @@ async fn a_lost_or_damaged_pack_refuses_the_start_or_fails_the_read() -> eyre::R
     fs::remove_dir_all(&epoch1)?;
 
     // epoch 0's pack under epoch 1's name: refused at its open as another epoch's, never read
+    // (damage beside a data log, whose read-side heal refuses it too)
     copy_dir(&epochs_dir.join("epoch-0"), &epoch1)?;
     let (env, _tasks) = run.reopen_pointers(0)?;
     let err = read(&env, first1).expect_err("another epoch's pack");
     let misplaced = resolve_error(&err);
     assert_names(misplaced, first1);
     assert!(
-        matches!(&misplaced.kind, TxBodyErrorKind::Read(e) if matches!(**e, BatchReadError::Open(_))),
+        matches!(&misplaced.kind, TxBodyErrorKind::Read(e) if matches!(**e, BatchReadError::Damaged(_))),
         "another epoch's pack fails its open: {misplaced}"
     );
     drop(env);
@@ -527,6 +528,46 @@ async fn a_lost_or_damaged_pack_refuses_the_start_or_fails_the_read() -> eyre::R
         "a damaged record is a read error: {damaged}"
     );
     assert_eq!(read(&env, first1)?, first1.encoded, "the other batches still read");
+    Ok(())
+}
+
+/// A past epoch's pack whose batch index is missing beside its sealed data log (a crash between
+/// discarding and recreating the index directories) is damage, not an install: the read fails at
+/// once, without the handoff wait, the chain's read-side heal rebuilds the index from the data
+/// log, as a consensus read of the epoch would, and the read answers again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_past_pack_missing_its_index_is_healed_and_reads_again() -> eyre::Result<()> {
+    let mut run = Run::new(&[TxBodies::Pointers], 0, 3, |_, _| Box::new(|| ())).await?;
+    let stored = read_all(run.env(TxBodies::Pointers))?;
+    run.close(TxBodies::Pointers);
+    let tx = stored.iter().find(|tx| tx.epoch == 1).expect("epoch 1 transactions");
+    let index = run.epochs_dir().join("epoch-1").join(BATCH_DIGEST_NAME);
+    fs::remove_dir_all(&index)?;
+
+    let (env, _tasks) = run.reopen_pointers(0)?;
+    let started = std::time::Instant::now();
+    let err = read(&env, tx).expect_err("the index is missing");
+    let damaged = resolve_error(&err);
+    assert_names(damaged, tx);
+    assert!(
+        matches!(&damaged.kind, TxBodyErrorKind::Read(e) if matches!(**e, BatchReadError::Damaged(_))),
+        "a missing index is damage: {damaged}"
+    );
+    assert!(started.elapsed() < super::PACK_WAIT, "failed at once: {:?}", started.elapsed());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match read(&env, tx) {
+            Ok(encoded) => {
+                assert_eq!(encoded, tx.encoded, "the healed pack resolves the transaction");
+                break;
+            }
+            Err(err) => {
+                assert!(std::time::Instant::now() < deadline, "not healed: {err}");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+    assert!(index.is_dir(), "the heal rebuilt the index");
     Ok(())
 }
 
