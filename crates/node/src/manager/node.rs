@@ -1563,7 +1563,7 @@ where
         // storage error before draining (a bare `?`) would skip that drain; the `Drop`
         // fallback is runtime-safe regardless. A storage error still takes precedence over
         // `result`.
-        let stop_result = self.finish_stopped_epoch().await;
+        let stop_result = self.finish_stopped_epoch(result.is_err()).await;
         node_task_manager.shutdown_tasks(NODE_TASK_EXIT_GRACE).await;
         stop_result?;
 

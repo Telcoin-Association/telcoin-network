@@ -603,12 +603,15 @@ where
     /// Once the consensus task has released the pack (waiting up to [`EPOCH_TASK_EXIT_GRACE`]),
     /// it is sealed as `finish_epoch` seals it ([`seal_certificate_pack`]), so a failed save or
     /// final flush stops the node with an error instead of only being logged by the pack's drop.
-    /// Then the consensus pack is persisted and the stores checked (`ensure_stores_durable`), the
-    /// barriers `finish_epoch` runs too.
+    /// Then the consensus pack is persisted and, on a clean stop, the stores are checked
+    /// (`ensure_stores_durable`), the barriers `finish_epoch` runs too.
     ///
     /// The loop's other ends come here as well: an epoch that ended through `finish_epoch` left no
-    /// pack, and an epoch that failed before it left its pack to be sealed here.
-    pub(super) async fn finish_stopped_epoch(&mut self) -> eyre::Result<()> {
+    /// pack, and an epoch that failed before it left its pack to be sealed here. When the loop
+    /// itself failed (`loop_failed`), its error is the node's exit error: a store that failed
+    /// mid-epoch is already reported by it (`run_epoch`'s store-failure arm), so the store check
+    /// is skipped rather than reporting the same failure again as an end-of-epoch one.
+    pub(super) async fn finish_stopped_epoch(&mut self, loop_failed: bool) -> eyre::Result<()> {
         if let Some(pack) = self.certificate_pack.take() {
             // a pack still shared after the wait is flushed, and its last handle seals it on drop
             let _ = tokio::time::timeout(EPOCH_TASK_EXIT_GRACE, async {
@@ -623,6 +626,9 @@ where
             .persist_current()
             .await
             .wrap_err("the consensus pack can no longer make writes durable; stopping the node")?;
+        if loop_failed {
+            return Ok(());
+        }
         ensure_stores_durable(&self.consensus_db).await
     }
 
@@ -1669,7 +1675,7 @@ pub(super) mod tests {
             drop(pack);
         });
 
-        manager.finish_stopped_epoch().await?;
+        manager.finish_stopped_epoch(false).await?;
         assert!(last_handle.upgrade().is_none(), "the stop sealed the pack's last handle");
         assert!(manager.certificate_pack.is_none(), "the slot is empty");
         let reopened = CertificatePack::open(packs.path(), 0);
@@ -1685,17 +1691,20 @@ pub(super) mod tests {
     async fn node_stop_reports_a_failed_epoch_store() -> eyre::Result<()> {
         let temp = TempDir::with_prefix("node_stop_failed_stores")?;
         let (mut manager, _engine, _reth_env, _tasks, _) = manager_with_engine(&temp).await?;
-        manager.finish_stopped_epoch().await.expect("a stop on healthy stores without a pack");
+        manager.finish_stopped_epoch(false).await.expect("a stop on healthy stores without a pack");
 
         let blocked = TempDir::with_prefix("node_stop_blocked_cert_pack")?;
         std::fs::write(blocked.path().join("epoch-0"), b"not a directory")?;
         manager.certificate_pack = Some(Arc::new(CertificatePack::open(blocked.path(), 0)));
-        let err = manager.finish_stopped_epoch().await.expect_err("a failed certificate pack");
+        let err = manager.finish_stopped_epoch(false).await.expect_err("a failed certificate pack");
         assert!(format!("{err:#}").contains("certificate pack"), "{err:#}");
 
         manager.consensus_db.fail_durability_for_test::<KadRecords>();
-        let err = manager.finish_stopped_epoch().await.expect_err("a store that cannot write");
+        let err = manager.finish_stopped_epoch(false).await.expect_err("a store that cannot write");
         assert!(format!("{err:#}").contains("the peer-record store"), "{err:#}");
+        // a loop that already failed (here: the store-failure arm) is the node's exit error; the
+        // stop does not report the same store again as an end-of-epoch failure
+        manager.finish_stopped_epoch(true).await.expect("the loop's error reports the store");
         Ok(())
     }
 
