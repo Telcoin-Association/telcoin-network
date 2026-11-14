@@ -18,7 +18,10 @@
 use crate::{
     consensus::LeaderSchedule,
     error::{ProposerError, ProposerResult},
-    metrics::{DigestsRequeuedHandles, HeadersProposedHandles, ProposeReason, RequeueCause},
+    metrics::{
+        DigestsRequeuedHandles, HeadersProposedHandles, ProposeReason, RequeueCause,
+        RequeueOrderUnknown, RequeuedOrderUnknownHandles, RequeuedOutOfOrderHandles,
+    },
     ConsensusBus, RecentBlocks,
 };
 use reth_metrics::metrics::Counter;
@@ -69,6 +72,7 @@ impl OurDigestMessage {
             received: now,
             first_received: now,
             requeued: false,
+            seq: None,
         };
         (ack_channel, digest)
     }
@@ -98,6 +102,13 @@ struct ProposerDigest {
     /// `requeued`, which splits headers whose digest wait may be cut short by a re-queue from the
     /// rest.
     pub requeued: bool,
+    /// This digest's place in its worker's lane: the order the worker reported it in, counted per
+    /// worker from zero over the proposer's life (one epoch), and kept across re-queues. `None`
+    /// when this proposer does not know it: the digest rode a stored header re-sent after a
+    /// restart, or a header re-sent after an own commit had settled its round. Read only to count
+    /// re-queues out of order (issue #1807, see [`LaneSequences`]), never when a header's contents
+    /// are chosen.
+    pub seq: Option<u64>,
 }
 
 #[cfg(test)]
@@ -188,6 +199,18 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// Which rule names the execution block of each new header (the `quorum_exec_block`
     /// switches), and the adaptive policy's window state. Epoch-scoped with the proposer.
     exec_block_policy: ExecBlockPolicy,
+    /// Each worker lane's sequence of reported digests and where the drained ones are, for the
+    /// out-of-order re-queue counter (issue #1807). Observability only.
+    lane_seqs: LaneSequences,
+    /// The highest own round a commit notice named in this proposer's life. Handling that notice
+    /// takes every tracked header at or below it out of [`Self::proposed_headers`], so a header
+    /// tracked there afterwards was put back by a re-send (the max-delay tick, or the restart
+    /// re-propose) and its digests are counted as `stale_resend`, never as out of order.
+    committed_own_round: Round,
+    /// The `tn_primary_requeued_out_of_order_total{cause}` counters, resolved once per epoch.
+    requeued_out_of_order: RequeuedOutOfOrderHandles,
+    /// The `tn_primary_requeued_order_unknown_total{reason}` counters, resolved once per epoch.
+    requeued_order_unknown: RequeuedOrderUnknownHandles,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -348,6 +371,10 @@ impl<DB: Database> Proposer<DB> {
                 quorum_exec_block,
                 quorum_exec_block_starved_rounds,
             ),
+            lane_seqs: LaneSequences::default(),
+            committed_own_round: 0,
+            requeued_out_of_order: RequeuedOutOfOrderHandles::new(),
+            requeued_order_unknown: RequeuedOrderUnknownHandles::new(),
         }
     }
 
@@ -902,6 +929,7 @@ impl<DB: Database> Proposer<DB> {
                 // a committed digest is done waiting, so its first receipt is no longer needed
                 Some(header) => header.payload().keys().for_each(|digest| {
                     self.proposed_first_received.remove(digest);
+                    self.lane_seqs.committed(digest);
                 }),
                 None => warn!(
                     "own committed header not found at round {round}, probably because of restarts."
@@ -920,21 +948,31 @@ impl<DB: Database> Proposer<DB> {
         // a re-queued digest's wait since it was last queued restarts here; its first receipt
         // comes back from `proposed_first_received`
         let requeued_at = Instant::now();
+        // a header tracked at or below an own round an earlier notice settled was re-sent after it
+        // left; its digests keep no sequence and are counted apart
+        let settled_round = self.committed_own_round;
+        let mut stale_resend = 0;
 
         // walk proposed headers in order by round, up to the committed round
         self.proposed_headers
             .iter()
             .take_while(|(header_round, _)| **header_round <= max_committed_round)
             .for_each(|(header_round, header)| {
+                let resent = *header_round <= settled_round;
+                if resent {
+                    stale_resend += header.payload().len();
+                }
                 // add payloads from oldest to newest into each worker's lane
                 push_payload(
                     &mut digests_to_resend,
                     header,
                     requeued_at,
                     &mut self.proposed_first_received,
+                    |batch| if resent { None } else { self.lane_seqs.returned(batch) },
                 );
                 retransmit_rounds.push(*header_round);
             });
+        self.committed_own_round = self.committed_own_round.max(max_committed_round);
 
         // process rounds that need to be retransmitted
         if !retransmit_rounds.is_empty() {
@@ -942,6 +980,7 @@ impl<DB: Database> Proposer<DB> {
                 digests_to_resend,
                 retransmit_rounds.first().copied().unwrap_or_default(),
                 RequeueCause::Committed,
+                stale_resend,
             );
 
             // remove the old headers that failed
@@ -981,7 +1020,7 @@ impl<DB: Database> Proposer<DB> {
     /// The commit path re-queues every expired header in one call and keeps them oldest first
     /// across rounds. With `max_header_num_of_batches` capping a header, the older batches here
     /// can wait one header longer. This is rare, and #1807 covers what out-of-order carriage
-    /// does to transaction nonces.
+    /// does to transaction nonces; `tn_primary_requeued_out_of_order_total` counts it.
     ///
     /// Every report, acted on here or not, also reaches [`ExecBlockPolicy::on_cancelled`]: under
     /// the adaptive `quorum_exec_block` policy a cancelled own header opens a window, counted in
@@ -992,14 +1031,23 @@ impl<DB: Database> Proposer<DB> {
         // header's digests below
         self.exec_block_policy.on_cancelled(round, self.round);
         let mut requeued = BTreeMap::new();
-        match self.proposed_headers.get(&round) {
+        // see `process_committed_headers`: a header tracked again after an own commit settled its
+        // round keeps no sequence
+        let resent = round <= self.committed_own_round;
+        let stale_resend = match self.proposed_headers.get(&round) {
             Some(header) if round < self.round && header.digest() == digest => {
                 push_payload(
                     &mut requeued,
                     header,
                     Instant::now(),
                     &mut self.proposed_first_received,
+                    |batch| if resent { None } else { self.lane_seqs.returned(batch) },
                 );
+                if resent {
+                    header.payload().len()
+                } else {
+                    0
+                }
             }
             _ => {
                 debug!(
@@ -1011,9 +1059,9 @@ impl<DB: Database> Proposer<DB> {
                 );
                 return;
             }
-        }
+        };
         self.proposed_headers.remove(&round);
-        self.prepend_requeued(requeued, round, RequeueCause::Canceled);
+        self.prepend_requeued(requeued, round, RequeueCause::Canceled, stale_resend);
     }
 
     /// Prepend `requeued`, the batch digests of own headers that will not be committed (oldest
@@ -1022,26 +1070,46 @@ impl<DB: Database> Proposer<DB> {
     /// A non-empty re-queue logs one `digests resent` line and counts the digests in
     /// `tn_primary_digests_requeued_total{cause}`. `from_round` is the round of the oldest header
     /// the digests came from.
+    ///
+    /// The digests are also judged for order (issue #1807, the rule is [`LaneSequences::judge`]):
+    /// those that return behind a newer digest of their worker count in
+    /// `tn_primary_requeued_out_of_order_total{cause}` and in the line's `out_of_order`, those
+    /// without a known sequence in `tn_primary_requeued_order_unknown_total{reason}`.
+    /// `stale_resend` digests came from headers tracked again by a re-send after an own commit
+    /// settled their round; their callers gave them no sequence.
     fn prepend_requeued(
         &mut self,
         mut requeued: BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
         from_round: Round,
         cause: RequeueCause,
+        stale_resend: usize,
     ) -> usize {
         let count: usize = requeued.values().map(VecDeque::len).sum();
         // a header without digests leaves nothing to re-send
         if count == 0 {
             return 0;
         }
+        // every digest of this re-queue has left `lane_seqs` by now, so none is judged against
+        // another digest that returns with it
+        let order = self.lane_seqs.judge(&requeued);
         info!(
             target: "consensus::metrics",
             count,
             from_round,
             round = self.round,
             cause = cause.as_str(),
+            out_of_order = order.out_of_order,
             "digests resent"
         );
-        self.digests_requeued.counter(cause).increment(u64::try_from(count).unwrap_or(u64::MAX));
+        let total = |digests: usize| u64::try_from(digests).unwrap_or(u64::MAX);
+        self.digests_requeued.counter(cause).increment(total(count));
+        self.requeued_out_of_order.counter(cause).increment(total(order.out_of_order));
+        self.requeued_order_unknown
+            .counter(RequeueOrderUnknown::UnknownSeq)
+            .increment(total(order.unknown.saturating_sub(stale_resend)));
+        self.requeued_order_unknown
+            .counter(RequeueOrderUnknown::StaleResend)
+            .increment(total(stale_resend));
 
         // prepend the re-queued digests to each worker's pending queue and update `self`
         std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
@@ -1049,6 +1117,13 @@ impl<DB: Database> Proposer<DB> {
         });
         self.digests = requeued;
         count
+    }
+
+    /// Queue a digest its worker just reported at the back of the worker's lane, numbered next in
+    /// that lane's sequence.
+    fn queue_reported(&mut self, mut digest: ProposerDigest) {
+        digest.seq = Some(self.lane_seqs.assign(digest.worker_id));
+        self.digests.entry(digest.worker_id).or_default().push_back(digest);
     }
 
     /// Total number of digests pending across all workers.
@@ -1093,12 +1168,13 @@ impl<DB: Database> Proposer<DB> {
             .filter_map(|worker_id| self.digests.get_mut(&worker_id).and_then(VecDeque::pop_front))
             .collect();
         // the header's payload keeps no time, so each digest's first receipt waits here until the
-        // digest commits or comes back in a re-queue
+        // digest commits or comes back in a re-queue; its sequence waits beside it
         drained.iter().for_each(|drained| {
             self.proposed_first_received
                 .entry(drained.digest)
                 .and_modify(|first| *first = (*first).min(drained.first_received))
                 .or_insert(drained.first_received);
+            self.lane_seqs.drained(drained);
         });
         drained
     }
@@ -1346,7 +1422,7 @@ impl<DB: Database> Proposer<DB> {
                     // parse message into parts
                     let (ack, digest) = msg.process();
                     let _ = ack.send(());
-                    self.digests.entry(digest.worker_id).or_default().push_back(digest);
+                    self.queue_reported(digest);
                 }
                 // check for new parent certificates
                 // synchronizer sends collection of certificates when there is quorum (2f+1)
@@ -1497,17 +1573,117 @@ impl fmt::Display for HeaderDigests<'_> {
     }
 }
 
+/// The order bookkeeping behind `tn_primary_requeued_out_of_order_total` (issue #1807): each worker
+/// lane's sequence of reported digests, and which drained digests are out of the queue.
+///
+/// A lane is one (author, worker) pair: this proposer's digests of one worker. The worker reports
+/// them in the order their transactions' nonces need, the queue and the drain keep that order, and
+/// a header carries them in it, so a re-queue is the only way an older digest can end up executed
+/// after a newer one.
+///
+/// Observability only: the proposer never reads this when it chooses a header's contents. It grows
+/// with the tracked headers: one entry per digest of the header in flight or of a tracked header,
+/// the same bound as `Proposer::proposed_first_received`, plus one value per worker.
+#[derive(Debug, Default)]
+struct LaneSequences {
+    /// The sequence the next digest each worker reports receives.
+    next: BTreeMap<WorkerId, u64>,
+    /// Every digest drained into an own header that has since neither returned to the queue nor
+    /// committed: the digests of the header in flight and of the tracked headers, each with its
+    /// worker and its sequence (`None` when unknown).
+    out: BTreeMap<BlockHash, (WorkerId, Option<u64>)>,
+    /// Per worker, the highest sequence a committed own header carried.
+    committed: BTreeMap<WorkerId, u64>,
+}
+
+impl LaneSequences {
+    /// The sequence of the next digest `worker_id` reports.
+    fn assign(&mut self, worker_id: WorkerId) -> u64 {
+        let next = self.next.entry(worker_id).or_default();
+        let seq = *next;
+        *next = seq.saturating_add(1);
+        seq
+    }
+
+    /// Record `digest` as drained into the header being built. A digest its worker reported twice
+    /// keeps the place of the copy drained first.
+    fn drained(&mut self, digest: &ProposerDigest) {
+        self.out.entry(digest.digest).or_insert((digest.worker_id, digest.seq));
+    }
+
+    /// Take back the sequence of `digest`, which returns to the queue.
+    fn returned(&mut self, digest: &BlockHash) -> Option<u64> {
+        self.out.remove(digest).and_then(|(_, seq)| seq)
+    }
+
+    /// Record `digest` as committed in an own header: it leaves for good, and its sequence raises
+    /// its lane's committed mark.
+    fn committed(&mut self, digest: &BlockHash) {
+        if let Some((worker_id, Some(seq))) = self.out.remove(digest) {
+            self.committed
+                .entry(worker_id)
+                .and_modify(|mark| *mark = (*mark).max(seq))
+                .or_insert(seq);
+        }
+    }
+
+    /// Judge the order of the digests in `requeued`, which return to the front of their lanes.
+    ///
+    /// A re-queued digest is **out of order** when its lane has a newer digest (a higher sequence)
+    /// that has already left the queue and does not return with it: one drained into an own header
+    /// that is still in flight or tracked and is not part of this re-queue, or one carried by an
+    /// own header that committed. Such a newer digest is executed first if its header commits, so
+    /// the older one can only follow it. A newer digest that came back to the queue earlier does
+    /// not count: the re-queued digest lands ahead of it. Every digest of this re-queue must have
+    /// left `out` before the call, so digests that return together are not judged against each
+    /// other.
+    ///
+    /// The count is per re-queue: a digest re-queued twice behind newer ones counts twice. A digest
+    /// without a known sequence is counted as unknown, never as out of order.
+    fn judge(&self, requeued: &BTreeMap<WorkerId, VecDeque<ProposerDigest>>) -> RequeueOrder {
+        // the newest sequence of each lane that is out of the queue for now or for good
+        let mut newest_out = self.committed.clone();
+        for (worker_id, seq) in self.out.values() {
+            if let Some(seq) = seq {
+                newest_out.entry(*worker_id).and_modify(|n| *n = (*n).max(*seq)).or_insert(*seq);
+            }
+        }
+        let mut order = RequeueOrder::default();
+        for digest in requeued.values().flatten() {
+            match digest.seq {
+                None => order.unknown += 1,
+                Some(seq) if newest_out.get(&digest.worker_id).is_some_and(|n| *n > seq) => {
+                    order.out_of_order += 1
+                }
+                Some(_) => {}
+            }
+        }
+        order
+    }
+}
+
+/// The order of one re-queue's digests, from [`LaneSequences::judge`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RequeueOrder {
+    /// Digests that return behind a newer digest of their lane.
+    out_of_order: usize,
+    /// Digests without a known sequence.
+    unknown: usize,
+}
+
 /// Append the batch digests of `header`, in payload order, to their workers' lanes in `lanes`,
 /// each stamped as queued at `requeued_at` and marked as re-queued.
 ///
 /// Each digest takes its first receipt back out of `first_received`, so its wait from the worker's
 /// report keeps counting across the re-queue. A digest without one (it rode a stored header
-/// re-sent after a restart, so this proposer never received it) starts at `requeued_at`.
+/// re-sent after a restart, so this proposer never received it) starts at `requeued_at`. Its lane
+/// sequence comes from `seq`, `None` when the proposer does not know it.
 fn push_payload(
     lanes: &mut BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
     header: &Header,
     requeued_at: Instant,
     first_received: &mut BTreeMap<BlockHash, Instant>,
+    mut seq: impl FnMut(&BlockHash) -> Option<u64>,
 ) {
     header.payload().iter().for_each(|(digest, worker_id)| {
         lanes.entry(*worker_id).or_default().push_back(ProposerDigest {
@@ -1516,6 +1692,7 @@ fn push_payload(
             received: requeued_at,
             first_received: first_received.remove(digest).unwrap_or(requeued_at),
             requeued: true,
+            seq: seq(digest),
         });
     });
 }
