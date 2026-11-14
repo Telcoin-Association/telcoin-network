@@ -2713,3 +2713,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `raw_block_transaction_gas_is_bounded_by_the_gas_cap`) and the trace permit tests, unchanged;
   where the work runs has no test.
   *Upstream*: no; upstream decodes in the handler.
+
+- **TN-0176** — Tests for the gas budget at the trace and debug call sites. *Kind*: test.
+  *Files*: `crates/rpc/rpc/src/permit_test_utils.rs` (`MockChain::eth_api_with_gas_cap`,
+  `MockChain::call_of_25_800_gas`), `crates/rpc/rpc/src/debug.rs` (tests
+  `raw_block_charges_each_transaction_to_the_budget`,
+  `trace_call_many_calls_share_the_gas_budget`), `crates/rpc/rpc/src/trace.rs` (test
+  `trace_call_many_calls_share_the_gas_budget`).
+  *Why*: TN-0057 and TN-0078 charge each call's or transaction's gas to one budget per request
+  in `trace_callMany`, `debug_traceCallMany` and raw `debug_traceBlock`, and only
+  `eth_callMany`'s charge had a test. In the raw block the charge never fails by itself (the
+  check before each transaction already holds it to what is left), so deleting it would have
+  checked every transaction against the whole cap unnoticed. Each test now fails when its
+  site's `charge` is removed: two 25,800-gas calls under a 50,000 cap, and two transfers with a
+  30,000 gas limit, of which the second fits only if the first was not charged. The
+  cancellation checks in these loops still have no test of their own. *Can reach execution or
+  storage*: no; tests.
+  *Tests*: the three above. Mutation-checked: each site's `charge` removed (each test fails).
+  *Upstream*: n/a.

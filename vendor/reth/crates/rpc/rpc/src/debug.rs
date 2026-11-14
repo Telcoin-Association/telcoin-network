@@ -1615,6 +1615,7 @@ mod raw_block_bound_tests {
     use alloy_primitives::TxKind;
     use reth_ethereum_primitives::{Block, BlockBody, Transaction as TnTransaction};
     use reth_rpc_eth_api::helpers::Call;
+    use reth_rpc_eth_types::GasCap;
     use reth_tasks::TokioTaskExecutor;
     use reth_testing_utils::generators;
 
@@ -1665,6 +1666,62 @@ mod raw_block_bound_tests {
         let err = api.debug_trace_raw_block(rlp, Default::default()).await.unwrap_err();
         assert!(
             matches!(&err, EthApiError::InvalidParams(m) if *m == format!("request exceeds the limit of {max} calls")),
+            "{err:?}"
+        );
+    }
+
+    /// TN(TN-0176): the first transaction's gas is charged to the block's budget: two 30,000
+    /// gas-limit transfers fit a 50,000 cap one at a time, not after the first used 21,000.
+    #[tokio::test]
+    async fn raw_block_charges_each_transaction_to_the_budget() {
+        let chain = MockChain::new();
+        let api = DebugApi::new(
+            chain.eth_api_with_gas_cap(GasCap(50_000)),
+            BlockingTaskGuard::new(1),
+            TokioTaskExecutor::default(),
+            futures::stream::empty(),
+        );
+        let traces = api
+            .debug_trace_raw_block(raw_block(&chain, [30_000]), Default::default())
+            .await
+            .expect("one transfer fits");
+        assert_eq!(traces.len(), 1);
+        let err = api
+            .debug_trace_raw_block(raw_block(&chain, [30_000, 30_000]), Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(m) if m == "request exceeds the gas budget of 50000"),
+            "{err:?}"
+        );
+    }
+
+    /// TN(TN-0176): `debug_traceCallMany`'s calls share the gas budget: one 25,800-gas call fits
+    /// a 50,000 cap, two do not.
+    #[tokio::test]
+    async fn trace_call_many_calls_share_the_gas_budget() {
+        let chain = MockChain::new();
+        let api = DebugApi::new(
+            chain.eth_api_with_gas_cap(GasCap(50_000)),
+            BlockingTaskGuard::new(1),
+            TokioTaskExecutor::default(),
+            futures::stream::empty(),
+        );
+        let call = MockChain::call_of_25_800_gas();
+        let at_block_1 =
+            Some(StateContext { block_number: Some(BlockId::number(1)), transaction_index: None });
+        let bundle = |calls| vec![Bundle { transactions: calls, block_override: None }];
+        let traces = api
+            .debug_trace_call_many(bundle(vec![call.clone()]), at_block_1, None)
+            .await
+            .expect("one call fits");
+        assert_eq!(traces[0].len(), 1);
+        let err = api
+            .debug_trace_call_many(bundle(vec![call.clone(), call]), at_block_1, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(m) if m == "request exceeds the gas budget of 50000"),
             "{err:?}"
         );
     }
