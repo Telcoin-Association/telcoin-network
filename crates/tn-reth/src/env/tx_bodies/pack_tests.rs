@@ -229,12 +229,12 @@ fn record(
     }
 }
 
-/// Three epochs of outputs saved into real packs and executed into one datadir per format.
+/// Epochs of outputs saved into real packs and executed into one datadir per format.
 struct Run {
     tmp: TempDir,
     chain: Arc<RethChainSpec>,
     consensus: ConsensusChain,
-    /// Every output, in order, and its epoch.
+    /// Every output, in order.
     outputs: Vec<LoadOutput>,
     /// Each epoch's committee.
     committees: Vec<Committee>,
@@ -256,9 +256,10 @@ impl Run {
     }
 
     /// Save `epochs` epochs of outputs into packs and execute them into a datadir per format of
-    /// `formats` (the pointer ones with a cache of `cache_bytes`), the packs attached before the
-    /// first output. Every epoch but the last is closed through the registry and handed off, and
-    /// at each handoff `during_handoff` runs beside it with the epoch's outputs.
+    /// `formats`, each with a cache of `cache_bytes`, the packs attached before the first output.
+    /// Every epoch but the last is closed through the registry and handed off: `during_handoff`
+    /// is called with the closing epoch before the handoff starts, and the closure it returns runs
+    /// once the handoff returns.
     async fn new(
         formats: &[TxBodies],
         cache_bytes: usize,
@@ -337,9 +338,10 @@ impl Run {
     }
 }
 
-/// A reader of `txs` through `env` in a loop on its own thread, until the returned stop runs:
-/// every read must give the transaction's bytes. The stop waits for one more whole pass, then
-/// asserts the reader read every transaction at least twice and failed none.
+/// A reader of `txs` through `env` in a loop on its own thread, started once it has read them all
+/// once, until the returned stop runs: every read must give the transaction's bytes. The stop
+/// waits for two more passes (so a whole pass ran after whatever happened meanwhile), then
+/// asserts no read failed.
 fn reader(env: RethEnv, txs: Vec<StoredTx>) -> Box<dyn FnOnce() + Send> {
     let stop = Arc::new(AtomicBool::new(false));
     let passes = Arc::new(AtomicUsize::new(0));
@@ -352,7 +354,6 @@ fn reader(env: RethEnv, txs: Vec<StoredTx>) -> Box<dyn FnOnce() + Send> {
                     let read = env
                         .blockchain_provider()
                         .database_provider_ro()
-                        .map_err(ProviderError::from)
                         .and_then(|provider| provider.transaction_by_id(tx.id));
                     match read {
                         Ok(Some(read)) if read.encoded_2718() == tx.encoded => {}
