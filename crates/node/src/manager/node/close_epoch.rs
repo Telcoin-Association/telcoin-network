@@ -24,7 +24,7 @@ use crate::{
 use eyre::{eyre, WrapErr as _};
 use std::{collections::BTreeSet, path::Path, time::Duration};
 use tn_config::TelcoinDirs;
-use tn_reth::{recover_raw_transaction, RethEnv};
+use tn_reth::{recover_raw_transaction, PoolError, PoolErrorKind, RethEnv};
 use tn_storage::{
     consensus_pack::DATA_NAME,
     tables::{
@@ -138,20 +138,57 @@ enum OrphanTxResult {
     Repooled,
     /// The bytes failed to decode, or the signer failed to recover.
     Invalid,
-    /// The pool refused the transaction, for any reason.
-    ///
-    /// The pool's [`tn_reth::PoolError`] carries the reason in a kind enum that `tn-reth` does
-    /// not re-export, so this crate cannot tell a nonce-too-low refusal from the others.
-    Refused,
+    /// The pool already held the transaction ([`PoolErrorKind::AlreadyImported`]): a retried
+    /// pass found what a cancelled one had pooled, or the transaction came back through RPC or a
+    /// peer. Harmless.
+    AlreadyPooled,
+    /// The executed state holds a higher nonce for the sender
+    /// ([`PoolErrorKind::InvalidTransaction`] whose error `is_nonce_too_low`): a transaction
+    /// with this sender and nonce has executed, this one or a replacement.
+    RefusedNonceTooLow,
+    /// Any other refusal: the pool's size or per-sender limits, a cheaper replacement of a
+    /// pooled transaction, another validation failure, or a failed state read during validation.
+    /// Only these can be a loss.
+    RefusedOther,
 }
 
 impl OrphanTxResult {
+    /// Every result, in label order, for touching every series of a finished batch.
+    const ALL: [Self; 5] = [
+        Self::Repooled,
+        Self::Invalid,
+        Self::AlreadyPooled,
+        Self::RefusedNonceTooLow,
+        Self::RefusedOther,
+    ];
+
+    /// Classify a pool refusal by its error kind.
+    ///
+    /// The match names every kind, so a new kind in a reth upgrade must be placed here by hand.
+    fn refused(error: &PoolError) -> Self {
+        match &error.kind {
+            PoolErrorKind::AlreadyImported => Self::AlreadyPooled,
+            PoolErrorKind::InvalidTransaction(invalid) if invalid.is_nonce_too_low() => {
+                Self::RefusedNonceTooLow
+            }
+            PoolErrorKind::InvalidTransaction(_)
+            | PoolErrorKind::ReplacementUnderpriced
+            | PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(_)
+            | PoolErrorKind::SpammerExceededCapacity(_)
+            | PoolErrorKind::DiscardedOnInsert
+            | PoolErrorKind::ExistingConflictingTransactionType(..)
+            | PoolErrorKind::Other(_) => Self::RefusedOther,
+        }
+    }
+
     /// The static `result` label value.
     const fn label(self) -> &'static str {
         match self {
             Self::Repooled => "repooled",
             Self::Invalid => "invalid",
-            Self::Refused => "refused",
+            Self::AlreadyPooled => "already_pooled",
+            Self::RefusedNonceTooLow => "refused_nonce_too_low",
+            Self::RefusedOther => "refused_other",
         }
     }
 }
@@ -163,18 +200,37 @@ struct OrphanTxCounts {
     repooled: u64,
     /// Transactions that failed to decode or to recover a signer.
     invalid: u64,
-    /// Transactions the pool refused.
-    refused: u64,
+    /// Transactions the pool already held.
+    already_pooled: u64,
+    /// Transactions refused as nonce too low.
+    refused_nonce_too_low: u64,
+    /// Transactions refused for any other reason.
+    refused_other: u64,
 }
 
 impl OrphanTxCounts {
-    /// Count one transaction's result.
-    fn note(self, result: OrphanTxResult) -> Self {
+    /// The count of one result.
+    const fn get(&self, result: OrphanTxResult) -> u64 {
         match result {
-            OrphanTxResult::Repooled => Self { repooled: self.repooled.saturating_add(1), ..self },
-            OrphanTxResult::Invalid => Self { invalid: self.invalid.saturating_add(1), ..self },
-            OrphanTxResult::Refused => Self { refused: self.refused.saturating_add(1), ..self },
+            OrphanTxResult::Repooled => self.repooled,
+            OrphanTxResult::Invalid => self.invalid,
+            OrphanTxResult::AlreadyPooled => self.already_pooled,
+            OrphanTxResult::RefusedNonceTooLow => self.refused_nonce_too_low,
+            OrphanTxResult::RefusedOther => self.refused_other,
         }
+    }
+
+    /// Count one transaction's result.
+    fn note(mut self, result: OrphanTxResult) -> Self {
+        let count = match result {
+            OrphanTxResult::Repooled => &mut self.repooled,
+            OrphanTxResult::Invalid => &mut self.invalid,
+            OrphanTxResult::AlreadyPooled => &mut self.already_pooled,
+            OrphanTxResult::RefusedNonceTooLow => &mut self.refused_nonce_too_low,
+            OrphanTxResult::RefusedOther => &mut self.refused_other,
+        };
+        *count = count.saturating_add(1);
+        self
     }
 
     /// Add another batch's counts.
@@ -182,22 +238,20 @@ impl OrphanTxCounts {
         Self {
             repooled: self.repooled.saturating_add(other.repooled),
             invalid: self.invalid.saturating_add(other.invalid),
-            refused: self.refused.saturating_add(other.refused),
+            already_pooled: self.already_pooled.saturating_add(other.already_pooled),
+            refused_nonce_too_low: self
+                .refused_nonce_too_low
+                .saturating_add(other.refused_nonce_too_low),
+            refused_other: self.refused_other.saturating_add(other.refused_other),
         }
     }
 
     /// Add one batch's counts to `tn_node.orphan_txs_total`. Every `result` series is touched,
     /// by 0 when the batch had none, so each exists once a batch has been re-pooled.
     fn record(self) {
-        [
-            (OrphanTxResult::Repooled, self.repooled),
-            (OrphanTxResult::Invalid, self.invalid),
-            (OrphanTxResult::Refused, self.refused),
-        ]
-        .into_iter()
-        .for_each(|(result, count)| {
+        OrphanTxResult::ALL.into_iter().for_each(|result| {
             metrics::counter!("tn_node.orphan_txs_total", "result" => result.label())
-                .increment(count);
+                .increment(self.get(result));
         });
     }
 }
@@ -238,21 +292,27 @@ impl OrphanBatchPath {
 /// Each transaction is counted once on `tn_node.orphan_txs_total{result}`, and the batch once
 /// on `tn_node.orphan_batches_total{path}`, when the whole batch has been handled. A cancelled
 /// batch counts nothing and is counted by the attempt that finishes it; the transactions the
-/// cancelled attempt already pooled are then counted as `refused` (already in the pool). The
-/// batch is counted again when it stays cached after its counts were recorded: a crash before
-/// the cache removal is durable (the restarted node re-pools it into an empty pool), or a
-/// failed removal.
+/// cancelled attempt already pooled are then counted as `already_pooled`. The batch is counted
+/// again when it stays cached after its counts were recorded: a crash before the cache removal
+/// is durable (the restarted node re-pools it into an empty pool), or a failed removal.
 ///
-/// `refused` covers every pool refusal: nonce too low, already in the pool, the pool's size
-/// and per-sender limits, other validation failures, and a failed state read during validation.
-/// A nonce-too-low refusal can mean two things. Either the transaction, or another with the
-/// same sender and nonce, already executed, which is expected: a batch can be orphaned and its
-/// transactions still land. Or a transaction that never executed was refused because the pool's
-/// view of the sender's nonce ran ahead of the executed state, which would be a loss. The counter
-/// alone cannot tell them apart; the fleet reads it against the generator's list of transactions
-/// that never landed. On this pool the second case does not arise from the batch builder: the
-/// nonce check reads the executed state through the validator's provider, not the pool's sender
-/// bookkeeping that the builder advances for each sealed batch.
+/// A refusal is classified by the pool's error kind ([`OrphanTxResult::refused`]):
+/// `already_pooled`, `refused_nonce_too_low` or `refused_other`. A nonce-too-low refusal could
+/// mean two things: the transaction, or another with the same sender and nonce, already
+/// executed, which is expected (a batch can be orphaned and its transactions still land); or a
+/// transaction that never executed was refused because the pool's view of the sender's nonce
+/// ran ahead of the executed state, which would be a loss. The counter alone cannot tell them
+/// apart; the fleet reads it against the generator's list of transactions that never landed.
+///
+/// On this pool the second case does not arise from the batch builder's update of the pool
+/// after each sealed batch (`update_canonical_state` with the batch's changed accounts,
+/// `crates/batch-builder/src/lib.rs` ≈ :673-678), because that update only moves the pool's
+/// per-sender record. Admission checks the nonce in the validator against `client.latest()`,
+/// the executed state (`vendor/reth/crates/transaction-pool/src/validate/eth.rs` ≈ :237, :549,
+/// :638-651), and the insert then overwrites the per-sender record with that executed nonce
+/// (`vendor/reth/crates/transaction-pool/src/pool/txpool.rs` ≈ :754-768). A
+/// `refused_nonce_too_low` transaction is therefore one whose sender and nonce have executed:
+/// this one or a replacement.
 async fn repool_batch_txns(
     pools: &[tn_reth::WorkerTxPool],
     active_workers: usize,
@@ -288,7 +348,7 @@ async fn repool_batch_txns(
                             Err(error) => {
                                 debug!(target: "epoch-manager", worker_id, ?error,
                                     "pool refused an orphaned transaction");
-                                OrphanTxResult::Refused
+                                OrphanTxResult::refused(&error)
                             }
                         }
                     }
@@ -351,7 +411,10 @@ where
         )
         .await?;
     info!(target: "epoch-manager", batches, processed_batches, processed_transactions,
-        txs_repooled = txs.repooled, txs_invalid = txs.invalid, txs_refused = txs.refused,
+        txs_repooled = txs.repooled, txs_invalid = txs.invalid,
+        txs_already_pooled = txs.already_pooled,
+        txs_refused_nonce_too_low = txs.refused_nonce_too_low,
+        txs_refused_other = txs.refused_other,
         "Finished processing orphaned batches");
     Ok(())
 }
@@ -4016,8 +4079,8 @@ mod tests {
     }
 
     /// A finished batch with these per-result counts.
-    fn repooled(repooled: u64, invalid: u64, refused: u64) -> OrphanBatchRecovery {
-        OrphanBatchRecovery::Complete(OrphanTxCounts { repooled, invalid, refused })
+    fn finished(counts: OrphanTxCounts) -> OrphanBatchRecovery {
+        OrphanBatchRecovery::Complete(counts)
     }
 
     /// Every counter of `snapshotter`'s recorder, keyed by `name{key=value}`. A snapshot drains
@@ -4047,8 +4110,7 @@ mod tests {
 
     /// Each transaction of a re-pooled batch is counted once by its result and each batch once
     /// by its path: all re-pooled, an undecodable transaction, a refused executed nonce, a refusal
-    /// for another reason (a sender without funds), and a batch handled twice. Both refusal
-    /// reasons count as `refused`: this crate cannot name the pool's error kind to split them.
+    /// for another reason (a sender without funds), and a batch handled twice (already pooled).
     #[tokio::test]
     async fn orphan_repool_counts_each_transaction_by_result() -> eyre::Result<()> {
         // the re-pool runs on this thread (current-thread runtime), so the local recorder sees it
@@ -4069,18 +4131,35 @@ mod tests {
         let unfunded = orphan_batch(0, vec![orphan_tx(&chain, &mut fixture.unfunded)]);
         let pools = &fixture.pools;
 
-        assert_eq!(repool_batch_txns(pools, 1, &all_valid).await, repooled(2, 0, 0));
-        assert_eq!(repool_batch_txns(pools, 1, &undecodable).await, repooled(1, 1, 0));
-        assert_eq!(repool_batch_txns(pools, 1, &executed_nonce).await, repooled(0, 0, 1));
-        assert_eq!(repool_batch_txns(pools, 1, &unfunded).await, repooled(0, 0, 1));
+        assert_eq!(
+            repool_batch_txns(pools, 1, &all_valid).await,
+            finished(OrphanTxCounts { repooled: 2, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &undecodable).await,
+            finished(OrphanTxCounts { repooled: 1, invalid: 1, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &executed_nonce).await,
+            finished(OrphanTxCounts { refused_nonce_too_low: 1, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &unfunded).await,
+            finished(OrphanTxCounts { refused_other: 1, ..Default::default() })
+        );
         // a pass cancelled after the re-pool and retried finds the transactions already pooled
-        assert_eq!(repool_batch_txns(pools, 1, &all_valid).await, repooled(0, 0, 2));
+        assert_eq!(
+            repool_batch_txns(pools, 1, &all_valid).await,
+            finished(OrphanTxCounts { already_pooled: 2, ..Default::default() })
+        );
 
         let counters = orphan_counters(&snapshotter);
         let count = |series: &str| counters.get(series).copied();
         assert_eq!(count("tn_node.orphan_txs_total{result=repooled}"), Some(3));
         assert_eq!(count("tn_node.orphan_txs_total{result=invalid}"), Some(1));
-        assert_eq!(count("tn_node.orphan_txs_total{result=refused}"), Some(4));
+        assert_eq!(count("tn_node.orphan_txs_total{result=already_pooled}"), Some(2));
+        assert_eq!(count("tn_node.orphan_txs_total{result=refused_nonce_too_low}"), Some(1));
+        assert_eq!(count("tn_node.orphan_txs_total{result=refused_other}"), Some(1));
         assert_eq!(count("tn_node.orphan_batches_total{path=own_worker}"), Some(5));
         assert_eq!(count("tn_node.orphan_batches_total{path=worker0_fallback}"), None);
         assert_eq!(count("tn_node.orphan_batches_total{path=non_validator}"), None);
@@ -4098,7 +4177,10 @@ mod tests {
         let chain = fixture.chain.clone();
         let batch = orphan_batch(1, vec![orphan_tx(&chain, &mut fixture.funded)]);
 
-        assert_eq!(repool_batch_txns(&fixture.pools, 1, &batch).await, repooled(1, 0, 0));
+        assert_eq!(
+            repool_batch_txns(&fixture.pools, 1, &batch).await,
+            finished(OrphanTxCounts { repooled: 1, ..Default::default() })
+        );
         assert_eq!(repool_batch_txns(&fixture.pools, 0, &batch).await, OrphanBatchRecovery::Retry);
 
         let counters = orphan_counters(&snapshotter);
@@ -4106,8 +4188,35 @@ mod tests {
         assert_eq!(count("tn_node.orphan_batches_total{path=worker0_fallback}"), Some(1));
         assert_eq!(count("tn_node.orphan_batches_total{path=own_worker}"), None);
         assert_eq!(count("tn_node.orphan_txs_total{result=repooled}"), Some(1));
-        assert_eq!(count("tn_node.orphan_txs_total{result=refused}"), Some(0));
+        // every result series is touched by a finished batch, at 0 when it had none
+        ["invalid", "already_pooled", "refused_nonce_too_low", "refused_other"].iter().for_each(
+            |result| {
+                assert_eq!(count(&format!("tn_node.orphan_txs_total{{result={result}}}")), Some(0));
+            },
+        );
         Ok(())
+    }
+
+    /// Every pool error kind lands in exactly one refusal result. The nonce-too-low arm needs the
+    /// validator's own error, so the pool test above covers it with an executed nonce.
+    #[test]
+    fn orphan_refusal_classified_by_every_pool_error_kind() {
+        let refused =
+            |kind: PoolErrorKind| OrphanTxResult::refused(&PoolError::new(B256::ZERO, kind));
+        assert_eq!(refused(PoolErrorKind::AlreadyImported), OrphanTxResult::AlreadyPooled);
+        [
+            PoolErrorKind::ReplacementUnderpriced,
+            PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(1),
+            PoolErrorKind::SpammerExceededCapacity(Address::ZERO),
+            PoolErrorKind::DiscardedOnInsert,
+            PoolErrorKind::InvalidTransaction(
+                tn_reth::InvalidPoolTransactionError::ExceedsGasLimit(2, 1),
+            ),
+            PoolErrorKind::ExistingConflictingTransactionType(Address::ZERO, 3),
+            PoolErrorKind::Other("state read failed".into()),
+        ]
+        .into_iter()
+        .for_each(|kind| assert_eq!(refused(kind), OrphanTxResult::RefusedOther));
     }
 
     /// Captures the fields of every event, so a test can read a log line without a log backend.
@@ -4204,7 +4313,9 @@ mod tests {
             ("processed_transactions", "3"),
             ("txs_repooled", "1"),
             ("txs_invalid", "1"),
-            ("txs_refused", "1"),
+            ("txs_already_pooled", "0"),
+            ("txs_refused_nonce_too_low", "0"),
+            ("txs_refused_other", "1"),
         ]
         .into_iter()
         .map(|(name, value)| (name, value.to_string()))
