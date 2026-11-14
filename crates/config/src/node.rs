@@ -583,7 +583,8 @@ impl Parameters {
     }
 }
 
-/// Defines [`Parameters::switches`] from the one list of runtime switch fields.
+/// Defines [`Parameters::switches`] and [`Parameters::log_switches`] from the one list of runtime
+/// switch fields.
 ///
 /// Each entry is the name of a [`Parameters`] field, which is also its `parameters.yaml` key; the
 /// field's type picks its [`SwitchValue`] kind through `SwitchValue::from`.
@@ -603,6 +604,22 @@ macro_rules! runtime_switches {
             /// Every switch field must be listed here. A test fails while one is missing.
             pub fn switches(&self) -> Vec<(&'static str, SwitchValue)> {
                 vec![$((stringify!($name), SwitchValue::from(self.$name))),*]
+            }
+
+            /// Log the `node switches` line: one info event on target `node::switches` whose
+            /// fields are the switches of [`Self::switches`], in its order, each named by its
+            /// YAML key with its value in YAML form (`true`, `3`, `150ms`, `0s`), whether or not
+            /// the file names it.
+            ///
+            /// The node logs it once at start, after `parameters.yaml` is loaded, so operators and
+            /// the benchmark harness can confirm the arm a node runs. With no switch it is the
+            /// bare message.
+            pub fn log_switches(&self) {
+                tracing::info!(
+                    target: "node::switches",
+                    $($name = %SwitchValue::from(self.$name),)*
+                    "node switches"
+                );
             }
         }
     };
@@ -1405,6 +1422,95 @@ mod test {
             for (name, _) in &defaults {
                 assert!(!text.contains(name), "{chain} preset sets switch {name}");
             }
+        }
+    }
+
+    /// One captured event: its level, target and fields rendered as the node's log files show
+    /// them.
+    type CapturedEvent = (tracing::Level, String, String);
+
+    /// A subscriber that renders each event's fields the way the node's log formatter does.
+    ///
+    /// By default the node logs through reth's `LogFormat::Terminal` for stdout and the log file: a
+    /// `tracing_subscriber::fmt` layer with its default field formatter. That formatter writes
+    /// the message first, then ` name=value` per field, each value through its `Debug` form, a
+    /// string value quoted and a `%`-recorded value as its `Display` form. [`FieldLine`]
+    /// reproduces exactly that (without the ANSI styling stdout adds when colour is on), so the
+    /// rendered fields here are the `key=value` tokens the benchmark harness parses.
+    #[derive(Clone, Default)]
+    struct LineCapture(std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+    impl tracing::Subscriber for LineCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = FieldLine::default();
+            event.record(&mut line);
+            let metadata = event.metadata();
+            self.0.lock().expect("capture lock").push((
+                *metadata.level(),
+                metadata.target().to_string(),
+                line.0,
+            ));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Event fields rendered like `tracing_subscriber::fmt::format::DefaultVisitor`.
+    #[derive(Default)]
+    struct FieldLine(String);
+
+    impl tracing::field::Visit for FieldLine {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.record_debug(field, &format_args!("{value}"))
+            } else {
+                self.record_debug(field, &value)
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let rendered = match field.name() {
+                "message" => format!("{value:?}"),
+                name => format!("{name}={value:?}"),
+            };
+            self.0.push_str(&rendered);
+        }
+    }
+
+    /// The `node switches` line is one info event on `node::switches`: the message, then one
+    /// `key=value` token per switch in `Parameters::switches()` order with its YAML-form value, at
+    /// the defaults and with every switch flipped. With no switch it is the bare message.
+    #[test]
+    fn node_switches_line_renders_yaml_tokens() {
+        for params in [Parameters::default(), every_switch_flipped()] {
+            let capture = LineCapture::default();
+            tracing::subscriber::with_default(capture.clone(), || params.log_switches());
+            let events = capture.0.lock().expect("capture lock").clone();
+            assert_eq!(events.len(), 1, "exactly one event: {events:?}");
+            let (level, target, line) = &events[0];
+            assert_eq!(*level, tracing::Level::INFO);
+            assert_eq!(target, "node::switches");
+            let expected: Vec<String> = std::iter::once("node switches".to_string())
+                .chain(params.switches().iter().map(|(name, value)| format!("{name}={value}")))
+                .collect();
+            assert_eq!(*line, expected.join(" "));
         }
     }
 }

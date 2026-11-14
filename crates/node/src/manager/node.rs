@@ -767,6 +767,10 @@ where
         key_config: KeyConfig,
         version_str: &'static str,
     ) -> eyre::Result<Self> {
+        // once per process: the arm this node runs, for operators and the benchmark harness
+        let parameters = &builder.tn_config.parameters;
+        parameters.log_switches();
+        crate::metrics::record_node_switches(&parameters.switches());
         // Note this can only fail if the consensus DB is very broken (bad path for instance).
         // So we will panic for now, this will kill the node on startup for a critical error.
         let committee_zero =
