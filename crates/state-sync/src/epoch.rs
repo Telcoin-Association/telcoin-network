@@ -188,12 +188,21 @@ impl<'m> Collection<'m> {
     /// that record hands over to, and that differs from the record this node stored for the epoch.
     /// That shows only that this many members of the committee signed another record than this
     /// node's: either this node's record is wrong or the signers are faulty, which the evidence
-    /// cannot tell apart. It is always counted; with the conflict halt on it is returned as an
-    /// error, which ends the record collector (and so the node) or fails startup, and it repeats
-    /// on every restart, since the startup sync meets the same conflict. No single peer can cause
-    /// it: the certificate takes more than `f` members of the committee this node's own previous
-    /// record names (see [`tn_types::EpochRecord::committee_compatible`]). Everything else goes to
-    /// [`stop_on_local_failure`]: our own store failing stops the node, a refusal is logged.
+    /// cannot tell apart. No single peer can cause it: the certificate takes more than `f` members
+    /// of the committee this node's own previous record names (see
+    /// [`tn_types::EpochRecord::committee_compatible`]).
+    ///
+    /// It is always counted, and also in
+    /// `tn_state_sync.epoch_record_conflicts_below_halt_threshold_total` when its signers fall
+    /// short of a super-quorum of that full committee ([`ConflictEvidence::halt_threshold`]):
+    /// validation accepts a super-quorum of a smaller committee left by an on-chain ejection, 5 of
+    /// an anchor committee of 10. With the conflict halt on and the threshold reached, it is
+    /// returned as an error, which ends the record collector (and so the node) or fails startup,
+    /// and it repeats on every restart, since the startup sync meets the same conflict. Otherwise
+    /// it is handled as before the halt existed: the store keeps this node's record, the offered
+    /// record is dropped, and the pass ends before the epoch and asks for it again on a later
+    /// pass. Everything else goes to [`stop_on_local_failure`]: our own store failing stops the
+    /// node, a refusal is logged.
     ///
     /// A conflict is logged at error with what an operator needs to look into it (see
     /// [`ConflictEvidence`]): both digests, the peer that served the record (a relay, not
@@ -214,7 +223,12 @@ impl<'m> Collection<'m> {
             let evidence = ConflictEvidence::read(epoch, record, cert, consensus_chain).await;
             let signers = evidence.signer_ids.len();
             let committee = evidence.committee;
-            let halt = self.switches.conflict_halt;
+            let halt_threshold = evidence.halt_threshold();
+            let reaches_threshold = signers >= halt_threshold;
+            if !reaches_threshold {
+                self.metrics.epoch_record_conflicts_below_halt_threshold_total.increment(1);
+            }
+            let halt = self.switches.conflict_halt && reaches_threshold;
             let text = if halt {
                 format!(
                     "epoch record conflict halt: this node's stored record of epoch {epoch} \
@@ -242,6 +256,8 @@ impl<'m> Collection<'m> {
                 offered_parent = %record.parent_hash,
                 offered_final_number = record.final_state.number,
                 offered_final_hash = %record.final_state.hash,
+                halt_threshold,
+                conflict_halt = self.switches.conflict_halt,
                 "{text}",
             );
             if halt {
@@ -292,6 +308,14 @@ impl ConflictEvidence {
             .map(|key| AuthorityIdentifier::from(*key))
             .collect();
         Self { signer_ids, committee: anchor.len() }
+    }
+
+    /// Signers the conflict halt needs: a super-quorum of the full committee the record before the
+    /// epoch names, the rule of [`EpochRecord::super_quorum`] applied to that committee rather
+    /// than to the offered record's own, possibly smaller, one. One with a failed read: never
+    /// reached, since no signer is counted then.
+    fn halt_threshold(&self) -> usize {
+        self.committee * 2 / 3 + 1
     }
 }
 
@@ -2173,7 +2197,10 @@ mod tests {
                 Ok(()) => assert!(!halt, "the conflict halt must fail startup"),
                 Err(err) => {
                     assert!(halt, "unexpected error: {err:#}");
-                    assert!(format!("{err:#}").starts_with(HALT_PHRASE), "unexpected error: {err:#}");
+                    assert!(
+                        format!("{err:#}").starts_with(HALT_PHRASE),
+                        "unexpected error: {err:#}"
+                    );
                 }
             }
         }
@@ -2260,6 +2287,82 @@ mod tests {
             .find(|line| line.starts_with("got an invalid epoch record, epoch 1"))
             .ok_or_else(|| eyre::eyre!("no invalid-record line in {lines:?}"))?;
         assert!(invalid.contains(&format!(" peer={peer}")), "{invalid}");
+        Ok(())
+    }
+
+    /// `tn_state_sync.epoch_record_conflicts_below_halt_threshold_total`.
+    const BELOW_HALT: &str = "tn_state_sync.epoch_record_conflicts_below_halt_threshold_total";
+
+    /// The conflict halt stops the node only when the conflicting certificate's signers reach a
+    /// super-quorum of the full committee the record before the epoch names. With an anchor
+    /// committee of 10, 5 signers of a committee of 7 left by an ejection pass validation (main's
+    /// rule, unchanged) but do not stop the node: the conflict is logged and counted below the
+    /// threshold, the pass ends as with the halt off and the node keeps its own record. 7 of 10
+    /// stop it, and so do 3 of a committee of 4 (the end-to-end tests' size).
+    #[tokio::test]
+    async fn test_conflict_halt_needs_a_super_quorum_of_the_full_committee() -> eyre::Result<()> {
+        // committee size, members left in the offered record's committee, signers, halts
+        let cases: [(usize, usize, u32, bool); 3] =
+            [(10, 7, 5, false), (10, 10, 7, true), (4, 4, 3, true)];
+        for (size, members, signed, halts) in cases {
+            let case = format!("{signed} signers of {members}, committee of {size}");
+            let committee_size =
+                NonZeroUsize::new(size).ok_or_else(|| eyre::eyre!("empty committee"))?;
+            let fixture = CommitteeFixture::builder(MemDatabase::default)
+                .committee_size(committee_size)
+                .build();
+            let (keys, signers) = keys_and_signers(&fixture);
+            let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 1).await?;
+            let ours = records[1].0.clone();
+            let mut theirs = ours.clone();
+            theirs.committee.truncate(members);
+            theirs.final_state.number = 7;
+            let indexes: Vec<u32> = (0..signed).collect();
+            let cert = make_cert(&theirs, &signers[..members], &indexes);
+            assert!(
+                chain.epochs().validate_downloaded_record(1, &theirs, &cert).await.is_valid(),
+                "{case}"
+            );
+            let handle =
+                mock_epoch_record_network(HashMap::from([(1, (theirs, cert))]), keys[0], 1);
+            let bus = ConsensusBus::new();
+            let (metrics, snapshotter) = local_metrics();
+            let mut collection = Collection::new(HALT, &metrics);
+            let (collected, lines) =
+                lines_of(collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection))
+                    .await;
+
+            let counted = counters(&snapshotter);
+            assert_eq!(counted.get(CONFLICTS), Some(&1), "{case}");
+            assert_eq!(counted.get(BELOW_HALT), Some(&u64::from(!halts)), "{case}");
+            let line = lines
+                .iter()
+                .find(|line| line.contains(" signer_ids="))
+                .ok_or_else(|| eyre::eyre!("no conflict line in {lines:?}"))?;
+            assert!(line.contains(&format!(" signers={signed} committee={size} ")), "{line}");
+            let threshold = size * 2 / 3 + 1;
+            assert!(
+                line.contains(&format!(" halt_threshold={threshold} conflict_halt=true")),
+                "{line}"
+            );
+            match collected {
+                Ok(pass) => {
+                    assert!(!halts, "{case}: the node must stop");
+                    assert_eq!(pass, CollectedPass { epoch: 0, definitive: true }, "{case}");
+                    assert!(line.starts_with("epoch record conflict: "), "{line}");
+                }
+                Err(err) => {
+                    assert!(halts, "{case}: unexpected error {err:#}");
+                    assert!(format!("{err:#}").starts_with(HALT_PHRASE), "{err:#}");
+                    assert!(line.starts_with(HALT_PHRASE), "{line}");
+                }
+            }
+            assert_eq!(
+                chain.epochs().get_epoch_by_number(1).await,
+                Some((ours, None)),
+                "{case}: the stored record stays"
+            );
+        }
         Ok(())
     }
 }

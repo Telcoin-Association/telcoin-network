@@ -55,8 +55,16 @@ pub(crate) struct StateSyncMetrics {
     pub(crate) epoch_record_walk_parent_mismatches_total: Counter,
     /// Certified records that validated against this node's record of the epoch before, with a
     /// super-quorum certificate, and differ from the record this node stored for the same epoch:
-    /// this node forked from the network. Counted with `epoch_record_conflict_halt` on or off.
+    /// either this node's record or the signers are wrong. Counted with
+    /// `epoch_record_conflict_halt` on or off.
     pub(crate) epoch_record_conflicts_total: Counter,
+    /// The conflicts of `epoch_record_conflicts_total` whose certificate's signers fall short of
+    /// the conflict halt's threshold, a super-quorum of the full committee the record before the
+    /// epoch names (validation also accepts a super-quorum of a smaller committee left by an
+    /// on-chain ejection). Counted with `epoch_record_conflict_halt` on or off; the halt stops the
+    /// node only on a conflict not counted here, so with the halt off the total minus this count
+    /// is the number of conflicts that would stop the node with it on.
+    pub(crate) epoch_record_conflicts_below_halt_threshold_total: Counter,
 }
 
 #[cfg(test)]
