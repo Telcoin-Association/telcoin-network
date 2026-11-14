@@ -58,7 +58,7 @@ Some `debug_*` methods are registered but do nothing; [debug](debug/README.md) l
 | `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests, shared by `debug_trace*`, `debug_executionWitness*` and `trace_*`; further requests wait for a free slot. Values below 2 are refused: `trace_filter` takes two slots at once. A request keeps its slot until its trace ends, even after a timeout or a disconnect |
 | `--rpc.max-trace-filter-blocks` | `100` | Largest block range one `trace_filter` request may cover |
 | `--rpc.max-blocks-per-filter` | `100000` (`0` = no limit) | Largest block range for `eth_getLogs` and log filters |
-| `--rpc.max-logs-per-response` | `20000` (`0` = no limit) | Most logs one `eth_getLogs` or filter response may return |
+| `--rpc.max-logs-per-response` | `20000` (`0` = no limit) | Most logs one `eth_getLogs` or filter response may return. A range query also reads at most 50 receipts and logs for each log this allows (1,000,000 by default), whether they match or not; a query that needs more fails with a smaller range to retry, as one over the log limit does. A single-block query is never refused for either, and `0` turns off both |
 | `--rpc.gascap` | `50000000` | Gas limit for `eth_call`, `eth_estimateGas` and the debug and trace call methods |
 | `--rpc.max-response-size` | `160` (MB) | Largest response the server sends |
 | `--rpc.max-connections` | `500` | Concurrent RPC connections |

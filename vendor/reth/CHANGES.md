@@ -2589,3 +2589,34 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   transaction decode correctly and leave each buffer at or under 128 KiB; a 64 KiB item's buffer is
   kept; a shrunk buffer decodes a large item again). Mutation-checked: never shrinking (fails,
   the receipt buffer keeps about 1 MB). *Upstream*: yes.
+
+- **TN-0193** — A log range scan reads at most 50 receipts and logs for each log its response may
+  return. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`SCAN_READS_PER_RESPONSE_LOG`, the read count in
+  `get_logs_in_block_range_inner`, which serves `eth_getLogs`, `eth_getFilterLogs`,
+  `eth_getFilterChanges` and `EngineEthFilter::logs`; `EthFilterError::QueryExceedsMaxReads`,
+  -32602 like `QueryExceedsMaxResults`; test `range_scan_reads_are_bounded`).
+  *Why*: a range scan reads every receipt of each block whose logs bloom matches the filter and
+  compares each of its logs, and only the logs that match count against
+  `--rpc.max-logs-per-response`. Blocks whose blooms match a filter that none of their logs
+  match were read in full for nothing, so a scan's work was bounded only by
+  `--rpc.max-blocks-per-filter` (100,000 blocks) and by what those blocks hold. The scan now
+  counts each block's receipts and logs as it reads them and ends, once a multi-block range has
+  read more than 50 times the response limit (1,000,000 at the default of 20,000), with an error
+  whose retry range ends at the block before the one that passed the bound, as
+  `QueryExceedsMaxResults` does (TN-0076): retrying that range fits, and a single-block range is
+  never refused. No response limit (`0`, or `QueryLimits::no_limits()`) means no read bound, so
+  an operator who turned the limit off keeps unbounded scans. A lower default for
+  `--rpc.max-blocks-per-filter` was not taken: TN's docs promise 100,000, it would refuse long
+  ranges over quiet history that cost little, and it would still not bound a range of blocks that
+  each hold many receipts; the read bound follows the work instead. 50 reads per returnable log
+  leaves room for blocks whose blooms match a filter by chance. Queries within the bound return
+  the same logs in the same order. Upstream reth has no such bound.
+  *Can reach execution or storage*: no. RPC only: the count runs inside the log query after the
+  receipts are read, and nothing on the block execution or storage path calls it.
+  *Tests*: `range_scan_reads_are_bounded` (five blocks whose blooms match everything, one receipt
+  of 30 non-matching logs each: a limit of one log ends the scan at the second block with the
+  retry range 100-100, a limit of four reads all 155, a single block and no limit are not
+  bounded, 60 matching logs are returned); `test_log_limit_retry_range_excludes_overflow_block`,
+  `test_range_scan_across_windows` and the other filter tests unchanged. Mutation-checked: the
+  bound never ending a scan (fails, the first range returns no error). *Upstream*: yes.
