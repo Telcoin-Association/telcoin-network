@@ -497,7 +497,12 @@ epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `ep
 complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
 read-side heal, `db migrate`, `db repair` and `db validate`, even when its indexes cannot attest its
 length. A legacy v0
-(batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. `db repair`,
+(batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. An
+interrupted install (`epoch-N.replaced` with no `epoch-N`: an install or migration stopped between
+its two renames) is reported by `db repair`, `db migrate` and `db validate` of the missing `epoch-N`,
+never read as "not found" or healthy; the node's next start puts it back
+(`ConsensusChain::recover_incomplete_installs`), and `db repair --force` runs that same step first,
+then checks the restored epoch with the others. `db repair`,
 `db migrate`, `db load-state` and `db tndb-stat` refuse to run while a live node holds the
 `<datadir>/telcoin.pid` lock (intentional-design item 9).
 

@@ -1270,7 +1270,10 @@ impl ConsensusChain {
     /// past epoch; if `epoch-N` EXISTS, the aside is a stale backup from a completed install
     /// and is removed. Deleting `.replaced` unconditionally (the old behavior) could brick
     /// startup or lose an epoch.
-    fn recover_incomplete_installs(base_path: &Path) {
+    ///
+    /// Public so that `db repair --force` runs this same step at rest; a failed restore is only
+    /// logged, so a caller that must know checks [`Self::interrupted_installs`] afterwards.
+    pub fn recover_incomplete_installs(base_path: &Path) {
         let Ok(entries) = std::fs::read_dir(base_path) else { return };
         for entry in entries.flatten() {
             let file_name = entry.file_name();
