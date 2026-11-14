@@ -2674,3 +2674,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `sidecar_heal_shrinks_a_trailing_run_and_refuses_a_gap` and the TN-0130 crash tests unchanged.
   Mutation-checked: no check (the test fails). *Upstream*: maybe (the run check; the checksums
   are TN-0121's).
+
+- **TN-0164** — `truncate_changesets` syncs the `.csoff` record it flushed before it writes the
+  configuration. *Kind*: fix (static-file crash safety).
+  *Files*: `crates/storage/provider/src/providers/static_file/writer.rs`
+  (`StaticFileProviderRW::truncate_changesets`).
+  *Why*: the prune flushed the pending block's `.csoff` record and then wrote the configuration
+  (through `prune_rows` or `commit`, whose own sidecar sync comes after `prune_rows`), which can
+  count that record, without syncing the sidecar. A crash then left a sidecar shorter than its
+  header, which a checksummed jar refuses at the next start (TN-0130). `sync_all` and `commit`
+  already sync the sidecar before the configuration; the prune now does too, and a failed sync
+  leaves the writer failed (TN-0161). Not reachable in TN: the only prunes are the startup heal's,
+  on writers just opened, which hold no pending record. *Can reach execution or storage*:
+  storage: one `fsync` more per changeset prune, no byte changes. *Tests*: none new (a sync's
+  ordering against a crash is not observable in a test); the TN-0130 crash tests unchanged.
+  *Upstream*: maybe.

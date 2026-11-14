@@ -1165,6 +1165,14 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
         // Flush any pending changeset offset before reading the sidecar
         self.flush_current_changeset_offset()?;
+        // TN(TN-0164): that record can be one the configuration written below counts, so it is
+        // durable first, as `sync_all` and `commit` sync the sidecar before the configuration.
+        if let Some(writer) = &mut self.changeset_offsets &&
+            let Err(err) = writer.sync()
+        {
+            self.writer.mark_failed();
+            return Err(ProviderError::other(err))
+        }
 
         let rows_to_keep = if blocks_to_keep == 0 {
             0
