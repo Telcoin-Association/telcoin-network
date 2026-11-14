@@ -185,20 +185,22 @@ impl<'m> Collection<'m> {
     ///
     /// A [`EpochDbError::ConflictingRecord`] here is a certified record that validated against
     /// this node's record of the epoch before, with a super-quorum certificate of the committee
-    /// that record hands over to, and that differs from the record this node stored for the epoch:
-    /// this node forked from the network. It is always counted; with the conflict halt on it is
-    /// returned as an error, which ends the record collector (and so the node) or fails startup,
-    /// and it repeats on every restart, since the startup sync meets the same conflict. No single
-    /// peer can cause it: the certificate takes more than `f` members of the committee this node's
-    /// own previous record names (see [`tn_types::EpochRecord::committee_compatible`]). Everything
-    /// else goes to [`stop_on_local_failure`]: our own store failing stops the node, a refusal is
-    /// logged.
+    /// that record hands over to, and that differs from the record this node stored for the epoch.
+    /// That shows only that this many members of the committee signed another record than this
+    /// node's: either this node's record is wrong or the signers are faulty, which the evidence
+    /// cannot tell apart. It is always counted; with the conflict halt on it is returned as an
+    /// error, which ends the record collector (and so the node) or fails startup, and it repeats
+    /// on every restart, since the startup sync meets the same conflict. No single peer can cause
+    /// it: the certificate takes more than `f` members of the committee this node's own previous
+    /// record names (see [`tn_types::EpochRecord::committee_compatible`]). Everything else goes to
+    /// [`stop_on_local_failure`]: our own store failing stops the node, a refusal is logged.
     ///
     /// A conflict is logged at error with what an operator needs to look into it (see
     /// [`ConflictEvidence`]): both digests, the peer that served the record (a relay, not
     /// necessarily a signer), the certificate's signers as authority ids, how many signed out of
     /// how many members of the committee the record before the epoch names, and the offered
-    /// record's epoch, parent and final execution state.
+    /// record's epoch, parent and final execution state. The halt's line and error start with
+    /// `epoch record conflict halt:`, every other conflict's line with `epoch record conflict:`.
     async fn refused(
         &self,
         e: EpochDbError,
@@ -214,9 +216,12 @@ impl<'m> Collection<'m> {
             let committee = evidence.committee;
             let halt = self.switches.conflict_halt;
             let text = if halt {
-                "this node's epoch record differs from a certified record of the network: this \
-                 node has forked and stops; do not delete its chain data before the cause is known"
-                    .to_string()
+                format!(
+                    "epoch record conflict halt: this node's stored record of epoch {epoch} \
+                     differs from a record certified by {signers} of the {committee} members of \
+                     the committee the record before it names; this node stops; do not delete \
+                     its chain data before the cause is known"
+                )
             } else {
                 format!(
                     "epoch record conflict: this node's stored record of epoch {epoch} differs \
@@ -240,11 +245,7 @@ impl<'m> Collection<'m> {
                 "{text}",
             );
             if halt {
-                return Err(eyre::Report::new(e).wrap_err(format!(
-                    "this node's record for epoch {epoch} differs from a certified record of the \
-                     network: the node has forked; do not delete its chain data before the cause \
-                     is known"
-                )));
+                return Err(eyre::Report::new(e).wrap_err(text));
             }
         }
         stop_on_local_failure(e, epoch)
@@ -1679,6 +1680,9 @@ mod tests {
     /// `tn_state_sync.epoch_record_conflicts_total`.
     const CONFLICTS: &str = "tn_state_sync.epoch_record_conflicts_total";
 
+    /// The stable start of the conflict halt's log line and error.
+    const HALT_PHRASE: &str = "epoch record conflict halt:";
+
     /// A collection with both switches off, reporting to the process-wide metrics: the collection
     /// from before the switches existed.
     fn walk_off() -> Collection<'static> {
@@ -2048,8 +2052,8 @@ mod tests {
     /// A peer's certified record that validates against this node's record 0 but differs from its
     /// own record 1 is counted whether or not the conflict halt is on. With it off the pass goes on
     /// as before (`test_collect_epoch_records_keeps_going_past_a_refused_record`); with it on the
-    /// pass, a gap retry and the critical record collector all end with the error that says the
-    /// node forked, and the node's own record stays.
+    /// pass, a gap retry and the critical record collector all end with the halt's error, and the
+    /// node's own record stays.
     #[tokio::test]
     async fn test_collect_epoch_records_halts_on_a_conflicting_certified_record() -> eyre::Result<()>
     {
@@ -2064,9 +2068,11 @@ mod tests {
         let handle = mock_epoch_record_network(HashMap::from([(1, (theirs, cert))]), peer, 1);
         let bus = ConsensusBus::new();
         let (metrics, snapshotter) = local_metrics();
-        let forked = |err: &eyre::Report| {
+        let halted = |err: &eyre::Report| {
             let text = format!("{err:#}");
-            text.contains("epoch 1") && text.contains("forked") && text.contains("do not delete")
+            text.starts_with(HALT_PHRASE)
+                && text.contains("epoch 1 differs")
+                && text.contains("do not delete")
         };
 
         let collected = collect_epoch_records(
@@ -2084,14 +2090,14 @@ mod tests {
         let err = collect_epoch_records(0, &chain, &handle, bus.app(), &mut halting)
             .await
             .expect_err("the conflict halt ends the pass");
-        assert!(forked(&err), "unexpected error: {err:#}");
+        assert!(halted(&err), "unexpected error: {err:#}");
         assert_eq!(counters(&snapshotter).get(CONFLICTS), Some(&1));
 
         halting.gaps.insert(1);
         let err = retry_gaps(&chain, &handle, bus.app(), &mut halting)
             .await
             .expect_err("the conflict halt ends a gap retry");
-        assert!(forked(&err), "unexpected error: {err:#}");
+        assert!(halted(&err), "unexpected error: {err:#}");
         assert_eq!(counters(&snapshotter).get(CONFLICTS), Some(&1));
         drop(halting);
 
@@ -2114,7 +2120,7 @@ mod tests {
             panic!("expected the record collector's error, got {ended:?}");
         };
         assert_eq!(name, "Epoch Record Collector");
-        assert!(err.to_string().contains("forked"), "unexpected error: {err}");
+        assert!(err.to_string().contains(HALT_PHRASE), "unexpected error: {err}");
         assert_eq!(chain.epochs().get_epoch_by_number(1).await, Some((ours, None)));
         Ok(())
     }
@@ -2167,7 +2173,7 @@ mod tests {
                 Ok(()) => assert!(!halt, "the conflict halt must fail startup"),
                 Err(err) => {
                     assert!(halt, "unexpected error: {err:#}");
-                    assert!(format!("{err:#}").contains("forked"), "unexpected error: {err:#}");
+                    assert!(format!("{err:#}").starts_with(HALT_PHRASE), "unexpected error: {err:#}");
                 }
             }
         }
@@ -2212,6 +2218,15 @@ mod tests {
             conflict_lines.extend(lines.into_iter().filter(|line| line.contains(" signer_ids=")));
         }
         assert_eq!(conflict_lines.len(), 2, "{conflict_lines:?}");
+        let evidence = "this node's stored record of epoch 1 differs from a record certified by 3 \
+                        of the 4 members of the committee the record before it names;";
+        let keeps = format!("epoch record conflict: {evidence} this node keeps its own record ");
+        let stops = format!(
+            "{HALT_PHRASE} {evidence} this node stops; do not delete its chain data before the \
+             cause is known "
+        );
+        assert!(conflict_lines[0].starts_with(&keeps), "{}", conflict_lines[0]);
+        assert!(conflict_lines[1].starts_with(&stops), "{}", conflict_lines[1]);
         let ids: Vec<String> =
             [0, 1, 3].iter().map(|i| AuthorityIdentifier::from(keys[*i]).to_string()).collect();
         let fields = [
