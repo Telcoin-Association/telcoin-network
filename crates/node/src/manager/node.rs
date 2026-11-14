@@ -782,7 +782,10 @@ where
         let bootstrap_servers = committee_zero.bootstrap_servers();
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
-        let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
+        // A peer's pack import keeps the execution database's next growth step free beside the
+        // consensus stores' own, so the node's writes never fail for the space an import holds.
+        let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?
+            .with_execution_growth_step(builder.node_config.execution_db_growth_step());
         // A power loss can leave the durable `LatestConsensus` hint ahead of the recovered pack
         // (e.g. meta-only at an epoch boundary); reconcile it to the pack tip so the executor's
         // re-derived output is not refused as non-monotonic on restart.

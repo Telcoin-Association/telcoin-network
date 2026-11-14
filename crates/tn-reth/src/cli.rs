@@ -518,6 +518,17 @@ impl RethConfig {
         self.3
     }
 
+    /// The largest single growth step of the execution database: `--db.growth-step` when set, else
+    /// the backend's default (tn-lmdb's `MAX_GROWTH`, 1 GiB; reth's 4 GiB for MDBX). The consensus
+    /// chain keeps this much free beside its own stores when it imports a peer's pack.
+    pub fn execution_db_growth_step(&self) -> u64 {
+        #[cfg(not(feature = "mdbx"))]
+        let default = tn_lmdb_reth::MAX_GROWTH;
+        #[cfg(feature = "mdbx")]
+        let default = 4 << 30;
+        self.0.db.growth_step.map_or(default, |step| u64::try_from(step).unwrap_or(u64::MAX))
+    }
+
     /// This config, with tn-lmdb's gap fill at `gap_fill`: for benches.
     pub fn with_db_gap_fill(mut self, gap_fill: GapFill) -> Self {
         self.3 = gap_fill;
@@ -871,6 +882,27 @@ mod tests {
         let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
 
         assert_eq!(config.0.txpool.max_account_slots, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
+    }
+
+    /// The execution database's growth step the consensus chain's imports keep free is the
+    /// configured `--db.growth-step`, else the backend's default largest step.
+    #[test]
+    fn execution_db_growth_step_is_the_configured_or_default_step() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let config = |args: &[&str]| -> eyre::Result<RethConfig> {
+            let command = RethCommand::try_parse_from(
+                std::iter::once("tn-reth").chain(args.iter().copied()),
+            )?;
+            Ok(RethConfig::new(command, None, tmp_dir.path(), true, chain.clone()))
+        };
+        #[cfg(not(feature = "mdbx"))]
+        let default = tn_lmdb_reth::MAX_GROWTH;
+        #[cfg(feature = "mdbx")]
+        let default = 4 << 30;
+        assert_eq!(config(&[])?.execution_db_growth_step(), default);
+        assert_eq!(config(&["--db.growth-step", "4GB"])?.execution_db_growth_step(), 4 << 30);
+        Ok(())
     }
 
     /// The TN-only forwarding args reach the config beside reth's `NodeConfig`, which has no
