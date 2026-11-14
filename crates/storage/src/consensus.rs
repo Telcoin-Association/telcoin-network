@@ -48,8 +48,8 @@ use tracing::{error, warn};
 use crate::{
     archive::data_file::{fsync_directory, fsync_file},
     consensus_pack::{
-        install_dir_rename_aside, pack_is_sealed, ConsensusPack, DeclaredBatches, PackError,
-        DATA_NAME,
+        install_dir_rename_aside, pack_is_sealed, BatchReadError, ConsensusPack, DeclaredBatches,
+        PackError, DATA_NAME,
     },
     epoch_records::{EpochDbError, EpochRecordDb},
 };
@@ -2090,6 +2090,39 @@ impl ConsensusChain {
     /// True if the current epoch pack contains the batch for digest.
     pub async fn contains_current_batch(&self, digest: BlockHash) -> bool {
         self.current_pack().contains_batch(digest).await
+    }
+
+    /// The batch stored under `digest` in `epoch`'s pack if `epoch` is the live one, else `None`
+    /// (a past epoch is read through a [`crate::consensus_pack::PackReader`]). See
+    /// [`ConsensusPack::batch_now`] for the answer: `Ok(None)` only when the pack does not hold the
+    /// digest; [`BatchReadError::Closed`] when the epoch was sealed under the read (read it as a
+    /// past epoch then).
+    ///
+    /// It reads through a clone of the live pack, dropped before it returns: an epoch handoff
+    /// waits up to `HANDOFF_SEAL_GRACE` for every clone of the pack it seals, so no caller may
+    /// keep one. A batch is visible here once its output is appended, before `persist_current`
+    /// makes it durable.
+    ///
+    /// Runs on the caller's thread (a read decompresses, decodes and re-hashes up to a megabyte):
+    /// call it from a blocking thread, never a tokio worker.
+    pub fn live_batch(
+        &self,
+        epoch: Epoch,
+        digest: BlockHash,
+    ) -> Option<Result<Option<Batch>, BatchReadError>> {
+        let pack = self.current_pack_for(epoch)?;
+        let batch = pack.batch_now(digest);
+        drop(pack);
+        Some(batch)
+    }
+
+    /// A counter that moves whenever an epoch's files are installed or replaced (an import, a
+    /// read-side heal) or the current pack is swapped (an epoch handoff). A reader that holds its
+    /// own read-only handles ([`crate::consensus_pack::PackReader`]) drops them when it moves:
+    /// an install renames a fuller copy over an epoch's files, and a handle opened before it
+    /// keeps reading the old copy.
+    pub fn install_generation(&self) -> u64 {
+        self.install_generation.load(Ordering::Acquire)
     }
 
     /// Return a vector of batches matching the provided digests (if found).
@@ -4647,6 +4680,179 @@ mod test {
             "the handoff waited for a stalled decode of the epoch it seals: {levels:?}"
         );
         decoding.abort();
+    }
+
+    /// `live_batch` reads the live epoch's batches on a blocking thread while saves land, and
+    /// answers `None` for any other epoch. It drops its clone of the live pack before it returns,
+    /// so a reader calling it without pause through an epoch handoff never holds the handoff up
+    /// (no `HANDOFF_SEAL_GRACE` wait, which warns); after the handoff the sealed epoch reads
+    /// through a `PackReader`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_live_batch_reads_beside_saves_and_never_holds_up_the_handoff() {
+        use crate::consensus_pack::PackReader;
+        use tn_types::{Batch, BlockHash};
+
+        let temp_dir = TempDir::with_prefix("test_live_batch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let epoch0 = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(epoch0.clone(), committee.clone()).await.unwrap();
+
+        // The batches saved so far, published to the reader once their save returned.
+        let saved = Arc::new(parking_lot::RwLock::new(Vec::<Batch>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = std::thread::spawn({
+            let (consensus_chain, saved, stop) =
+                (consensus_chain.clone(), saved.clone(), stop.clone());
+            move || {
+                let (mut live_reads, mut not_live) = (0_usize, 0_usize);
+                while !stop.load(Ordering::Acquire) {
+                    let batches = saved.read().clone();
+                    for batch in batches {
+                        match consensus_chain.live_batch(0, batch.digest()) {
+                            Some(Ok(Some(read))) => {
+                                assert_eq!(read, batch, "a saved batch reads back");
+                                live_reads += 1;
+                            }
+                            None => not_live += 1,
+                            other => panic!("a saved batch must read back, got {other:?}"),
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                (live_reads, not_live)
+            }
+        });
+        let mut parent = ConsensusHeaderDigest::default();
+        for n in 1..=6u64 {
+            let output = make_test_output(&committee, (n as usize) % 4, chain.clone(), n, parent);
+            parent = output.digest();
+            let batches: Vec<Batch> =
+                output.batches().iter().flat_map(|c| c.batches.iter().cloned()).collect();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+            saved.write().extend(batches);
+        }
+        consensus_chain.persist_current().await.unwrap();
+        let first = saved.read()[0].clone();
+        assert!(consensus_chain.live_batch(1, first.digest()).is_none(), "epoch 1 is not live");
+        assert!(
+            matches!(consensus_chain.live_batch(0, BlockHash::repeat_byte(0xcd)), Some(Ok(None))),
+            "a digest the live pack does not hold is a miss"
+        );
+
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            parent_hash: epoch0.digest(),
+            final_consensus: ConsensusNumHash { number: 6, hash: parent },
+            ..Default::default()
+        };
+        // A handoff that waited out its grace for a handle would warn that it sealed with live
+        // handles. It runs on this thread, so its log lines are captured here.
+        let (handed_off, levels) = crate::consensus_pack::test::warnings_and_errors(|| {
+            let runtime = tokio::runtime::Handle::current();
+            let next = committee.advance_epoch_for_test(1);
+            tokio::task::block_in_place(|| {
+                runtime.block_on(consensus_chain.new_epoch(record0, next))
+            })
+        });
+        handed_off.expect("handoff");
+        assert!(levels.is_empty(), "the handoff waited for a live_batch reader: {levels:?}");
+        stop.store(true, Ordering::Release);
+        let (live_reads, _) = reader.join().expect("reader");
+        assert!(live_reads > 0, "the reader read the live epoch");
+
+        assert!(consensus_chain.live_batch(0, first.digest()).is_none(), "epoch 0 is sealed");
+        assert!(
+            matches!(consensus_chain.live_batch(1, first.digest()), Some(Ok(None))),
+            "the new live epoch holds no batch yet"
+        );
+        let sealed = PackReader::open(temp_dir.path(), 0).expect("epoch 0 is sealed");
+        for batch in saved.read().iter() {
+            assert_eq!(sealed.batch(batch.digest()).expect("read").as_ref(), Some(batch));
+        }
+        drop(sealed);
+        consensus_chain.close().await;
+    }
+
+    /// A `PackReader` opened on an epoch keeps reading the copy it opened when an import installs
+    /// a fuller copy over it (`install_imported_epoch_dir` renames the new files in), and the
+    /// install moves `install_generation`, which tells a reader holding handles to reopen them; a
+    /// reader opened after the install reads the installed copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pack_reader_keeps_its_copy_across_an_install() {
+        use crate::consensus_pack::PackReader;
+        use tn_types::BlockHash;
+        use tokio::io::AsyncReadExt as _;
+
+        let source_dir = TempDir::with_prefix("test_reader_install_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (source, record0, _) = chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source");
+        source.epochs().save_record(record0.clone()).await.expect("save epoch record");
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let mut outputs = Vec::new();
+        for n in 1..=3u64 {
+            outputs.push(source.get_consensus_output_current(n).await.expect("source output"));
+        }
+        let digests = |output: &ConsensusOutput| -> Vec<BlockHash> {
+            output.batches().iter().flat_map(|c| c.batches.iter().map(|b| b.digest())).collect()
+        };
+        let (kept, added) = (digests(&outputs[0]), digests(&outputs[2]));
+
+        // The target holds a sealed partial copy of epoch 0 (its first two outputs).
+        let target_dir = TempDir::with_prefix("test_reader_install_target").expect("temp dir");
+        let target = ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
+        target.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        for output in &outputs[..2] {
+            target.save_consensus_output(output.clone()).await.unwrap();
+        }
+        target.persist_current().await.unwrap();
+        let partial = EpochRecord {
+            final_consensus: ConsensusNumHash { number: 2, hash: outputs[1].digest() },
+            ..record0.clone()
+        };
+        target.new_epoch(partial, committee.advance_epoch_for_test(1)).await.unwrap();
+
+        let old = PackReader::open(target_dir.path(), 0).expect("the partial copy is sealed");
+        assert!(matches!(old.batch(kept[0]), Ok(Some(_))), "the partial copy holds output 1");
+        assert!(matches!(old.batch(added[0]), Ok(None)), "the partial copy lacks output 3");
+        let generation = target.install_generation();
+        let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
+        target
+            .stream_import(stream.take(len), &record0, &previous_epoch, Duration::from_secs(5))
+            .await
+            .expect("the whole epoch installs over the partial copy");
+        assert_ne!(target.install_generation(), generation, "an install moves the generation");
+
+        // The old handle still reads the copy it opened.
+        for digest in &kept {
+            assert!(matches!(old.batch(*digest), Ok(Some(b)) if b.digest() == *digest));
+        }
+        assert!(matches!(old.batch(added[0]), Ok(None)), "the old copy still lacks output 3");
+        let new = PackReader::open(target_dir.path(), 0).expect("the installed copy");
+        for digest in kept.iter().chain(&added) {
+            assert!(matches!(new.batch(*digest), Ok(Some(b)) if b.digest() == *digest));
+        }
+        drop((old, new));
+        source.close().await;
+        target.close().await;
     }
 
     /// The handoff's seal of the previous epoch fails when that epoch's data log did not end up

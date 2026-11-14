@@ -174,6 +174,29 @@ no thread of its own.
   gossiped certificate. A hit runs the caller's function on the remembered header (the primary
   reads three fields), so it copies and re-hashes nothing; `consensus_header_by_digest` is the
   same lookup returning a copy.
+- **Checked batch reads**, synchronous, for a caller on a blocking thread (the transaction-body
+  resolver runs on RPC's blocking threads):
+  - `ConsensusPack::batch_now` reads one batch on the caller's thread under the read lock, as each
+    batch of a `batches` request is read. It is `Ok(None)` only when the batch-digest index does not
+    hold the digest. Anything else is a `BatchReadError`: a lookup or record load that failed
+    (`Read`), an index entry where the log holds no record (`NoRecordAt`, past the data end) or a
+    record that is not a batch (`NotBatch`) or is another batch (`DigestMismatch`: every read
+    re-hashes the batch), a closed pack (`Closed`), or a legacy pack (`Legacy`, whose by-digest
+    lookups miss). The async `batch` and `batches` read the same way but collapse every failure to a
+    logged miss.
+  - `PackReader` is a read-only handle on one sealed past epoch for a reader that keeps its own
+    handles instead of sharing `ConsensusChain`'s cache. Its open refuses an unsealed pack
+    (`Unsealed`: the live epoch, or one a handoff is sealing) and a legacy one (`Legacy`); other
+    failures are `Open`. It writes nothing, and it sits beside the node's own handles on the epoch
+    (packs take no file locks).
+  - `ConsensusChain::live_batch` reads the live epoch through a clone of the current pack that it
+    drops before returning (`None` for any other epoch): an epoch handoff waits up to
+    `HANDOFF_SEAL_GRACE` for the clones of the pack it seals, so nothing may keep one. A batch is
+    visible there once its output is appended, before the persist.
+  - `ConsensusChain::install_generation` moves at every install of an epoch's files (an import, a
+    read-side heal) and every swap of the current pack. A handle opened before an install keeps
+    reading the copy it opened (the replaced files stay readable while it holds them), so a reader
+    holding `PackReader`s reopens them when the generation moves.
 
 **Open doors:**
 | door | mode | on damage |
@@ -257,6 +280,14 @@ the epoch ran meanwhile and the file is the handle's (same device and inode); ot
 `StreamUnavailable` and the requester retries.
 `LatestConsensus` persists the tip `(epoch, number)` in double-buffered, CRC-checked
 `consensus_slot{1,2}` files — a non-authoritative hint; the pack files are ground truth.
+
+**Pack retention (invariant).** Packs are never pruned: no code deletes an `epoch-{N}` pack that
+holds outputs. The only removal of a data log, `remove_header_only_legacy`, removes a legacy pack
+holding nothing but its header. An install replaces an epoch's files only with the epoch's whole
+certified chain (`stream_import`, over a pack lacking that chain's final output) or with the same
+log re-indexed or migrated (a read-side heal). The checked batch reads above serve readers that
+record where a batch is (its leader epoch and digest) and treat a missing pack as damage, so
+pruning, if it is ever added, must first move such references off the packs it removes.
 
 `epoch_records` (`EpochRecordDb`) is the singleton chain of `EpochRecord`s (`epochs.pack`) and their
 `EpochCertificate`s (`epoch_certs.pack`), auto-healed on open under the same rules: `persist()` stamps
