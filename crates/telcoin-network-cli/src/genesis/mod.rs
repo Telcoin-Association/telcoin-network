@@ -656,6 +656,10 @@ mod tests {
     /// HOW to run: `cargo test -p telcoin-network-cli regenerate_mainnet_chain_configs --
     /// --ignored` then commit the three rewritten yaml files.
     ///
+    /// `bootstrap_servers.yaml` is not regenerated: the bootstrap servers are chosen by hand and
+    /// need not be validators, so the ceremony's committee file is written with an empty
+    /// `bootstrap_servers` map (kept, not dropped, because older binaries require the key).
+    ///
     /// This is the full genesis ceremony (`GenesisArgs::execute`) driven in-process the same
     /// way the e2e suite drives it (`crates/e2e-tests/src/lib.rs`): mint 4 placeholder
     /// validators via the in-process keytool, then run the ceremony with flags mirroring the
@@ -749,12 +753,29 @@ mod tests {
             (shared.join("genesis").join("committee.yaml"), target.join("committee.yaml")),
             (shared.join("parameters.yaml"), target.join("parameters.yaml")),
         ];
+        let committee_destination = target.join("committee.yaml");
         let contents: Vec<(std::path::PathBuf, Vec<u8>)> = outputs
             .into_iter()
             .map(|(source, destination)| {
                 let bytes = std::fs::read(&source)
                     .unwrap_or_else(|e| panic!("read ceremony output {}: {e}", source.display()));
-                (destination, bytes)
+                if destination != committee_destination {
+                    return (destination, bytes);
+                }
+                // the ceremony lists its validators as bootstrap servers; the bundled chain keeps
+                // its own list in bootstrap_servers.yaml, so the committee file's map is emptied
+                // in place (older binaries require the key)
+                let mut committee: serde_yaml::Value = serde_yaml::from_slice(&bytes)
+                    .unwrap_or_else(|e| panic!("parse ceremony committee.yaml: {e}"));
+                *committee
+                    .as_mapping_mut()
+                    .expect("ceremony committee.yaml is a mapping")
+                    .get_mut(&serde_yaml::Value::String("bootstrap_servers".into()))
+                    .expect("ceremony committee.yaml lists bootstrap_servers") =
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+                let yaml = serde_yaml::to_string(&committee)
+                    .unwrap_or_else(|e| panic!("serialize regenerated committee.yaml: {e}"));
+                (destination, yaml.into_bytes())
             })
             .collect();
         contents.iter().for_each(|(destination, bytes)| {

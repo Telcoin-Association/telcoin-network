@@ -72,10 +72,12 @@ pub struct NetworkConfig {
     hostname: String,
     /// Bootstrap dial hints for peer discovery, keyed by BLS public key.
     ///
-    /// A nonempty map replaces the genesis bootstrap set in full; entries are never merged.
-    /// An empty or absent map preserves the genesis fallback. A CLI override takes precedence
-    /// over this map, with an explicitly empty override selecting the genesis fallback.
-    /// Committee membership and gossip publisher authorization remain derived from chain state.
+    /// A nonempty map replaces the chain's default set in full; entries are never merged. The
+    /// default is the list built into the binary for a named chain (`--chain`), or the genesis
+    /// committee file's for a network started from datadir genesis files. An empty or absent map
+    /// keeps the default. A CLI override takes precedence over this map, with an explicitly empty
+    /// override selecting the default. Committee membership and gossip publisher authorization
+    /// remain derived from chain state.
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
     /// Operator-provisioned hubs, maintained on the primary and every configured worker swarm.
     ///
@@ -92,6 +94,32 @@ pub struct NetworkConfig {
     committee_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
     /// Optional local listener and advertised endpoint mappings, independent of node identities.
     endpoints: EndpointMappings,
+}
+
+/// Where the node's bootstrap dial hints came from (see
+/// [`NetworkConfig::resolve_bootstrap_peers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapSource {
+    /// `--bootstrap-peers` or `--bootstrap-peers-file`.
+    Cli,
+    /// `bootstrap_peers` in the datadir's `network-config`.
+    NetworkConfig,
+    /// The list built into the binary for the named chain
+    /// (`chain-configs/*/bootstrap_servers.yaml`).
+    Bundled,
+    /// The genesis committee file (`genesis/committee.yaml`).
+    GenesisCommittee,
+}
+
+impl fmt::Display for BootstrapSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cli => "command line",
+            Self::NetworkConfig => "network-config",
+            Self::Bundled => "built-in chain list",
+            Self::GenesisCommittee => "genesis committee file",
+        })
+    }
 }
 
 /// Independent endpoint configuration for the primary and each worker transport identity.
@@ -379,20 +407,37 @@ impl NetworkConfig {
         &self.bootstrap_peers
     }
 
-    /// Select bootstrap dial hints: CLI override, then network config, then genesis.
+    /// Select bootstrap dial hints: CLI override, then network config, then the chain default.
     ///
-    /// The selected override or config map replaces genesis in full when nonempty. An empty
-    /// selected map falls back to genesis, including when the CLI explicitly supplies `{}`.
+    /// `chain_default` is the named chain's built-in list, or the genesis committee file's. The
+    /// selected override or config map replaces it in full when nonempty. An empty selected map
+    /// falls back to it, including when the CLI explicitly supplies `{}`.
     pub fn resolve_bootstrap_peers(
         &self,
-        genesis: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        chain_default: &BTreeMap<BlsPublicKey, BootstrapServer>,
         cli_override: Option<&BTreeMap<BlsPublicKey, BootstrapServer>>,
     ) -> BTreeMap<BlsPublicKey, BootstrapServer> {
         let configured = cli_override.unwrap_or(&self.bootstrap_peers);
         if configured.is_empty() {
-            genesis.clone()
+            chain_default.clone()
         } else {
             configured.clone()
+        }
+    }
+
+    /// Name the source [`Self::resolve_bootstrap_peers`] selects from the same CLI override,
+    /// for the startup log. `bundled` says whether the chain default is a named chain's
+    /// built-in list rather than the genesis committee file's.
+    pub fn bootstrap_source(
+        &self,
+        cli_override: Option<&BTreeMap<BlsPublicKey, BootstrapServer>>,
+        bundled: bool,
+    ) -> BootstrapSource {
+        match cli_override {
+            Some(peers) if !peers.is_empty() => BootstrapSource::Cli,
+            None if !self.bootstrap_peers.is_empty() => BootstrapSource::NetworkConfig,
+            _ if bundled => BootstrapSource::Bundled,
+            _ => BootstrapSource::GenesisCommittee,
         }
     }
 
@@ -1130,11 +1175,20 @@ mod tests {
         Ok(())
     }
 
-    /// Use the checked-in genesis peers so fixtures exercise real key decoding.
+    /// Real keys and addresses, so fixtures exercise real key decoding.
     fn bootstrap_fixture() -> eyre::Result<BTreeMap<BlsPublicKey, BootstrapServer>> {
-        serde_yaml::from_str::<tn_types::Committee>(tn_types::MAINNET_COMMITTEE)
-            .map(|committee| committee.bootstrap_servers())
-            .map_err(Into::into)
+        Ok(tn_types::test_utils::bootstrap_servers_fixture())
+    }
+
+    /// A committee at `epoch` whose members are the [`bootstrap_fixture`] servers, and that
+    /// fixture as its complete launch inventory.
+    fn launch_fixture(
+        epoch: tn_types::Epoch,
+    ) -> eyre::Result<(Committee, BTreeMap<BlsPublicKey, BootstrapServer>)> {
+        let peers = bootstrap_fixture()?;
+        let mut builder = tn_types::CommitteeBuilder::new(epoch);
+        peers.keys().for_each(|key| builder.add_authority(*key, tn_types::Address::ZERO));
+        Ok((builder.build(), peers))
     }
 
     /// Build hubs with explicit worker IDs from real genesis identities.
@@ -1350,8 +1404,7 @@ mod tests {
     /// Launch inventory round-trips and is independent of bootstrap override selection.
     #[test]
     fn committee_peers_round_trip_and_preserve_bootstrap_selection() -> eyre::Result<()> {
-        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let inventory = committee.bootstrap_servers();
+        let (committee, inventory) = launch_fixture(0)?;
         let config = NetworkConfig { committee_peers: inventory.clone(), ..Default::default() };
         let parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
         assert_eq!(parsed.committee_peers(), &inventory);
@@ -1365,11 +1418,9 @@ mod tests {
     /// Missing validators and worker mappings fail at genesis only; later epochs use discovery.
     #[test]
     fn committee_peers_require_complete_launch_coverage() -> eyre::Result<()> {
-        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let later: Committee =
-            serde_yaml::from_str(&tn_types::MAINNET_COMMITTEE.replace("epoch: 0", "epoch: 1"))?;
+        let (committee, full) = launch_fixture(0)?;
+        let (later, _) = launch_fixture(1)?;
         assert_eq!((committee.epoch(), later.epoch()), (0, 1));
-        let full = committee.bootstrap_servers();
         let mut config = NetworkConfig { committee_peers: full.clone(), ..Default::default() };
         config.validate_committee_peers(&committee, &BTreeMap::new())?;
         config.committee_peers.values_mut().for_each(|peer| peer.workers.clear());
@@ -1385,9 +1436,8 @@ mod tests {
     /// Contradictory bootstrap keys, address identities and local keys are actionable errors.
     #[test]
     fn committee_peers_reject_conflicting_identity_hints() -> eyre::Result<()> {
-        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let config =
-            NetworkConfig { committee_peers: committee.bootstrap_servers(), ..Default::default() };
+        let (committee, committee_peers) = launch_fixture(0)?;
+        let config = NetworkConfig { committee_peers, ..Default::default() };
         let (key, peer) = config
             .committee_peers
             .iter()
@@ -1420,9 +1470,8 @@ mod tests {
     /// One network identity cannot represent different validators or different swarms.
     #[test]
     fn committee_peers_reject_reused_network_identity() -> eyre::Result<()> {
-        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let mut config =
-            NetworkConfig { committee_peers: committee.bootstrap_servers(), ..Default::default() };
+        let (committee, committee_peers) = launch_fixture(0)?;
+        let mut config = NetworkConfig { committee_peers, ..Default::default() };
         let primary = config
             .committee_peers
             .values()
@@ -1462,8 +1511,7 @@ mod tests {
     /// Distinct worker identities round-trip and cover every configured swarm.
     #[test]
     fn committee_peers_support_multiple_worker_ids() -> eyre::Result<()> {
-        let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let mut peers = committee.bootstrap_servers();
+        let (committee, mut peers) = launch_fixture(0)?;
         peers.values_mut().for_each(|peer| {
             peer.workers.push(P2pNode {
                 network_key: libp2p::identity::Keypair::generate_ed25519().public().into(),
@@ -1501,14 +1549,14 @@ mod tests {
         Ok(())
     }
 
-    /// Missing files, absent keys, and explicit empty maps preserve the genesis fallback.
+    /// Missing files, absent keys, and explicit empty maps keep the chain default.
     #[test]
-    fn bootstrap_peers_default_and_legacy_configs_use_genesis() -> eyre::Result<()> {
-        let genesis = bootstrap_fixture()?;
+    fn bootstrap_peers_default_and_legacy_configs_use_chain_default() -> eyre::Result<()> {
+        let chain_default = bootstrap_fixture()?;
         let dir = tempfile::tempdir()?;
         let missing = NetworkConfig::read_config(&dir.path().to_path_buf())?;
         assert!(missing.bootstrap_peers().is_empty());
-        assert_eq!(missing.resolve_bootstrap_peers(&genesis, None), genesis);
+        assert_eq!(missing.resolve_bootstrap_peers(&chain_default, None), chain_default);
 
         let mut legacy = serde_yaml::to_value(NetworkConfig::default())?;
         assert!(legacy
@@ -1521,7 +1569,7 @@ mod tests {
             .try_for_each(|yaml| -> eyre::Result<()> {
                 let parsed: NetworkConfig = serde_yaml::from_str(&yaml)?;
                 assert!(parsed.bootstrap_peers().is_empty());
-                assert_eq!(parsed.resolve_bootstrap_peers(&genesis, None), genesis);
+                assert_eq!(parsed.resolve_bootstrap_peers(&chain_default, None), chain_default);
                 Ok(())
             })
     }
@@ -1556,29 +1604,52 @@ mod tests {
         Ok(())
     }
 
-    /// A nonempty configured map replaces all genesis peers, including colliding entries.
+    /// A nonempty configured map replaces the whole chain default, including colliding entries.
     #[test]
-    fn bootstrap_peers_config_replaces_genesis() -> eyre::Result<()> {
-        let genesis = bootstrap_fixture()?;
-        let mut peers: BTreeMap<_, _> = genesis.clone().into_iter().take(1).collect();
+    fn bootstrap_peers_config_replaces_chain_default() -> eyre::Result<()> {
+        let chain_default = bootstrap_fixture()?;
+        let mut peers: BTreeMap<_, _> = chain_default.clone().into_iter().take(1).collect();
         peers.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
-        assert!(genesis.len() > peers.len());
+        assert!(chain_default.len() > peers.len());
         let config = NetworkConfig { bootstrap_peers: peers.clone(), ..Default::default() };
-        assert_eq!(config.resolve_bootstrap_peers(&genesis, None), peers);
+        assert_eq!(config.resolve_bootstrap_peers(&chain_default, None), peers);
         Ok(())
     }
 
-    /// CLI peers win over YAML; an explicitly empty CLI map restores genesis.
+    /// CLI peers win over YAML; an explicitly empty CLI map restores the chain default.
     #[test]
     fn bootstrap_peers_cli_override_has_precedence() -> eyre::Result<()> {
-        let genesis = bootstrap_fixture()?;
-        let configured = genesis.clone().into_iter().take(1).collect();
-        let mut cli: BTreeMap<_, _> = genesis.clone().into_iter().skip(1).collect();
+        let chain_default = bootstrap_fixture()?;
+        let configured = chain_default.clone().into_iter().take(1).collect();
+        let mut cli: BTreeMap<_, _> = chain_default.clone().into_iter().skip(1).collect();
         cli.values_mut().for_each(|server| server.workers.push(server.primary.clone()));
         assert!(!cli.is_empty());
         let config = NetworkConfig { bootstrap_peers: configured, ..Default::default() };
-        assert_eq!(config.resolve_bootstrap_peers(&genesis, Some(&cli)), cli);
-        assert_eq!(config.resolve_bootstrap_peers(&genesis, Some(&BTreeMap::new())), genesis);
+        assert_eq!(config.resolve_bootstrap_peers(&chain_default, Some(&cli)), cli);
+        assert_eq!(
+            config.resolve_bootstrap_peers(&chain_default, Some(&BTreeMap::new())),
+            chain_default
+        );
+        Ok(())
+    }
+
+    /// The logged source names the map [`NetworkConfig::resolve_bootstrap_peers`] selects.
+    #[test]
+    fn bootstrap_source_names_the_selected_map() -> eyre::Result<()> {
+        let peers = bootstrap_fixture()?;
+        let empty = BTreeMap::new();
+        let unset = NetworkConfig::default();
+        let configured = NetworkConfig { bootstrap_peers: peers.clone(), ..Default::default() };
+        assert_eq!(unset.bootstrap_source(None, true), BootstrapSource::Bundled);
+        assert_eq!(unset.bootstrap_source(None, false), BootstrapSource::GenesisCommittee);
+        assert_eq!(configured.bootstrap_source(None, true), BootstrapSource::NetworkConfig);
+        assert_eq!(configured.bootstrap_source(Some(&peers), true), BootstrapSource::Cli);
+        // an explicit empty CLI map selects the default even over a configured map
+        assert_eq!(configured.bootstrap_source(Some(&empty), true), BootstrapSource::Bundled);
+        assert_eq!(
+            configured.bootstrap_source(Some(&empty), false),
+            BootstrapSource::GenesisCommittee
+        );
         Ok(())
     }
 

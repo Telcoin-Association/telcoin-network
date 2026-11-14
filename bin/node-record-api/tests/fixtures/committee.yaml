@@ -1,5 +1,6 @@
 # A two-validator committee in the current on-disk shape (`workers:` list), used by the
-# `keys` unit tests. Keys and addresses are copied from `chain-configs/testnet/committee.yaml`.
+# `keys` and `cli` unit tests. It lists bootstrap servers as a datadir genesis committee file does.
+# Keys are from `chain-configs/testnet/committee.yaml`, addresses from its `bootstrap_servers.yaml`.
 ---
 authorities:
   pDmpE29YEhr93MPVPCGkWx3BsCcow4oExmxv5viJz2GTjsaXwc3YwKxE1CFdVuTVSudsFDutFSVmtgF98Abs56JZPfGQs6GzbqXDFkGA1eZx2edkwfP2Q6eRLo8coLhvTNj:

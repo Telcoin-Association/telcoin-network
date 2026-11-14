@@ -44,6 +44,7 @@ zeroize = { workspace = true }
 [dev-dependencies]
 hex = { workspace = true }
 tempfile = { workspace = true }
+tn-types = { workspace = true, features = ["test-utils"] }
 
 # `umask` for the key-permission tests, which run under a deliberately permissive umask so they fail
 # if the writer ever regresses to relying on the ambient umask for restrictiveness.
