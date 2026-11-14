@@ -81,7 +81,11 @@
 //! it writes. On a mismatch the task fails and the walk computes that root on its own transaction;
 //! the failure is logged at error and counted in `tn_reth.parallel_state_root_task_failures_total`
 //! as `tip_moved` (alert on any nonzero value). A writer that changed state without advancing that
-//! marker would not be caught.
+//! marker would not be caught. The walk's own transaction is held to the output: the overlay keeps
+//! the finalized block number its first root's transaction saw, and a later root of the output
+//! whose transaction sees another fails its block with an error (the overlay was built over the
+//! database its first root saw). That catches a commit between two roots of one output, not one
+//! between the start of an output and its first root.
 //!
 //! # Checks
 //!
@@ -272,6 +276,9 @@ impl OutputTrieOverlay {
     /// Block `number`'s state root and trie updates, as [`Self::layered_root_with_updates`]
     /// computes them, with the storage roots of the accounts with changed storage on rayon's pool
     /// as `mode` says. `factory` opens the tasks' transactions; it must be `tx`'s database.
+    ///
+    /// Fails, computing nothing, when `tx` sees another finalized block than the transaction of
+    /// this overlay's first root ([`Self::check_anchor`]).
     pub(crate) fn block_root_with_updates<F, TX>(
         &self,
         factory: &F,
@@ -284,6 +291,8 @@ impl OutputTrieOverlay {
         F: DatabaseProviderFactory,
         TX: DbTx,
     {
+        let walk_tip = snapshot_tip(tx)?;
+        self.check_anchor(walk_tip)?;
         let prefix_sets = current.construct_prefix_sets().freeze();
         let current = current.into_sorted();
         let (walks, shadow) = match mode {
@@ -300,12 +309,22 @@ impl OutputTrieOverlay {
         let storage = walks.storage;
         if !shadow && !block_is_checked(number) {
             return Ok(self
-                .parallel_root(factory, tx, &current, prefix_sets, targets, split, storage)?
+                .parallel_root(
+                    factory,
+                    tx,
+                    walk_tip,
+                    &current,
+                    prefix_sets,
+                    targets,
+                    split,
+                    storage,
+                )?
                 .result);
         }
         let parallel = self.parallel_root(
             factory,
             tx,
+            walk_tip,
             &current,
             prefix_sets.clone(),
             targets,
@@ -337,20 +356,50 @@ impl OutputTrieOverlay {
         if targets.is_empty() && !split {
             return self.serial_root(tx, &current, prefix_sets);
         }
+        let walk_tip = snapshot_tip(tx)?;
         Ok(self
-            .parallel_root(factory, tx, &current, prefix_sets, targets, split, walks.storage)?
+            .parallel_root(
+                factory,
+                tx,
+                walk_tip,
+                &current,
+                prefix_sets,
+                targets,
+                split,
+                walks.storage,
+            )?
             .result)
+    }
+
+    /// Fail unless `tip`, the finalized block number a root's transaction sees, is the one the
+    /// transaction of this overlay's first root saw (recorded by that root). The overlay's runs
+    /// were built over that database: over another, its blocks would be laid over a state they
+    /// were not built on, so the root would be wrong. Nothing commits during an output's builds on
+    /// the node path (module docs); this turns a writer that does into an error of the block.
+    fn check_anchor(&self, tip: Option<BlockNumber>) -> ProviderResult<()> {
+        let anchor = *self.anchor.get_or_init(|| tip);
+        if anchor != tip {
+            error!(target: "engine", ?anchor, ?tip, "the database moved during an output's builds; the block's root is refused");
+            return Err(DatabaseError::Other(format!(
+                "the root's transaction sees finalized block {tip:?}, the output's first root saw \
+                 {anchor:?}: the database moved during the output's builds"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// The account walk over `tx`, split by first nibble when `split` says so (on this thread and
     /// pool jobs) and otherwise on this thread, with one storage-root task per target on rayon's
     /// global pool, the hot targets' tries split as `storage` says (pieces on this thread and the
-    /// same pool jobs, before the walk).
+    /// same pool jobs, before the walk). `walk_tip` is `tx`'s finalized block number, which every
+    /// task's transaction must see too.
     #[allow(clippy::too_many_arguments)]
     fn parallel_root<F, TX>(
         &self,
         factory: &F,
         tx: &TX,
+        walk_tip: Option<BlockNumber>,
         current: &HashedPostStateSorted,
         prefix_sets: TriePrefixSets,
         targets: Vec<(B256, PrefixSet)>,
@@ -361,7 +410,6 @@ impl OutputTrieOverlay {
         F: DatabaseProviderFactory,
         TX: DbTx,
     {
-        let walk_tip = snapshot_tip(tx)?;
         let runs = &self.runs;
         let (trie, hashed) = layered_factories(tx, runs, current);
         let (whole, hot) = split_storage_targets(&trie, targets, storage)?;
