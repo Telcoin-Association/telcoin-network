@@ -336,8 +336,14 @@ pub struct Parameters {
     /// the closing epoch), the startup re-arm does the same, and a vote round for a record is
     /// seeded with the signatures earlier rounds for that record verified, so two rounds that each
     /// fell short can add up to a quorum. The vote is the same signed message as the original:
-    /// nothing new goes on the wire. The default `false` keeps the previous behaviour: only the
-    /// previous epoch's record is re-voted, once, and every vote round starts empty. Issue #1850.
+    /// nothing new goes on the wire. The round for the older record leaves the
+    /// `tn_node.epoch_record_signers` gauge to the rounds of the latest and the previous record
+    /// and reports its outcome in `tn_node.epoch_record_recertify_rounds_total` instead. A
+    /// node that holds an old record which differs from the network's stops at the close that
+    /// picks it, through the fork check the vote round already makes when it fetches the
+    /// certificate from a peer. The default `false` keeps the previous behaviour: only the
+    /// previous epoch's record is re-voted, once, and every vote round starts empty. Issue
+    /// #1850.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_recertify: bool,
 
