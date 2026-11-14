@@ -323,8 +323,6 @@ where
         block: Option<BlockId>,
     ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<alloy::network::Ethereum>>>> {
         let block = tip_block(block, self.pending_block);
-        // Match reth's RPC entry point: the helper itself does not acquire this guard.
-        let _permit = self.eth_api.tracing_task_guard().clone().acquire_owned().await;
         // Leave oversized payloads untouched for reth's cheap block-count rejection.
         if payload.validation
             && targets_tip(block.unwrap_or_default())

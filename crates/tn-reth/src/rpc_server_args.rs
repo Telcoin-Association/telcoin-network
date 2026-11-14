@@ -265,8 +265,10 @@ pub struct RpcServerArgs {
     )]
     pub rpc_eth_proof_window: u64,
 
-    /// Maximum number of concurrent getproof requests. At least 1: with none, every
-    /// `eth_getProof` would wait forever.
+    /// Maximum number of concurrent `eth_getProof` and `eth_simulateV1` requests on each worker's
+    /// RPC server, which share these permits. A request keeps its permit until its work ends,
+    /// even after its client disconnects. At least 1: with none, every such request would wait
+    /// forever.
     #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(1..=MAX_PERMITS), default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
 

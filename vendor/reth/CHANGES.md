@@ -2975,3 +2975,25 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   error. *Tests*: `test_populate_bundle_state_hashed_refuses_a_hashed_key` (panics on the
   `debug_assert!` without the change); `test_populate_bundle_state_hashed_with_plain_keys`
   unchanged. *Upstream*: n/a (upstream removed `StorageSlotKey` in 815037e27).
+
+- **TN-0181** — `eth_simulateV1` holds its tracing permit for as long as its blocking work runs.
+  *Kind*: fix. *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`simulate_v1` takes the
+  permit after its cheap checks and moves it into the blocking work with the blocking-IO one),
+  `crates/rpc/rpc-eth-api/src/core.rs` (the `eth_simulateV1` handler no longer takes it),
+  `crates/rpc/rpc/src/eth/helpers/call.rs` (`simulation_chain`, test
+  `simulate_takes_a_tracing_permit`); TN's `crates/tn-reth/src/rpc_call.rs` (its handler no
+  longer takes it either).
+  *Why*: the handler took the eth API's tracing permit (the `--rpc.proof-permits` semaphore,
+  25 by default, which `eth_getProof` also takes) and held it in the request future, while
+  `simulate_v1` moved only the blocking-IO permit into its blocking work. When an HTTP client
+  disconnected, the future was dropped and the permit returned at once, while the simulation
+  ran on to its next cancellation check (the end of a call of up to `--rpc.gascap` gas, or of a
+  block's system calls), so a client that sent requests and dropped them could run more
+  simulations at once than there are permits. The handler also ignored the acquire's error; a
+  closed semaphore now fails the request instead of running it without a permit. Requests the
+  cheap checks refuse (too many blocks, no blocks, a system contract's code overridden) no
+  longer wait for a permit. *Can reach execution or storage*: no. RPC only.
+  *Tests*: `simulate_takes_a_tracing_permit` (a request waits while the only permit is held and
+  runs once it is free). Mutation-checked: no permit taken in `simulate_v1` (the request runs
+  while the permit is held).
+  *Upstream*: no; upstream has the same shape (its handler in `rpc-eth-api/src/core.rs`).
