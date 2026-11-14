@@ -15,9 +15,13 @@ use super::{
 use crate::{
     env::output_overlay::{
         layered_factories,
-        parallel::{ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK, CHECK_ONE_BLOCK_IN},
+        parallel::{
+            ParallelRoots, Walks, CHECK_NEXT_SAMPLED_BLOCK, CHECK_ONE_BLOCK_IN, LAST_ROOT_FAILURES,
+            RUN_JOBS_BEFORE_WALK, WALK_HELPERS,
+        },
         storage_split::StorageWalk,
     },
+    metrics::ParallelRootTaskFailure,
     OutputTrieOverlay, RethChainSpec, RethEnv,
 };
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -593,7 +597,9 @@ async fn failed_and_panicked_subtries_are_recomputed() -> eyre::Result<()> {
 /// A commit between the walk's transaction and the helpers' (accounts under every nibble change
 /// and the finalized block number advances, as a persist does): every helper sees another tip and
 /// claims nothing, so the calling thread walks all sixteen subtries over its own transaction and
-/// the root is that transaction's serial root.
+/// the root is that transaction's serial root. Every helper runs before the calling thread claims
+/// a subtrie ([`RUN_JOBS_BEFORE_WALK`]), so without the tip check the helpers would compute the
+/// subtries over the moved database whatever the scheduling.
 #[tokio::test]
 async fn moved_tip_leaves_the_subtries_to_the_walk() -> eyre::Result<()> {
     let mut fixture = Fixture::new(large_base())?;
@@ -614,10 +620,14 @@ async fn moved_tip_leaves_the_subtries_to_the_walk() -> eyre::Result<()> {
     drop(after);
 
     let composed_before = SPLITS_COMPOSED.with(|n| n.get());
+    RUN_JOBS_BEFORE_WALK.with(|f| f.set(true));
     let parallel =
         overlay.layered_root_with_updates_parallel(factory, walk_tx, block, Walks::SPLIT)?;
     assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
     assert_eq!(SPLITS_COMPOSED.with(|n| n.get()), composed_before + 1, "the split composed");
+    let helpers = rayon::current_num_threads().min(WALK_HELPERS);
+    let failures = LAST_ROOT_FAILURES.with(|f| f.get());
+    assert_eq!(failures, (helpers, Some(ParallelRootTaskFailure::TipMoved)), "every helper");
     Ok(())
 }
 

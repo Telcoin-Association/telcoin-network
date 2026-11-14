@@ -8,10 +8,12 @@
 use super::{
     block_is_checked, checked, storage_root_targets, DatabaseError, ParallelRoot, ParallelRoots,
     ProviderError, StorageRootSource as _, StorageRootTasks, StorageSplits, TaskError,
-    CHECK_ONE_BLOCK_IN, FAIL_NEXT_WALK, INJECTED_WALK_FAILURE, TASKS_STARTED, TASK_ROOTS_TAKEN,
+    CHECK_ONE_BLOCK_IN, FAIL_NEXT_WALK, INJECTED_WALK_FAILURE, LAST_ROOT_FAILURES,
+    RUN_JOBS_BEFORE_WALK, TASKS_STARTED, TASK_ROOTS_TAKEN,
 };
 use crate::{
     env::output_overlay::{AccountWalk, StorageWalk, Walks},
+    metrics::ParallelRootTaskFailure,
     OutputTrieOverlay, RethChainSpec, RethEnv,
 };
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -313,7 +315,8 @@ async fn no_storage_changes_runs_serially() -> eyre::Result<()> {
 /// A commit between the walk's transaction and the tasks' (it changes a slot of every target and
 /// advances the finalized block number, as a persist does): every task sees another tip and
 /// leaves its account to the walk, so the root is the serial one over the walk's transaction.
-/// Without the tip check any task result the walk took would carry the commit's slot.
+/// Every task runs before the walk claims any ([`RUN_JOBS_BEFORE_WALK`]), so without the tip
+/// check every task's root would carry the commit's slot whatever the scheduling.
 #[tokio::test]
 async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
     let mut fixture = Fixture::new()?;
@@ -340,10 +343,13 @@ async fn moved_tip_falls_back_to_serial() -> eyre::Result<()> {
     drop(after);
 
     let taken_before = TASK_ROOTS_TAKEN.with(|n| n.get());
+    RUN_JOBS_BEFORE_WALK.with(|f| f.set(true));
     let parallel =
         overlay.layered_root_with_updates_parallel(factory, walk_tx, block, Walks::SPLIT)?;
     assert_eq!(parallel, serial, "the root must be the walk transaction's serial root");
     assert_eq!(TASK_ROOTS_TAKEN.with(|n| n.get()), taken_before, "a task's root was used");
+    let failures = LAST_ROOT_FAILURES.with(|f| f.get());
+    assert_eq!(failures, (61, Some(ParallelRootTaskFailure::TipMoved)), "every task saw the move");
     Ok(())
 }
 

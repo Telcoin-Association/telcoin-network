@@ -433,6 +433,10 @@ impl OutputTrieOverlay {
         let tasks = Arc::new(StorageRootTasks::new(whole, StorageSplits::new(hot)));
         let source = Arc::clone(&tasks) as Arc<dyn StorageRootSource>;
         let subtries = (split && account_trie_splits(&trie)?).then(|| Subtries::new(&prefix_sets));
+        #[cfg(test)]
+        let jobs_first = RUN_JOBS_BEFORE_WALK.with(|f| f.replace(false));
+        #[cfg(test)]
+        let helpers_done = &std::sync::atomic::AtomicUsize::new(0);
         let root = rayon::in_place_scope(|scope| -> ProviderResult<ParallelRoot> {
             let shared = &*tasks;
             // However the walk below ends, a task not yet started returns at once: the scope's end
@@ -450,13 +454,22 @@ impl OutputTrieOverlay {
             }
             let splits = &shared.splits;
             let subtries = subtries.as_ref();
-            if subtries.is_some() || !splits.is_empty() {
-                let source = &source;
-                for _ in 0..rayon::current_num_threads().min(WALK_HELPERS) {
-                    scope.spawn(move |_| {
-                        walk_helper(factory, walk_tip, runs, current, subtries, source, shared)
-                    });
-                }
+            let helpers = if subtries.is_some() || !splits.is_empty() {
+                rayon::current_num_threads().min(WALK_HELPERS)
+            } else {
+                0
+            };
+            let source_ref = &source;
+            for _ in 0..helpers {
+                scope.spawn(move |_| {
+                    walk_helper(factory, walk_tip, runs, current, subtries, source_ref, shared);
+                    #[cfg(test)]
+                    helpers_done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            #[cfg(test)]
+            if jobs_first {
+                shared.wait_for_jobs(helpers_done, helpers);
             }
             // The hot storage tries' pieces first: the walks below consume them.
             splits.work(tx, &trie, &hashed, &|error| shared.record_failure(error));
@@ -489,6 +502,11 @@ impl OutputTrieOverlay {
         tasks.log_failures();
         tasks.splits.record_fallbacks();
         #[cfg(test)]
+        {
+            let (count, first) = &*tasks.failures.lock();
+            LAST_ROOT_FAILURES.with(|f| f.set((*count, first.as_ref().map(TaskError::reason))));
+        }
+        #[cfg(test)]
         if let Ok(root) = &root {
             STORAGE_SPLITS_COMPOSED.with(|n| n.set(n.get() + root.storage_composed));
         }
@@ -509,7 +527,7 @@ struct ParallelRoot {
 
 /// Pool jobs offered to the split walks besides the calling thread: one per account subtrie but
 /// the one the calling thread takes first (the storage pieces come first on each).
-const WALK_HELPERS: usize = 15;
+pub(super) const WALK_HELPERS: usize = 15;
 
 /// Storage-root targets: hashed address and storage prefix set.
 type Targets = Vec<(B256, PrefixSet)>;
@@ -769,6 +787,22 @@ impl StorageRootTasks {
         failures.1.get_or_insert(error);
     }
 
+    /// Wait until every slot task has finished and `helpers` walk helpers have returned
+    /// (`helpers_done` counts them), so each job has run before the walk claims anything
+    /// ([`RUN_JOBS_BEFORE_WALK`]). The calling thread is not a pool worker, so the pool runs them.
+    #[cfg(test)]
+    fn wait_for_jobs(&self, helpers_done: &std::sync::atomic::AtomicUsize, helpers: usize) {
+        for slot in &self.slots {
+            let mut state = slot.state.lock();
+            while matches!(*state, TaskState::Pending | TaskState::Running) {
+                slot.finished.wait(&mut state);
+            }
+        }
+        while helpers_done.load(std::sync::atomic::Ordering::SeqCst) < helpers {
+            std::thread::yield_now();
+        }
+    }
+
     /// Mark the tasks that have not started as claimed, so they return at once (the walk is done
     /// or failed).
     fn claim_unstarted(&self) {
@@ -879,6 +913,13 @@ thread_local! {
     /// Set by a test to make this thread's next walk on one thread fail before it reads anything,
     /// as a database read error would.
     static FAIL_NEXT_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by a test to make this thread's next parallel root run every slot task and walk helper
+    /// before its walk claims anything, so each one's tip check runs whatever the scheduling.
+    pub(super) static RUN_JOBS_BEFORE_WALK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The failed tasks of the last parallel root this thread computed, and the first one's reason.
+    pub(super) static LAST_ROOT_FAILURES: std::cell::Cell<(usize, Option<ParallelRootTaskFailure>)> =
+        const { std::cell::Cell::new((0, None)) };
 }
 
 /// The error a walk failed by [`FAIL_NEXT_WALK`] returns.
