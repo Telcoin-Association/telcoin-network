@@ -2632,18 +2632,27 @@ async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
     assert_eq!(round_five.round(), 5);
     assert_eq!(line.field("exec_policy"), Some("starved"));
     assert_eq!(proposer.exec_block_policy.next_window, 16);
-    // the round jumps to 20: the window counts headers, so the next one still uses the rule
+    // the round jumps to 20 with no report: the window counts headers, so the next one still uses
+    // the rule (a window of rounds would have ended at round 12)
     proposer.round = 20;
-    proposer.process_uncertified_header(19, HeaderDigest::default());
     proposer.last_parents = exec_parents(&fixture, 20, 112);
     let (round_21, line) = exec_propose(&mut proposer, &capture).await;
     assert_eq!(round_21.round(), 21);
     assert_eq!(line.field("exec_policy"), Some("starved"));
+    assert_eq!(proposer.exec_block_policy.next_window, 16);
+    // the round-21 header is cancelled once the proposer has moved on to round 22: the window
+    // extends, and K doubles again when round 23 is built
+    proposer.round = 22;
+    proposer.process_uncertified_header(21, round_21.digest());
+    proposer.last_parents = exec_parents(&fixture, 22, 112);
+    let (round_23, line) = exec_propose(&mut proposer, &capture).await;
+    assert_eq!(round_23.round(), 23);
+    assert_eq!(line.field("exec_policy"), Some("starved"));
     assert_eq!(proposer.exec_block_policy.next_window, 32);
     // the window's last fifteen headers, built through the policy as the proposer builds them
     assert_eq!(
-        exec_build_headers(&mut proposer.exec_block_policy, 22..=37),
-        (22..=36).collect::<Vec<_>>()
+        exec_build_headers(&mut proposer.exec_block_policy, 24..=39),
+        (24..=38).collect::<Vec<_>>()
     );
 
     // the own round-40 certificate, a tip header, among the parents of round 41 starts the streak;
