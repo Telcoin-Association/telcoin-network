@@ -254,6 +254,10 @@ impl<DB: Database> Proposer<DB> {
     /// backwards. The genesis certificates are the parents of round 1 only, so they seed
     /// `last_parents` only when the round starts at 0; a proposer seeded above round 0 waits for
     /// parents of its own round (see `Self::has_parents_for_round`).
+    ///
+    /// The `quorum_exec_block` switch values are checked here, where they take effect: values the
+    /// proposer cannot use as written are logged as a warning (see
+    /// [`ExecBlockPolicy::starved_rounds_warning`]).
     pub(crate) fn new(
         config: ConsensusConfig<DB>,
         authority_id: AuthorityIdentifier, // We need to be a validator so must have an id.
@@ -298,6 +302,21 @@ impl<DB: Database> Proposer<DB> {
         // (`InvalidParentRound`), so genesis seeds the parents of round 1 and nothing else
         let last_parents = if round == 0 { genesis } else { Vec::new() };
 
+        let quorum_exec_block = config.parameters().quorum_exec_block;
+        let quorum_exec_block_starved_rounds = config.parameters().quorum_exec_block_starved_rounds;
+        if let Some(warning) = ExecBlockPolicy::starved_rounds_warning(
+            quorum_exec_block,
+            quorum_exec_block_starved_rounds,
+        ) {
+            warn!(
+                target: "primary::proposer",
+                quorum_exec_block,
+                quorum_exec_block_starved_rounds,
+                bound = QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS,
+                "{warning}"
+            );
+        }
+
         Self {
             authority_id,
             committee: config.committee().clone(),
@@ -326,8 +345,8 @@ impl<DB: Database> Proposer<DB> {
             headers_proposed: HeadersProposedHandles::new(),
             digests_requeued: DigestsRequeuedHandles::new(),
             exec_block_policy: ExecBlockPolicy::new(
-                config.parameters().quorum_exec_block,
-                config.parameters().quorum_exec_block_starved_rounds,
+                quorum_exec_block,
+                quorum_exec_block_starved_rounds,
             ),
         }
     }
@@ -1532,8 +1551,11 @@ pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
 /// the model, 1.5 % in its worst 4000-round sample. Every climb to the bound also costs one or two
 /// headers per doubling (five doublings from a window of 4), so a measurement that starts as a
 /// regime starts loses 5 to 10 headers before the steady state: the e2e test, about 100 rounds
-/// long, lost 7 or 8 and certified 0.92 to 0.93. A configured value above the bound is used as is
-/// and never doubled.
+/// long, lost 7 or 8 and certified 0.92 to 0.93.
+///
+/// A configured value above the bound is lowered to it, and the proposer warns at the start of
+/// each epoch (see [`ExecBlockPolicy::starved_rounds_warning`]): a first window that long keeps the
+/// rule on for most of the epoch after one cancel, the `always` policy under another name.
 pub(crate) const QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS: Round = 128;
 
 /// How many consecutive own headers, proposed outside a window (under the tip policy) and
@@ -1648,15 +1670,37 @@ pub(crate) struct ExecBlockPolicy {
 
 impl ExecBlockPolicy {
     /// The policy for the switch values `quorum_exec_block` and
-    /// `quorum_exec_block_starved_rounds`.
+    /// `quorum_exec_block_starved_rounds`, the window lowered to
+    /// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`] when it is above it.
     pub(crate) fn new(enabled: bool, starved_rounds: u32) -> Self {
+        let window = starved_rounds.min(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS);
         Self {
             enabled,
-            base_window: starved_rounds,
-            next_window: starved_rounds,
+            base_window: window,
+            next_window: window,
             window_start: 0,
             starved_through: 0,
             certified_streak: 0,
+        }
+    }
+
+    /// The warning for switch values the proposer does not use as written, or `None`.
+    ///
+    /// A window with `quorum_exec_block` off has no effect, and a window above
+    /// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`] is lowered to it by [`Self::new`]. Neither stops
+    /// the node: the first is a valid configuration of the switch-off behaviour, and the second
+    /// still runs the adaptive policy. The proposer logs the warning when it starts, once per
+    /// epoch, so the mistake shows in the node's log instead of passing silently.
+    pub(crate) fn starved_rounds_warning(
+        enabled: bool,
+        starved_rounds: u32,
+    ) -> Option<&'static str> {
+        if !enabled && starved_rounds > 0 {
+            Some("quorum_exec_block_starved_rounds has no effect while quorum_exec_block is off")
+        } else if enabled && starved_rounds > QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS {
+            Some("quorum_exec_block_starved_rounds is above its bound; the bound is used")
+        } else {
+            None
         }
     }
 
@@ -1845,10 +1889,10 @@ pub(crate) struct ExecBlockChoice {
 ///   always this node's own execution, never a parent's hash;
 /// - nothing is named below the block the header's epoch opened on, the previous epoch's closing
 ///   block (see [`RecentBlocks::newest_before_epoch`]): a parent naming an older block is not
-///   counted. Every member executed that block before it entered the epoch, so only a faulty
-///   parent names less, and a voter restored from that epoch's export holds nothing older: one
-///   low parent in a minimal parent set would otherwise drag the choice to a floor entry that
-///   such a voter refuses for good.
+///   counted. Every member executed that block before it entered the epoch, so only a faulty parent
+///   names less, and a voter restored from that epoch's export holds nothing older: one low parent
+///   in a minimal parent set would otherwise drag the choice to a floor entry that such a voter
+///   refuses for good.
 ///
 /// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
 /// An empty ring names the default block, as the tip read did before the switch existed.

@@ -342,9 +342,8 @@ mod tests {
         let mut recent = RecentBlocks::new(8);
         let mut pushed = Vec::new();
         // epoch 4 closes at block 16; epoch 5 executes blocks 19 and 22
-        for (round, (epoch, number)) in [(4u64, 10u64), (4, 13), (4, 16), (5, 19), (5, 22)]
-            .into_iter()
-            .enumerate()
+        for (round, (epoch, number)) in
+            [(4u64, 10u64), (4, 13), (4, 16), (5, 19), (5, 22)].into_iter().enumerate()
         {
             let round = u32::try_from(round).expect("small ring");
             let nonce = (epoch << 32) | u64::from(round);
