@@ -1234,11 +1234,14 @@ until `execution-reset-*` is deleted, and the rebuild (or the swap's copy) needs
 again. The moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
 refuses to start while a `.partial` directory holding an entry is there, and running the command
 again finishes it. An empty one (left when the entries are moved back to undo it) blocks nothing.
-It refuses, and moves nothing, a datadir whose consensus database holds a later epoch's pack and none
-for epoch 0, as a datadir bootstrapped with `db load-state` does (it holds consensus only from the
-restored epoch on). The rebuild replays epoch 0 from the node's own packs, and the node fetches no
-pack below the epoch its consensus database is at, so it could not start. Such a node rebuilds as a
-new one: move `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
+It refuses, dry run included, and moves nothing, a datadir whose consensus database lacks the pack
+of an epoch below the latest one it holds (a pack counts as the node's start finds it, its `data`
+log, an interrupted install's aside included), as a datadir bootstrapped with `db load-state` does
+(it holds consensus only from the restored epoch on) and one that lost a pack does. The rebuild
+re-executes every epoch from 0 from the node's own packs, and the node fetches no pack below the
+epoch its consensus database is at, so every start would stop at the gap. Such a node restores
+`consensus-db/` from a backup, or rebuilds as a new one: move `consensus-db/` aside as well, as for
+a forked record below, and it syncs from genesis.
 A validator rebuilt that way stays stopped until the network has closed the last epoch it took part
 in: its votes and proposals for that epoch leave with `consensus-db/`. A validator takes the
 side-observer swap below instead, which keeps its `consensus-db/`: `--for-swap` skips this refusal,
@@ -1322,7 +1325,7 @@ because the copied execution database replaces the rebuild.
   3. Stop the validator, then move its execution database aside:
      `telcoin-network db reset-execution --datadir <validator-datadir> --force --for-swap`.
      `--for-swap` lets a validator bootstrapped with `db load-state` through: the start in step 5
-     executes only the consensus output past the copy's tip, so it needs no epoch-0 pack. A copy
+     executes only the consensus output past the copy's tip, so it needs no pack below it. A copy
      that stores transactions by position needs, at that start, the validator's packs of every
      epoch its rows point into ("Startup check" above): an observer synced from genesis points
      into epoch 0, so for such a validator bootstrap the observer with `db load-state` too, from

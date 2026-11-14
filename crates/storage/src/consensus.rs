@@ -1270,7 +1270,10 @@ impl ConsensusChain {
     /// past epoch; if `epoch-N` EXISTS, the aside is a stale backup from a completed install
     /// and is removed. Deleting `.replaced` unconditionally (the old behavior) could brick
     /// startup or lose an epoch.
-    fn recover_incomplete_installs(base_path: &Path) {
+    ///
+    /// Public so that `db repair --force` runs this same step at rest; a failed restore is only
+    /// logged, so a caller that must know checks [`Self::interrupted_installs`] afterwards.
+    pub fn recover_incomplete_installs(base_path: &Path) {
         let Ok(entries) = std::fs::read_dir(base_path) else { return };
         for entry in entries.flatten() {
             let file_name = entry.file_name();
@@ -1305,6 +1308,47 @@ impl ConsensusChain {
                 }
             }
         }
+    }
+
+    /// The epochs of the interrupted installs under the epochs directory `base_path`, lowest first:
+    /// an `epoch-N.replaced` with no `epoch-N` beside it (a stop between an install's two renames).
+    /// The node's next start puts each back ([`Self::recover_incomplete_installs`]); the at-rest
+    /// tools, which do not, report them. A failed look is an error, never "none".
+    pub fn interrupted_installs(base_path: &Path) -> io::Result<Vec<Epoch>> {
+        let mut epochs = Vec::new();
+        for entry in std::fs::read_dir(base_path)? {
+            let file_name = entry?.file_name();
+            let Some(live_name) = file_name.to_str().and_then(|n| n.strip_suffix(".replaced"))
+            else {
+                continue;
+            };
+            let Some(epoch) =
+                live_name.strip_prefix("epoch-").and_then(|n| n.parse::<Epoch>().ok())
+            else {
+                continue;
+            };
+            if !base_path.join(live_name).try_exists()? {
+                epochs.push(epoch);
+            }
+        }
+        epochs.sort_unstable();
+        Ok(epochs)
+    }
+
+    /// Whether the node's next start on the epochs directory `base_path` finds the data log of
+    /// `epoch`'s pack, the test the startup coverage check and [`Self::epoch_absent`] apply once
+    /// the start has run: `epoch-N/data`, or, with no `epoch-N`, the data log in an interrupted
+    /// install's `epoch-N.replaced`, which the start puts back before it opens anything
+    /// ([`Self::recover_incomplete_installs`]). For the tools that judge a datadir at rest. A
+    /// failed look is an error, never "absent".
+    pub fn pack_data_at_start(base_path: &Path, epoch: Epoch) -> io::Result<bool> {
+        let live = base_path.join(format!("epoch-{epoch}"));
+        let dir = if live.try_exists()? {
+            live
+        } else {
+            base_path.join(format!("epoch-{epoch}.replaced"))
+        };
+        dir.join(DATA_NAME).try_exists()
     }
 
     /// Atomically install a freshly-imported `epoch-{epoch}` directory at `base_path`, replacing
@@ -3085,6 +3129,45 @@ mod test {
         // epoch-6 untouched, its stale aside removed.
         assert!(base.join("epoch-6").is_dir(), "existing epoch-6 must be left in place");
         assert!(!base.join("epoch-6.replaced").exists(), "a stale aside must be removed");
+    }
+
+    /// The at-rest view (`interrupted_installs`, `pack_data_at_start`) answers before a start what
+    /// the start's `recover_incomplete_installs` then makes true: an aside with no live directory
+    /// is an interrupted install whose data log counts as present, an aside beside a live
+    /// directory is not (the start removes it, so only the live data log counts), and a directory
+    /// without a data log is no pack.
+    #[test]
+    fn test_at_rest_pack_view_matches_the_start() {
+        let temp_dir = TempDir::with_prefix("at_rest_view").expect("temp dir");
+        let base = temp_dir.path();
+        let data = crate::consensus_pack::DATA_NAME;
+        // 1: live with its data log. 2: only an aside holding one (an interrupted install).
+        // 3: live without a data log, beside an aside holding one (a stale aside). 4: an aside
+        // without a data log. 5: nothing.
+        for dir in
+            ["epoch-1", "epoch-2.replaced", "epoch-3", "epoch-3.replaced", "epoch-4.replaced"]
+        {
+            std::fs::create_dir(base.join(dir)).expect("mkdir");
+        }
+        for dir in ["epoch-1", "epoch-2.replaced", "epoch-3.replaced"] {
+            std::fs::write(base.join(dir).join(data), b"pack").expect("data log");
+        }
+        let present = |base: &std::path::Path| -> Vec<Epoch> {
+            (0..=5)
+                .filter(|epoch| ConsensusChain::pack_data_at_start(base, *epoch).expect("look"))
+                .collect()
+        };
+
+        assert_eq!(ConsensusChain::interrupted_installs(base).expect("list"), vec![2, 4]);
+        let before = present(base);
+        assert_eq!(before, vec![1, 2]);
+
+        ConsensusChain::recover_incomplete_installs(base);
+        assert!(ConsensusChain::interrupted_installs(base).expect("list").is_empty());
+        assert_eq!(present(base), before, "the start finds what the at-rest view predicted");
+        for epoch in &before {
+            assert!(base.join(format!("epoch-{epoch}")).join(data).is_file(), "epoch {epoch}");
+        }
     }
 
     #[tokio::test]

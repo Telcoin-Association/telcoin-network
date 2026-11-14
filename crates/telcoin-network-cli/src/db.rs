@@ -98,7 +98,9 @@ enum DbSubcommand {
     Validate(DbValidateArgs),
 
     /// Repair consensus epoch packs at rest: truncate a torn data-file tail and rebuild indexes.
-    /// The node MUST be stopped. Dry-run by default; pass `--force` to apply.
+    /// The node MUST be stopped. Dry-run by default; pass `--force` to apply. Reports an
+    /// interrupted install (`epoch-N.replaced` with no `epoch-N`), which `--force` puts back as
+    /// the node's next start would.
     Repair(DbRepairArgs),
 
     /// Migrate legacy (pre-v2) consensus epoch packs up to the current v2 format: rewrite the data
@@ -122,10 +124,12 @@ enum DbSubcommand {
     /// re-executing the chain, in the storage layout new datadirs get. Moves `db`,
     /// `static_files` and `restored-state-floor` into `execution-reset-<UTC time>` under the
     /// datadir (renames, never deletes: moving them back undoes it); the consensus database, keys
-    /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database holds
-    /// a later epoch's pack and none for epoch 0 (one bootstrapped with `db load-state`): the
-    /// rebuild replays epoch 0 from the node's own packs. `--for-swap` skips that refusal for the
-    /// side-observer swap. Dry-run by default; pass `--force` to apply.
+    /// and config stay. The node MUST be stopped. Refuses a datadir whose consensus database lacks
+    /// the pack of an epoch below its latest one (one bootstrapped with `db load-state` lacks
+    /// every epoch below the restored one): the rebuild re-executes every epoch from 0 from
+    /// the node's own packs. `--for-swap` skips that refusal for the side-observer swap. Refuses,
+    /// in both modes, a datadir an unfinished `db load-state` left, as the node does. Dry-run by
+    /// default; pass `--force` to apply.
     ///
     /// The default build's new datadirs store each transaction once: their rows hold its position
     /// in a batch of the consensus packs, so a rebuild is how an existing datadir moves to that
@@ -145,9 +149,9 @@ pub struct DbResetExecutionArgs {
     pub force: bool,
     /// The side-observer swap: a synced observer's `db` and `static_files` are copied in before
     /// the next start, which then executes only the consensus output past the copy's tip. Skips
-    /// the refusal of a datadir whose consensus database holds no epoch-0 pack (one bootstrapped
-    /// with `db load-state`). Without that copy the next start rebuilds from genesis, which such a
-    /// datadir cannot do.
+    /// the refusal of a datadir whose consensus database lacks the pack of an epoch below its
+    /// latest one (one bootstrapped with `db load-state`). Without that copy the next start
+    /// rebuilds from genesis, which such a datadir cannot do.
     ///
     /// An observer's database that stores transactions by their position in consensus packs
     /// needs this node to hold the pack of every epoch from the one of its first transaction to
@@ -525,6 +529,29 @@ fn resolve_data_file_and_epoch(
     } else if path.is_file() {
         (path.to_path_buf(), path.parent().map(Path::to_path_buf))
     } else {
+        // an `epoch-N` (or its `data`) that an interrupted install left only as `epoch-N.replaced`
+        let epoch_dir = if path.file_name().is_some_and(|name| name == DATA_NAME) {
+            path.parent()
+        } else {
+            Some(path)
+        };
+        if let Some((epoch_dir, epoch)) =
+            epoch_dir.and_then(|dir| epoch_from_dir_name(dir).map(|epoch| (dir, epoch)))
+        {
+            let mut aside = epoch_dir.as_os_str().to_owned();
+            aside.push(".replaced");
+            let aside = PathBuf::from(aside);
+            if aside.is_dir() {
+                bail!(
+                    "path does not exist: {}. {}. `telcoin-network db repair --force` (node \
+                     stopped) puts it back now; to check the copy first, run `telcoin-network db \
+                     validate {}`",
+                    path.display(),
+                    interrupted_install_note(epoch),
+                    aside.display(),
+                );
+            }
+        }
         bail!("path does not exist: {}", path.display());
     };
 
@@ -574,12 +601,32 @@ fn warn_if_current_epoch(data_file: &Path, epoch: Epoch) {
     }
 }
 
-/// Parse an epoch out of an `epoch-NN` directory name.
+/// Parse an epoch out of an `epoch-NN` directory name, or out of an interrupted install's
+/// `epoch-NN.replaced`.
 fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
     dir.file_name()
         .and_then(|name| name.to_str())
+        .map(|name| name.strip_suffix(".replaced").unwrap_or(name))
         .and_then(|name| name.strip_prefix("epoch-"))
         .and_then(|num| num.parse::<Epoch>().ok())
+}
+
+/// The interrupted installs under `epochs_dir` ([`ConsensusChain::interrupted_installs`]): an
+/// `epoch-N.replaced` with no `epoch-N` beside it.
+fn interrupted_installs(epochs_dir: &Path) -> eyre::Result<Vec<Epoch>> {
+    ConsensusChain::interrupted_installs(epochs_dir).map_err(|e| {
+        eyre!("failed to look for interrupted installs under {}: {e}", epochs_dir.display())
+    })
+}
+
+/// What an interrupted install of `epoch` is, and what the node's next start does with it, for
+/// the at-rest commands' reports.
+fn interrupted_install_note(epoch: Epoch) -> String {
+    format!(
+        "INTERRUPTED INSTALL — `epoch-{epoch}` is missing and `epoch-{epoch}.replaced` holds its \
+         last good copy (an install or migration stopped between its two renames); the node's \
+         next start puts it back before it opens anything (`recover_incomplete_installs`)"
+    )
 }
 
 /// Select which epochs `db repair` targets, given all `epoch-{N}` dirs (sorted ascending) and an
@@ -607,8 +654,8 @@ fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Optio
 ///
 /// Truncates a torn `data`-file tail and rebuilds missing/corrupt sidecar indexes from the data log
 /// (the source of truth), then re-seals the pack. Damage that truncation cannot fix — a
-/// torn/corrupt epoch-meta, or mid-log data corruption — is reported (re-sync required), never
-/// touched.
+/// torn/corrupt epoch-meta, or mid-log data corruption — is reported with its recovery (a backup,
+/// or starting the node over), never touched.
 ///
 /// The node MUST be stopped: with `--force` this opens packs for append and rewrites them, which
 /// would corrupt a running node's memory mapping. It refuses to run while the datadir PID lock
@@ -617,6 +664,12 @@ fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Optio
 /// `--force` to apply. In repair-all mode the current/latest epoch (the one a running node holds
 /// open for append) is skipped; repair it explicitly with `--epoch N` once the node is confirmed
 /// stopped.
+///
+/// An interrupted install (`epoch-N.replaced` with no `epoch-N`) is reported, whatever `--epoch`
+/// names. When there is one, `--force` first runs the node's own start-time step on the epochs
+/// directory (`ConsensusChain::recover_incomplete_installs`), which puts each one back (and
+/// removes an aside left beside its `epoch-N`), so the restored epoch is then checked like any
+/// other.
 #[derive(Debug, Args)]
 pub struct DbRepairArgs {
     /// Repair only this epoch. Without it, every epoch except the current/latest is repaired.
@@ -653,14 +706,25 @@ impl DbRepairArgs {
         // a confusing partial report.
         let _pid_lock = PidLock::acquire(&datadir)?;
 
+        // An interrupted install hides its epoch from the listing below. With `--force`, put each
+        // back as the node's next start would, so the restored epoch is checked with the others.
+        let interrupted = interrupted_installs(&epochs_dir)?;
+        let (restored, interrupted) = if self.force && !interrupted.is_empty() {
+            ConsensusChain::recover_incomplete_installs(&epochs_dir);
+            let left = interrupted_installs(&epochs_dir)?;
+            (interrupted.into_iter().filter(|e| !left.contains(e)).collect(), left)
+        } else {
+            (Vec::new(), interrupted)
+        };
         let all = ConsensusPack::epoch_dirs(&epochs_dir)
             .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
         if let Some(e) = self.epoch {
-            if !all.contains(&e) {
+            if !all.contains(&e) && !interrupted.contains(&e) {
                 bail!("epoch {e} not found under {}", epochs_dir.display());
             }
         }
-        let (targets, skipped_current) = repair_targets(&all, self.epoch);
+        let (mut targets, skipped_current) = repair_targets(&all, self.epoch);
+        targets.retain(|e| !interrupted.contains(e));
         if let Some(cur) = skipped_current {
             println!(
                 "epoch {cur}: SKIPPED (current/latest epoch) — repair explicitly with \
@@ -679,6 +743,26 @@ impl DbRepairArgs {
             let mut actionable = 0usize;
             let mut unrepairable = 0usize;
             let mut errored = 0usize;
+            for epoch in &restored {
+                actionable += 1;
+                println!(
+                    "epoch {epoch}: RESTORED — `epoch-{epoch}` was missing (an interrupted \
+                     install); put back from `epoch-{epoch}.replaced`, as the node's start does"
+                );
+            }
+            for epoch in &interrupted {
+                let note = interrupted_install_note(*epoch);
+                if self.force {
+                    errored += 1;
+                    println!(
+                        "epoch {epoch}: ERROR — {note}, but putting it back failed: with the node \
+                         stopped, rename `epoch-{epoch}.replaced` to `epoch-{epoch}`"
+                    );
+                } else {
+                    actionable += 1;
+                    println!("epoch {epoch}: would restore — {note}; `--force` puts it back now");
+                }
+            }
             for epoch in &targets {
                 match ConsensusPack::repair_epoch(&epochs_dir, *epoch, self.force).await {
                     Ok(EpochRepair::Healthy) => println!("epoch {epoch}: OK"),
@@ -745,8 +829,8 @@ impl DbRepairArgs {
 
             let verb = if self.force { "repaired" } else { "to repair (dry run)" };
             println!(
-                "\nsummary: {actionable} epoch(s) {verb}, {unrepairable} unrepairable (data loss / \
-                 re-sync), {errored} error(s)."
+                "\nsummary: {actionable} epoch(s) {verb}, {unrepairable} unrepairable (see each \
+                 epoch's reason), {errored} error(s)."
             );
             // Non-zero exit when anything could not be made healthy, so automation can distinguish a
             // clean datadir from one needing attention (a dry run that only found `WouldRepair` items
@@ -777,7 +861,9 @@ impl DbRepairArgs {
 /// node's memory mapping. It refuses to run while the datadir PID lock (`telcoin.pid`) is held by a
 /// live node (and takes that lock for its own run), and is a dry run by default, requiring
 /// `--force` to apply. A legacy pack whose data log is damaged below the acked frontier is reported
-/// (re-sync required), never truncated.
+/// with its recovery (a backup, or starting the node over), never truncated. An interrupted install
+/// (`epoch-N.replaced` with no `epoch-N`) is reported and not migrated: `db repair --force`, or the
+/// node's next start, puts it back.
 #[derive(Debug, Args)]
 pub struct DbMigrateArgs {
     /// Migrate only this epoch. Without it, every legacy epoch is migrated.
@@ -813,17 +899,27 @@ impl DbMigrateArgs {
         // reclaimed.
         let _pid_lock = PidLock::acquire(&datadir)?;
 
+        // An interrupted install hides its epoch from the listing below: report it instead.
+        let interrupted = interrupted_installs(&epochs_dir)?;
         let all = ConsensusPack::epoch_dirs(&epochs_dir)
             .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
         if let Some(e) = self.epoch {
-            if !all.contains(&e) {
+            if !all.contains(&e) && !interrupted.contains(&e) {
                 bail!("epoch {e} not found under {}", epochs_dir.display());
             }
         }
         let targets: Vec<Epoch> = match self.epoch {
+            Some(e) if interrupted.contains(&e) => Vec::new(),
             Some(e) => vec![e],
             None => all,
         };
+        for epoch in &interrupted {
+            println!(
+                "epoch {epoch}: NOT MIGRATED — {}; `telcoin-network db repair --force` puts it back \
+                 now, then migrate it",
+                interrupted_install_note(*epoch)
+            );
+        }
 
         let runtime =
             tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
@@ -861,7 +957,8 @@ impl DbMigrateArgs {
             let verb = if self.force { "migrated" } else { "to migrate (dry run)" };
             println!(
                 "\nsummary: {actionable} epoch(s) {verb}, {already} already v2, {corrupt} corrupt \
-                 (re-sync required)."
+                 or failed (see each epoch's reason), {} interrupted install(s).",
+                interrupted.len()
             );
             // Non-zero exit when any pack could not be migrated, so scripts/operators notice.
             if corrupt > 0 {
@@ -1920,6 +2017,57 @@ mod tests {
             "repair must clear its PID on exit"
         );
         drop(PidLock::acquire(&datadir).expect("repair must release its lock on exit"));
+    }
+
+    /// An interrupted install (`epoch-N.replaced`, no `epoch-N`) is not hidden from the at-rest
+    /// commands: `repair` and `migrate` take `--epoch N` for it instead of answering "not found",
+    /// their dry runs leave it as it is, `repair --force` puts it back with the node's own
+    /// start-time step, and `validate` of the missing `epoch-N` says what it is.
+    #[cfg(unix)]
+    #[test]
+    fn db_commands_report_an_interrupted_install() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        let aside = epochs.join("epoch-2.replaced");
+        fs::create_dir_all(&aside).unwrap();
+        fs::write(aside.join("marker"), b"last good copy").unwrap();
+        let untouched = || {
+            assert!(aside.join("marker").is_file(), "the aside stays");
+            assert!(!epochs.join("epoch-2").exists(), "nothing put back");
+        };
+
+        let err = super::DbValidateArgs { path: epochs.join("epoch-2"), epoch: None }
+            .execute()
+            .expect_err("the epoch's directory is missing");
+        let err = format!("{err:#}");
+        assert!(err.contains("INTERRUPTED INSTALL"), "{err}");
+        assert!(err.contains("the node's next start puts it back"), "{err}");
+        assert!(err.contains("db repair --force"), "{err}");
+        assert!(err.contains("epoch-2.replaced"), "{err}");
+        assert_eq!(super::epoch_from_dir_name(&aside), Some(2), "the aside validates by its path");
+
+        super::DbMigrateArgs { epoch: Some(2), force: false }
+            .execute(datadir.clone())
+            .expect("migrate reports the interrupted install, not \"not found\"");
+        super::DbMigrateArgs { epoch: Some(2), force: true }
+            .execute(datadir.clone())
+            .expect("migrate reports the interrupted install");
+        untouched();
+        super::DbRepairArgs { epoch: Some(2), force: false }
+            .execute(datadir.clone())
+            .expect("a dry run reports the interrupted install, not \"not found\"");
+        super::DbRepairArgs { epoch: None, force: false }
+            .execute(datadir.clone())
+            .expect("a dry run reports the interrupted install");
+        untouched();
+
+        super::DbRepairArgs { epoch: None, force: true }
+            .execute(datadir.clone())
+            .expect("--force puts the interrupted install back");
+        assert_eq!(fs::read(epochs.join("epoch-2").join("marker")).unwrap(), b"last good copy");
+        assert!(!aside.exists(), "the aside is consumed");
     }
 
     /// A torn tail is only self-healing in the current epoch; whether a pack is a past epoch is

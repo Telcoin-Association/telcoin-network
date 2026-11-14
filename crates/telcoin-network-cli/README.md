@@ -488,14 +488,18 @@ build with the legacy `mdbx` feature refuses it.
 `telcoin-network db reset-execution --force` moves the execution database (`db/`, `static_files/`
 and `restored-state-floor`) into `execution-reset-<UTC time>/` under the datadir, so the next start
 rebuilds it from genesis in the storage layout new datadirs get; without `--force` it prints what
-would move. It refuses while a node holds the datadir. It also refuses a datadir whose consensus
-database holds a later epoch's pack and none for epoch 0, as a datadir bootstrapped with `db
-load-state` does (it holds consensus only from the restored epoch on): the rebuild replays epoch 0
-from the node's own packs, so the node could not start. Such a node rebuilds as a new one, with
+would move. It refuses while a node holds the datadir. It also refuses, dry run included, a
+datadir whose consensus database lacks the pack of an epoch below the latest one it holds (a pack
+counts as the node's start finds it: the epoch's `data` log), as a datadir bootstrapped with `db
+load-state` does (it holds consensus only from the restored epoch on) and one that lost a pack does:
+the rebuild re-executes every epoch from 0 from the node's own packs, so every start would stop at
+the gap. Such a node restores `consensus-db/` from a backup, or rebuilds as a new one, with
 `consensus-db/` moved aside first; a validator rebuilt that way stays stopped until the network has
 closed the last epoch it took part in, because its votes and proposals for that epoch leave with
 `consensus-db/`. `--for-swap` skips this refusal for the side-observer swap, which copies a synced
-observer's execution database in and keeps `consensus-db/`. While a reset is unfinished (an `execution-reset-*.partial`
+observer's execution database in and keeps `consensus-db/`. Both modes refuse a datadir an
+unfinished `db load-state` left (its `load-state-in-progress` marker), with the node's message:
+rerun `db load-state` with the same bundle instead. While a reset is unfinished (an `execution-reset-*.partial`
 directory holding an entry), the node, `db load-state`, `db stats`, `db check` and `db
 migrate-execution` refuse the datadir, and running the reset again finishes it. An empty one (left
 when the entries are moved back to undo an unfinished reset) blocks nothing. The layouts, the
