@@ -163,7 +163,8 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// payload keeps no time, so a re-queue takes the digest's stamp back from here and its wait
     /// keeps counting from its first receipt. A stamp leaves when its digest is re-queued or its
     /// header commits, so this holds at most the payloads of the tracked headers and the one in
-    /// flight.
+    /// flight. A digest in two tracked headers (its worker reported it twice) has one stamp, which
+    /// the first header to leave takes, so the other copy's wait restarts at its re-queue.
     proposed_first_received: BTreeMap<BlockHash, Instant>,
     /// The consensus leader schedule to be used in order to resolve the leader needed for the
     /// protocol advancement.
