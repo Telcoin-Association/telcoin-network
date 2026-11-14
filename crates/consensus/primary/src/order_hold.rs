@@ -901,3 +901,7 @@ mod tests {
         assert_eq!(plan.held_workers, set(&[0, 1]));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/order_hold_model.rs"]
+mod model;
