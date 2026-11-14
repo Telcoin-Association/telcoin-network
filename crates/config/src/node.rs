@@ -493,6 +493,27 @@ pub struct Parameters {
     /// larger value, so the node refuses to start an epoch it can vote in with one.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub vote_queue_fix: bool,
+
+    /// Keep each worker lane's batch digests executing in the order the worker sealed them, by
+    /// holding a lane while an older own header that carries it is not a proven ancestor of the
+    /// next one.
+    ///
+    /// When `true`, the proposer leaves queued every digest of a worker named in a tracked older
+    /// own header with digests that the new header's parents do not prove to be on its own chain
+    /// (the own certificate of the previous round is missing, or the chain below it was already
+    /// unproven). The lane is released when that header commits, is canceled, or is re-queued by
+    /// an own commit, and at the epoch's end. What peers vote for does not change, and the rules
+    /// for when a header is built do not either, but held digests still count toward
+    /// `header_num_of_batches_threshold`, so a held backlog can make a header skip the min delay.
+    /// The cost is latency on a held lane: its digests wait until the older header is settled,
+    /// usually one commit, and while the own chain stays broken the lane drains at most one
+    /// header's worth per own commit. Nothing is held while the own chain is intact. A
+    /// garbage-collection cut below the leader can still reorder a lane;
+    /// `tn_primary.requeued_out_of_order_total` counts it. The default `false` keeps the previous
+    /// behaviour: every header drains every lane, and a re-queued older digest can execute after a
+    /// newer one of its lane. Issue #1807.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub digest_order_hold: bool,
     // ---- runtime switches: end ----
 }
 
@@ -601,6 +622,7 @@ impl Default for Parameters {
             epoch_record_recertify: false,
             epoch_record_collect_past_uncertified: false,
             vote_queue_fix: false,
+            digest_order_hold: false,
             // ---- runtime switches: end ----
         }
     }
@@ -805,6 +827,7 @@ runtime_switches! {
     epoch_record_recertify,
     epoch_record_collect_past_uncertified,
     vote_queue_fix,
+    digest_order_hold,
     // ---- runtime switches: end ----
 }
 
