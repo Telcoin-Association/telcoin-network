@@ -3826,3 +3826,71 @@ async fn test_header_proposed_reports_own_parent_and_hold_fields() {
         );
     }
 }
+
+/// When the proposer shuts down it logs one `proposer stopped` line with its epoch and round and
+/// what it leaves to the next epoch's orphan re-pool: the queued digests, the own headers proposed
+/// and neither committed nor canceled with their digests, and the digests of a header still in
+/// flight, the three counted apart.
+///
+/// Catches: a shutdown arm that still returns silently, a digest counted in two of the three
+/// counts, and an in-flight header's digests left out.
+#[tokio::test]
+async fn test_proposer_stopped_reports_what_it_leaves() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let task_manager = TaskManager::default();
+    let cb = ConsensusBus::new();
+    let _rx_headers = cb.subscribe_headers();
+
+    // two tracked headers with three digests, one header in flight with one, two digests queued
+    let mut proposer = proposer_on(&config, &committee, &cb, &task_manager);
+    report_fixed(&mut proposer, 0, &[1, 2]);
+    propose_and_track(&mut proposer).await;
+    report_fixed(&mut proposer, 1, &[101]);
+    propose_and_track(&mut proposer).await;
+    report_fixed(&mut proposer, 0, &[3]);
+    proposer
+        .propose_next_header(ProposeReason::MinDelay)
+        .expect("proposal spawned")
+        .await
+        .expect("proposal task reported")
+        .expect("header proposed");
+    report_fixed(&mut proposer, 0, &[4]);
+    report_fixed(&mut proposer, 1, &[102]);
+    proposer.log_stopped();
+
+    // the run loop's shutdown arm logs the line: a proposer with no parents for its round and
+    // nothing to re-send only waits
+    let mut idle = proposer_on(&config, &committee, &cb, &task_manager);
+    idle.round = 5;
+    idle.last_parents.clear();
+    idle.spawn(&task_manager);
+    config.shutdown().notify();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while capture.events("proposer stopped").len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the shutdown arm logs proposer stopped");
+
+    let lines = capture.events("proposer stopped");
+    assert_eq!(lines.len(), 2);
+    let names = [
+        "epoch",
+        "round",
+        "queued_digests",
+        "proposed_uncommitted",
+        "uncommitted_digests",
+        "in_flight_digests",
+    ];
+    let fields = |line: &crate::log_capture::CapturedEvent| names.map(|name| line.u64_field(name));
+    let epoch = Some(u64::from(committee.epoch()));
+    assert_eq!(fields(&lines[0]), [epoch, Some(3), Some(2), Some(2), Some(3), Some(1)]);
+    assert_eq!(fields(&lines[1]), [epoch, Some(5), Some(0), Some(0), Some(0), Some(0)]);
+}
