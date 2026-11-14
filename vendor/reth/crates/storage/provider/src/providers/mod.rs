@@ -27,6 +27,8 @@ pub use static_file::{
     decode_tx_row, encode_tx_ref, JarFormat, TaggedJarError, TxPositionsError, TxRow, TxRowError,
     TX_ROW_INLINE, TX_ROW_REF,
 };
+// TN(TN-0202): resolving the `Transactions` rows that store positions.
+pub use static_file::{TxBodyReadError, TxBodyResolver, TxBodyResolverInstalled};
 
 mod state;
 pub use state::{
