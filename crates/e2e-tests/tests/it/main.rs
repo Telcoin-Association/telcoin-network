@@ -8,6 +8,7 @@ mod clock_skew;
 mod common;
 mod eject;
 mod epochs;
+mod exec_block;
 #[cfg(feature = "faucet")]
 mod faucet;
 mod forward_txs;
