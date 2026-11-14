@@ -105,7 +105,8 @@ struct ProposerDigest {
     /// This digest's place in its worker's lane: the order the worker reported it in, counted per
     /// worker from zero over the proposer's life (one epoch), and kept across re-queues. `None`
     /// when this proposer does not know it: the digest rode a stored header re-sent after a
-    /// restart, or a header re-sent after an own commit had settled its round. Read only to count
+    /// restart or a header re-sent after an own commit had settled its round, or its worker
+    /// reported it twice and the other copy kept the sequence. Read only to count
     /// re-queues out of order (issue #1807, see [`LaneSequences`]), never when a header's contents
     /// are chosen.
     pub seq: Option<u64>,
@@ -993,7 +994,15 @@ impl<DB: Database> Proposer<DB> {
                     header,
                     requeued_at,
                     &mut self.proposed_first_received,
-                    |batch| if resent { None } else { self.lane_seqs.returned(batch) },
+                    |batch| {
+                        // the entry leaves either way, as the first receipt does
+                        let seq = self.lane_seqs.returned(batch);
+                        if resent {
+                            None
+                        } else {
+                            seq
+                        }
+                    },
                 );
                 retransmit_rounds.push(*header_round);
             });
@@ -1066,7 +1075,15 @@ impl<DB: Database> Proposer<DB> {
                     header,
                     Instant::now(),
                     &mut self.proposed_first_received,
-                    |batch| if resent { None } else { self.lane_seqs.returned(batch) },
+                    |batch| {
+                        // the entry leaves either way, as the first receipt does
+                        let seq = self.lane_seqs.returned(batch);
+                        if resent {
+                            None
+                        } else {
+                            seq
+                        }
+                    },
                 );
                 if resent {
                     header.payload().len()
@@ -1432,6 +1449,9 @@ impl<DB: Database> Proposer<DB> {
     /// proposed and neither committed nor canceled (the tracked ones) and `uncommitted_digests`
     /// their distinct digests; `in_flight_digests` were drained into a header whose proposal had
     /// not come back. The three digest counts do not overlap.
+    ///
+    /// Only the shutdown arm of [`Self::run`] logs it, which is how an epoch closes: an error exit
+    /// from `run`, or the task dropped without its shutdown notice, ends without the line.
     fn log_stopped(&self) {
         let tracked: BTreeSet<&BlockHash> =
             self.proposed_headers.values().flat_map(|header| header.payload().keys()).collect();
@@ -1654,7 +1674,7 @@ impl fmt::Display for HeaderDigests<'_> {
 ///
 /// Observability only: the proposer never reads this when it chooses a header's contents. It grows
 /// with the tracked headers: one entry per digest of the header in flight or of a tracked header,
-/// the same bound as `Proposer::proposed_first_received`, plus one value per worker.
+/// the same bound as `Proposer::proposed_first_received`, plus two values per worker.
 #[derive(Debug, Default)]
 struct LaneSequences {
     /// The sequence the next digest each worker reports receives.
@@ -1709,13 +1729,17 @@ impl LaneSequences {
     /// that has already left the queue and does not return with it: one drained into an own header
     /// that is still in flight or tracked and is not part of this re-queue, or one carried by an
     /// own header that committed. Such a newer digest is executed first if its header commits, so
-    /// the older one can only follow it. A newer digest that came back to the queue earlier does
+    /// the older one may execute after it: the count says what the lane looks like at the
+    /// re-queue, not that an execution inversion happened. A newer digest that came back to the
+    /// queue earlier does
     /// not count: the re-queued digest lands ahead of it. Every digest of this re-queue must have
     /// left `out` before the call, so digests that return together are not judged against each
     /// other.
     ///
-    /// The count is per re-queue: a digest re-queued twice behind newer ones counts twice. A digest
-    /// without a known sequence is counted as unknown, never as out of order.
+    /// The count is per re-queue: a digest returned again while a newer one is still out counts
+    /// again, while an inversion that one later re-queue returns together (the newer digest's
+    /// header and the older's die in the same commit notice) is not counted a second time. A
+    /// digest without a known sequence is counted as unknown, never as out of order.
     fn judge(&self, requeued: &BTreeMap<WorkerId, VecDeque<ProposerDigest>>) -> RequeueOrder {
         // the newest sequence of each lane that is out of the queue for now or for good
         let mut newest_out = self.committed.clone();
