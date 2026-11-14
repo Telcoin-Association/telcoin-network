@@ -131,9 +131,10 @@ struct Collection<'m> {
     /// (the collector, this node's vote round, a re-vote) stores its certificate. At most
     /// [`MAX_UNCERTIFIED_GAPS`]; empty with the walk off.
     gaps: BTreeSet<Epoch>,
-    /// The gap the next [`retry_gaps`] asks for first (or the first gap after it): the gap after
-    /// the one the previous retry stopped at, so the retry's deadline cannot keep one gap from
-    /// ever being asked by sorting it last.
+    /// The gap the next [`retry_gaps`] asks for first (or the first gap after it). A gap the
+    /// previous retry's deadline cut short after other gaps had used part of the window leads the
+    /// next retry with the whole window; one cut short while it led goes last. So the deadline
+    /// cannot keep one gap from ever being asked by sorting it last.
     retry_from: Epoch,
     /// The first epoch of the last walk that ended before a certified record after it was stored,
     /// and when it ended. A walk from that epoch is not tried again until a retry interval has
@@ -779,9 +780,11 @@ async fn store_epoch_record(
 /// Each gap's request is one `request_epoch_cert`, which asks up to three peers in turn. The retry
 /// stops at [`GAP_RETRY_DEADLINE`] or when `node_shutdown` fires, mid-request too (only the wait
 /// for peers is cut short, never a validation or a save), and the gaps not asked wait for the next
-/// retry. A retry starts at [`Collection::retry_from`] and wraps around, so every open gap is
-/// asked for at least once in as many retries as there are gaps, however slow the peers are on
-/// the others.
+/// retry. A retry starts at [`Collection::retry_from`] and wraps around: the gap it stopped at
+/// leads the next retry unless it led this one, so every open gap gets a retry that asks for it
+/// first, with the whole deadline, however slow the peers are on the others. A gap whose request
+/// takes longer than the deadline every time is left to the other paths (a pass after a restart,
+/// this node's vote round, a re-vote).
 ///
 /// A gap whose certificate is stored already, by whatever path, is dropped without a request; so
 /// is one whose certificate this request stores, and the store is persisted then. Only a stored
@@ -800,6 +803,8 @@ async fn retry_gaps(
     let open: Vec<Epoch> =
         collection.gaps.range(from..).chain(collection.gaps.range(..from)).copied().collect();
     let mut stored = false;
+    // whether a request of this retry has ended yet
+    let mut asked = false;
     for epoch in open {
         match consensus_chain.epochs().get_epoch_by_number(epoch).await {
             Some((_, Some(_))) => {
@@ -817,10 +822,12 @@ async fn retry_gaps(
             answer = primary_handle.request_epoch_cert(Some(epoch), None) => Some(answer),
         };
         let Some(answer) = answer else {
-            // the next retry starts after the gap this one stopped at
-            collection.retry_from = epoch.saturating_add(1);
+            // a gap cut short after others used the window leads the next retry, one that led
+            // this retry goes last
+            collection.retry_from = if asked { epoch } else { epoch.saturating_add(1) };
             break;
         };
+        asked = true;
         let closed = match store_epoch_record(
             epoch,
             answer,
@@ -2403,8 +2410,13 @@ mod tests {
     #[tokio::test]
     async fn test_conflict_halt_needs_a_super_quorum_of_the_full_committee() -> eyre::Result<()> {
         // committee size, members left in the offered record's committee, signers, halts
-        let cases: [(usize, usize, u32, bool); 3] =
-            [(10, 7, 5, false), (10, 10, 7, true), (4, 4, 3, true)];
+        let cases: [(usize, usize, u32, bool); 5] = [
+            (10, 7, 5, false),
+            (10, 7, 6, false),
+            (10, 7, 7, true),
+            (10, 10, 7, true),
+            (4, 4, 3, true),
+        ];
         for (size, members, signed, halts) in cases {
             let case = format!("{signed} signers of {members}, committee of {size}");
             let committee_size =
@@ -2637,6 +2649,56 @@ mod tests {
         );
         expect_requests(&mut requests, &[1, 1, 1, 2, 2, 2]).await?;
         assert!(collection.gaps.is_empty());
+        Ok(())
+    }
+
+    /// A gap the retry's deadline cuts short after another gap used most of the window leads the
+    /// next retry; the gap that led a retry and was cut goes last. Gap 1's peer answers after
+    /// 4.9 s with a record that fails validation, gap 2's never answers.
+    #[tokio::test(start_paused = true)]
+    async fn test_gap_retry_leads_with_the_gap_its_deadline_cut_short() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let (keys, signers) = keys_and_signers(&fixture);
+        let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 2).await?;
+        chain.epochs().save_record(records[2].0.clone()).await?;
+        let invalid = (records[1].0.clone(), make_cert(&records[1].0, &signers, &[0]));
+        let (tx, mut rx) = mpsc::channel(100);
+        let (requests_tx, mut requests) = mpsc::unbounded_channel();
+        let peer = keys[0];
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(cmd) = rx.recv().await {
+                let NetworkCommand::SendRequestAny { request, reply } = cmd else {
+                    continue;
+                };
+                let PrimaryRequest::EpochRecord { epoch: Some(epoch), .. } = request else {
+                    continue;
+                };
+                let _ = requests_tx.send(epoch);
+                if epoch == 1 {
+                    tokio::time::sleep(Duration::from_millis(4_900)).await;
+                    let (record, certificate) = invalid.clone();
+                    let result = PrimaryResponse::EpochRecord { record, certificate };
+                    let _ = reply.send(Ok(NetworkResponseMessage { peer, result }));
+                } else {
+                    held.push(reply);
+                }
+            }
+        });
+        let handle = PrimaryNetworkHandle::new_for_test(tx);
+        let bus = ConsensusBus::new();
+        let (metrics, _snapshotter) = local_metrics();
+        let mut collection = Collection::new(WALK, &metrics);
+        collection.gaps.extend([1, 2]);
+        let shutdown = tn_types::ShutdownNotifier::new();
+
+        retry_gaps(&chain, &handle, bus.app(), &mut collection, &shutdown.subscribe()).await?;
+        expect_requests(&mut requests, &[1, 2]).await?;
+        assert_eq!(collection.retry_from, 2, "gap 2 was cut short after gap 1 used the window");
+        retry_gaps(&chain, &handle, bus.app(), &mut collection, &shutdown.subscribe()).await?;
+        expect_requests(&mut requests, &[2]).await?;
+        assert_eq!(collection.retry_from, 3, "gap 2 led and was cut: it goes last");
+        assert_eq!(collection.gaps, BTreeSet::from([1, 2]));
         Ok(())
     }
 }
