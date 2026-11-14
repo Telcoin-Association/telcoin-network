@@ -549,6 +549,102 @@ impl DigestsRequeuedHandles {
     }
 }
 
+// bench7 digest-order-hold
+/// The `tn_primary_requeued_out_of_order_total{cause}` counters, resolved once when a proposer is
+/// built so no `metrics` macro runs per re-queue. The handles are `Arc`-backed.
+///
+/// A re-queued batch digest counts here when it returns to its worker's queue behind a newer digest
+/// of the same worker, by the proposer's per-worker sequence: the out-of-order carriage of issue
+/// #1807. The proposer's `LaneSequences::judge` holds the exact rule.
+#[derive(Clone, Debug)]
+pub(crate) struct RequeuedOutOfOrderHandles {
+    /// One counter per [`RequeueCause`], indexed by its position in [`RequeueCause::ALL`].
+    by_cause: [Counter; RequeueCause::ALL.len()],
+}
+
+impl RequeuedOutOfOrderHandles {
+    /// Resolve the counter of every cause against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            by_cause: RequeueCause::ALL.map(|cause| {
+                metrics::counter!(
+                    "tn_primary.requeued_out_of_order_total",
+                    "cause" => cause.as_str()
+                )
+            }),
+        }
+    }
+
+    /// The counter of digests re-queued out of order for `cause`.
+    pub(crate) fn counter(&self, cause: RequeueCause) -> &Counter {
+        &self.by_cause[cause.index()]
+    }
+}
+
+/// Why the proposer could not judge the order of a re-queued batch digest: the `reason` label of
+/// `tn_primary_requeued_order_unknown_total`. Such a digest never counts as out of order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequeueOrderUnknown {
+    /// The proposer holds no sequence for the digest: it rode a stored header re-sent after a
+    /// restart, which this proposer never drained, or its worker reported it twice and the other
+    /// copy took the sequence.
+    UnknownSeq,
+    /// The digest's header was tracked again by a re-send after a commit notice at or above its
+    /// round had settled it: it committed and the max-delay tick re-sent it before the round moved
+    /// on, or a restart re-sent it from the store. Either way its digests have no place in the
+    /// queue's order, and a committed header's digests are re-queued a second time.
+    StaleResend,
+}
+
+impl RequeueOrderUnknown {
+    /// Every reason, in [`Self::index`] order.
+    pub(crate) const ALL: [Self; 2] = [Self::UnknownSeq, Self::StaleResend];
+
+    /// The static metric label for this reason.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownSeq => "unknown_seq",
+            Self::StaleResend => "stale_resend",
+        }
+    }
+
+    /// This reason's position in [`Self::ALL`] and in [`RequeuedOrderUnknownHandles`].
+    const fn index(self) -> usize {
+        match self {
+            Self::UnknownSeq => 0,
+            Self::StaleResend => 1,
+        }
+    }
+}
+
+/// The `tn_primary_requeued_order_unknown_total{reason}` counters, resolved once when a proposer is
+/// built so no `metrics` macro runs per re-queue. The handles are `Arc`-backed.
+#[derive(Clone, Debug)]
+pub(crate) struct RequeuedOrderUnknownHandles {
+    /// One counter per [`RequeueOrderUnknown`], indexed by its position in
+    /// [`RequeueOrderUnknown::ALL`].
+    by_reason: [Counter; RequeueOrderUnknown::ALL.len()],
+}
+
+impl RequeuedOrderUnknownHandles {
+    /// Resolve the counter of every reason against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            by_reason: RequeueOrderUnknown::ALL.map(|reason| {
+                metrics::counter!(
+                    "tn_primary.requeued_order_unknown_total",
+                    "reason" => reason.as_str()
+                )
+            }),
+        }
+    }
+
+    /// The counter of re-queued digests whose order is unknown for `reason`.
+    pub(crate) fn counter(&self, reason: RequeueOrderUnknown) -> &Counter {
+        &self.by_reason[reason.index()]
+    }
+}
+
 /// Why this node changed its mode: the `reason` label of `tn_node_mode_transitions_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModeTransitionReason {
