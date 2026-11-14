@@ -2227,7 +2227,7 @@ fn self_feeding_fleet(
             .collect();
         let mut this_round = Vec::new();
         let mut next_named = Vec::new();
-        for (author, policy) in ids.iter().zip(&policies) {
+        for (author, policy) in ids.iter().zip(&mut policies) {
             let inputs = ExecBlockInputs {
                 policy: policy.for_round(round),
                 author: author.clone(),
@@ -2329,61 +2329,73 @@ fn test_quorum_exec_block_self_feeding_fleet() {
     }
 }
 
-/// The adaptive policy's state machine: a cancel opens a window of K rounds after the proposer's
-/// round and the policy returns to the tip when they have elapsed; the lagging cancel of the
-/// header built before the window is not counted again; repeated cancels double K up to
-/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]; a streak of [`QUORUM_EXEC_BLOCK_RESET_STREAK`]
-/// certified tip headers resets K, a header certified inside a window does not count, including the
-/// window's last header when a cancel reported at that round extends the run. The switch off and
-/// the `always` policy keep no window.
+/// The adaptive policy's state machine, one header a round: a cancel opens a window of the next K
+/// headers and the policy returns to the tip once they are built; the doubling waits for the
+/// window's first header; the lagging cancel of the header built before the window is not counted
+/// again; repeated cancels double K up to [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]; a streak of
+/// [`QUORUM_EXEC_BLOCK_RESET_STREAK`] certified tip headers resets K, a header certified inside a
+/// window does not count, including the window's last header when a cancel reported before the
+/// proposer moved past it extends the run. The switch off and the `always` policy keep no window.
 #[test]
 fn test_quorum_exec_block_adaptive_policy_state_machine() {
     let mut policy = ExecBlockPolicy::new(true, 4);
-    assert!((1..=50).all(|round| policy.for_round(round) == ExecPolicy::Tip));
+    assert!(exec_build_headers(&mut policy, 1..=4).is_empty());
 
-    // round 3 is cancelled when round 4 is proposed: rounds 5-8 use the rule
+    // round 3 is cancelled once round 4 is built: rounds 5-8 use the rule
     policy.on_cancelled(3, 4);
-    let window = |p: &ExecBlockPolicy| -> Vec<Round> {
-        (1..=300).filter(|r| p.for_round(*r) == ExecPolicy::Starved).collect()
-    };
-    assert_eq!(window(&policy), (5..=8).collect::<Vec<_>>());
+    assert_eq!(exec_window_from(&policy, 5), (5..=8).collect::<Vec<_>>());
+    assert_eq!(policy.next_window, 4, "the doubling waits for the window's first header");
+    assert_eq!(exec_build_headers(&mut policy, [5]), vec![5]);
     assert_eq!(policy.next_window, 8);
     // round 4 named its tip before the window opened: its cancel is the same episode
     policy.on_cancelled(4, 5);
-    assert_eq!(window(&policy), (5..=8).collect::<Vec<_>>());
+    assert_eq!(exec_window_from(&policy, 6), (6..=8).collect::<Vec<_>>());
     assert_eq!(policy.next_window, 8);
     // a header certified inside the window does not count toward the reset
+    assert_eq!(exec_build_headers(&mut policy, [6]), vec![6]);
     policy.on_certified(6);
     assert_eq!((policy.certified_streak, policy.next_window), (0, 8));
 
-    // the rounds are spent: the round-9 tip probe is cancelled at round 10, so the doubled window
-    // covers rounds 11-18
-    assert_eq!(policy.for_round(9), ExecPolicy::Tip);
+    // the window's headers are built: the round-9 tip probe is cancelled once round 10 is built,
+    // so the doubled window covers rounds 11-18
+    assert_eq!(exec_build_headers(&mut policy, 7..=10), vec![7, 8]);
     policy.on_cancelled(9, 10);
-    assert_eq!(window(&policy), (11..=18).collect::<Vec<_>>());
+    assert_eq!(exec_window_from(&policy, 11), (11..=18).collect::<Vec<_>>());
+    assert_eq!(exec_build_headers(&mut policy, 11..=13), vec![11, 12, 13]);
     assert_eq!(policy.next_window, 16);
 
-    // a header inside the window cancelled: the window extends from the proposer's round
+    // a header inside the window cancelled: the window extends to the next sixteen headers, so
+    // rounds 11-29 use the rule
     policy.on_cancelled(12, 13);
-    assert_eq!(window(&policy), (11..=29).collect::<Vec<_>>());
+    assert_eq!(exec_window_from(&policy, 14), (14..=29).collect::<Vec<_>>());
+    assert_eq!(exec_build_headers(&mut policy, [14]), vec![14]);
     assert_eq!(policy.next_window, 32);
 
-    // more cancels double K up to the bound and no further
+    // more cancels double K up to the bound and no further: each tip probe after a window is
+    // cancelled once the next header is built, and the policy returns to the tip when the
+    // window's headers are built
+    assert_eq!(exec_build_headers(&mut policy, 15..=31), (15..=29).collect::<Vec<_>>());
     let mut round = 30;
-    for expected in [64, 128, 128, 128] {
+    let mut last = 0;
+    for (len, expected) in [(32, 64), (64, 128), (128, 128), (128, 128)] {
         policy.on_cancelled(round, round + 1);
-        round = policy.starved_through + 1;
+        let first = round + 2;
+        last = first + len - 1;
+        assert_eq!(
+            exec_build_headers(&mut policy, first..=last + 2),
+            (first..=last).collect::<Vec<_>>(),
+            "returns once the window's headers are built"
+        );
         assert_eq!(policy.next_window, expected);
+        round = last + 1;
     }
     assert_eq!(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS, 128);
-    let last = policy.starved_through;
-    assert_eq!(policy.for_round(last), ExecPolicy::Starved);
-    assert_eq!(policy.for_round(last + 1), ExecPolicy::Tip, "returns by rounds elapsed");
 
     // one certified header that named its tip does not reset K; a streak of them does
     policy.on_certified(last + 1);
     assert_eq!(policy.next_window, 128, "one certified tip header");
     let streak_end = last + QUORUM_EXEC_BLOCK_RESET_STREAK;
+    assert!(exec_build_headers(&mut policy, last + 3..=streak_end + 2).is_empty());
     for round in last + 2..streak_end {
         policy.on_certified(round);
     }
@@ -2391,27 +2403,33 @@ fn test_quorum_exec_block_adaptive_policy_state_machine() {
     policy.on_certified(streak_end);
     assert_eq!(policy.next_window, 4);
     policy.on_cancelled(streak_end + 1, streak_end + 2);
-    assert_eq!(policy.for_round(streak_end + 3), ExecPolicy::Starved);
-    assert_eq!(policy.for_round(streak_end + 6), ExecPolicy::Starved);
-    assert_eq!(policy.for_round(streak_end + 7), ExecPolicy::Tip, "a fresh window of K = 4");
+    assert_eq!(
+        exec_window_from(&policy, streak_end + 3),
+        (streak_end + 3..=streak_end + 6).collect::<Vec<_>>(),
+        "a fresh window of K = 4"
+    );
 
-    // round 7, inside the window 5-8, is cancelled when round 8 is proposed: the run extends, so
-    // round 8 stays a rule header and its certificate keeps the doubled K
+    // round 7, inside the window 5-8, is cancelled once round 8, the window's last header, is
+    // built: the run extends, so round 8 stays a rule header and its certificate keeps the doubled
+    // K
     let mut edge = ExecBlockPolicy::new(true, 4);
+    assert!(exec_build_headers(&mut edge, 1..=4).is_empty());
     edge.on_cancelled(3, 4);
+    assert_eq!(exec_build_headers(&mut edge, 5..=8), (5..=8).collect::<Vec<_>>());
     edge.on_cancelled(7, 8);
-    assert_eq!(window(&edge), (5..=16).collect::<Vec<_>>());
-    assert_eq!(edge.next_window, 16);
+    assert_eq!(exec_window_from(&edge, 9), (9..=16).collect::<Vec<_>>());
     edge.on_certified(8);
     assert_eq!(edge.certified_streak, 0, "a rule header's certificate does not count");
+    assert_eq!(exec_build_headers(&mut edge, [9]), vec![9]);
     assert_eq!(edge.next_window, 16);
 
     // a configured window above the bound is lowered to it
     let mut wide = ExecBlockPolicy::new(true, 200);
     assert_eq!((wide.base_window, wide.next_window), (128, 128));
     wide.on_cancelled(1, 2);
-    assert_eq!(window(&wide), (3..=130).collect::<Vec<_>>());
+    assert_eq!(exec_build_headers(&mut wide, 3..=251), (3..=130).collect::<Vec<_>>());
     wide.on_cancelled(250, 251);
+    assert_eq!(exec_build_headers(&mut wide, [252]), vec![252]);
     assert_eq!(wide.next_window, 128);
 
     // the switch off and the `always` policy ignore the reports
@@ -2564,11 +2582,12 @@ async fn test_quorum_exec_block_switch_off_keeps_header_bytes() {
 
 /// The adaptive policy through the proposer: the certifier's cancel report, handled by
 /// `process_uncertified_header`, moves the next headers onto the quorum rule
-/// (`exec_policy=starved`) for K rounds, and an own certificate among a new header's parents counts
-/// toward the streak that resets K.
+/// (`exec_policy=starved`) for K headers, a round jump does not end the window, and an own
+/// certificate among a new header's parents counts toward the streak that resets K.
 ///
-/// Catches: a cancel report that never reaches the policy, a window counted from anything but the
-/// proposer's round, and an own certificate that is not seen as a certified header.
+/// Catches: a cancel report that never reaches the policy, a window counted in rounds or spent by
+/// anything but the proposer's own headers, and an own certificate that is not seen as a certified
+/// header.
 #[tokio::test]
 async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
     use crate::log_capture::LogCapture;
@@ -2599,18 +2618,33 @@ async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
     assert_eq!(line.field("exec_policy"), Some("starved"));
     assert_eq!(line.field("exec_basis"), Some("quorum"));
     assert_eq!(line.u64_field("exec_block"), Some(112));
-    assert_eq!(proposer.exec_block_policy.for_round(6), ExecPolicy::Starved);
-    assert_eq!(proposer.exec_block_policy.for_round(7), ExecPolicy::Tip);
+    assert_eq!(exec_window_from(&proposer.exec_block_policy, 4), (4..=6).collect::<Vec<_>>());
 
-    // two more counted cancels, with no certified tip header between them, double K twice; a
-    // cancel of round 3 arrives once the proposer has moved on to round 4
+    // two more counted cancels, with no certified tip header between them, double K twice, each
+    // when the next header under the rule is built; a cancel of round 3 arrives once the proposer
+    // has moved on to round 4
     assert_eq!(proposer.exec_block_policy.next_window, 8);
     proposer.round = 4;
     proposer.process_uncertified_header(3, round_three.digest());
+    assert_eq!(proposer.exec_block_policy.next_window, 8);
+    proposer.last_parents = exec_parents(&fixture, 4, 112);
+    let (round_five, line) = exec_propose(&mut proposer, &capture).await;
+    assert_eq!(round_five.round(), 5);
+    assert_eq!(line.field("exec_policy"), Some("starved"));
     assert_eq!(proposer.exec_block_policy.next_window, 16);
+    // the round jumps to 20: the window counts headers, so the next one still uses the rule
     proposer.round = 20;
     proposer.process_uncertified_header(19, HeaderDigest::default());
+    proposer.last_parents = exec_parents(&fixture, 20, 112);
+    let (round_21, line) = exec_propose(&mut proposer, &capture).await;
+    assert_eq!(round_21.round(), 21);
+    assert_eq!(line.field("exec_policy"), Some("starved"));
     assert_eq!(proposer.exec_block_policy.next_window, 32);
+    // the window's last fifteen headers, built through the policy as the proposer builds them
+    assert_eq!(
+        exec_build_headers(&mut proposer.exec_block_policy, 22..=37),
+        (22..=36).collect::<Vec<_>>()
+    );
 
     // the own round-40 certificate, a tip header, among the parents of round 41 starts the streak;
     // one certified tip header does not reset K
@@ -2644,13 +2678,14 @@ async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
 #[test]
 fn test_quorum_exec_block_reset_needs_a_streak_of_certified_tip_headers() {
     let streak = QUORUM_EXEC_BLOCK_RESET_STREAK;
-    let window = |p: &ExecBlockPolicy| -> Vec<Round> {
-        (1..=400).filter(|r| p.for_round(*r) == ExecPolicy::Starved).collect()
-    };
     let mut policy = ExecBlockPolicy::new(true, 4);
-    // round 3 cancelled at round 4 opens 5-8; the round-9 probe cancelled at round 10 opens 11-18
+    // round 3 cancelled once round 4 is built opens 5-8; the round-9 probe cancelled once round 10
+    // is built opens 11-18
+    assert!(exec_build_headers(&mut policy, 1..=4).is_empty());
     policy.on_cancelled(3, 4);
+    assert_eq!(exec_build_headers(&mut policy, 5..=10), vec![5, 6, 7, 8]);
     policy.on_cancelled(9, 10);
+    assert_eq!(exec_build_headers(&mut policy, 11..=12), vec![11, 12]);
     assert_eq!(policy.next_window, 16);
 
     // a header certified inside the window does not count
@@ -2658,30 +2693,34 @@ fn test_quorum_exec_block_reset_needs_a_streak_of_certified_tip_headers() {
     assert_eq!(policy.certified_streak, 0);
 
     // back on the tip at round 19: one certified tip header leaves the doubled window
-    assert_eq!(policy.for_round(19), ExecPolicy::Tip);
+    assert_eq!(exec_build_headers(&mut policy, 13..=19), (13..=18).collect::<Vec<_>>());
     policy.on_certified(19);
     assert_eq!((policy.certified_streak, policy.next_window), (1, 16));
 
-    // a cancel inside the streak restarts it: round 30 cancelled at round 31 opens 32-47
+    // a cancel inside the streak restarts it: round 30 cancelled once round 31 is built opens
+    // 32-47, and K doubles when round 32 is built
+    assert!(exec_build_headers(&mut policy, 20..=31).is_empty());
     for round in 20..30 {
         policy.on_certified(round);
     }
     assert_eq!(policy.certified_streak, 11);
     policy.on_cancelled(30, 31);
-    assert_eq!((policy.certified_streak, policy.next_window), (0, 32));
-    assert_eq!(window(&policy), (32..=47).collect::<Vec<_>>());
+    assert_eq!((policy.certified_streak, policy.next_window), (0, 16));
+    assert_eq!(exec_window_from(&policy, 32), (32..=47).collect::<Vec<_>>());
 
     // a late report for a header built before that window opened leaves the window alone but
     // still restarts the streak
     policy.on_certified(31);
     assert_eq!(policy.certified_streak, 1);
+    assert_eq!(exec_build_headers(&mut policy, [32]), vec![32]);
     policy.on_cancelled(25, 32);
     assert_eq!((policy.certified_streak, policy.next_window), (0, 32));
-    assert_eq!(window(&policy), (32..=47).collect::<Vec<_>>());
+    assert_eq!(exec_window_from(&policy, 33), (33..=47).collect::<Vec<_>>());
 
     // the window is spent at round 48: one short of the streak keeps K doubled, a certified window
     // header in between neither counts nor breaks it, and the streak's last header resets K
     let last = 48 + streak - 1;
+    assert_eq!(exec_build_headers(&mut policy, 33..=last + 2), (33..=47).collect::<Vec<_>>());
     for round in 48..last {
         policy.on_certified(round);
     }
@@ -2694,7 +2733,7 @@ fn test_quorum_exec_block_reset_needs_a_streak_of_certified_tip_headers() {
     // the next isolated cancel opens a window of the configured K
     policy.on_cancelled(last + 1, last + 2);
     assert_eq!(policy.certified_streak, 0);
-    assert_eq!(window(&policy), (last + 3..=last + 6).collect::<Vec<_>>());
+    assert_eq!(exec_window_from(&policy, last + 3), (last + 3..=last + 6).collect::<Vec<_>>());
 }
 
 /// SplitMix64, the model's seeded draw: no wall clock, no generator state.
@@ -2888,6 +2927,103 @@ fn test_quorum_exec_block_policy_model_after_the_regime_ends() {
 
 // ---- bench7 quorum-exec-block ----
 
+/// Build one own header at each of `rounds`, in order, under `policy` as the proposer does (one
+/// [`ExecBlockPolicy::for_round`] call per header), and return the rounds whose header was built
+/// under the quorum rule.
+fn exec_build_headers(
+    policy: &mut ExecBlockPolicy,
+    rounds: impl IntoIterator<Item = Round>,
+) -> Vec<Round> {
+    rounds.into_iter().filter(|round| policy.for_round(*round) == ExecPolicy::Starved).collect()
+}
+
+/// The rounds of the headers a copy of `policy` builds under the quorum rule when the proposer
+/// builds one header a round from `from` on, up to the first header that names the tip again.
+/// `policy` itself is left as it is.
+fn exec_window_from(policy: &ExecBlockPolicy, from: Round) -> Vec<Round> {
+    let mut policy = policy.clone();
+    (from..).take_while(|round| policy.for_round(*round) == ExecPolicy::Starved).collect()
+}
+
+/// Review finding V1: the adaptive window counts headers built under the rule, not rounds. A
+/// proposer that jumps rounds right after a cancel (its next round is its parents' round plus one)
+/// still builds K headers under the rule, whatever their rounds; the review's sequence (K = 4, a
+/// cancel at round 4, parents of round 10 next) now puts the round-11 header under the rule, where
+/// a window of rounds 5-8 had passed without one header and still doubled. A cancel of a header
+/// built under the rule after the jump extends the run, and the header's certificate does not
+/// count toward the reset streak.
+///
+/// Catches: a window that ends by round number, a window opened at the cancel's round rather than
+/// spent by the next headers, and a rule header after a jump classified as a tip header.
+#[test]
+fn test_quorum_exec_block_window_counts_headers_across_a_round_jump() {
+    // the cancel arrives once round 4 is built, then the proposer's next header is at round 11
+    let mut policy = ExecBlockPolicy::new(true, 4);
+    assert!(exec_build_headers(&mut policy, 1..=4).is_empty());
+    policy.on_cancelled(3, 4);
+    assert_eq!(exec_build_headers(&mut policy, [11, 12, 13, 14, 15]), vec![11, 12, 13, 14]);
+    assert_eq!(policy.next_window, 8);
+
+    // jumps inside the window: every header built is under the rule until four were built
+    let mut jumpy = ExecBlockPolicy::new(true, 4);
+    jumpy.on_cancelled(3, 4);
+    assert_eq!(exec_build_headers(&mut jumpy, [11, 20, 35, 36, 50]), vec![11, 20, 35, 36]);
+
+    // parents of a later round moved the proposer's round to 10 before the cancel arrived, with no
+    // header at 10: the window still starts with the next header built
+    let mut moved = ExecBlockPolicy::new(true, 4);
+    assert!(exec_build_headers(&mut moved, 1..=4).is_empty());
+    moved.on_cancelled(4, 10);
+    assert_eq!(exec_build_headers(&mut moved, 11..=15), vec![11, 12, 13, 14]);
+
+    // the review's sequence: the round-11 header, built under the rule, is cancelled once round 12
+    // is built; the run extends to eight more headers and K doubles once per window that got a
+    // header (at rounds 11 and 13)
+    let mut review = ExecBlockPolicy::new(true, 4);
+    assert!(exec_build_headers(&mut review, 1..=4).is_empty());
+    review.on_cancelled(3, 4);
+    assert_eq!(exec_build_headers(&mut review, [11, 12]), vec![11, 12]);
+    review.on_cancelled(11, 12);
+    assert_eq!(exec_build_headers(&mut review, 13..=21), (13..=20).collect::<Vec<_>>());
+    assert_eq!(review.next_window, 16);
+    // the round-12 header was built under the rule after the jump: its certificate does not count
+    review.on_certified(12);
+    assert_eq!(review.certified_streak, 0, "a rule header's certificate does not count");
+    // the round-21 header named the tip: its certificate does
+    review.on_certified(21);
+    assert_eq!(review.certified_streak, 1);
+}
+
+/// Review finding V1, the doubling: a counted cancel asks for the next window to double, and the
+/// doubling is applied when the next header under the rule is built. A window that has had no
+/// header built under it yet has not doubled, reports that are not counted leave it as it is, and
+/// several counted cancels with no rule header built between them double once: no header built
+/// under the rule means no new evidence that the rule's blocks fail.
+///
+/// Catches: a doubling applied at the cancel, before any header was built under the window, and
+/// one doubling per report rather than per window that got a header.
+#[test]
+fn test_quorum_exec_block_window_without_a_header_does_not_double() {
+    let mut policy = ExecBlockPolicy::new(true, 4);
+    assert!(exec_build_headers(&mut policy, 1..=4).is_empty());
+    policy.on_cancelled(3, 4);
+    assert_eq!((policy.remaining, policy.next_window), (4, 4), "open, not yet doubled");
+    // the lagging cancel of the round-4 header is the same episode: no change
+    policy.on_cancelled(4, 4);
+    assert_eq!((policy.remaining, policy.next_window), (4, 4));
+    // the window's first header applies the doubling, once
+    assert_eq!(exec_build_headers(&mut policy, 5..=7), vec![5, 6, 7]);
+    assert_eq!((policy.remaining, policy.next_window), (1, 8));
+
+    // two counted cancels arrive before the next header: the window extends to eight headers and
+    // K doubles once, when round 8 is built
+    policy.on_cancelled(5, 7);
+    policy.on_cancelled(6, 7);
+    assert_eq!((policy.remaining, policy.next_window), (8, 8));
+    assert_eq!(exec_build_headers(&mut policy, 8..=16), (8..=15).collect::<Vec<_>>());
+    assert_eq!(policy.next_window, 16);
+}
+
 /// The quorum rule in an epoch's first rounds, under both forms that apply it: the ring holds
 /// twenty outputs of the epoch before (blocks 100 to 157; 157 closed that epoch) and three of the
 /// header's epoch (160, 163, 166), so the floor entry eight back (142) lies before the epoch's
@@ -3014,7 +3150,7 @@ async fn test_quorum_exec_block_starved_rounds_warning() {
             quorum_exec_block_starved_rounds: starved_rounds,
             ..tn_config::Parameters::default()
         });
-        let proposer = exec_proposer(&fixture, &exec_bus(), &task_manager, Vec::new());
+        let mut proposer = exec_proposer(&fixture, &exec_bus(), &task_manager, Vec::new());
         assert_eq!(proposer.exec_block_policy, ExecBlockPolicy::new(enabled, starved_rounds));
         assert_eq!(proposer.exec_block_policy.base_window, window);
         let rule = if enabled { ExecPolicy::Tip } else { ExecPolicy::Off };
