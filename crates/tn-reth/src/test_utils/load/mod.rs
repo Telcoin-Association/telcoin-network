@@ -31,8 +31,9 @@
 //! - [`differential`]: a seeded sample of past-block and by-hash reads over a finished chain,
 //!   recorded with its answers, and the comparison of two runs' records: the storage-layout
 //!   differential.
-//! - [`layout`]: [`StorageLayout`], reth's storage layout, selected for a new datadir in one place
-//!   and read back from an open env; [`open_production_env_with_layout`] opens in it.
+//! - [`layout`]: [`StorageLayout`], reth's storage layout, and [`TxBodies`], where the transactions
+//!   are kept, each selected for a new datadir in one place and read back from an open env;
+//!   [`open_production_env_with_layout`] and [`open_production_env_with_format`] open in them.
 //! - [`sf_sync`]: the static files' per-segment sync timing ([`SfSyncStats`]) and what reads it
 //!   from an env ([`SfSyncSource`]); [`static_file_sizes`] splits the static files' bytes by
 //!   segment.
@@ -53,9 +54,10 @@ pub use base::{build_base, slim_chain, BaseMeta};
 pub use db_counters::{db_counters, db_page_size, DbCounters, NOT_DIFFERENCES};
 pub use env::{
     announce_temp_dir, clone_datadir, db_file_bytes, dir_bytes, open_production_env,
-    open_production_env_with_db, open_production_env_with_layout, static_file_sizes, SegmentFiles,
+    open_production_env_with_db, open_production_env_with_format, open_production_env_with_layout,
+    static_file_sizes, SegmentFiles,
 };
-pub use layout::StorageLayout;
+pub use layout::{StorageLayout, TxBodies};
 pub use output::{LoadOutput, OutputConfig, OutputFactory};
 pub use readers::{
     poll_addresses, ReadKind, ReadMix, ReadSamples, Readers, SubmitSamples, Submitter,
