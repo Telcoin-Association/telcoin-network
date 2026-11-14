@@ -374,6 +374,6 @@ pub use env::{RethTableStat, TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
 pub use timeout::DEFAULT_READ_TRANSACTION_TIMEOUT;
 pub use tn_lmdb::{
     CheckReport, GapFill, IoStats, ParseGapFillError, SyncMode, TableCheck, MAX_GAP_FILL,
-    MIN_GROWTH,
+    MAX_GROWTH, MIN_GROWTH,
 };
 pub use tx::{TnLmdbTx, TnLmdbTxMut};

@@ -241,7 +241,17 @@ to the peer, before free space could drop below a floor (each check needs `IMPOR
 it for every floored import in flight in the process, for the growth their files may preallocate before
 their next checks: the epoch fetchers and an observer's staging import can run several at once onto the
 live stores' filesystem), since the peer's bytes
-are authenticated only at the final header; `db load-state`'s restore of a local bundle has no floor;
+are authenticated only at the final header. The floor (`import_min_free`) is the execution database's
+largest growth step (`--db.growth-step`, plumbed by `ConsensusChain::with_execution_growth_step`; tn-lmdb's
+default 1 GiB otherwise) plus a margin for a pack and a tndb growth step and every other writer, so the
+node's own next growth step always fits beside an import held at the floor. It is checked as the import's
+data log grows and, by the reader's task, every second whatever the stream does (`ImportClock`), so an
+import gives its space back once the node's own writes eat into the headroom; and an import must write
+at least `IMPORT_MIN_PROGRESS_BYTES` per `IMPORT_PROGRESS_WINDOW` (progress in what it writes, since its
+records are re-encoded with zstd and the bytes a peer streams say nothing about the disk it holds), or it
+stops as `ImportStalled`, which the fetcher charges to the peer; a stream declared uncompressed is
+refused (every pack writer compresses with zstd). A stopped import's files are removed only after its
+blocking half stopped writing them. `db load-state`'s restore of a local bundle has no floor and no clock;
 the imported pack is sealed before `pack_install` is taken, and the live (writable) epoch is replaced
 only with its stored record's chain, anything else, such as a prefix's partial final, being refused as
 `LiveEpochImport`), and drives epoch handoff.
