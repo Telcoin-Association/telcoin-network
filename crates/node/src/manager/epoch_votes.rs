@@ -994,8 +994,9 @@ impl RetainedEpochVotes {
         inner.report();
     }
 
-    /// Note that this node sent its re-certify vote for `epoch`; the round for `epoch` that
-    /// ends next reports its outcome.
+    /// Note that this node picked `epoch` to re-certify (whether or not it sent its vote: the
+    /// withhold test hook keeps the mark); the round for `epoch` that ends next reports its
+    /// outcome.
     fn mark_recertify(&self, epoch: Epoch) {
         self.inner.lock().recertifying.insert(epoch);
     }
@@ -1054,7 +1055,7 @@ struct RetainedVotes {
     /// The newest record epoch the collector has pruned at; the window is
     /// `latest - MAX_RECERTIFY_LOOKBACK ..`.
     latest: Epoch,
-    /// Epochs this node sent a re-certify vote for whose round has not reported yet.
+    /// Epochs this node picked to re-certify whose round has not reported yet.
     recertifying: BTreeSet<Epoch>,
 }
 
