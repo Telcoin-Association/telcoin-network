@@ -1568,6 +1568,21 @@ impl ConsensusPack {
         None
     }
 
+    /// The batch stored under `digest`, read here on the caller's thread under the read lock, as
+    /// [`Self::batches`] reads each of its batches: `Ok(None)` only when the pack does not hold
+    /// the digest (see [`BatchReadError`] for the rest; a legacy pack is
+    /// [`BatchReadError::Legacy`], since its by-digest lookups miss). The record is re-hashed, so
+    /// a batch is returned only under its own digest.
+    ///
+    /// A read decompresses, decodes and re-hashes up to a megabyte: call it from a blocking
+    /// thread, never a tokio worker.
+    pub fn batch_now(&self, digest: BlockHash) -> Result<Option<Batch>, BatchReadError> {
+        if self.is_legacy() {
+            return Err(BatchReadError::Legacy);
+        }
+        self.read_now(|inner| inner.batch_checked(digest)).map_err(|_| BatchReadError::Closed)?
+    }
+
     /// [`Self::batch`] for each of `digests`, in order, in one blocking task. The read lock is
     /// taken once per digest, not for the whole request: a batch read decompresses, decodes and
     /// re-hashes up to a megabyte, and a peer may ask for hundreds, so one lock across them all
@@ -1698,6 +1713,85 @@ impl ConsensusPack {
         tokio::task::spawn_blocking(move || shared.close_checked_if_open())
             .await
             .map_err(|_| PackError::ReceiveFailed)?
+    }
+}
+
+/// A read-only handle on one sealed past epoch's pack, for a reader that keeps its own handles
+/// instead of sharing `ConsensusChain`'s static-pack cache (the live epoch is read through
+/// [`crate::consensus::ConsensusChain::live_batch`]).
+///
+/// - It writes nothing: the files are opened read-only, and dropping it closes them.
+/// - Packs take no file locks, so it can sit beside the node's own handles on the same epoch.
+/// - An install of a fuller copy of the epoch (`ConsensusChain::stream_import`) renames new files
+///   over the ones it holds. It keeps reading the copy it opened, which may lack batches the new
+///   one holds. `ConsensusChain::install_generation` moves at every install: a reader holding
+///   handles reopens them when it does.
+/// - Each open copies the two digest indexes' blooms into memory (about 4 MiB) and holds six
+///   descriptors.
+#[derive(Debug)]
+pub struct PackReader {
+    pack: ConsensusPack,
+}
+
+impl PackReader {
+    /// Open `epoch`'s pack under `epochs_dir` (the directory holding the `epoch-{N}` directories).
+    ///
+    /// - A pack that is not sealed is [`BatchReadError::Unsealed`]: the live epoch, or the epoch a
+    ///   handoff is sealing (retry shortly).
+    /// - A legacy (pre-v2) pack is [`BatchReadError::Legacy`].
+    /// - Any other failure is [`BatchReadError::Open`]: an epoch with no pack on disk fails with
+    ///   [`PackError::is_missing_static_files`], damage as `CorruptPack`.
+    ///
+    /// Blocking (it maps six files and reads the blooms): call it from a blocking thread.
+    pub fn open(epochs_dir: &Path, epoch: Epoch) -> Result<Self, BatchReadError> {
+        let pack = match ConsensusPack::open_static(epochs_dir, epoch) {
+            Ok(pack) => pack,
+            Err(e) if e.is_missing_static_files() || e.is_environmental() => {
+                return Err(BatchReadError::Open(e));
+            }
+            Err(e) => {
+                // The read-only open refuses an unsealed data log as `CorruptPack`, as it does a
+                // damaged one; the log's seal tells them apart (a pre-v2 log never carries one, so
+                // a refused legacy pack is damage). A log that reads back sealed now may have been
+                // sealed after the open read it (a handoff in progress): open once more.
+                let data = epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME);
+                match open_data_for_check(&data, epoch) {
+                    Ok(log) if log.version() >= SENTINEL_MIN_VERSION && log.opened_unclean() => {
+                        return Err(BatchReadError::Unsealed);
+                    }
+                    Ok(log) if log.version() >= SENTINEL_MIN_VERSION => {
+                        drop(log);
+                        ConsensusPack::open_static(epochs_dir, epoch)
+                            .map_err(BatchReadError::Open)?
+                    }
+                    Ok(_) | Err(_) => return Err(BatchReadError::Open(e)),
+                }
+            }
+        };
+        let reader = Self { pack };
+        if reader.pack.is_legacy() {
+            return Err(BatchReadError::Legacy);
+        }
+        Ok(reader)
+    }
+
+    /// The epoch this reader serves.
+    pub fn epoch(&self) -> Epoch {
+        self.pack.epoch()
+    }
+
+    /// The batch stored under `digest` ([`ConsensusPack::batch_now`]): `Ok(None)` only when the
+    /// pack does not hold it. Call it from a blocking thread.
+    pub fn batch(&self, digest: BlockHash) -> Result<Option<Batch>, BatchReadError> {
+        self.pack.batch_now(digest)
+    }
+}
+
+impl Drop for PackReader {
+    /// Close the read-only files here (unmap and close, nothing written), so the pack's last
+    /// handle finds nothing to seal.
+    fn drop(&mut self) {
+        self.pack.shared.close();
     }
 }
 
@@ -5353,52 +5447,60 @@ impl Inner {
 
     /// Return the Batch for digest if found.
     ///
-    /// As [`Self::consensus_header_by_digest`], `None` is both a quiet miss and an indexed record
-    /// that cannot be served, which is logged: a record that fails to load or decode at `error!`,
-    /// and one that hashes to another digest (an entry a rolled-back save left stale) at `warn!`.
+    /// [`Self::batch_checked`] with every failure collapsed to `None`. As
+    /// [`Self::consensus_header_by_digest`], `None` is then both a quiet miss and an indexed
+    /// record that cannot be served, which is logged: a lookup or a record that fails to load or
+    /// decode at `error!`, and a record that hashes to another digest (an entry a rolled-back
+    /// save left stale) at `warn!`. An entry past the data log's end (also left by a rolled-back
+    /// save) stays a quiet miss.
     fn batch(&self, digest: BlockHash) -> Option<Batch> {
+        let epoch = self.epoch_meta.epoch;
+        match self.batch_checked(digest) {
+            Ok(batch) => batch,
+            Err(BatchReadError::NoRecordAt { .. }) => None,
+            Err(BatchReadError::DigestMismatch { pos, found }) => {
+                warn!(target: "consensus_pack", epoch, ?digest, got = ?found, pos, "batch loaded from the pack does not hash to its indexed digest (a stale index entry)");
+                None
+            }
+            Err(e) => {
+                error!(target: "consensus_pack", epoch, ?digest, "indexed batch could not be served from the pack: {e}");
+                None
+            }
+        }
+    }
+
+    /// The batch stored under `digest`: `Ok(None)` only when the batch-digest index does not hold
+    /// the digest ([`fetch_error_is_absent`]), every other failure an error (see
+    /// [`BatchReadError`]). The record is re-hashed, so a batch is returned only under its own
+    /// digest.
+    fn batch_checked(&self, digest: BlockHash) -> Result<Option<Batch>, BatchReadError> {
         #[cfg(test)]
         if let Some(delay) = self.batch_read_delay {
             std::thread::sleep(delay);
         }
-        let epoch = self.epoch_meta.epoch;
-        let pos = self
-            .batch_digests
-            .get(digest)
-            .inspect_err(|e| {
-                if !fetch_error_is_absent(e) {
-                    error!(target: "consensus_pack", epoch, ?digest, "batch digest index lookup failed (not a miss): {e}");
-                }
-            })
-            .ok()?;
-        // This is not strickly needed, the fetch below will fail if
-        // we try to read past the end of the file but this potentially
-        // short circuits a lot of checks for a small cost.
-        // Note, this could happen if a file is damaged and repaired.
+        let pos = match self.batch_digests.get(digest) {
+            Ok(pos) => pos,
+            Err(e) if fetch_error_is_absent(&e) => return Ok(None),
+            Err(e) => return Err(BatchReadError::Read(e)),
+        };
+        // Not strictly needed (the fetch below fails past the end too), but it skips the fetch's
+        // checks for an entry a rolled-back save left past the data log's end.
         if pos >= self.data.file_len() {
-            return None;
+            return Err(BatchReadError::NoRecordAt { pos });
         }
         let batch = self
             .data
             .fetch(pos)
-            .inspect_err(|e| {
-                error!(target: "consensus_pack", epoch, ?digest, pos, "indexed batch record exists but failed to load from the pack: {e}");
-            })
-            .ok()?
+            .map_err(BatchReadError::Read)?
             .into_batch()
-            .inspect_err(|e| {
-                error!(target: "consensus_pack", epoch, ?digest, pos, "indexed batch record exists but did not decode as a batch: {e}");
-            })
-            .ok()?;
-        // Verify the digest.  There is an extremely unlikely edge case where
-        // a repaired DB could write a new batch to the same location as an
-        // old batch.  This makes sure the contract is always intact.
-        let got = batch.digest();
-        if got != digest {
-            warn!(target: "consensus_pack", epoch, ?digest, ?got, pos, "batch loaded from the pack does not hash to its indexed digest (a stale index entry)");
-            return None;
+            .map_err(|_| BatchReadError::NotBatch { pos })?;
+        // Verify the digest. A save rolled back after indexing leaves entries that a later save
+        // can land another record under; this keeps every answer the batch named.
+        let found = batch.digest();
+        if found != digest {
+            return Err(BatchReadError::DigestMismatch { pos, found });
         }
-        Some(batch)
+        Ok(Some(batch))
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
@@ -6698,6 +6800,77 @@ impl Display for PackError {
                      {max}-byte per-output budget"
                 )
             }
+        }
+    }
+}
+
+/// Why a checked batch read ([`ConsensusPack::batch_now`], [`PackReader`],
+/// [`crate::consensus::ConsensusChain::live_batch`]) could not answer. A batch the pack does not
+/// hold is `Ok(None)`, never one of these: each says the pack could not show whether it holds the
+/// batch, or holds something else under its digest.
+#[derive(Debug)]
+pub enum BatchReadError {
+    /// The batch-digest index lookup or the record's load failed: a damaged index or record
+    /// (its CRC, decompression or decode), or an I/O error.
+    Read(FetchError),
+    /// The index names a position where the data log holds no record (at or past its end): an
+    /// entry a save rolled back after indexing left behind (the pack fails every persist until a
+    /// reopen rebuilds its indexes), or a damaged index.
+    NoRecordAt {
+        /// The position the index named.
+        pos: u64,
+    },
+    /// The record the index names is not a batch.
+    NotBatch {
+        /// The position the index named.
+        pos: u64,
+    },
+    /// The record the index names is a batch with another digest: an entry a rolled-back save
+    /// left stale, with a later record written where it points.
+    DigestMismatch {
+        /// The position the index named.
+        pos: u64,
+        /// The digest of the batch stored there.
+        found: BlockHash,
+    },
+    /// The pack is closed: it was sealed under the read (an epoch handoff seals the previous
+    /// epoch's pack after a short grace), or a failed save took it out of service.
+    Closed,
+    /// The pack predates the v2 format. Its digest indexes use the old key placement, so a
+    /// by-digest lookup misses batches it holds: only `ConsensusChain`'s read-side heal (a
+    /// migration) makes it readable by digest.
+    Legacy,
+    /// The epoch's data log is not sealed: it is the live epoch, or the epoch a handoff is
+    /// sealing. A past epoch that stays unsealed is damage (`db validate`, `db repair`).
+    Unsealed,
+    /// The epoch's pack failed to open ([`ConsensusPack::open_static`]). An epoch with no pack on
+    /// disk is an error whose [`PackError::is_missing_static_files`] is true.
+    Open(PackError),
+}
+
+impl Error for BatchReadError {}
+
+impl Display for BatchReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(e) => write!(f, "the batch could not be read from the pack: {e}"),
+            Self::NoRecordAt { pos } => {
+                write!(f, "the batch digest index names position {pos}, which holds no record")
+            }
+            Self::NotBatch { pos } => {
+                write!(f, "the batch digest index names position {pos}, which is not a batch")
+            }
+            Self::DigestMismatch { pos, found } => write!(
+                f,
+                "the batch digest index names position {pos}, which holds the batch {found}"
+            ),
+            Self::Closed => write!(f, "the pack is closed"),
+            Self::Legacy => write!(
+                f,
+                "the pack predates format v2 and cannot be read by digest until it is migrated"
+            ),
+            Self::Unsealed => write!(f, "the epoch's pack is not sealed"),
+            Self::Open(e) => write!(f, "the epoch's pack failed to open: {e}"),
         }
     }
 }
@@ -10484,6 +10657,186 @@ pub(crate) mod test {
         let (read, logged) = warnings_and_errors(|| inner.batch(digests[0]));
         assert!(read.is_none(), "a corrupt batch is not served");
         assert_eq!(logged, [tracing::Level::ERROR], "a corrupt batch is an error");
+    }
+
+    /// A checked batch read (`batch_now`) answers `Ok(None)` only for a digest the pack does not
+    /// hold. An entry naming another batch's record is `DigestMismatch`, an entry past the data
+    /// end `NoRecordAt`, a record damaged at rest a read error, and a read of a closed pack
+    /// `Closed`: none reads as absent, as each does through `batch`.
+    #[tokio::test]
+    async fn test_batch_now_tells_absent_from_unservable() {
+        use crate::{
+            archive::{error::fetch::FetchError, index::Index as _},
+            consensus_pack::BatchReadError,
+        };
+        let temp_dir = TempDir::with_prefix("test_cp_batch_now").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 2);
+        for output in &outputs {
+            pack.save_consensus_output(output.clone()).await.expect("save");
+        }
+        pack.persist().await.expect("persist");
+        let digests = batch_digests_of(&outputs[0]);
+        assert!(digests.len() >= 2, "fixture has batches");
+        for (digest, batch) in batches_by_digest(&outputs[0]) {
+            let read = pack.batch_now(digest).expect("a stored batch reads");
+            assert_eq!(read, Some(batch), "a stored batch reads back");
+        }
+        let absent = BlockHash::repeat_byte(0xcd);
+        assert!(matches!(pack.batch_now(absent), Ok(None)), "an absent digest is a miss");
+
+        // A stale entry: a digest indexed at another batch's record.
+        let stale = BlockHash::repeat_byte(0xab);
+        let (other, data_len) = {
+            let mut guard = pack.shared.inner.write();
+            let inner = guard.as_mut().expect("open");
+            let other = inner.batch_digests.get(digests[1]).expect("indexed");
+            inner.batch_digests.save(stale, other).expect("index the stale entry");
+            (other, inner.data.file_len())
+        };
+        let read = pack.batch_now(stale);
+        assert!(
+            matches!(read, Err(BatchReadError::DigestMismatch { pos, found })
+                if pos == other && found == digests[1]),
+            "a batch under another digest is a mismatch, got {read:?}"
+        );
+        // An entry past the data log's end, as a rolled-back save leaves.
+        let past = BlockHash::repeat_byte(0xef);
+        pack.shared
+            .inner
+            .write()
+            .as_mut()
+            .expect("open")
+            .batch_digests
+            .save(past, data_len + 64)
+            .expect("index the entry past the end");
+        let read = pack.batch_now(past);
+        assert!(
+            matches!(read, Err(BatchReadError::NoRecordAt { pos }) if pos == data_len + 64),
+            "an entry past the end is no record, got {read:?}"
+        );
+        // `batch` collapses both to a miss.
+        assert!(pack.batch(stale).await.is_none() && pack.batch(past).await.is_none());
+
+        // A clone of a pack sealed under it.
+        let clone = pack.clone();
+        pack.seal_now().await;
+        let read = clone.batch_now(digests[0]);
+        assert!(matches!(read, Err(BatchReadError::Closed)), "got {read:?}");
+        drop(clone);
+
+        // Rot: a byte of a sealed batch record flipped at rest.
+        let pos = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            let pos = pack
+                .read_now(|inner| inner.batch_digests.get(digests[0]).expect("indexed"))
+                .expect("open");
+            pack.close().await;
+            pos
+        };
+        corrupt_byte_at(&temp_dir.path().join("epoch-0").join(Inner::DATA_NAME), pos + 8);
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+        let read = pack.batch_now(digests[0]);
+        assert!(
+            matches!(read, Err(BatchReadError::Read(FetchError::CrcFailed))),
+            "a damaged record is a read error, got {read:?}"
+        );
+        assert!(matches!(pack.batch_now(digests[1]), Ok(Some(_))), "the next batch still reads");
+        assert!(matches!(pack.batch_now(absent), Ok(None)), "an absent digest is still a miss");
+        pack.close().await;
+    }
+
+    /// A legacy (pre-v2) pack opens, but its by-digest lookups miss what it holds, so a checked
+    /// read never answers from it: `PackReader::open` and `batch_now` both refuse it as `Legacy`.
+    /// A damaged one is an open error.
+    #[tokio::test]
+    async fn test_checked_batch_reads_refuse_a_legacy_pack() {
+        use crate::consensus_pack::{BatchReadError, PackReader};
+        let temp_dir = TempDir::with_prefix("test_cp_legacy_reader").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let outputs =
+            build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 2, 1).await;
+        let digest = batch_digests_of(&outputs[0])[0];
+
+        let read = PackReader::open(temp_dir.path(), 0);
+        assert!(matches!(read, Err(BatchReadError::Legacy)), "got {read:?}");
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("a legacy pack opens");
+        assert!(pack.is_legacy(), "precondition: a v1 pack");
+        let read = pack.batch_now(digest);
+        assert!(matches!(read, Err(BatchReadError::Legacy)), "got {read:?}");
+        pack.close().await;
+
+        // A legacy log never carries a seal, so a legacy pack the open refuses is damage, never
+        // `Unsealed`.
+        break_index_file(&temp_dir.path().join("epoch-0").join("idx").join("index_pos.pdx"));
+        let read = PackReader::open(temp_dir.path(), 0);
+        assert!(
+            matches!(&read, Err(BatchReadError::Open(e)) if !e.is_missing_static_files()),
+            "got {read:?}"
+        );
+    }
+
+    /// `PackReader` serves only a sealed epoch: the live writer's pack is refused as `Unsealed`,
+    /// an epoch with no pack as a missing one, and a sealed pack with a damaged index as
+    /// `CorruptPack` (not `Unsealed`). Once sealed, two readers read it side by side, and dropping
+    /// them leaves every file of the epoch as it was.
+    #[tokio::test]
+    async fn test_pack_reader_serves_only_a_sealed_epoch() {
+        use crate::consensus_pack::{BatchReadError, PackError, PackReader};
+        let temp_dir = TempDir::with_prefix("test_cp_pack_reader").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 2);
+        for output in &outputs {
+            pack.save_consensus_output(output.clone()).await.expect("save");
+        }
+        pack.persist().await.expect("persist");
+        let read = PackReader::open(temp_dir.path(), 0);
+        assert!(matches!(read, Err(BatchReadError::Unsealed)), "the live pack, got {read:?}");
+        let read = PackReader::open(temp_dir.path(), 1);
+        assert!(
+            matches!(&read, Err(BatchReadError::Open(e)) if e.is_missing_static_files()),
+            "an epoch with no pack, got {read:?}"
+        );
+        pack.close().await;
+
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let files = |dir: &Path| {
+            let mut files = BTreeMap::new();
+            let mut dirs = vec![dir.to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                for entry in std::fs::read_dir(&dir).expect("read dir") {
+                    let path = entry.expect("entry").path();
+                    if path.is_dir() {
+                        dirs.push(path);
+                    } else {
+                        let bytes = std::fs::read(&path).expect("read file");
+                        files.insert(path, bytes);
+                    }
+                }
+            }
+            files
+        };
+        let before = files(&epoch_dir);
+        let (first, second) = (
+            PackReader::open(temp_dir.path(), 0).expect("a sealed epoch opens"),
+            PackReader::open(temp_dir.path(), 0).expect("a second reader opens beside it"),
+        );
+        assert_eq!(first.epoch(), 0);
+        for (digest, batch) in batches_by_digest(&outputs[1]) {
+            assert_eq!(first.batch(digest).expect("read"), Some(batch.clone()));
+            assert_eq!(second.batch(digest).expect("read"), Some(batch));
+        }
+        assert!(matches!(first.batch(BlockHash::repeat_byte(0xcd)), Ok(None)));
+        drop((first, second));
+        assert!(files(&epoch_dir) == before, "dropping a reader writes nothing");
+
+        break_index_file(&epoch_dir.join("idx").join("index_pos.pdx"));
+        let read = PackReader::open(temp_dir.path(), 0);
+        assert!(
+            matches!(read, Err(BatchReadError::Open(PackError::CorruptPack(_)))),
+            "a damaged sealed pack is not unsealed, got {read:?}"
+        );
     }
 
     /// `ConsensusPack::close` is an async drop: it must fully SEAL the pack (commit the data, sync
