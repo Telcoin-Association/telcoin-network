@@ -24,11 +24,14 @@
 //!
 //! The walk never waits for a task that has not started: it claims it and computes the root itself
 //! (the task then does nothing), and it waits only for a task already running, which waits on
-//! nothing. A busy pool (batch validation on a validator shares it) therefore degrades the root to
-//! serial instead of stalling it; the scope's end waits only for jobs the pool has not picked up,
-//! which then return at once. A task that fails (opening its transaction, a database read, a
-//! moved tip, below) or panics leaves its account to the walk, which computes it serially: the
-//! failures are logged once a block and change no result.
+//! nothing. A busy pool (batch validation on a validator shares it, and so does the next output's
+//! signer recovery) therefore moves the storage roots to the walk instead of holding the walk up.
+//! The root still returns only when `rayon::in_place_scope` ends, which waits until the pool has
+//! run every job the root spawned (one per target, and up to [`WALK_HELPERS`] helpers). A job the
+//! walk claimed returns at once when it runs, but it runs only when a pool thread reaches it in the
+//! pool's queue, so a busy pool delays the end of the root by its backlog. A task that fails
+//! (opening its transaction, a database read, a moved tip, below) or panics leaves its account to
+//! the walk, which computes it serially: the failures are logged once a block and change no result.
 //!
 //! # The account walk
 //!
@@ -92,34 +95,50 @@
 //! A wrong root forks the chain, and TN builds its own blocks: no payload's root checks this one.
 //! In production the blocks whose number is a multiple of [`CHECK_ONE_BLOCK_IN`] (of those with
 //! parallel work: storage-root tasks or a split account walk) also compute the root serially and
-//! compare the roots and the trie updates; on a difference the block logs both roots, whether the
-//! split composed the block's and how many split storage roots it took, counts it
-//! (`tn_reth.parallel_state_root_mismatches_total`, a split walk's also in
+//! compare the roots and the trie updates (account nodes, removed nodes and storage tries). On a
+//! difference the block logs both roots, whether the trie updates were equal, whether the split
+//! composed the block's root and how many split storage roots it took, counts it
+//! (`tn_reth.parallel_state_root_mismatches_total`; a block whose root the split composed also in
 //! `tn_reth.account_walk_fallbacks_total` and a block with split storage roots also in
-//! `tn_reth.storage_walk_fallbacks_total`, both as `mismatch`) and uses the serial result.
+//! `tn_reth.storage_walk_fallbacks_total`, both as `mismatch`) and uses the serial result. The
+//! check never fails the block, and nothing turns the parallel paths off after it.
+//!
+//! What the check finds, and what it cannot:
+//! - It finds a parallel result that differs from the serial walk over the same stored trie and
+//!   overlay, on a checked block. The other blocks commit the parallel result unchecked.
+//! - It cannot see a wrong trie node that an unchecked block persisted or put in the output's
+//!   overlay. The serial walk reads the same layers (`layered_factories`), recomputes only along
+//!   its block's prefix sets and takes the stored hashes elsewhere, so it agrees with the parallel
+//!   walk over that node, on this block and on every later one.
+//! - It does not say which part was wrong. The `mismatch` labels say which splits ran on the block;
+//!   a block where both ran counts under both.
 //!
 //! The sample is a function of the block alone, never of what one node has seen since it started,
-//! so every node checks the same blocks. A repeatable bug in a parallel path then gives every node
-//! running the same code the same root: the serial one on a checked block, the same wrong one on an
-//! unchecked block. (A per-node count would split such nodes by their counts' phase.) The one
-//! per-node difference left is a task that fails (logged, and counted by reason in
-//! `tn_reth.parallel_state_root_task_failures_total`): its part goes to the serial computation on
-//! that node only. The pool's thread count is no such difference: it changes which thread computes
-//! a part, not how, so a node whose pool runs one thread runs the same parallel code (on the
-//! calling thread and that one pool thread) and composes the same roots as its peers; only the off
-//! switches compute serially.
+//! so every node checks the same blocks. (A per-node count would split nodes by their counts'
+//! phase.) Which code computes each part is not the same on every node. Scheduling decides whether
+//! the walk takes a storage root from its task or computes it itself (it claims a task that has not
+//! started, and computes on its own cursors), and which thread works each subtrie and piece; a task
+//! that fails (logged, and counted by reason in `tn_reth.parallel_state_root_task_failures_total`)
+//! leaves its part to the serial computation on that node only. Every one of these paths computes
+//! the same value, which is what keeps nodes agreeing. A node whose pool runs one thread runs the
+//! same parallel code (on the calling thread and that one pool thread); only the off switches
+//! compute every root serially. A bug that every path shares gives every node running this code the
+//! same root: the serial one on a checked block, the same wrong one on an unchecked block. A bug in
+//! one path gives a wrong root only on the nodes whose scheduling took that path, so it can part
+//! nodes running the same code.
 //!
-//! Any nonzero mismatch count therefore means the parallel code computed a wrong root, and the
-//! unchecked blocks the same bug hit carry it on every node running this code. The response is
-//! network-wide, not local: turn the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`,
-//! or only the split the `mismatch` fallback names, `TN_PARALLEL_ACCOUNT_WALK=0` or
-//! `TN_PARALLEL_STORAGE_WALK=0`; read at the first block, so a restart) and report it. Turning
-//! them off on one node only parts it from its peers on the next block the bug hits. Turning them
-//! off stops the bug; it repairs no trie node an unchecked block already persisted (the comparison
-//! covers the trie updates too, so a bug can be in them). Every later root, serial ones included,
-//! is computed over those nodes, so the nodes keep agreeing while a block's root may not be the
-//! root of its state. A snapshot restore (`snapshot.rs`) finds it: it rebuilds the trie from the
-//! hashed state and fails when that root differs from the snapshot block's header.
+//! Any nonzero mismatch count therefore means the parallel code computed a wrong root, and
+//! unchecked blocks the same bug hit carry it. The response is network-wide, not local: turn the
+//! parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`; read at the first block, so a
+//! restart) and report it. The split switches (`TN_PARALLEL_ACCOUNT_WALK=0`,
+//! `TN_PARALLEL_STORAGE_WALK=0`) narrow that once the fault is known; the `mismatch` labels do not
+//! name it. Turning them off on one node only parts it from its peers on the next block a shared
+//! bug hits. Turning them off stops the bug; it repairs no trie node an unchecked block already
+//! persisted (the comparison covers the trie updates too, so a bug can be in them). Every later
+//! root, serial ones included, is computed over those nodes, so the nodes keep agreeing while a
+//! block's root may not be the root of its state. A snapshot restore (`snapshot.rs`) finds it: it
+//! rebuilds the trie from the hashed state and fails when that root differs from the snapshot
+//! block's header.
 //!
 //! With `TN_PARALLEL_STATE_ROOT_SHADOW=1` (test builds; the default in tn-reth's unit tests) every
 //! such block is compared and a difference panics: the shadow runs of the exec bench compare every
@@ -141,9 +160,7 @@ use super::{
     account_split::{AccountWalk, Subtries},
     layered_factories,
     sorted_runs::SortedTrieRuns,
-    storage_split::{
-        shape, splittable, Splittable, StorageRootResult, StorageSplits, StorageWalk,
-    },
+    storage_split::{shape, splittable, Splittable, StorageRootResult, StorageSplits, StorageWalk},
     OutputTrieOverlay,
 };
 use crate::metrics::{
