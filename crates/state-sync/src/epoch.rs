@@ -560,7 +560,8 @@ fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
 /// the epoch is a gap of `collection`, which the record collector asks for again
 /// ([`retry_gaps`]). If the walk ends before that, on a record naming another parent (this node's
 /// own record differs from the one the network built on), a peer without the next record or no
-/// answer, the pass stops where it would have stopped with the walk off.
+/// answer, the pass stops where it would have stopped with the walk off. A pass that walked always
+/// ends with the persist and the final-consensus publish below, a refused record included.
 async fn collect_epoch_records(
     last_epoch: Epoch,
     consensus_chain: &ConsensusChain,
@@ -577,6 +578,8 @@ async fn collect_epoch_records(
     let mut best_final_consensus: Option<(Epoch, u64, ConsensusHeaderDigest)> = None;
     // epochs this pass walked past that no stored certified record after them confirms yet
     let mut walked: Vec<Epoch> = Vec::new();
+    // whether this pass walked at all: such a pass ends at the persist below, whatever stops it
+    let mut walked_any = false;
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
         if let Some((rec, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
@@ -616,17 +619,20 @@ async fn collect_epoch_records(
                 }
             }
             Fetched::Refused { parent_mismatch } => {
-                if walked.is_empty() {
+                if !walked_any {
                     return Ok(CollectedPass { epoch: epoch.saturating_sub(1), definitive: true });
                 }
-                if parent_mismatch {
+                if parent_mismatch && !walked.is_empty() {
                     // the record after a walked epoch names another parent: this node's own
                     // record of that epoch differs from the one the network built on
                     collection.metrics.epoch_record_walk_parent_mismatches_total.increment(1);
                 }
-                // the cursor stays before the walk, where a pass with the walk off stops, so the
-                // next pass meets the walked epoch again rather than starting on it
-                return Ok(CollectedPass { epoch: result_epoch, definitive: true });
+                // the cursor stays where it is: before a walk that did not land, where a pass with
+                // the walk off stops, so the next pass meets the walked epoch again rather than
+                // starting on it; after one that landed, on the last stored epoch. The pass ends
+                // below, so what it stored is persisted.
+                definitive = true;
+                break;
             }
             Fetched::Missing(err) => {
                 // We delibrately go past the latest epoch so this is expected to happen. Only a
@@ -640,6 +646,7 @@ async fn collect_epoch_records(
                 );
                 if definitive && collection.may_walk_past(epoch, &walked, consensus_chain).await {
                     walked.push(epoch);
+                    walked_any = true;
                     continue;
                 }
             }
@@ -2518,6 +2525,60 @@ mod tests {
         assert_eq!(collection.gaps, BTreeSet::from([1, 5]));
         expect_requests(&mut requests, &[1, 1, 1]).await?;
         assert!(requests.try_recv().is_err(), "the unreadable gap must not be asked for");
+        Ok(())
+    }
+
+    /// A refused record after a walk ends the pass at its end, not with an early return: what the
+    /// pass stored is persisted and its newest final consensus header is published, as after any
+    /// other pass. Here the pass stores epoch 1's certificate, walks past this node's own
+    /// uncertified epoch 2, and refuses epoch 3, whose record names another parent.
+    #[tokio::test]
+    async fn test_a_refusal_after_a_walk_reaches_the_end_of_the_pass() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let (keys, signers) = keys_and_signers(&fixture);
+        let mut records = certified_chain(&keys, &signers, 2);
+        // epoch 1 ends on a real consensus header, so storing its certificate publishes one
+        let final_consensus =
+            ConsensusNumHash { number: 9, hash: ConsensusHeaderDigest::from([9; 32]) };
+        records[1].0.final_consensus = final_consensus;
+        records[1].1 = make_cert(&records[1].0, &signers, &[0, 1, 2]);
+        records[2].0.parent_hash = records[1].0.digest();
+        records[2].1 = make_cert(&records[2].0, &signers, &[0, 1, 2]);
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        chain.epochs().save(records[0].0.clone(), records[0].1.clone()).await?;
+        chain.epochs().save_record(records[1].0.clone()).await?;
+        chain.epochs().save_record(records[2].0.clone()).await?;
+        // the network's epoch 3 builds on another record than this node's epoch 2
+        let theirs3 = EpochRecord {
+            epoch: 3,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            parent_hash: records[1].0.digest(),
+            ..Default::default()
+        };
+        let cert3 = make_cert(&theirs3, &signers, &[0, 1, 2]);
+        let mut answers = served(&records, &[1]);
+        answers.insert(3, (theirs3, cert3));
+        let handle = mock_epoch_record_network(answers, keys[0], 1);
+        let bus = ConsensusBus::new();
+        let (metrics, snapshotter) = local_metrics();
+        let mut collection = Collection::new(WALK, &metrics);
+
+        let collected =
+            collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?;
+        assert_eq!(collected, CollectedPass { epoch: 1, definitive: true });
+        assert_eq!(counters(&snapshotter).get(PARENT_MISMATCHES), Some(&1));
+        assert!(collection.gaps.is_empty());
+        assert_eq!(
+            *bus.app().last_published_consensus_num_hash().borrow(),
+            (1, final_consensus.number, final_consensus.hash)
+        );
+        assert_eq!(
+            chain.epochs().get_epoch_by_number(1).await,
+            Some((records[1].0.clone(), Some(records[1].1.clone())))
+        );
         Ok(())
     }
 }
