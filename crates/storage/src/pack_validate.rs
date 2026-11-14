@@ -217,6 +217,26 @@ impl CorruptionKind {
     }
 }
 
+/// What an operator can do about a consensus pack whose committed data is lost or damaged beyond
+/// what repair can fix: every report of one ends with it (`db validate`, `db repair`, `db migrate`
+/// and the pack opens). `epoch_dir` names the pack's `epoch-N` directory.
+///
+/// Nothing brings a lost pack back: the node fetches no pack below the epoch its consensus database
+/// is at, no command fetches one, and a rebuild of the execution database re-executes from the same
+/// packs. Removing the directory makes it worse: a datadir that stores transactions by position
+/// refuses every start without the pack of each epoch its rows point into (tn-reth's
+/// `TxPackCoverageError`).
+pub fn lost_pack_remedy(epoch_dir: impl Display) -> String {
+    format!(
+        "No node or command fetches a past epoch's pack again. With the node stopped, restore \
+         `consensus-db` from a backup, or only `{epoch_dir}` from a backup taken after its epoch \
+         closed; without a backup, start the node over as the recovery steps for a missing pack in \
+         crates/tn-reth/README.md (\"Transactions stored by position\") describe. Do NOT delete \
+         `{epoch_dir}` or the chain-data directories (`db`, `static_files`, `consensus-db`): a \
+         datadir that stores transactions by position refuses every start without that pack."
+    )
+}
+
 /// A physical corruption found while walking a pack's `data` stream, with enough context for an
 /// operator to decide whether to act (truncatable vs data loss).
 #[derive(Debug, Clone)]
@@ -261,10 +281,14 @@ impl Display for PhysicalCorruption {
         match self.kind {
             CorruptionKind::TornMetaEmpty => writeln!(
                 f,
-                "no committed data at risk, but ACTION NEEDED — both open doors refuse torn \
-                 epoch-meta bytes (only a header followed by nothing but zeros is re-initialized, \
-                 and only when the node creates the epoch): remove this `epoch-N` directory to \
-                 rebuild (re-sync the epoch from peers if it is not the current one)."
+                "ACTION NEEDED — both open doors refuse torn epoch-meta bytes (only a header \
+                 followed by nothing but zeros is re-initialized, and only when the node creates \
+                 the epoch). If this is the node's newest epoch (no later `epoch-M` directory \
+                 beside it), it holds no output and no committed data is at risk: with the node \
+                 stopped, remove this `epoch-N` directory, and the node creates it again when it \
+                 enters the epoch. If a later epoch exists, this is a past epoch and its outputs \
+                 are lost: do not remove it. {}",
+                lost_pack_remedy("epoch-N")
             ),
             CorruptionKind::TornTrailingTail => writeln!(
                 f,
@@ -277,9 +301,8 @@ impl Display for PhysicalCorruption {
             | CorruptionKind::MidLogCorruption
             | CorruptionKind::CorruptSealedRecord => writeln!(
                 f,
-                "DATA LOSS — the damaged records cannot be recovered locally. Replace this epoch by \
-                 re-syncing it from peers (state-sync). Do NOT delete the chain-data directories \
-                 (`db`, `static_files`, `consensus-db`)."
+                "DATA LOSS — the damaged records cannot be recovered locally. {}",
+                lost_pack_remedy("epoch-N")
             ),
         }
     }
@@ -1859,6 +1882,57 @@ mod test {
         assert!(text.contains("CURRENT"), "must qualify the current-epoch case: {text}");
         assert!(text.contains("PAST epoch"), "must distinguish past epochs: {text}");
         assert!(text.contains("db repair"), "must point a past epoch at db repair: {text}");
+    }
+
+    /// Every data-loss kind's recommended action names what works: nothing fetches a past epoch's
+    /// pack again, so it points at a backup or starting the node over, and warns off deleting the
+    /// `epoch-N` directory (a datadir storing transactions by position refuses every start without
+    /// it). A torn meta with nothing behind it says which case removing the directory is for: the
+    /// newest epoch, which holds no output, never a past one.
+    #[test]
+    fn test_data_loss_remediation_names_a_backup_never_a_resync() {
+        for kind in [
+            super::CorruptionKind::TornMetaEmpty,
+            super::CorruptionKind::CorruptMetaWithData,
+            super::CorruptionKind::MidLogCorruption,
+            super::CorruptionKind::CorruptSealedRecord,
+        ] {
+            let text = super::PhysicalCorruption {
+                kind,
+                offset: 28,
+                records_ok_before: 0,
+                decodable_after: false,
+                detail: "crc mismatch".to_string(),
+            }
+            .to_string();
+            assert!(!text.contains("re-sync"), "{kind:?}: no re-sync exists: {text}");
+            assert!(!text.contains("from peers"), "{kind:?}: no fetch from peers: {text}");
+            assert!(text.contains("from a backup"), "{kind:?}: must name a backup: {text}");
+            assert!(
+                text.contains("crates/tn-reth/README.md"),
+                "{kind:?}: must point at the recovery steps: {text}"
+            );
+            assert!(
+                text.contains("Do NOT delete `epoch-N`"),
+                "{kind:?}: must warn off removing the pack: {text}"
+            );
+        }
+        let torn_meta = super::PhysicalCorruption {
+            kind: super::CorruptionKind::TornMetaEmpty,
+            offset: 28,
+            records_ok_before: 0,
+            decodable_after: false,
+            detail: "short read".to_string(),
+        }
+        .to_string();
+        assert!(
+            torn_meta.contains("newest epoch"),
+            "must name the case removal is for: {torn_meta}"
+        );
+        assert!(
+            torn_meta.contains("past epoch and its outputs are lost: do not remove it"),
+            "must keep a past epoch's directory: {torn_meta}"
+        );
     }
 
     /// The index-degraded remediation no longer tells operators to delete `hash`/`bhash` by

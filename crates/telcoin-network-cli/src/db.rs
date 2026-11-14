@@ -607,8 +607,8 @@ fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Optio
 ///
 /// Truncates a torn `data`-file tail and rebuilds missing/corrupt sidecar indexes from the data log
 /// (the source of truth), then re-seals the pack. Damage that truncation cannot fix — a
-/// torn/corrupt epoch-meta, or mid-log data corruption — is reported (re-sync required), never
-/// touched.
+/// torn/corrupt epoch-meta, or mid-log data corruption — is reported with its recovery (a backup,
+/// or starting the node over), never touched.
 ///
 /// The node MUST be stopped: with `--force` this opens packs for append and rewrites them, which
 /// would corrupt a running node's memory mapping. It refuses to run while the datadir PID lock
@@ -745,8 +745,8 @@ impl DbRepairArgs {
 
             let verb = if self.force { "repaired" } else { "to repair (dry run)" };
             println!(
-                "\nsummary: {actionable} epoch(s) {verb}, {unrepairable} unrepairable (data loss / \
-                 re-sync), {errored} error(s)."
+                "\nsummary: {actionable} epoch(s) {verb}, {unrepairable} unrepairable (see each \
+                 epoch's reason), {errored} error(s)."
             );
             // Non-zero exit when anything could not be made healthy, so automation can distinguish a
             // clean datadir from one needing attention (a dry run that only found `WouldRepair` items
@@ -777,7 +777,7 @@ impl DbRepairArgs {
 /// node's memory mapping. It refuses to run while the datadir PID lock (`telcoin.pid`) is held by a
 /// live node (and takes that lock for its own run), and is a dry run by default, requiring
 /// `--force` to apply. A legacy pack whose data log is damaged below the acked frontier is reported
-/// (re-sync required), never truncated.
+/// with its recovery (a backup, or starting the node over), never truncated.
 #[derive(Debug, Args)]
 pub struct DbMigrateArgs {
     /// Migrate only this epoch. Without it, every legacy epoch is migrated.
@@ -861,7 +861,7 @@ impl DbMigrateArgs {
             let verb = if self.force { "migrated" } else { "to migrate (dry run)" };
             println!(
                 "\nsummary: {actionable} epoch(s) {verb}, {already} already v2, {corrupt} corrupt \
-                 (re-sync required)."
+                 or failed (see each epoch's reason)."
             );
             // Non-zero exit when any pack could not be migrated, so scripts/operators notice.
             if corrupt > 0 {
