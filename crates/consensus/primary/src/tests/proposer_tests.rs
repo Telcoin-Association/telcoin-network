@@ -3024,6 +3024,63 @@ fn test_quorum_exec_block_window_without_a_header_does_not_double() {
     assert_eq!(policy.next_window, 16);
 }
 
+/// Review item I1: the final bound of [`choose_exec_block`] holds on a ring whose numbers do not
+/// rise. The ring holds twenty outputs of the epoch before (blocks 100 to 157; 157 opened the
+/// header's epoch), then an entry of the header's epoch numbered 130, below the opening block,
+/// then 163 and 166. A quorum at 160 resolves through that entry, so the rule alone names 130, a
+/// block a voter restored at the opening block refuses for good. The bound names the opening block
+/// instead, under both forms that apply the rule; a debug build stops at the assertion first, so
+/// the tests catch any choice that needs the bound.
+///
+/// Catches: a missing bound, a bound read from anything but the ring's previous-epoch entries, a
+/// raised choice that names a block this node did not execute, a bound that moves a choice at or
+/// above the opening block, and a debug assertion that does not fire on a broken ring.
+#[test]
+fn test_quorum_exec_block_bound_holds_on_a_ring_whose_numbers_drop() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let mut ring = RecentBlocks::new(50);
+    for output in 0..20 {
+        push_epoch_output(&mut ring, EXEC_MODEL_EPOCH - 1, output);
+    }
+    let opening = ring.latest_execution_block_num_hash();
+    assert_eq!(opening.number, 157);
+    // an entry of the header's epoch below the opening block: the ring's numbers drop
+    let dropped = push_exec_output(&mut ring, 10);
+    assert_eq!(dropped.number, 130);
+    push_exec_output(&mut ring, 21);
+    let tip = push_exec_output(&mut ring, 22);
+    assert_eq!(tip.number, 166);
+    assert_eq!(ring.newest_before_epoch(EXEC_MODEL_EPOCH), Some(opening));
+    let bounded = ExecBlockChoice { block: opening, tip, basis: ExecBasis::Floor };
+
+    for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
+        let inputs = table_inputs(policy, table_parents(1, 6, 160));
+        let raw = quorum_rule_choice(&ring, &inputs, Some(opening));
+        assert_eq!(
+            raw,
+            ExecBlockChoice { block: dropped, tip, basis: ExecBasis::Quorum },
+            "{policy:?}: the rule alone names the entry below the opening block"
+        );
+        assert_eq!(bound_to_opening(raw, Some(opening)), bounded, "{policy:?}: the bound");
+        // end to end: a debug build stops at the assertion, a release build names the opening
+        // block
+        let result = catch_unwind(AssertUnwindSafe(|| choose_exec_block(&ring, &inputs)));
+        if cfg!(debug_assertions) {
+            assert!(result.is_err(), "{policy:?}: the debug assertion fires");
+        } else {
+            assert_eq!(result.ok(), Some(bounded), "{policy:?}: the bound in a release build");
+        }
+    }
+
+    // the bound leaves a choice at or above the opening block alone, and does nothing without an
+    // opening block in the ring
+    let at = ExecBlockChoice { block: opening, tip, basis: ExecBasis::Quorum };
+    assert_eq!(bound_to_opening(at, Some(opening)), at);
+    let below = ExecBlockChoice { block: dropped, tip, basis: ExecBasis::Quorum };
+    assert_eq!(bound_to_opening(below, None), below);
+}
+
 /// The quorum rule in an epoch's first rounds, under both forms that apply it: the ring holds
 /// twenty outputs of the epoch before (blocks 100 to 157; 157 closed that epoch) and three of the
 /// header's epoch (160, 163, 166), so the floor entry eight back (142) lies before the epoch's

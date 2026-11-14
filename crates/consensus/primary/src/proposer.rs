@@ -1618,7 +1618,8 @@ pub(crate) enum ExecBasis {
     Quorum,
     /// The quorum value is older than the floor: the ring entry
     /// [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip, or the oldest entry of a shorter
-    /// ring.
+    /// ring. Also the epoch's opening block when a choice fell below it, which the final bound of
+    /// [`choose_exec_block`] prevents and an honest node never reaches.
     Floor,
 }
 
@@ -1930,23 +1931,43 @@ pub(crate) struct ExecBlockChoice {
 ///   one low parent in a minimal parent set would otherwise drag the choice to a floor entry that
 ///   such a voter refuses for good. The bound matches a restored voter's floor only because every
 ///   state export is taken at an epoch's closing block; an export taken inside an epoch would need
-///   a bound in blocks below the own tip as well.
+///   a bound in blocks below the own tip as well;
+/// - a final bound names the opening block itself (`exec_basis=floor`) if the choice still fell
+///   below it. On an honest node it never fires, and a debug assertion says so: the choice is at
+///   or above the opening block as long as the ring's numbers rise in push order and the proposer
+///   starts the epoch only after executing the previous epoch's closing block. The bound keeps the
+///   guarantee when either fails.
 ///
 /// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
 /// An empty ring names the default block, as the tip read did before the switch existed.
 pub(crate) fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -> ExecBlockChoice {
     let tip = ring.latest_execution_block_num_hash();
-    let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
     if !inputs.policy.applies_quorum_rule() || ring.is_empty() {
-        return own_tip;
+        return ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
     }
-
     // the epoch's opening block, while the ring still holds it; once the ring holds only this
-    // epoch's blocks, every entry (and so every choice below) is above it. The own tip and every
-    // counted parent value are at or above it, so the quorum value is too; the block named for
-    // that value is the newest entry at or below it (the opening entry is a candidate) or the
-    // floor entry above it, so no separate clamp is needed
-    let lowest_usable = ring.newest_before_epoch(inputs.epoch).map_or(0, |opening| opening.number);
+    // epoch's blocks, every entry is above it
+    let opening = ring.newest_before_epoch(inputs.epoch);
+    let choice = quorum_rule_choice(ring, inputs, opening);
+    let bounded = bound_to_opening(choice, opening);
+    debug_assert_eq!(bounded, choice, "the quorum rule chose a block before the epoch opened");
+    bounded
+}
+
+/// The quorum rule's choice for a header, before the final bound of [`choose_exec_block`]:
+/// `opening` is the epoch's opening block if the ring still holds it.
+fn quorum_rule_choice(
+    ring: &RecentBlocks,
+    inputs: &ExecBlockInputs,
+    opening: Option<BlockNumHash>,
+) -> ExecBlockChoice {
+    let tip = ring.latest_execution_block_num_hash();
+    let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+    // the own tip and every counted parent value are at or above the opening block, so the
+    // quorum value is too; the block named for that value is the newest entry at or below it (the
+    // opening entry is a candidate) or the floor entry above it, so on a ring whose numbers rise
+    // nothing below the opening block is named
+    let lowest_usable = opening.map_or(0, |opening| opening.number);
     let mut counted = BTreeSet::from([&inputs.author]);
     let mut values = vec![(tip.number, inputs.own_power)];
     for parent in &inputs.parents {
@@ -1980,6 +2001,20 @@ pub(crate) fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -
     match ring.newest_at_or_below(quorum_value) {
         Some(block) => ExecBlockChoice { block, tip, basis: ExecBasis::Quorum },
         None => ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor },
+    }
+}
+
+/// `choice`, or the epoch's `opening` block when `choice` names a block before it.
+///
+/// The opening block is an entry of the own ring, so the header still names a block this node
+/// executed, by its own hash. A raised choice reports [`ExecBasis::Floor`]: the opening block is
+/// the lowest block the rule may name.
+fn bound_to_opening(choice: ExecBlockChoice, opening: Option<BlockNumHash>) -> ExecBlockChoice {
+    match opening {
+        Some(opening) if choice.block.number < opening.number => {
+            ExecBlockChoice { block: opening, tip: choice.tip, basis: ExecBasis::Floor }
+        }
+        _ => choice,
     }
 }
 
