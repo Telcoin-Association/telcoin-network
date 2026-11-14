@@ -20,11 +20,18 @@
 //! The cache's recent part is filled when a persist stores a batch's transactions by position
 //! ([`TxBodyCacheFill`], the env's [`PersistedBatchSink`]), on a blocking task: a read before the
 //! fill lands goes to the live pack.
+//!
+//! The packs are attached at startup by [`RethEnv::attach_tx_packs`], which first refuses a
+//! datadir whose rows can point into a pack that is not on disk ([`TxPackCoverageError`]).
 
 mod cache;
+mod coverage;
 mod packs;
 #[cfg(test)]
 mod tests;
+// pointer datadirs are storage v2, which runs on the tn-lmdb build only
+#[cfg(all(test, not(feature = "mdbx")))]
+mod pack_tests;
 
 use std::{
     sync::{Arc, OnceLock},
@@ -39,6 +46,7 @@ use tn_types::{
 
 pub use cache::TX_BODY_CACHE_BYTES;
 pub(crate) use cache::{BatchCache, CachePart, CachedBatch};
+pub use coverage::TxPackCoverageError;
 pub use packs::{ChainPacks, EpochBatches, PackBatches, PackOpenError, PackSource};
 
 use crate::{

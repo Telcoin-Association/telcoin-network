@@ -83,7 +83,7 @@ pub use output_overlay::OutputTrieOverlay;
 pub use tx_bodies::MemoryBatches;
 pub use tx_bodies::{
     ChainPacks, EpochBatches, PackBatches, PackOpenError, PackSource, TxBodyCacheFill, TxBodyError,
-    TxBodyErrorKind, TxBodySource, TX_BODY_CACHE_BYTES,
+    TxBodyErrorKind, TxBodySource, TxPackCoverageError, TX_BODY_CACHE_BYTES,
 };
 
 /// This is a wrapped abstraction around Reth.
@@ -307,19 +307,25 @@ impl RethEnv {
         self.inner.datadir_format
     }
 
-    /// Give the transaction resolver the node's consensus packs: `chain` for the live epoch and
-    /// `epochs_dir` (the directory holding the `epoch-{N}` directories) for the closed ones, and
-    /// fill its decoded-batch cache with the batches each persist stores by position. Once per
-    /// env, before anything reads transactions; a datadir that stores its transactions inline
-    /// needs neither, and takes nothing.
+    /// Give the transaction resolver the node's consensus packs: `chain` for the live epoch (held
+    /// weakly: the env never keeps the chain open) and `epochs_dir` (the directory holding the
+    /// `epoch-{N}` directories) for the closed ones, and fill its decoded-batch cache with the
+    /// batches each persist stores by position. Once per env, before anything reads transactions;
+    /// a datadir that stores its transactions inline needs neither, and takes nothing.
+    ///
+    /// First it refuses a datadir whose rows can point into a pack `epochs_dir` lacks
+    /// ([`TxPackCoverageError`]): every epoch from the one of the block holding the lowest stored
+    /// transaction to the one of the block holding the highest must have its pack's data log. The
+    /// node calls this at startup, so a lost pack stops it there.
     pub fn attach_tx_packs(
         &self,
-        chain: tn_storage::consensus::ConsensusChain,
+        chain: &tn_storage::consensus::ConsensusChain,
         epochs_dir: PathBuf,
     ) -> eyre::Result<()> {
         if self.inner.datadir_format.tx_bodies == TxBodies::Inline {
             return Ok(());
         }
+        self.check_tx_pack_coverage(&epochs_dir)?;
         self.inner.tx_bodies.attach_packs(PackSource::new(ChainPacks::new(chain, epochs_dir)))?;
         #[cfg(any(feature = "test-utils", test))]
         if self.inner.tx_bodies.has_memory_batches() {

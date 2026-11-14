@@ -1,12 +1,17 @@
 //! Where the resolver reads a batch the cache does not hold: the consensus packs.
 //!
-//! The live epoch is read through `ConsensusChain::live_batch` (a clone of the live pack, dropped
-//! before the read returns). A closed epoch is read through a [`PackReader`] the resolver owns:
-//! at most [`READERS`] of them are kept open, least recently used first out, and all are dropped
-//! when `ConsensusChain::install_generation` moves (an install renamed new files over an epoch, or
-//! an epoch handoff swapped the live pack). At most [`DECODE_PERMITS`] pack reads run at once, so
-//! a burst of history reads never occupies more blocking threads than that, nor piles onto the
-//! live pack's read lock.
+//! The packs are reached through the chain's `LiveBatches` (`ConsensusChain::live_batches`), which
+//! holds the chain weakly: the resolver lives as long as the env and must never keep the chain
+//! from closing.
+//! - The live epoch is read through a clone of the live pack, dropped before the read returns.
+//! - A closed epoch is read through a [`PackReader`] the resolver owns (`LiveBatches::open_past`,
+//!   which tells an epoch handoff's seal in progress from a damaged pack). At most [`READERS`] of
+//!   them are kept open, least recently used first out, and all are dropped when
+//!   `ConsensusChain::install_generation` moves (an install renamed new files over an epoch, or an
+//!   epoch handoff swapped the live pack).
+//!
+//! At most [`DECODE_PERMITS`] pack reads run at once, so a burst of history reads never occupies
+//! more blocking threads than that, nor piles onto the live pack's read lock.
 
 use std::{
     collections::VecDeque,
@@ -17,7 +22,7 @@ use std::{
 
 use parking_lot::{Condvar, Mutex};
 use tn_storage::{
-    consensus::ConsensusChain,
+    consensus::{ConsensusChain, LiveBatches},
     consensus_pack::{BatchReadError, PackReader, DATA_NAME},
 };
 use tn_types::{Batch, Epoch, B256};
@@ -71,18 +76,19 @@ pub trait PackBatches: Send + Sync + fmt::Debug {
     fn open(&self, epoch: Epoch) -> Result<Arc<dyn EpochBatches>, PackOpenError>;
 }
 
-/// The node's consensus packs: the live one through its [`ConsensusChain`], the closed ones from
-/// `epochs_dir` (the directory holding the `epoch-{N}` directories).
+/// The node's consensus packs: the live one through its [`ConsensusChain`] (held weakly, see
+/// [`LiveBatches`]), the closed ones from `epochs_dir` (the directory holding the `epoch-{N}`
+/// directories).
 #[derive(Debug)]
 pub struct ChainPacks {
-    chain: ConsensusChain,
+    live: LiveBatches,
     epochs_dir: PathBuf,
 }
 
 impl ChainPacks {
     /// The packs of `chain`, whose epochs are under `epochs_dir`.
-    pub fn new(chain: ConsensusChain, epochs_dir: PathBuf) -> Self {
-        Self { chain, epochs_dir }
+    pub fn new(chain: &ConsensusChain, epochs_dir: PathBuf) -> Self {
+        Self { live: chain.live_batches(), epochs_dir }
     }
 
     /// Whether `epoch`'s pack, which an open just found missing, is being replaced: an install
@@ -97,7 +103,7 @@ impl ChainPacks {
 
 impl PackBatches for ChainPacks {
     fn install_generation(&self) -> u64 {
-        self.chain.install_generation()
+        self.live.install_generation()
     }
 
     fn live_batch(
@@ -105,11 +111,11 @@ impl PackBatches for ChainPacks {
         epoch: Epoch,
         digest: B256,
     ) -> Option<Result<Option<Batch>, BatchReadError>> {
-        self.chain.live_batch(epoch, digest)
+        self.live.live_batch(epoch, digest)
     }
 
     fn open(&self, epoch: Epoch) -> Result<Arc<dyn EpochBatches>, PackOpenError> {
-        match PackReader::open(&self.epochs_dir, epoch) {
+        match self.live.open_past(&self.epochs_dir, epoch) {
             Ok(reader) => Ok(Arc::new(reader)),
             Err(BatchReadError::Unsealed) => Err(PackOpenError::Unsealed),
             Err(BatchReadError::Open(e)) if e.is_missing_static_files() => {
