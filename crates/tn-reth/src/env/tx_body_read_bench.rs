@@ -45,7 +45,9 @@
 //! µs; before each timed read an untimed step puts the column's state in place):
 //! - `inline`: the inline datadir; the step runs the read once (a warm page cache);
 //! - `recent`: by position, default cache (`TX_BODY_CACHE_BYTES`); the step copies the read's
-//!   batches into the cache's recent part as a persist does (`TxBodySource::fill_recent`);
+//!   batches into the cache's recent part as a persist does (`TxBodySource::fill_recent`), then
+//!   runs the read once, which the recent part answers (so the RPC's own caches and the page cache
+//!   are as warm as in the other columns);
 //! - `cold hit`: by position, default cache, closed epochs; the step runs the read once, which
 //!   reads the packs and fills the cache's cold part;
 //! - `pack warm`: by position, no cache (budget 0), closed epochs; the step runs the read once, so
@@ -651,6 +653,7 @@ fn prepare(
             source.fill_recent(
                 touched.iter().map(|block| (block.digest, &chain.batches[&block.digest])),
             );
+            run(chain, opened, read, sample)?;
         }
         Column::Inline | Column::ColdHit | Column::PackWarm | Column::LivePack => {
             run(chain, opened, read, sample)?;
