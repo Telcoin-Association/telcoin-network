@@ -205,37 +205,50 @@ where
         opts: GethDebugTracingOptions,
     ) -> Result<Vec<TraceResult>, Eth::Error> {
         let permit = self.trace_task_permit().await?;
-        let block: ProviderBlock<Eth::Provider> = Decodable::decode(&mut rlp_block.as_ref())
-            .map_err(BlockError::RlpDecodeRawBlock)
-            .map_err(Eth::Error::from_eth_err)?;
-
-        // TN(TN-0078): the header and the transactions come from the caller, so nothing the
-        // chain enforced bounds them: a header with a huge gas limit and no base fee lets a
-        // transaction with a huge gas limit run until it ends. The block is bounded
-        // as a `debug_traceCallMany` request is: a call count the gas cap can hold, which also
-        // bounds the signer recovery below, and one gas budget across its transactions.
         let gas_budget = self.eth_api().call_gas_limit();
-        call_many::check_call_count(gas_budget, block.body().transaction_count())
-            .map_err(Eth::Error::from_eth_err)?;
-
-        let evm_env = self
+        // TN(TN-0175): decoding and signer recovery run in a blocking task that holds the
+        // permit, not in the handler on the RPC runtime.
+        let (block, evm_env, permit) = self
             .eth_api()
-            .evm_config()
-            .evm_env(block.header())
-            .map_err(RethError::other)
-            .map_err(Eth::Error::from_eth_err)?;
+            .spawn_blocking_io(move |eth_api| {
+                let block: ProviderBlock<Eth::Provider> =
+                    Decodable::decode(&mut rlp_block.as_ref())
+                        .map_err(BlockError::RlpDecodeRawBlock)
+                        .map_err(Eth::Error::from_eth_err)?;
 
-        // Depending on EIP-2 we need to recover the transactions differently
-        let senders =
-            if self.provider().chain_spec().is_homestead_active_at_block(block.header().number()) {
-                block.body().recover_signers()
-            } else {
-                block.body().recover_signers_unchecked()
-            }
-            .map_err(Eth::Error::from_eth_err)?;
+                // TN(TN-0078): the header and the transactions come from the caller, so nothing
+                // the chain enforced bounds them: a header with a huge gas limit and no base fee
+                // lets a transaction with a huge gas limit run until it ends. The block is
+                // bounded as a `debug_traceCallMany` request is: a call count the gas cap can
+                // hold, which also bounds the signer recovery below, and one gas budget across
+                // its transactions.
+                call_many::check_call_count(gas_budget, block.body().transaction_count())
+                    .map_err(Eth::Error::from_eth_err)?;
+
+                let evm_env = eth_api
+                    .evm_config()
+                    .evm_env(block.header())
+                    .map_err(RethError::other)
+                    .map_err(Eth::Error::from_eth_err)?;
+
+                // Depending on EIP-2 we need to recover the transactions differently
+                let senders = if eth_api
+                    .provider()
+                    .chain_spec()
+                    .is_homestead_active_at_block(block.header().number())
+                {
+                    block.body().recover_signers()
+                } else {
+                    block.body().recover_signers_unchecked()
+                }
+                .map_err(Eth::Error::from_eth_err)?;
+
+                Ok((block.into_recovered_with_signers(senders), evm_env, permit))
+            })
+            .await?;
 
         self.trace_block(
-            Arc::new(block.into_recovered_with_signers(senders)),
+            Arc::new(block),
             evm_env,
             opts,
             Some(CallManyBudget::new(gas_budget)),

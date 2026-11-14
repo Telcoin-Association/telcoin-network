@@ -2699,3 +2699,17 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   freed both are accepted). Mutation-checked: acceptance before the listener (the subscription
   is accepted).
   *Upstream*: n/a (TN-0056's cap is TN's).
+
+- **TN-0175** — Raw `debug_traceBlock` decodes its block and recovers its signers in a blocking
+  task. *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/debug.rs` (`debug_trace_raw_block`).
+  *Why*: the handler decoded the caller's RLP block (up to the request size limit), checked
+  TN-0078's call count and recovered up to 2,380 signers (a parallel iterator, on a node built
+  with rayon) in the `async fn`, on the runtime that polls RPC handlers. That work now runs in a
+  `spawn_blocking_io` task that holds the trace permit taken first, and hands the permit on to
+  the trace, as `eth_callBundle` does since TN-0054. The order of the checks and the errors are
+  unchanged. *Can reach execution or storage*: no. RPC only.
+  *Tests*: the raw-block tests (`raw_block_transaction_count_is_bounded_by_the_gas_cap`,
+  `raw_block_transaction_gas_is_bounded_by_the_gas_cap`) and the trace permit tests, unchanged;
+  where the work runs has no test.
+  *Upstream*: no; upstream decodes in the handler.
