@@ -21,7 +21,7 @@ use crate::{
     worker::worker_task_manager_name,
 };
 use eyre::WrapErr as _;
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _};
 use std::{
     collections::{HashSet, VecDeque},
     future::{ready, Future},
@@ -781,13 +781,20 @@ where
         loop {
             let waiting_since = Instant::now();
             let permit = to_engine.reserve().await?;
-            // the forward-wait stamp: an output found queued once there is room is stamped
-            // `waiting_since`, exact for one that was queued before the wait began (the usual
-            // case under backpressure) and an upper bound for one that arrived during it; an
-            // output that arrives after the room is stamped on arrival
-            let (mut output, forwarded_at) = match consensus_output.try_recv() {
-                Ok(output) => (output, waiting_since),
-                Err(_) => match consensus_output.recv().await {
+            // take a queued output with one poll of `recv`, not `try_recv`: `try_recv` parks the
+            // thread while a concurrent send has claimed a slot but not written it (the
+            // subscriber sends from another worker), where the poll returns not-ready and the
+            // await below takes the output once the send lands
+            //
+            // the forward-wait stamp: an output the poll takes is stamped `waiting_since`, exact
+            // for one queued before the wait for room began (the usual case under backpressure)
+            // and an upper bound for one that arrived during it; an output the await takes (it
+            // arrived after the room, its send was mid-write, or the runtime's task budget
+            // deferred the poll) is stamped on arrival
+            let queued = consensus_output.recv().now_or_never().flatten();
+            let (mut output, forwarded_at) = match queued {
+                Some(output) => (output, waiting_since),
+                None => match consensus_output.recv().await {
                     Some(output) => (output, Instant::now()),
                     None => break,
                 },
@@ -3423,6 +3430,125 @@ pub(super) mod tests {
         let (received, last_forwarded) = forward_then_exit_then_drain(exit).await?;
         assert_eq!(received, [1, 2, 3], "the engine executes every output, in order");
         assert_eq!(last_forwarded, 3);
+        Ok(())
+    }
+
+    // ---- bench7 epoch-loop-output-drop: review follow-ups ----
+
+    /// The live forward's intake fixture: a manager that already forwarded output 1 into an
+    /// engine channel of a chosen capacity, and a boundary every output reaches, so the forward
+    /// returns once it hands one output over.
+    struct ForwardFixture {
+        /// The manager under test.
+        manager: EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        /// The committee whose member leads every test output.
+        committee: Committee,
+        /// The engine channel's sender, as `run_epoch` passes it.
+        to_engine: mpsc::Sender<ConsensusOutput>,
+        /// The engine channel's receiver, holding output 1.
+        engine_rx: mpsc::Receiver<ConsensusOutput>,
+        /// The engine, reth environment, their tasks and the datadir, kept alive for the test.
+        _keep: (ExecutionNode, RethEnv, TaskManager, TempDir),
+    }
+
+    impl ForwardFixture {
+        /// Forward output 1 into an engine channel of `capacity`.
+        async fn new(capacity: usize) -> eyre::Result<Self> {
+            let temp = TempDir::with_prefix("forward_intake")?;
+            let (mut manager, engine, reth_env, tasks, committee) =
+                manager_with_engine(&temp).await?;
+            manager.epoch_boundary = 0;
+            let (to_engine, engine_rx) = mpsc::channel(capacity);
+            manager.process_output(&to_engine, member_output_at(&committee, 1)).await?;
+            Ok(Self {
+                manager,
+                committee,
+                to_engine,
+                engine_rx,
+                _keep: (engine, reth_env, tasks, temp),
+            })
+        }
+    }
+
+    /// An output queued while the forward waits for room is taken by the forward's one poll of
+    /// the queue once the room appears, and stamped with the start of the wait for room.
+    #[tokio::test]
+    async fn the_forward_takes_an_output_queued_during_its_wait_for_room() -> eyre::Result<()> {
+        use futures::FutureExt as _;
+
+        // a full engine channel, output 2 queued before the forward starts
+        let mut fx = ForwardFixture::new(1).await?;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        queue_tx.send(member_output_at(&fx.committee, 2)).await?;
+        let room_at;
+        let res = {
+            let forward = fx.manager.wait_for_epoch_boundary(&fx.to_engine, &mut queue);
+            tokio::pin!(forward);
+            assert!((&mut forward).now_or_never().is_none(), "the forward waits for room");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            room_at = Instant::now();
+            assert_eq!(fx.engine_rx.recv().await.map(|output| output.number()), Some(1));
+            forward.await
+        };
+        let forwarded = fx.engine_rx.try_recv()?;
+        assert_eq!(res?, forwarded.consensus_header_hash(), "the boundary is output 2");
+        assert_eq!(forwarded.number(), 2);
+        let stamp = forwarded.forwarded_at().expect("a forwarded output is stamped");
+        assert!(stamp < room_at, "stamped when the wait for room began, not when it ended");
+        assert_eq!(fx.manager.last_forwarded_consensus_number, 2);
+        Ok(())
+    }
+
+    /// An output that arrives while the forward holds room and waits for output is taken by the
+    /// forward's await, and stamped on arrival.
+    #[tokio::test]
+    async fn the_forward_stamps_a_late_output_on_arrival() -> eyre::Result<()> {
+        use futures::FutureExt as _;
+
+        // room for one more output, an empty queue
+        let mut fx = ForwardFixture::new(2).await?;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        let sent_at;
+        let res = {
+            let forward = fx.manager.wait_for_epoch_boundary(&fx.to_engine, &mut queue);
+            tokio::pin!(forward);
+            assert!((&mut forward).now_or_never().is_none(), "the forward waits for output");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sent_at = Instant::now();
+            queue_tx.send(member_output_at(&fx.committee, 2)).await?;
+            forward.await
+        };
+        assert_eq!(fx.engine_rx.try_recv()?.number(), 1);
+        let forwarded = fx.engine_rx.try_recv()?;
+        assert_eq!(res?, forwarded.consensus_header_hash(), "the boundary is output 2");
+        let stamp = forwarded.forwarded_at().expect("a forwarded output is stamped");
+        assert!(stamp >= sent_at, "stamped on arrival");
+        assert_eq!(fx.manager.last_forwarded_consensus_number, 2);
+        Ok(())
+    }
+
+    /// A closed queue still yields what it holds: the forward hands over the queued output, then
+    /// finds the queue closed and empty and ends with its error, without a boundary.
+    #[tokio::test]
+    async fn the_forward_drains_a_closed_queue_then_ends() -> eyre::Result<()> {
+        let mut fx = ForwardFixture::new(4).await?;
+        // a boundary no test output reaches
+        fx.manager.epoch_boundary = u64::MAX;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        queue_tx.send(member_output_at(&fx.committee, 2)).await?;
+        drop(queue_tx);
+        let err = fx
+            .manager
+            .wait_for_epoch_boundary(&fx.to_engine, &mut queue)
+            .await
+            .expect_err("the queue closed before a boundary");
+        assert!(format!("{err:#}").contains("invalid wait for epoch end"), "{err:#}");
+        let mut received = Vec::new();
+        while let Ok(output) = fx.engine_rx.try_recv() {
+            received.push(output.number());
+        }
+        assert_eq!(received, [1, 2], "the queued output reaches the engine");
+        assert_eq!(fx.manager.last_forwarded_consensus_number, 2);
         Ok(())
     }
 }
