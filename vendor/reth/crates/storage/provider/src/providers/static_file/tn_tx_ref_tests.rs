@@ -5,7 +5,10 @@
 //! an error on every read, never a missing or another transaction; the static-file provider's own
 //! reads refuse position rows; `remove_blocks_above` resolves them to drop their hashes.
 
-use super::{JarFormat, TxBodyReadError, TxBodyResolver, TxBodyResolverInstalled, TxRow};
+use super::{
+    encode_tx_ref, JarFormat, TxBodyReadError, TxBodyResolver, TxBodyResolverInstalled, TxRow,
+    TxRowError, TX_ROW_REF,
+};
 use crate::{
     providers::BlockchainProvider,
     test_utils::{create_test_provider_factory_with_blocks_per_file, MockNodeTypesWithDB},
@@ -26,8 +29,9 @@ use reth_ethereum_primitives::{
     Block, BlockBody, EthPrimitives, Receipt, Transaction, TransactionSigned,
 };
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
+use reth_nippy_jar::{value_checksum, NippyJar};
 use reth_primitives_traits::{BlockBody as _, RecoveredBlock, SealedBlock};
-use reth_static_file_types::StaticFileSegment;
+use reth_static_file_types::{SegmentHeader, StaticFileSegment};
 use reth_storage_api::StorageSettingsCache;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_testing_utils::generators::{self, sign_tx_with_random_key_pair};
@@ -773,4 +777,67 @@ fn a_second_resolver_is_refused() {
     );
     // The first one stays.
     assert_reads(&built, &chain, Rows::Positions);
+}
+
+/// Overwrites the stored bytes of transaction `id`'s `Transactions` value (in block `number`'s
+/// jar) with `value`, of the same length, and gives it a valid checksum, so the jar's cursor
+/// passes it to the row decoder.
+fn rewrite_tx_value(built: &Built, id: TxNumber, number: BlockNumber, value: &[u8]) {
+    let static_files = built.factory.static_file_provider();
+    let segment = StaticFileSegment::Transactions;
+    let range = static_files.find_fixed_range(segment, number);
+    let jar =
+        NippyJar::<SegmentHeader>::load(&static_files.directory().join(segment.filename(&range)))
+            .unwrap();
+    let row = (id - jar.user_header().tx_start().unwrap()) as usize;
+    let reader = jar.open_data_reader().unwrap();
+    let (start, end) =
+        (reader.offset(row).unwrap() as usize, reader.offset(row + 1).unwrap() as usize);
+    let mut data = std::fs::read(jar.data_path()).unwrap();
+    let (stored, checksum) = data[start..end].split_at_mut(end - start - 4);
+    assert_eq!(stored.len(), value.len(), "the rewrite keeps the value's length");
+    stored.copy_from_slice(value);
+    checksum.copy_from_slice(&value_checksum(row as u64, 0, value).to_le_bytes());
+    std::fs::write(jar.data_path(), data).unwrap();
+}
+
+/// A tagged row whose checksum holds but which does not decode (an unknown tag, a non-canonical
+/// position) is [`TxBodyReadError::Row`] on every read, through the database provider and the
+/// static-file provider alike: never `None`, a shorter list, or another transaction.
+#[test]
+fn an_undecodable_row_fails_every_read() {
+    let chain = chain();
+    let id = chain.tx_range(FAR).start;
+    let position = chain.positions[FAR as usize][0];
+    let mut encoded = Vec::new();
+    encode_tx_ref(position, &mut encoded);
+    assert_eq!(encoded.len(), 3, "fixture: a tag and a two-byte position");
+    let mut unknown_tag = encoded;
+    unknown_tag[0] = 2;
+    // The position's low seven bits in two bytes, the second a redundant zero.
+    let non_canonical = vec![TX_ROW_REF, 0x80 | (position as u8 & 0x7f), 0];
+    let total = chain.txs().len() as TxNumber;
+    for (value, expected) in [
+        (unknown_tag, TxRowError::UnknownTag(2)),
+        (non_canonical, TxRowError::NonCanonicalPosition),
+    ] {
+        let built = build(&chain, Rows::Positions, true);
+        rewrite_tx_value(&built, id, FAR, &value);
+        let is_row_error = |err: &ProviderError| matches!(read_error(err), Some(TxBodyReadError::Row { tx, error, .. }) if *tx == id && *error == expected);
+        assert_reads_fail(&built, &chain, is_row_error);
+        // The static-file provider's reads, from the damaged row on (an earlier row of the range
+        // stores a position, which these reads refuse first).
+        let static_files = built.factory.static_file_provider();
+        for (read, result) in [
+            ("static transaction_by_id", static_files.transaction_by_id(id).map(drop)),
+            (
+                "static transactions_by_tx_range",
+                static_files.transactions_by_tx_range(id..total).map(drop),
+            ),
+            ("static tx_rows_by_tx_range", static_files.tx_rows_by_tx_range(id..total).map(drop)),
+        ] {
+            let err = result.expect_err(read);
+            assert!(is_row_error(&err), "{read}: {err}");
+        }
+    }
 }

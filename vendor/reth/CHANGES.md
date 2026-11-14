@@ -3245,12 +3245,15 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   the kept ones stay, for inline, position and mixed rows; without a resolver the removal fails),
   `a_position_row_outside_its_indexed_block_is_an_error` (`TransactionBlocks` without the block's
   entry names the next block, whose body does not hold the transaction: an error, not the next
-  block's batch; a block read still resolves) and `a_second_resolver_is_refused`.
+  block's batch; a block read still resolves), `a_second_resolver_is_refused`, and
+  `an_undecodable_row_fails_every_read` (a stored row given an unknown tag, or a non-canonical
+  position, with a valid checksum: `TxBodyReadError::Row` from every read through
+  `BlockchainProvider` and the static-file provider's).
   Mutation-checked, each failing a test: no length check on the resolver's answer, no hash check
   by hash or with meta, a missing resolver read as no transactions, the static-file reads taking
   a position row for a missing one (by number and in `transaction_hashes_by_range`), each of the
   factory's three reads back on the static files, no re-read in `transaction_hashes_by_range`,
   the wrong header fetched for a looked-up block, block numbers off by one in
   `transactions_by_block_range`, a block's rows split wrongly or resolved one call per row, the
-  tag ignored, a second resolver accepted silently, and no check that the indexed block holds the
-  transaction. *Upstream*: no.
+  tag ignored, a second resolver accepted silently, no check that the indexed block holds the
+  transaction, and an undecodable row read as no row. *Upstream*: no.
