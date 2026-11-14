@@ -83,7 +83,8 @@ pub struct TnBuilder {
     /// the given capacity.
     pub exex_fns: Vec<(String, usize, ExExInstallFn)>,
     /// Optional process-local bootstrap dial hints, taking precedence over the network config.
-    /// An explicitly empty map selects the genesis fallback.
+    /// An explicitly empty map selects the chain's default set (`Config::bootstrap_servers`, else
+    /// the genesis committee file's).
     bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
     /// The datadir lock, when the caller took it before opening the execution database (so a
     /// second node is refused before it touches the live node's database). The node holds it for

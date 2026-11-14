@@ -122,8 +122,8 @@ Neither flag exists; `--bootstrap-peers` is available to override bootstrap dial
 The node command's flags cover the named chain, bootstrap dial hints, a consensus-metrics socket, an instance number, state export and its retention limit, the re-pack monitor, unused-port mode, a healthcheck bind (port or socket address), a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
 
 Listener addresses come from the generated node info and the two override variables above.
-Bootstrap peers come from the network config's `bootstrap_peers` map, falling back to the genesis committee when the map is empty.
-The `--bootstrap-peers` flag replaces that map for the current process; an explicit `{}` selects the genesis fallback.
+Bootstrap peers come from the network config's `bootstrap_peers` map, falling back to the default set when the map is empty: the list built into the binary for `--chain`, or else the genesis committee file's.
+The `--bootstrap-peers` flag replaces that map for the current process; an explicit `{}` selects the default set.
 See [Bootstrap peers](../getting-started/bootstrap-peers.md) for the map format and examples.
 The transport settings in the table above are read from the network config file in the data directory, where any field may be omitted to take its default.
 The chain id is not an operator tunable at all: it is stamped onto the network config from genesis at startup and is deliberately never written to the config file.
