@@ -55,6 +55,11 @@ reth is vendored at `vendor/reth` and built from source. TN's changes to it are 
   created, so a restart) builds every block without the cache; any value other than `1` does too,
   and an error is logged. That node builds the same blocks (every hit must equal the read it
   skips, and the state root never reads the cache), so the switch is safe on one node.
+  The cache never holds a slot of a genesis account with storage but no code (storage v1 only; v2
+  refuses such a genesis, and adiri and mainnet have none): once a block changes such an account
+  with nonce 0 (an EIP-7702 delegation), reth's in-memory overlay answers 0 for its unwritten
+  slots until the output persists while the database keeps their values, so each read goes to the
+  parent state, as on a node without the cache (module docs, "Codeless genesis storage").
 
 ### Block-building timings
 

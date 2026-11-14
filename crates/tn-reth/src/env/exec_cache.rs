@@ -31,7 +31,8 @@
 //! changes: the header commits to its post-state root, and TN has no reorgs or fork choice
 //! (consensus output is the only source of blocks, see `execution.rs`). Entries come from two
 //! places only: misses filled from `state_by_block_hash(parent)`, which is the parent's state by
-//! contract, and the block's full bundle, which carries every account, slot and contract the block
+//! contract (except for one kind of slot, which the cache never holds: "Codeless genesis storage"
+//! below), and the block's full bundle, which carries every account, slot and contract the block
 //! changed, system calls included (TN's epoch-close and fork writes all commit through revm's
 //! `State`, see `evm/block.rs`).
 //!
@@ -73,6 +74,25 @@
 //! each a funded address plus a CREATE2 (at least about 58k gas), so about 240M gas per drop at the
 //! default cap (eight full 30M-gas blocks); before the set, one wipe (about 60-80k gas a block)
 //! dropped the whole cache.
+//!
+//! # Codeless genesis storage
+//!
+//! A miss fills the value the parent state gave, so the cache needs every later read of that
+//! state to give the same value. reth's memory overlay breaks that for one kind of account: one
+//! with storage, no code and nonce 0 that a block of the output changes (an EIP-7702 delegation by
+//! its key holder). revm then marks it `InMemoryChange`, which it takes to mean "holds no
+//! storage", so until the output persists the overlay answers 0 for every slot the output did not
+//! write, while the database keeps the old values and serves them again after the persist. A
+//! cached slot would carry the database's value into the overlay's blocks, or the overlay's 0 past
+//! the persist, and the node would build other blocks than one without the cache.
+//!
+//! No block can give a codeless account with nonce 0 storage (a CREATE sets nonce 1, an
+//! authorization bumps the nonce, a fork's etch sets the nonce to at least 1), so only genesis
+//! holds such accounts, and only on storage v1: v2's genesis refuses storage without code
+//! (TN-0116). Adiri and mainnet have none. [`ExecutionCacheSlot::new`] takes the genesis accounts
+//! with storage and no code (any nonce) and every new cache starts with them in its wiped set,
+//! beyond the cap, so their storage reads always go to the parent state, as on a node without the
+//! cache. On a chain without such accounts the set starts empty.
 //!
 //! # Checks
 //!
@@ -137,7 +157,10 @@
 use std::{
     fmt,
     hash::{BuildHasher, Hasher},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use alloy::primitives::{
@@ -155,6 +178,7 @@ use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
+use tn_types::Genesis;
 use tracing::{debug, error, info, warn};
 
 use super::RethEnv;
@@ -353,15 +377,15 @@ pub(crate) struct ExecutionCache {
 
 impl ExecutionCache {
     /// An empty cache with `capacity` entries, over `code` (a dropped cache's bytecode table) when
-    /// there is one. Allocation is lazy (zeroed pages), so a large capacity costs memory only as
-    /// entries fill.
-    fn with_code(capacity: CacheCapacity, code: Option<CodeTable>) -> Self {
+    /// there is one, its wiped set seeded with `seeds` (beyond the cap; see the module docs).
+    /// Allocation is lazy (zeroed pages), so a large capacity costs memory only as entries fill.
+    fn with_code(capacity: CacheCapacity, code: Option<CodeTable>, seeds: &[Address]) -> Self {
         Self {
             code: code.unwrap_or_else(|| FixedCache::new(capacity.code, TopBitHash::default())),
             storage: FixedCache::new(capacity.storage, TopBitHash::default()),
             accounts: FixedCache::new(capacity.accounts, TopBitHash::default()),
-            wiped: HashSet::default(),
-            wiped_limit: capacity.wiped,
+            wiped: seeds.iter().copied().collect(),
+            wiped_limit: capacity.wiped + seeds.len(),
             counters: Counters::default(),
             #[cfg(any(test, feature = "test-utils"))]
             shadow: shadow_from_env(),
@@ -464,13 +488,16 @@ pub(crate) struct ExecutionCacheSlot {
     rebuilds: u64,
     /// Build every block without a cache (`TN_EXEC_CACHE=0`, module docs).
     disabled: bool,
+    /// The wiped set every new cache starts with: [`codeless_accounts_with_storage`].
+    seeds: Arc<[Address]>,
 }
 
 impl ExecutionCacheSlot {
-    /// An empty slot (no cache yet) at the default capacity, or the test knobs' (see
-    /// [`CacheCapacity::from_env`]), switched on or off by `TN_EXEC_CACHE`.
-    pub(crate) fn new() -> Self {
-        Self::from_env_value(std::env::var(EXEC_CACHE_ENV).ok().as_deref())
+    /// An empty slot (no cache yet) for a chain from `genesis`, at the default capacity, or the
+    /// test knobs' (see [`CacheCapacity::from_env`]), switched on or off by `TN_EXEC_CACHE`.
+    pub(crate) fn new(genesis: &Genesis) -> Self {
+        let slot = Self::from_env_value(std::env::var(EXEC_CACHE_ENV).ok().as_deref());
+        Self { seeds: codeless_accounts_with_storage(genesis), ..slot }
     }
 
     /// An empty slot switched by a value of `TN_EXEC_CACHE` (`None`: unset).
@@ -486,8 +513,23 @@ impl ExecutionCacheSlot {
                 true
             }
         };
-        Self { saved: None, code: None, capacity: CacheCapacity::from_env(), rebuilds: 0, disabled }
+        let capacity = CacheCapacity::from_env();
+        Self { saved: None, code: None, capacity, rebuilds: 0, disabled, seeds: Arc::from([]) }
     }
+}
+
+/// The genesis accounts with storage and no code (TN-0116's predicate; storage v2 refuses them,
+/// so on v2 none). See the module docs, "Codeless genesis storage".
+fn codeless_accounts_with_storage(genesis: &Genesis) -> Arc<[Address]> {
+    genesis
+        .alloc
+        .iter()
+        .filter(|(_, account)| {
+            account.storage.as_ref().is_some_and(|storage| !storage.is_empty())
+                && account.code.as_ref().is_none_or(|code| code.is_empty())
+        })
+        .map(|(address, _)| *address)
+        .collect()
 }
 
 impl RethEnv {
@@ -498,12 +540,12 @@ impl RethEnv {
     /// The env holds no cache while a block builds: only [`Self::check_in_execution_cache`] puts
     /// one back, so a build that fails at any point leaves none.
     pub(crate) fn check_out_execution_cache(&self, parent: B256) -> Option<ExecutionCache> {
-        let (saved, code, capacity) = {
+        let (saved, code, capacity, seeds) = {
             let mut slot = self.inner.execution_cache.lock();
             if slot.disabled {
                 return None;
             }
-            (slot.saved.take(), slot.code.take(), slot.capacity)
+            (slot.saved.take(), slot.code.take(), slot.capacity, slot.seeds.clone())
         };
         let cache = match saved {
             Some(saved) if saved.hash == parent => saved.cache,
@@ -514,7 +556,7 @@ impl RethEnv {
                 // the stale cache's accounts and storage drop here; its code carries over
                 let code = stale.map(|stale| stale.cache.into_code()).or(code);
                 debug!(target: "engine", %parent, bytes = capacity.bucket_bytes(), "new execution cache");
-                ExecutionCache::with_code(capacity, code)
+                ExecutionCache::with_code(capacity, code, &seeds)
             }
         };
         Some(cache)
