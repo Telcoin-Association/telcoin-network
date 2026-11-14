@@ -3777,7 +3777,8 @@ where
         // The default budget is unbounded, so this only observes until an operator sets
         // `serve_budget.vote`. An enforcing vote class also caps each peer at
         // `MAX_PERMITS_PER_PEER`, so one committee peer cannot hold the whole pool while its
-        // requests wait on its author lock in `RequestHandler::vote`.
+        // requests wait in `RequestHandler::vote`: on its author lock, and with `vote_queue_fix`
+        // on also in the bounded wait for execution before that lock.
         if let Some(serve_permit) =
             self.network_handle.handle.serve_permits().try_acquire(ServiceClass::Vote, peer)
         {
