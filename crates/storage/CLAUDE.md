@@ -109,6 +109,10 @@ and remember that everything after `mod test` is tests (more than half of `conse
     so a failed or killed open that replays it still finds it sealed.
   - Every recovery or heal must `mark_consistent` its data log and every index file, or the pack
     rebuilds on every open.
+- **Packs a stored execution row points into are never removed** (README §6, "Pack retention"):
+  tn-reth's pointer datadirs keep each transaction only as its position in a batch of its epoch's
+  pack. No code deletes a pack holding outputs; pruning must first move those rows off it, and an
+  install or repair must keep every batch's bytes and digest.
 - **Persist on the hot path is the data log's msync, nothing more.**
   - Indexes are derived and rebuilt from the log.
   - Durable watermarks go in the commit marker (`stamp_commit_marker`, best effort), never as

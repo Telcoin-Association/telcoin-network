@@ -249,10 +249,9 @@ impl RethEnv {
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
         let tx_bodies = TxBodySource::new(reth_config.tx_body_cache_bytes());
         #[cfg(any(feature = "test-utils", test))]
-        let tx_bodies = if reth_config.memory_batches() {
-            tx_bodies.with_memory_batches(MemoryBatches::global())
-        } else {
-            tx_bodies
+        let tx_bodies = match reth_config.memory_batches() {
+            Some(memory) => tx_bodies.with_memory_batches(memory),
+            None => tx_bodies,
         };
         let tx_bodies = Arc::new(tx_bodies);
         let (provider_factory, datadir_format) = Self::init_provider_factory(
