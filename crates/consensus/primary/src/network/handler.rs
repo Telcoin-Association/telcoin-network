@@ -1367,12 +1367,11 @@ where
     /// mark refuses any lower round of its author without checking the header, so a malformed
     /// header below the mark (a round-0 one, say) is answered `SupersededRequest` without the
     /// penalty its own check would bring; only the author's own requests get that far. The caller
-    /// has checked that the peer
-    /// is the header's author, and records only a header inside [`Self::in_vote_window`]: one past
-    /// it is never voted on, and a mark it set would refuse the author's real headers until its
-    /// rounds caught up. It is asked on arrival, after the wait before the author lock and once
-    /// the lock is taken. The refusal is `SupersededRequest`: recoverable, without a penalty, and
-    /// never written to the author's vote state.
+    /// has checked that the peer is the header's author, and records only a header inside
+    /// [`Self::in_vote_window`]: one past it is never voted on, and a mark it set would refuse the
+    /// author's real headers until its rounds caught up. It is asked on arrival, after the wait
+    /// before the author lock and once the lock is taken. The refusal is `SupersededRequest`:
+    /// recoverable, without a penalty, and never written to the author's vote state.
     ///
     /// On arrival it comes before the author lock, so ahead of the cached-vote answer and the
     /// stored-vote recast that run under it: a repeat of an older header this node voted for,
@@ -2564,7 +2563,11 @@ impl VoteOutcome {
     }
 }
 
-// compile-time check that `ALL` holds each outcome at its `index`, as for `VoteStage::ALL`
+// compile-time check that `ALL` holds each outcome at its `index`, as for `VoteStage::ALL`, with
+// the same limits: an outcome given a position at or past `COUNT` passes it and still needs `COUNT`
+// raised and `ALL` extended by hand (until then `record_outcome` indexes past its counters and
+// panics the first time the outcome is recorded, as `record_stage` would), and an outcome given a
+// position another outcome already holds passes it too, and would count under that outcome's label
 const _: () = {
     let mut position = 0;
     while position < VoteOutcome::COUNT {

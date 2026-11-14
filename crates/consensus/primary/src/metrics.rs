@@ -408,9 +408,7 @@ impl VoteStageHandles {
 
     /// Count a finished vote request under its outcome.
     pub(crate) fn record_outcome(&self, outcome: crate::network::handler::VoteOutcome) {
-        if let Some(counter) = self.outcomes.get(outcome.index()) {
-            counter.increment(1);
-        }
+        self.outcomes[outcome.index()].increment(1);
     }
 }
 
