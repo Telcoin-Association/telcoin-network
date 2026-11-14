@@ -307,7 +307,9 @@ pub struct Parameters {
     /// Must be at least `max_header_delay + max_header_time_drift_tolerance` (the tolerance lives
     /// in the network config's `sync_config`; while the sub-second gate is dormant for the epoch
     /// it is rounded up to whole seconds, matching the voter), above the voter's 1 s execution
-    /// wait (`VOTE_EXECUTION_WAIT`) and below the 10 s libp2p request timeout.
+    /// wait (`VOTE_EXECUTION_WAIT`) and below the 10 s libp2p request timeout. With
+    /// [`Self::vote_queue_fix`] on it must be below 9 s: the request timeout less the execution
+    /// wait, which the voter then does before it takes the author lock and starts this timeout.
     /// `ConsensusConfig::validate_epoch_timing` rejects other values, and the node runs
     /// it on entering any epoch it can still vote in, so it refuses to start such an epoch with
     /// one. An epoch its committee has already closed is replayed without the check. Defaults to
@@ -392,6 +394,12 @@ pub struct Parameters {
     /// there, for example one waiting for a pending parent certificate its author attached, holds
     /// the lock for up to `vote_timeout`, and a newer request from the same author waits behind
     /// it.
+    ///
+    /// With the switch on, [`Self::vote_timeout`] must be below 9 s instead of 10 s. The voter's
+    /// 1 s execution wait (`VOTE_EXECUTION_WAIT`) then runs before the lock and before the vote
+    /// timeout starts, and both run inside the 10 s libp2p request timeout, so the wait plus
+    /// `vote_timeout` must stay below it. `ConsensusConfig::validate_epoch_timing` rejects a
+    /// larger value, so the node refuses to start an epoch it can vote in with one.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub vote_queue_fix: bool,
     // ---- runtime switches: end ----
