@@ -3387,3 +3387,102 @@ fn test_quorum_exec_block_inputs_carry_the_committee_epoch() {
     // dragged the choice to the floor entry 115, below the opening block
     assert_eq!(choose([136, 103]), ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip });
 }
+
+// ---- bench7 digest-order-hold ----
+
+/// A batch digest numbered `n`, the same on every run, so a payload can be pinned as a list.
+fn fixed_digest(n: u8) -> BlockHash {
+    B256::with_last_byte(n)
+}
+
+/// A header's payload as `(digest, worker)` entries, in payload order.
+fn payload_entries(header: &Header) -> Vec<(BlockHash, WorkerId)> {
+    header.payload().iter().map(|(digest, worker_id)| (*digest, *worker_id)).collect()
+}
+
+/// The payload order of a scripted run through both re-queue paths, a lane rotation and the
+/// header cap, pinned as a golden list (issue #1807).
+///
+/// The list is the payload order of the base commit, before the proposer numbered its digests:
+/// this test was committed and run green there first. The order bookkeeping is observability only,
+/// so every header must still carry exactly these digests in exactly this order.
+///
+/// Catches: bookkeeping that changes which digests a header drains, their order, or what a cancel
+/// or a commit puts back in the queue.
+#[tokio::test]
+async fn test_digest_order_bookkeeping_keeps_payloads_golden() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let task_manager = TaskManager::default();
+    let cb = ConsensusBus::new();
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager);
+    assert_eq!(proposer.max_header_num_of_batches, 10, "the script assumes the default header cap");
+    // worker 0 reports digests 1.., worker 1 digests 101..
+    let report = |proposer: &mut Proposer<MemDatabase>, worker_id: WorkerId, numbers: &[u8]| {
+        for n in numbers {
+            proposer
+                .digests
+                .entry(worker_id)
+                .or_default()
+                .push_back(queued(fixed_digest(*n), worker_id));
+        }
+    };
+    let mut headers = Vec::new();
+
+    report(&mut proposer, 0, &[1, 2, 3]);
+    report(&mut proposer, 1, &[101, 102]);
+    let h1 = propose_and_track(&mut proposer).await;
+    headers.push(h1.clone());
+    report(&mut proposer, 0, &[4, 5]);
+    headers.push(propose_and_track(&mut proposer).await);
+    // the certifier cancels round 1 after round 2 drained newer worker-0 digests
+    proposer.process_uncertified_header(h1.round(), h1.digest());
+    report(&mut proposer, 1, &[103]);
+    headers.push(propose_and_track(&mut proposer).await);
+    report(&mut proposer, 0, &[6]);
+    headers.push(propose_and_track(&mut proposer).await);
+    // round 3 commits: round 2 died behind it, round 4 is still in flight
+    proposer.process_committed_headers(5, vec![3]);
+    headers.push(propose_and_track(&mut proposer).await);
+    // round 5 commits: round 4 died behind it
+    proposer.process_committed_headers(6, vec![5]);
+    report(&mut proposer, 1, &(104..=115).collect::<Vec<_>>());
+    report(&mut proposer, 0, &[7]);
+    headers.push(propose_and_track(&mut proposer).await);
+    headers.push(propose_and_track(&mut proposer).await);
+
+    // (digest number, worker) per header, in payload order
+    let golden: [&[(u8, WorkerId)]; 7] = [
+        &[(1, 0), (101, 1), (2, 0), (102, 1), (3, 0)],
+        &[(4, 0), (5, 0)],
+        &[(101, 1), (1, 0), (102, 1), (2, 0), (103, 1), (3, 0)],
+        &[(6, 0)],
+        &[(4, 0), (5, 0)],
+        &[
+            (104, 1),
+            (6, 0),
+            (105, 1),
+            (7, 0),
+            (106, 1),
+            (107, 1),
+            (108, 1),
+            (109, 1),
+            (110, 1),
+            (111, 1),
+        ],
+        &[(112, 1), (113, 1), (114, 1), (115, 1)],
+    ];
+    let golden: Vec<Vec<(BlockHash, WorkerId)>> = golden
+        .iter()
+        .map(|entries| {
+            entries.iter().map(|(n, worker_id)| (fixed_digest(*n), *worker_id)).collect()
+        })
+        .collect();
+    assert_eq!(headers.iter().map(payload_entries).collect::<Vec<_>>(), golden);
+    assert_eq!(
+        headers.iter().map(Header::round).collect::<Vec<_>>(),
+        (1..=7).collect::<Vec<Round>>()
+    );
+}
