@@ -264,7 +264,8 @@ fn sync_at_once(jobs: Vec<SyncJob<'_>>) -> Vec<(SyncPhase, ProviderResult<Durati
 thread_local! {
     /// TN(TN-0166): test-only: `sync_at_once` on this thread treats every thread as failing to
     /// start.
-    pub(crate) static FAIL_SYNC_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_SYNC_THREADS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// TN(TN-0161): test-only: `jobs` with each one of a phase in `failed` replaced by one that
