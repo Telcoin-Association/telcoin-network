@@ -20,7 +20,9 @@ pub(crate) struct EpochMetrics {
     /// Consensus outputs replayed from the consensus chain after a restart.
     pub(crate) replayed_outputs_total: Counter,
     /// Stored epoch records whose `final_state` is not the closing block this node executed for
-    /// the epoch. Each one stops the node.
+    /// the epoch, and certified records from peers that conflict with this node's own record for
+    /// an epoch (counted by state-sync's epoch record collector under this name). Each one stops
+    /// the node.
     pub(crate) final_state_mismatches_total: Counter,
 }
 

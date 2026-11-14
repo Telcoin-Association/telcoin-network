@@ -1003,12 +1003,24 @@ because the copied execution database replaces the rebuild.
   proposing a second header for one, as after a restart, so it needs no wait before its start,
   unlike a fresh datadir (Rollback below).
 
+  At the live edge the order is the other way round. A node whose execution diverges before the
+  epoch's certified record reaches it builds and stores its own record at the close, then meets
+  the certified one. A committee validator stops at the epoch vote, which finds the fork. Every
+  node, an observer or a node outside the epoch's committee included, also stops when its epoch
+  record collector downloads the certified record and the store refuses it beside its own: it
+  logs `a certified epoch record from peers conflicts with this node's own record` with the epoch
+  and both record digests, counts `tn_epoch_final_state_mismatches_total`, and stops. A restart
+  stops again, as the collector asks for the record again. The recovery is the forked-record one
+  below.
+
   A record of the node's own that a bad execution wrote stops every rebuild on this release. A
   node that forked (its execution diverged, and it built and stored its own record for that
   epoch, which no quorum certified) still holds that record after the reset. The rebuild, on a
-  fixed binary, stops at that epoch with an `uncertified` mismatch, and again on every restart.
-  Nothing replaces the record in place: the consensus database keeps one record per epoch, refuses
-  a different one (a peer's certified record too), and no `db` command removes or rewrites one.
+  fixed binary, stops at that epoch with an `uncertified` mismatch, or earlier when its record
+  collector downloads the certified record for that epoch, and again on every restart. Nothing
+  replaces the record in place: the consensus database keeps one record per epoch, refuses a
+  different one (a peer's certified record too, which stops the node), and no `db` command removes
+  or rewrites one.
   The recovery is a fresh datadir, which keeps the keys and config:
 
   ```sh
