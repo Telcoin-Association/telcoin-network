@@ -179,6 +179,40 @@ It is not the cache's live data, because committed batches are evicted.
 Resident memory includes pages of the memory-mapped databases that the process has touched, so it rises slowly as the database working set grows.
 Alert on how fast it climbs during load and after restarts, not only on the level.
 
+## Execution alerts
+
+The execution layer publishes these series with the node's other metrics (`--metrics`).
+Each should stay at 0: alert on any increase, for example `increase(tn_reth_exec_cache_stale_hits_total[15m]) > 0`.
+The release ships no alert rules or dashboard panels for them.
+
+| Series | A nonzero value means | What the node does | What to do |
+| --- | --- | --- | --- |
+| `reth_db_latched` (a gauge, 1 or 0) | The execution database met damage on disk or an I/O error, and refuses every write | Stops at its next persist of executed blocks | See [Execution database damage](#execution-database-damage). |
+| `tn_reth_exec_cache_stale_hits_total` | The execution cache served a value its sampled check (one hit of each kind in 256) found stale: a bug in the cache | Drops the cache, builds that block again without it, and runs on | Compare the node's recent block hashes with a peer's before you trust it: unchecked values it served earlier may have put it on another state. Tell the Telcoin Association network team. A 0 on other nodes clears nothing, since each node checks its own hits. |
+| `tn_reth_parallel_state_root_mismatches_total` | A sampled block's parallel state root (block numbers that are multiples of 256, with parallel work) differed from the serial one: a bug in the parallel code. Every node checks the same blocks with the same code, so the bug hits every node alike | Uses the serial result and runs on | A network-wide response, which the Telcoin Association network team coordinates: every node sets `TN_PARALLEL_STATE_ROOT=0`, or only the switch of the split a `mismatch` reason below names, and restarts. A node that switches alone parts from its peers on the next block the bug hits. |
+| `tn_reth_account_walk_fallbacks_total{reason="mismatch"}`, `tn_reth_storage_walk_fallbacks_total{reason="mismatch"}` | The mismatch above was in the account walk's split or the storage split | As above | As above, with `TN_PARALLEL_ACCOUNT_WALK=0` or `TN_PARALLEL_STORAGE_WALK=0`. |
+| `tn_reth_account_walk_fallbacks_total{reason="stored_root_node"}`, `tn_reth_storage_walk_fallbacks_total{reason="stored_root_node"}` | The database holds a trie node at the empty path, which reth never writes: the stored trie is not one reth wrote | Computes that root on one thread and runs on | Tell the Telcoin Association network team. |
+| `tn_reth_parallel_state_root_task_failures_total{reason="tip_moved"}` | A parallel state-root task saw another finalized block than its walk: something wrote the state or trie tables while an output's blocks were built, and the node has no such writer | Leaves that part to the serial computation and runs on | Tell the Telcoin Association network team. The other reasons (`provider`, `database`, `panicked`) cost block time only; read this series first when one node parts from its peers. |
+| `tn_reth_unrecoverable_txs_dropped_total` | A certified batch carried transaction bytes that do not decode: batch validation was bypassed somewhere | Drops the transaction and runs on | Tell the Telcoin Association network team. |
+| `tn_reth_canon_state_lagged_total` | The transaction pool's maintenance fell behind and lost canonical-state notifications | Reloads the pool's sender state and runs on | A rate that does not fall back to 0 means the worker cannot keep up: check CPU pressure and the engine backlog. |
+| `tn_epoch_final_state_mismatches_total` | An epoch the node re-executed closed on another block than the epoch record it holds | Stops, and stops again at every restart | Keep the moved-aside execution database, follow the rebuild text of the tn-reth README ("Upgrading a testnet node": a record of the node's own from a diverged execution needs a fresh `consensus-db/`), and tell the Telcoin Association network team. |
+
+### Execution database damage
+
+The execution database (tn-lmdb, `<datadir>/db/tn-lmdb.dat`) stops taking writes at its first failure: damage on disk that any read finds, or an I/O error while it writes or syncs.
+The read can be block execution, an RPC call, or the database gauges the metrics endpoint samples at each scrape.
+Reads go on, but the node's next persist of executed blocks fails and the node stops.
+The damage stays on disk, so after a restart the next read that reaches it stops the node again: a restart does not clear it.
+The node log names the first failure (target `tn_lmdb`), and `reth_db_latched` reads 1 until the process exits.
+Reads do not recompute most pages' checksums, so some damage is read as data until a write copies the page or `db check` runs.
+
+What to do:
+
+1. Stop the node.
+2. After an I/O error, check the disk, then reboot the host: `db check` reads through the page cache, which can still hold pages the device never took.
+3. Run `telcoin-network db check --datadir <datadir>`. It checks every page's checksum and the structure of the whole database, and names what failed. If it passes, the failure was no damage on disk (a full disk, say): fix the cause and start the node.
+4. A damaged database is not repaired in place. Move it aside with `telcoin-network db reset-execution --datadir <datadir> --force` and rebuild it: in place, or for a validator by the side-observer swap (the tn-reth README's "Upgrading a testnet node"). One damaged page usually means more: check the disk and the memory before you trust the host again.
+
 ## Required evidence before mainnet
 
 - firewall policy tested from allowed and denied source networks;
