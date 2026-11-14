@@ -37,8 +37,9 @@
 //! process migrating or finishing the same files is refused. The open reads the directory's files
 //! under that lock, so a migration another process finishes just before it is seen as finished. A
 //! build running reth on MDBX takes neither lock; the migration's exclusive open of MDBX, held from
-//! step 2 until step 8 has removed MDBX's files, keeps such a process out, and an open that
-//! finishes a stopped migration takes it again before it removes them.
+//! step 2 until step 8 has removed MDBX's files, keeps such a process from writing (MDBX refuses
+//! its read-write open), and an open that finishes a stopped migration takes it again before it
+//! removes them.
 //!
 //! **Steps.**
 //! 1. Remove a stopped migration's temp directory.
@@ -46,15 +47,16 @@
 //!    transaction timeout as tn-lmdb takes it (`--db.read-transaction-timeout`). While another
 //!    process has the environment open (a build running reth on MDBX on a second datadir naming the
 //!    same directory, writing or idle), MDBX refuses the open with `MDBX_BUSY`, and the error says
-//!    to stop that process; while the migration holds it open, which it does until step 8 has
-//!    removed MDBX's files, MDBX refuses any other process's open. An environment stopped uncleanly
-//!    under `--db.sync-mode safe-no-sync` is refused by MDBX with `MDBX_WANNA_RECOVERY`, and the
-//!    error says to run the previous binary once and stop it cleanly. Take the record of the source
-//!    ([`MdbxSource`]): MDBX's last transaction id, and `mdbx.dat`'s length and modification time,
-//!    as the open finds them. Sum the live bytes of reth's tables in it: their branch, leaf and
-//!    overflow pages times the page size, as `db stats` reports them on the MDBX build
-//!    ([`mdbx_live_bytes`]). Warn of any named database in it that is not one of reth's tables: its
-//!    rows are not copied (reth does not read them either).
+//!    to stop that process. While the migration holds it open, which it does until step 8 has
+//!    removed MDBX's files, MDBX refuses another process's read-write open (`EAGAIN`) and its
+//!    exclusive open (`MDBX_BUSY`); a non-exclusive read-only open gets in, and reads without
+//!    writing. An environment stopped uncleanly under `--db.sync-mode safe-no-sync` is refused by
+//!    MDBX with `MDBX_WANNA_RECOVERY`, and the error says to run the previous binary once and stop
+//!    it cleanly. Take the record of the source ([`MdbxSource`]): MDBX's last transaction id, and
+//!    `mdbx.dat`'s length and modification time, as the open finds them. Sum the live bytes of
+//!    reth's tables in it: their branch, leaf and overflow pages times the page size, as `db stats`
+//!    reports them on the MDBX build ([`mdbx_live_bytes`]). Warn of any named database in it that
+//!    is not one of reth's tables: its rows are not copied (reth does not read them either).
 //! 3. Check the free disk: the live bytes plus headroom ([`needed_bytes`]), else refuse, naming the
 //!    live bytes and the bytes needed and free. `mdbx.dat`'s size is no measure: the file grows in
 //!    large steps (a local node's is 4 GiB, mostly sparse) and keeps the pages it frees.
@@ -81,7 +83,7 @@
 //!    fails, before its commit point. Write the record in the temp directory
 //!    ([`MDBX_SOURCE_RECORD`], fsynced), fsync the temp directory, and rename its `tn-lmdb.dat`
 //!    into the database directory: the commit point. MDBX stays open, so no process MDBX's locks
-//!    reach can open and write it between the check and the rename, nor before step 8 removes it.
+//!    reach can open it to write between the check and the rename, nor before step 8 removes it.
 //!    Then fsync the database directory.
 //! 8. Finish ([`finish`]; a later open finishing a stopped migration starts here). First the
 //!    checks, which refuse with both files kept and nothing changed: `tn-lmdb.dat` must open
@@ -617,11 +619,13 @@ fn refuse_non_v1_source(mdbx: &DatabaseEnv) -> eyre::Result<()> {
 /// read, which lives as long as the copy, opts out of it.
 ///
 /// The open is exclusive (`MDBX_EXCLUSIVE`): MDBX refuses it with `MDBX_BUSY` while another
-/// process has the environment open, read-write or read-only, committing or idle, and refuses
-/// another process's open while the returned environment is open. A process holding MDBX open
-/// without committing leaves no trace in the record the migration takes ([`MdbxSource`]), and
-/// would keep writing to the `mdbx.dat` that [`finish`] removes, so the environment is held open
-/// until then.
+/// process has the environment open, read-write or read-only, committing or idle. While the
+/// returned environment is open, MDBX refuses another process's read-write open (`EAGAIN`) and its
+/// exclusive open (`MDBX_BUSY`), and lets a non-exclusive read-only open in, which reads and
+/// cannot write (`no_other_process_opens_mdbx_during_the_copy` pins the writer's refusal). A
+/// process holding MDBX open without committing leaves no trace in the record the migration takes
+/// ([`MdbxSource`]), and would keep writing to the `mdbx.dat` that [`finish`] removes, so the
+/// environment is held open until then.
 fn open_mdbx_read_only(
     path: &Path,
     read_transaction_timeout: Option<std::time::Duration>,
@@ -650,7 +654,7 @@ const WANNA_RECOVERY_HINT: &str =
 const BUSY_HINT: &str =
     "another process has the MDBX database open (MDBX_BUSY: a build running reth on MDBX, on a \
      second datadir naming the same directory?): the migration opens it exclusively, so that no \
-     process writes it during the copy or keeps it open while the migration removes it. Stop that \
+     process writes it during the copy or while the migration removes it. Stop that \
      process, then start this build; MDBX is unchanged";
 
 /// Whether the MDBX open whose error is `err` was refused with `code`.
@@ -820,7 +824,7 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
 /// opened (its last transaction id and `mdbx.dat`'s stat, both taken again with `src` still open),
 /// failing on a difference ([`changed_during_copy`]); write the record there, and move the copy
 /// into `path`: the commit point, so a failure here leaves MDBX as it was. `src` stays open: its
-/// exclusive open keeps any other process's MDBX open out from the check to the rename, and on
+/// exclusive open keeps any other process's MDBX writer out from the check to the rename, and on
 /// until [`finish`] removes MDBX's files. Returns the copy of each table.
 fn copy_and_install(
     path: &Path,

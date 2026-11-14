@@ -685,7 +685,8 @@ one of reth's: its rows are not copied (reth does not read them either).
   exclusively (`MDBX_EXCLUSIVE`): while another process has the MDBX database open (an MDBX build
   on a second datadir naming the same `db/`, writing or idle), MDBX refuses the open with
   `MDBX_BUSY` and the migration does not start, and while the migration holds it open, from the
-  copy until MDBX's files are removed, MDBX refuses any other process's open. It takes a record of
+  copy until MDBX's files are removed, MDBX refuses another process's read-write open (`EAGAIN`)
+  and lets only a non-exclusive read-only open in, which cannot write. It takes a record of
   `mdbx.dat` when it opens MDBX (MDBX's last transaction id, and the file's length and
   modification time), and takes it again once the copy is checked, with MDBX still open: a
   difference means something wrote MDBX during the migration past the exclusive open (a write to
