@@ -6754,3 +6754,71 @@ async fn vote_queue_fix_recasts_a_stored_vote_once() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// What a requester's cancel does on the default path (switch off): it sends nothing the voter
+/// can see, and the voter's request queued on the author lock runs to its answer.
+///
+/// The certifier cancels an older header's vote requests by dropping their `request_vote`
+/// futures. A dropped future emits no network command: the swarm's only trace of the cancel is a
+/// closed reply channel on the requester's own node. On the voter, `RequestHandler::vote` has no
+/// link to the requester, so a request that waits for the author lock is evaluated, and here
+/// signed, once the lock frees. The swarm drops a voter's future only through the inbound
+/// request's cancel signal, which fires on an inbound failure (the transport's request timeout or
+/// a closed connection), a duplicate request id or after the response is sent, never for a
+/// requester's cancel (`crates/network-libp2p/src/consensus.rs`, `close_inbound`). So a cancelled
+/// request stays queued on the lock until it is answered or the transport times it out.
+#[tokio::test(start_paused = true)]
+async fn vote_request_cancelled_by_requester_still_runs_on_the_voter() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let voter = *committee.first_authority().authority().protocol_key();
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+
+    // the requester sends the request, then cancels it by dropping the future
+    let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(10);
+    let requester = PrimaryNetworkHandle::new_for_test(commands_tx);
+    let (request, reply) = {
+        let request_vote = requester.request_vote(voter, header.clone(), Vec::new());
+        tokio::pin!(request_vote);
+        let command = tokio::select! {
+            biased;
+            _ = &mut request_vote => panic!("the vote request ended before the voter answered"),
+            command = commands_rx.recv() => command.expect("the requester sends the request"),
+        };
+        let NetworkCommand::SendRequest {
+            request: PrimaryRequest::Vote { header, parents },
+            reply,
+            ..
+        } = command
+        else {
+            panic!("the requester sent something other than a vote request");
+        };
+        ((Arc::unwrap_or_clone(header), parents), reply)
+    };
+    assert!(reply.is_closed(), "the cancel leaves only a closed reply channel");
+    assert_matches!(
+        commands_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+        "the cancel sends no command to the network layer"
+    );
+
+    // on the voter the request waits for the author lock, held by an earlier request
+    let held = handler.lock_author_vote(&author.id()).await.expect("a committee member");
+    let (header, parents) = request;
+    let digest = header.digest();
+    let queued = handler.vote(peer, header, parents);
+    tokio::pin!(queued);
+    assert!(futures::poll!(queued.as_mut()).is_pending(), "the request waits for the author lock");
+    drop(held);
+    assert_matches!(queued.await?, PrimaryResponse::Vote(_), "the cancelled request is signed");
+    assert!(handler.author_guard_holds_vote(&author.id(), digest).await);
+
+    Ok(())
+}
