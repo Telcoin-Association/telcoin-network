@@ -58,7 +58,8 @@ mod call_many_budget_tests {
     use alloy_rpc_types_eth::{
         simulate::{SimBlock, SimulatePayload, SimulatedBlock},
         state::{AccountOverride, StateOverride},
-        Bundle, StateContext, TransactionInput, TransactionRequest,
+        BlockOverrides, Bundle, EthCallResponse, StateContext, TransactionInput,
+        TransactionRequest,
     };
     use reth_chainspec::{ChainSpecBuilder, ChainSpecProvider};
     use reth_ethereum_primitives::{Block, BlockBody};
@@ -78,7 +79,7 @@ mod call_many_budget_tests {
         gas_cap: u64,
         count: usize,
         calldata: usize,
-    ) -> Result<Vec<Vec<alloy_rpc_types_eth::EthCallResponse>>, EthApiError> {
+    ) -> Result<Vec<Vec<EthCallResponse>>, EthApiError> {
         let provider = MockEthProvider::default()
             .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
         let block = Block {
@@ -185,8 +186,17 @@ mod call_many_budget_tests {
         EthCall::simulate_v1(&api, payload, Some(BlockNumberOrTag::Number(1).into())).await
     }
 
+    /// TN(TN-0183): a contract that returns 1 MiB of zeros (`PUSH3 0x100000; PUSH1 0; RETURN`),
+    /// for 2,216,462 gas with the intrinsic 21,000.
+    const RETURNS_A_MIB: Address = Address::repeat_byte(0xdd);
+
+    /// TN(TN-0183): a contract that logs 512 KiB of zeros and returns the same 512 KiB
+    /// (`PUSH3 0x80000; PUSH1 0; LOG0; PUSH3 0x80000; PUSH1 0; RETURN`), for 4,789,131 gas with
+    /// the intrinsic 21,000.
+    const LOGS_AND_RETURNS_A_MIB: Address = Address::repeat_byte(0xee);
+
     /// TN(TN-0156): the mock chain [`simulate`] runs on: block 1, a funded [`SENDER`] and
-    /// [`LOOP`].
+    /// [`LOOP`], and (TN-0183) [`RETURNS_A_MIB`] and [`LOGS_AND_RETURNS_A_MIB`].
     fn simulation_chain() -> MockEthProvider {
         let provider = MockEthProvider::default()
             .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
@@ -202,6 +212,17 @@ mod call_many_budget_tests {
             LOOP,
             ExtendedAccount::new(0, U256::ZERO)
                 .with_bytecode(Bytes::from_static(&[0x5b, 0x60, 0x00, 0x56])),
+        );
+        provider.add_account(
+            RETURNS_A_MIB,
+            ExtendedAccount::new(0, U256::ZERO)
+                .with_bytecode(Bytes::from_static(&[0x62, 0x10, 0x00, 0x00, 0x60, 0x00, 0xf3])),
+        );
+        provider.add_account(
+            LOGS_AND_RETURNS_A_MIB,
+            ExtendedAccount::new(0, U256::ZERO).with_bytecode(Bytes::from_static(&[
+                0x62, 0x08, 0x00, 0x00, 0x60, 0x00, 0xa0, 0x62, 0x08, 0x00, 0x00, 0x60, 0x00, 0xf3,
+            ])),
         );
         provider
     }
@@ -259,6 +280,99 @@ mod call_many_budget_tests {
         assert!(
             matches!(&err, EthApiError::InvalidParams(message)
                 if message == "request exceeds the gas budget of 100000"),
+            "{err:?}"
+        );
+    }
+
+    /// TN(TN-0183): `count` calls to [`RETURNS_A_MIB`] as one `eth_callMany` on the
+    /// [`simulation_chain`], under a 100M gas cap.
+    async fn call_many_returning_a_mib(
+        count: usize,
+    ) -> Result<Vec<Vec<EthCallResponse>>, EthApiError> {
+        let provider = simulation_chain();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .gas_cap(GasCap(100_000_000))
+        .build();
+        let call = TransactionRequest {
+            from: Some(SENDER),
+            to: Some(TxKind::Call(RETURNS_A_MIB)),
+            gas: Some(2_500_000),
+            ..Default::default()
+        };
+        EthCall::call_many(
+            &api,
+            vec![Bundle { transactions: vec![call; count], block_override: None }],
+            Some(StateContext {
+                block_number: Some(BlockNumberOrTag::Number(1).into()),
+                transaction_index: None,
+            }),
+            None,
+        )
+        .await
+    }
+
+    /// TN(TN-0183): 32 calls that return 1 MiB each fill the output budget; with a 33rd, the
+    /// request is refused, though its gas fits the budget.
+    #[tokio::test]
+    async fn call_many_output_over_the_budget_is_refused() {
+        let results = call_many_returning_a_mib(32).await.expect("32 MiB fits");
+        assert_eq!(results[0].len(), 32);
+        assert!(results[0]
+            .iter()
+            .all(|response| response.value.as_ref().is_some_and(|value| value.len() == 1 << 20)));
+
+        let err = call_many_returning_a_mib(33).await.expect_err("33 MiB exceeds the budget");
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(message)
+                if message == "request exceeds the output budget of 33554432 bytes"),
+            "{err:?}"
+        );
+    }
+
+    /// TN(TN-0183): `count` calls to [`LOGS_AND_RETURNS_A_MIB`] as one `eth_simulateV1` block
+    /// of 200M gas, under a 200M gas cap.
+    async fn simulate_logging_a_mib(
+        count: usize,
+    ) -> Result<Vec<SimulatedBlock<alloy_rpc_types_eth::Block>>, EthApiError> {
+        let call = TransactionRequest {
+            from: Some(SENDER),
+            to: Some(TxKind::Call(LOGS_AND_RETURNS_A_MIB)),
+            gas: Some(5_000_000),
+            gas_price: Some(0),
+            ..Default::default()
+        };
+        let block = SimBlock {
+            block_overrides: Some(BlockOverrides {
+                gas_limit: Some(200_000_000),
+                ..Default::default()
+            }),
+            state_overrides: None,
+            calls: vec![call; count],
+        };
+        simulate_blocks(200_000_000, vec![block]).await
+    }
+
+    /// TN(TN-0183): a simulated call keeps its return data and its logs' data, 1 MiB for each
+    /// call here: 32 fill the output budget, and with a 33rd the request is refused.
+    #[tokio::test]
+    async fn simulate_output_over_the_budget_is_refused() {
+        let simulated = simulate_logging_a_mib(32).await.expect("32 MiB fits");
+        assert!(simulated[0].calls.iter().all(|call| call.status &&
+            call.gas_used == 4_789_131 &&
+            call.return_data.len() == 1 << 19 &&
+            call.logs.len() == 1 &&
+            call.logs[0].data().data.len() == 1 << 19));
+        assert_eq!(simulated[0].calls.len(), 32);
+
+        let err = simulate_logging_a_mib(33).await.expect_err("33 MiB exceeds the budget");
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(message)
+                if message == "request exceeds the output budget of 33554432 bytes"),
             "{err:?}"
         );
     }

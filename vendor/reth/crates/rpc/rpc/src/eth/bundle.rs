@@ -12,7 +12,10 @@ use reth_rpc_eth_api::{
     helpers::{Call, EthTransactions, LoadPendingBlock},
     EthCallBundleApiServer, FromEthApiError, FromEvmError,
 };
-use reth_rpc_eth_types::{utils::recover_raw_transaction, EthApiError, RpcInvalidTransactionError};
+use reth_rpc_eth_types::{
+    call_many::OutputBudget, utils::recover_raw_transaction, EthApiError,
+    RpcInvalidTransactionError,
+};
 use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard};
 use reth_transaction_pool::{
     EthBlobTransactionSidecar, EthPoolTransaction, PoolPooledTx, PoolTransaction, TransactionPool,
@@ -183,6 +186,8 @@ where
 
                 let mut results = Vec::with_capacity(transactions.len());
                 let mut transactions = transactions.into_iter().peekable();
+                // TN(TN-0183): the return or revert data the response keeps.
+                let mut output_budget = OutputBudget::default();
 
                 while let Some(tx) = transactions.next() {
                     if is_cancelled() {
@@ -237,6 +242,10 @@ where
 
                     // update the coinbase balance
                     coinbase_balance_before_tx = coinbase_balance_after_tx;
+
+                    output_budget
+                        .charge(result.output().map_or(0, |output| output.len()))
+                        .map_err(Eth::Error::from_eth_err)?;
 
                     // set the return data for the response
                     let (value, revert) = if result.is_success() {
@@ -477,6 +486,99 @@ mod gas_limit_tests {
         let max = max_bundle_transactions(50_000_000);
         let err = call_undecodable(max).await.expect_err("undecodable transactions");
         assert!(matches!(&err, EthApiError::FailedToDecodeSignedTransaction), "{err:?}");
+    }
+}
+
+/// TN(TN-0183): an `eth_callBundle` request keeps at most
+/// [`MAX_REQUEST_OUTPUT_BYTES`](reth_rpc_eth_types::call_many::MAX_REQUEST_OUTPUT_BYTES) of
+/// return data.
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    use crate::EthApiBuilder;
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
+    use alloy_primitives::{Address, Bytes, TxKind};
+    use reth_chainspec::ChainSpecBuilder;
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_primitives_traits::Block as _;
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_rpc_eth_types::GasCap;
+    use reth_testing_utils::generators::{self, generate_key, sign_tx_with_key_pair};
+    use reth_transaction_pool::test_utils::testing_pool;
+
+    /// A contract that returns 1 MiB of zeros (`PUSH3 0x100000; PUSH1 0; RETURN`), for 2,216,462
+    /// gas with the intrinsic 21,000.
+    const RETURNS_A_MIB: Address = Address::repeat_byte(0xdd);
+
+    /// `count` transactions from one sender to [`RETURNS_A_MIB`] as one bundle, under a 100M gas
+    /// cap.
+    async fn call_returning_a_mib(count: u64) -> Result<EthCallBundleResponse, EthApiError> {
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
+        let block = Block {
+            header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+            body: BlockBody::default(),
+        }
+        .seal_slow();
+        provider.add_block(block.hash(), block.into_block());
+        provider.add_account(
+            RETURNS_A_MIB,
+            ExtendedAccount::new(0, U256::ZERO)
+                .with_bytecode(Bytes::from_static(&[0x62, 0x10, 0x00, 0x00, 0x60, 0x00, 0xf3])),
+        );
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .gas_cap(GasCap(100_000_000))
+        .build();
+        let bundle = EthBundle::new(api, BlockingTaskGuard::new(1));
+        let key = generate_key(&mut generators::rng());
+        let txs = (0..count)
+            .map(|nonce| {
+                sign_tx_with_key_pair(
+                    key,
+                    Transaction::Legacy(TxLegacy {
+                        nonce,
+                        gas_limit: 2_500_000,
+                        to: TxKind::Call(RETURNS_A_MIB),
+                        ..Default::default()
+                    }),
+                )
+                .encoded_2718()
+                .into()
+            })
+            .collect();
+        bundle
+            .call_bundle(EthCallBundle {
+                txs,
+                block_number: 2,
+                state_block_number: BlockNumberOrTag::Number(1),
+                ..Default::default()
+            })
+            .await
+    }
+
+    /// 32 transactions that return 1 MiB each fill the output budget; with a 33rd, the bundle is
+    /// refused, though its gas fits the block gas limit.
+    #[tokio::test]
+    async fn bundle_output_over_the_budget_is_refused() {
+        let response = call_returning_a_mib(32).await.expect("32 MiB fits");
+        assert_eq!(response.results.len(), 32);
+        assert!(response.results.iter().all(|result| result.gas_used == 2_216_462 &&
+            result.value.as_ref().is_some_and(|value| value.len() == 1 << 20)));
+
+        let err = call_returning_a_mib(33).await.expect_err("33 MiB exceeds the budget");
+        assert!(
+            matches!(&err, EthApiError::InvalidParams(message)
+                if message == "request exceeds the output budget of 33554432 bytes"),
+            "{err:?}"
+        );
     }
 }
 

@@ -471,6 +471,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             },
                         )?;
                         budget.charge(res.result.gas_used()).map_err(Self::Error::from_eth_err)?;
+                        // TN(TN-0183): the return or revert data stays until the response is
+                        // built.
+                        budget
+                            .charge_output(res.result.output().map_or(0, |output| output.len()))
+                            .map_err(Self::Error::from_eth_err)?;
 
                         match Self::Error::ensure_success(res.result) {
                             Ok(output) => {

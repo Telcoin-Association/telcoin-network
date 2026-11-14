@@ -3015,3 +3015,33 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: `a_pending_read_holding_every_blocking_thread_still_gets_its_block` (a runtime with
   one blocking thread; the read at `pending` waited forever before the change).
   *Upstream*: no; upstream has the same shape.
+
+- **TN-0183** — `eth_callMany`, `eth_simulateV1` and `eth_callBundle` keep at most 32 MiB of call
+  output per request. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-types/src/call_many.rs` (`MAX_REQUEST_OUTPUT_BYTES`,
+  `OutputBudget`, `CallManyBudget::charge_output`, test `output_is_charged_up_to_the_budget`),
+  `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`call_many` charges each call's return or revert
+  data), `crates/rpc/rpc-eth-types/src/simulate.rs` (`execute_transactions` charges each call's
+  return or revert data and its logs' data), `crates/rpc/rpc/src/eth/bundle.rs` (`call_bundle`
+  charges each transaction's return or revert data; tests `output_budget_tests`),
+  `crates/rpc/rpc/src/eth/helpers/call.rs` (`simulation_chain` gains two contracts; tests
+  `call_many_output_over_the_budget_is_refused`, `simulate_output_over_the_budget_is_refused`).
+  *Why*: these methods keep every call's output until the response is built, and only the
+  request's gas bounded it. A call pays for its memory quadratically, but many calls of about
+  100 KB each pay little, so one request kept about 2 bytes per gas: about 100 MB at the default
+  50M `--rpc.gascap`, about 200 MB as hex, which the 160 MB response limit refused only after
+  building it. Each worker's server ran up to 256 such requests at once (one blocking-IO permit
+  each), enough to exhaust the node's memory. A request now counts the raw bytes it keeps after
+  each call (return and revert data; for `eth_simulateV1` also its logs' data, which the response
+  returns) and fails with `-32602` "request exceeds the output budget of 33554432 bytes" once they
+  pass 32 MiB. The limit is fixed, with no flag: a third of what the gas allowed, 64 MiB as hex,
+  well under the response limit. TN-0184 bounds how many of these requests run at once.
+  Requests under the budget get the same results as before. `trace_callMany` and
+  `debug_traceCallMany` stay bounded by the trace cap (TN-0079) instead.
+  *Can reach execution or storage*: no. RPC only: it counts what a call returned after it ran;
+  nothing executed changes.
+  *Tests*: `call_many_output_over_the_budget_is_refused` and
+  `bundle_output_over_the_budget_is_refused` (32 calls returning 1 MiB each run, 33 are refused),
+  `simulate_output_over_the_budget_is_refused` (each call logs 512 KiB and returns 512 KiB, so it
+  fails if either is not counted), `output_is_charged_up_to_the_budget`.
+  *Upstream*: no; upstream has the same shape.
