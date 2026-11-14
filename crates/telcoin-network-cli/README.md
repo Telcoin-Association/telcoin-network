@@ -454,6 +454,8 @@ Complete tree after the node has run:
   static_files/                   # execution layer static files (block data)
   execution-reset-<UTC time>/     # what `db reset-execution` moved aside (db/, static_files/,
                                   #   restored-state-floor); `.partial` while it moves them
+  load-state-in-progress          # marker: a `db load-state` is writing chain data (or stopped
+                                  #   part-way); the node refuses to start while it is there
   consensus-db/                   # consensus protocol database
     tndb/                         #   consensus DB (tndb): one log per environment
       epoch/                      #     certificates, votes, payloads, last proposal
@@ -475,6 +477,15 @@ database (`db/tn-lmdb.dat`, or the marker `db/mdbx-migrated`) as the node does.
 datadir, and the default build refuses a `db/` holding `mdbx.dat`, or an unfinished migration
 (`db/tn-lmdb-migrating/` beside `tn-lmdb.dat`, which the node's next start finishes), before
 anything opens it.
+
+`db load-state` writes `load-state-in-progress` into the datadir once it has found no chain data
+there, before it writes any, and removes it when the restore is complete. A run stopped part-way
+(killed, out of memory, power lost) leaves it, and the node refuses to start while it is there:
+the execution and consensus databases are incomplete. Run `db load-state` again with the same
+bundle: it removes the chain data the stopped run created (`db/`, `static_files/`, `consensus-db/`
+and `restored-state-floor`) and restores again. Keys and config stay. If the stopped run wrote into
+a chain-data directory that was there before it, the rerun names it and stops: remove it, and the
+marker, by hand. A failed run (a bad bundle, say) removes what it created itself.
 
 `telcoin-network db migrate-execution` runs the MDBX to tn-lmdb migration of the execution
 database with the node stopped, instead of at the node's next start: it refuses while a node
