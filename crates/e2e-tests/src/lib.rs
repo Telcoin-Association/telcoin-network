@@ -656,6 +656,42 @@ impl FleetOverrides {
         static NONE: NodeOverrides = NodeOverrides { parameters: Vec::new(), env: Vec::new() };
         self.nodes.get(node).unwrap_or(&NONE)
     }
+
+    /// Apply each named node's overrides to its datadir `base_dir/<node>`, with the entries of
+    /// `TN_E2E_PARAMETERS` beneath them (see [`NodeOverrides::apply_with_e2e_parameters`]), in
+    /// order, stopping at the first node that cannot take them.
+    ///
+    /// A start helper that spawns several nodes calls this before it spawns any of them, so an
+    /// override that one node cannot take fails the start while no process exists yet that the
+    /// caller would have to stop.
+    ///
+    /// # Errors
+    ///
+    /// The first failure, naming the node; the nodes before it keep their merged files, which
+    /// their next start rebuilds anyway.
+    pub fn apply_with_e2e_parameters<'a>(
+        &self,
+        base_dir: &Path,
+        nodes: impl IntoIterator<Item = &'a str>,
+    ) -> eyre::Result<()> {
+        self.apply_layered(base_dir, nodes, e2e_parameters()?)
+    }
+
+    /// [`FleetOverrides::apply_with_e2e_parameters`] with `fleet_wide` in place of the entries of
+    /// `TN_E2E_PARAMETERS`.
+    fn apply_layered<'a>(
+        &self,
+        base_dir: &Path,
+        nodes: impl IntoIterator<Item = &'a str>,
+        fleet_wide: &[(String, String)],
+    ) -> eyre::Result<()> {
+        for node in nodes {
+            self.node(node)
+                .apply_layered(&base_dir.join(node), fleet_wide)
+                .wrap_err_with(|| format!("the overrides of {node} do not apply"))?;
+        }
+        Ok(())
+    }
 }
 
 /// `base`, the text of a `parameters.yaml`, with each `(key, value)` of `overrides` as a top-level
@@ -1343,5 +1379,40 @@ mod tests {
         // no fleet-wide entries and none of its own: the harness's file comes back
         NodeOverrides::default().apply_layered(dir.path(), &[]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    }
+
+    // ---- bench7 bench6-e2e-scaffold ----
+
+    /// The pass a multi-node start helper runs before it spawns anything fails at the first node
+    /// that cannot take its overrides, naming it and leaving its file alone, so the helper returns
+    /// before any process exists; a fleet every node can take reaches every datadir.
+    #[test]
+    fn fleet_apply_fails_on_the_node_that_cannot_take_its_overrides() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nodes = ["validator-1", "validator-2", "validator-3", "validator-4"];
+        for node in nodes {
+            std::fs::create_dir(dir.path().join(node)).unwrap();
+            let path = dir.path().join(node).join("parameters.yaml");
+            Config::write_to_path(&path, Parameters::default(), ConfigFmt::YAML).unwrap();
+        }
+        let fourth = dir.path().join("validator-4").join("parameters.yaml");
+        let written = std::fs::read_to_string(&fourth).unwrap();
+
+        let bad = FleetOverrides::default().parameter(nodes, "unknown_switch", "true").parameter(
+            ["validator-4"],
+            "max_header_delay",
+            "soon",
+        );
+        let err = bad.apply_layered(dir.path(), nodes, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("validator-4"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&fourth).unwrap(), written);
+
+        let good = FleetOverrides::default().parameter(nodes, "unknown_switch", "true");
+        good.apply_layered(dir.path(), nodes, &[]).unwrap();
+        for node in nodes {
+            let merged =
+                std::fs::read_to_string(dir.path().join(node).join("parameters.yaml")).unwrap();
+            assert!(merged.ends_with("\nunknown_switch: true\n"), "{node}: {merged}");
+        }
     }
 }

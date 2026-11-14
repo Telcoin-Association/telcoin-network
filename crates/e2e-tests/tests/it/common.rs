@@ -1239,12 +1239,13 @@ pub(crate) fn start_nodes(
 /// `validators` (its datadir under `temp_path`), so a restart of a subset finds the same nodes'
 /// overrides.
 ///
-/// A node's `parameters.yaml` entries are merged into `temp_path/<name>` before it starts, after
-/// the fleet-wide entries of `TN_E2E_PARAMETERS` (see [`NodeOverrides::apply_with_e2e_parameters`];
-/// a start without entries puts the harness's file back), and its environment variables are set
-/// on its process only. A restart through [`start_nodes`] drops both, so a node whose overrides
-/// matter to the chain is restarted here with the same fleet. A node the fleet sets nothing for
-/// starts exactly as [`start_nodes`] starts it.
+/// Every node's `parameters.yaml` entries are merged into `temp_path/<name>` before any node
+/// starts, after the fleet-wide entries of `TN_E2E_PARAMETERS` (see
+/// [`FleetOverrides::apply_with_e2e_parameters`]; a start without entries puts the harness's file
+/// back), so an override one node cannot take fails the start with nothing spawned. Each node's
+/// environment variables are set on its process only. A restart through [`start_nodes`] drops both,
+/// so a node whose overrides matter to the chain is restarted here with the same fleet. A node the
+/// fleet sets nothing for starts exactly as [`start_nodes`] starts it.
 pub(crate) fn start_nodes_with_overrides(
     temp_path: &Path,
     validators: &[(&str, Address)],
@@ -1252,6 +1253,9 @@ pub(crate) fn start_nodes_with_overrides(
     run: u32,
     fleet: &FleetOverrides,
 ) -> eyre::Result<(Vec<Child>, Vec<NodeEndpoints>)> {
+    // every node's overrides before any spawn: the caller guards the children only after an `Ok`,
+    // so a node that cannot take its overrides must fail the start while none is running
+    fleet.apply_with_e2e_parameters(temp_path, validators.iter().map(|(v, _)| *v))?;
     let bin = e2e_tests::get_telcoin_network_binary();
 
     let mut children = Vec::new();
@@ -1259,7 +1263,6 @@ pub(crate) fn start_nodes_with_overrides(
     for (v, _) in validators.iter() {
         let dir = temp_path.join(v);
         let node_overrides = fleet.node(v);
-        node_overrides.apply_with_e2e_parameters(&dir)?;
 
         if *v == NEW_VALIDATOR {
             info!(target: "epoch-test", ?v, "starting new validator");
