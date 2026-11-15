@@ -208,10 +208,14 @@ impl<'m> Collection<'m> {
     /// Handle a failed save of `peer`'s validated record of `epoch`.
     ///
     /// A [`EpochDbError::ConflictingRecord`] here is a certified record that validated against
-    /// this node's record of the epoch before, with a super-quorum certificate of the committee
-    /// that record hands over to, and that differs from the record this node stored for the epoch.
-    /// No single peer can cause it: the certificate takes more than `f` members of the committee
-    /// this node's own previous record names (see [`tn_types::EpochRecord::committee_compatible`]).
+    /// this node's record of the epoch before and differs from the record this node stored for the
+    /// epoch. Its certificate holds a super-quorum of the record's own committee, which validation
+    /// accepts when it is the committee this node's previous record hands over to (for epoch 0,
+    /// the genesis committee) or a subset of that committee with at least four members and at
+    /// least two thirds of its members (see [`tn_types::EpochRecord::committee_compatible`]): with
+    /// 10 members handed over and 7 in the record, 5 signers certify it. No single peer can cause
+    /// it: the certificate takes more than `f` members of the committee this node's own previous
+    /// record names.
     /// [`stop_on_local_failure`] reads a conflict as this node's execution having diverged from
     /// the certified chain, counts it in `tn_epoch.final_state_mismatches_total` and stops the
     /// node. The evidence line logged before that stop lets an operator check that reading: it

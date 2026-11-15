@@ -53,14 +53,16 @@ pub(crate) struct StateSyncMetrics {
     /// Counted on every pass that meets it; any peer can send such a record, so this alone proves
     /// nothing.
     pub(crate) epoch_record_walk_parent_mismatches_total: Counter,
-    /// Certified records that validated against this node's record of the epoch before, with a
-    /// super-quorum certificate, and differ from the record this node stored for the same epoch.
-    /// The stop that follows reads each one as this node's execution having diverged from the
-    /// certified chain; the `epoch record conflict:` line logged with it names who certified the
-    /// other record, and how many members of which committee, so an operator can check that
-    /// reading. Each one stops the node right after it is counted here, and is counted again in
-    /// `tn_epoch.final_state_mismatches_total` (`tn_epoch_final_state_mismatches_total` in
-    /// Prometheus).
+    /// Certified records that validated against this node's record of the epoch before and differ
+    /// from the record this node stored for the same epoch. The certificate holds a super-quorum
+    /// of the record's own committee: the committee the record before it hands over to, or a
+    /// subset of that committee with at least four members and at least two thirds of its
+    /// members. The stop that follows reads each one as this node's execution having diverged
+    /// from the certified chain; the `epoch record conflict:` line logged with it names who
+    /// certified the other record, and how many members of which committee, so an operator can
+    /// check that reading. Each one stops the node right after it is counted here, and is
+    /// counted again in `tn_epoch.final_state_mismatches_total`
+    /// (`tn_epoch_final_state_mismatches_total` in Prometheus).
     pub(crate) epoch_record_conflicts_total: Counter,
 }
 
