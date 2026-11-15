@@ -630,7 +630,10 @@ fn resolve_data_file_and_epoch(
     } else if path.is_file() {
         (path.to_path_buf(), path.parent().map(Path::to_path_buf))
     } else {
-        // an `epoch-N` (or its `data`) that an interrupted install left only as `epoch-N.replaced`
+        // an `epoch-N` (or its `data`) that an interrupted install left only as `epoch-N.replaced`:
+        // only when `epoch-N` itself is missing, the test `interrupted_installs` makes. Beside an
+        // `epoch-N` that lost its `data` the aside is stale, no command puts it back, and the
+        // node's next start removes it.
         let epoch_dir = if path.file_name().is_some_and(|name| name == DATA_NAME) {
             path.parent()
         } else {
@@ -642,7 +645,7 @@ fn resolve_data_file_and_epoch(
             let mut aside = epoch_dir.as_os_str().to_owned();
             aside.push(".replaced");
             let aside = PathBuf::from(aside);
-            if aside.is_dir() {
+            if aside.is_dir() && matches!(epoch_dir.try_exists(), Ok(false)) {
                 bail!(
                     "path does not exist: {}. {}. `telcoin-network db repair --force` (node \
                      stopped) puts it back now; to check the copy first, run `telcoin-network db \
@@ -2258,6 +2261,36 @@ mod tests {
             ),
             "{report}"
         );
+    }
+
+    /// `validate` of an `epoch-N/data` that is missing from an `epoch-N/` that is there gives no
+    /// interrupted-install hint for a stale `epoch-N.replaced` beside it: no command puts that
+    /// aside back (it is no interrupted install), and the node's next start removes it.
+    #[test]
+    fn db_validate_gives_no_interrupted_install_hint_beside_a_live_epoch() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let epochs = dir.path().to_path_buf().epochs_db_path();
+        fs::create_dir_all(epochs.join("epoch-2")).unwrap();
+        let aside = epochs.join("epoch-2.replaced");
+        fs::create_dir_all(&aside).unwrap();
+        fs::write(aside.join(tn_storage::consensus_pack::DATA_NAME), b"stale copy").unwrap();
+
+        let data = epochs.join("epoch-2").join(tn_storage::consensus_pack::DATA_NAME);
+        let err = super::DbValidateArgs { path: data.clone(), epoch: None }
+            .execute()
+            .expect_err("the epoch's data log is missing");
+        let err = format!("{err:#}");
+        assert!(err.contains("path does not exist"), "{err}");
+        assert!(!err.contains("INTERRUPTED INSTALL"), "{err}");
+        assert!(!err.contains("db repair --force"), "{err}");
+
+        // with `epoch-2` itself missing, the aside is an interrupted install and the hint is given
+        fs::remove_dir(epochs.join("epoch-2")).unwrap();
+        let err = super::DbValidateArgs { path: data, epoch: None }
+            .execute()
+            .expect_err("the epoch's directory is missing");
+        assert!(format!("{err:#}").contains("INTERRUPTED INSTALL"), "{err:#}");
     }
 
     /// `db --help` lists each command on one line, with the details in the command's own help,
