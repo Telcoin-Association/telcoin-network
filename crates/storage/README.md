@@ -503,8 +503,10 @@ its two renames) is reported by `db repair`, `db migrate` and `db validate` of t
 never read as "not found" or healthy; the node's next start puts it back
 (`ConsensusChain::recover_incomplete_installs`), and `db repair --force` runs that same step first,
 then checks the restored epoch with the others. `db repair`,
-`db migrate`, `db load-state` and `db tndb-stat` refuse to run while a live node holds the
-`<datadir>/telcoin.pid` lock (intentional-design item 9).
+`db migrate`, `db load-state`, `db tndb-stat`, `db reset-execution`, `db migrate-execution` and,
+on the default (tn-lmdb) build, `db stats` and `db check` refuse to run while a live node holds the
+`<datadir>/telcoin.pid` lock, and hold it while they run (intentional-design item 9); `db validate`
+takes a pack path and no lock.
 
 ### Benchmarks
 

@@ -455,6 +455,10 @@ Complete tree after the node has run:
     epochs/                       #   per-epoch consensus packs, epoch records, certificate packs
 ```
 
+[Database commands](../../docs/src/getting-started/validator-operations.md#database-commands) lists
+the `telcoin-network db` commands: what each does and checks, whether it needs the node stopped, and
+whether it writes. Each prints the datadir it acts on to stderr first.
+
 `telcoin-network db stats` prints the static files and each table of the execution database:
 rows, pages and size. The default (tn-lmdb) build needs the node stopped: it refuses while a node
 holds the datadir, and holds the datadir while it runs, so a node started meanwhile is refused
@@ -470,8 +474,9 @@ anything opens it.
 
 `db load-state` writes `load-state-in-progress` into the datadir once it has found no chain data
 there, before it writes any, and removes it when the restore is complete. A run stopped part-way
-(killed, out of memory, power lost) leaves it, and the node refuses to start while it is there:
-the execution and consensus databases are incomplete. Run `db load-state` again with the same
+(killed, out of memory, power lost) leaves it, and the node refuses to start while it is there
+(`db reset-execution` and `db migrate-execution` refuse the datadir too): the execution and
+consensus databases are incomplete. Run `db load-state` again with the same
 bundle: it removes the chain data the stopped run created (`db/`, `static_files/`, `consensus-db/`
 and `restored-state-floor`) and restores again. Keys and config stay. If the stopped run wrote into
 a chain-data directory that was there before it, the rerun names it and stops: remove it, and the
