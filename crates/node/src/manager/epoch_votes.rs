@@ -85,6 +85,13 @@ async fn save_and_persist_with_logs(
 /// record is certified the kept signatures for its epoch are dropped. Without it the round starts
 /// empty and keeps nothing.
 ///
+/// A round whose vote windows run out short of a quorum asks peers for the epoch's certified
+/// record. When the record a peer returns validates against the committee this node trusts for
+/// the epoch (see `EpochRecordDb::validate_downloaded_record`) and its digest differs from this
+/// node's own, the round logs the fork and calls `node_shutdown`, whatever the record's epoch: a
+/// round for an older record (a re-certify round) stops the node as the previous record's round
+/// does.
+///
 /// Returns `Err` only when our own epoch store fails to save or persist the certificate (see
 /// `EpochDbError::stop_on_local_failure`); every other way a round ends is `Ok`.
 async fn manage_epoch_votes(
@@ -4260,5 +4267,142 @@ mod epoch_vote_collector_tests {
         assert_eq!(read.misses.get("recertify"), Some(&(4, 1)), "{read:?}");
         assert!(read.recertify.is_empty(), "{read:?}");
         assert!(!fx.retained.take_recertify(0), "the prune dropped the mark");
+    }
+
+    /// What [`conflicting_record_round`] saw.
+    struct ConflictingRound {
+        /// The kind the round was given when it started.
+        kind: RoundKind,
+        /// Whether the round called the node's shutdown.
+        stopped: bool,
+        /// Whether the store holds a certificate for the network's record afterwards.
+        adopted: bool,
+        /// The round's `epoch-manager` lines.
+        lines: Vec<String>,
+    }
+
+    /// Run a vote round for this node's own record of epoch 1 that falls short, and whose peer
+    /// recovery downloads a different record of epoch 1 that validates against the epoch-0
+    /// record, certified by three of its four members.
+    ///
+    /// `recertify` is the switch `epoch_record_recertify`; with it on, `latest` is the newest
+    /// record the collector saw, so 3 makes the round a re-certify round and 2 the previous
+    /// record's round, and `mark` makes the round one this node picked to re-certify.
+    async fn conflicting_record_round(
+        recertify: bool,
+        latest: Epoch,
+        mark: bool,
+    ) -> ConflictingRound {
+        let mut rng = StdRng::from_os_rng();
+        let pairs: Vec<BlsKeypair> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let public: Vec<BlsPublicKey> = pairs.iter().map(|pair| *pair.public()).collect();
+        let keys: Vec<KeyConfig> = pairs.into_iter().map(KeyConfig::new_with_testing_key).collect();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("conflicting_record_round").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: public.clone(),
+            next_committee: public.clone(),
+            ..Default::default()
+        };
+        let ours = EpochRecord {
+            epoch: 1,
+            committee: public.clone(),
+            next_committee: public.clone(),
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        // the network's record of epoch 1: the same committee, another next committee
+        let theirs = EpochRecord { next_committee: public[1..].to_vec(), ..ours.clone() };
+        assert_ne!(theirs.digest(), ours.digest());
+        let theirs_digest = theirs.digest();
+        consensus_chain.epochs().save_record(rec0).await.unwrap();
+        consensus_chain.epochs().save_record(ours.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+        let cert = make_cert(&theirs, &[&keys[0], &keys[1], &keys[2]]);
+
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        let peer = public[1];
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::SendRequestAny { reply, .. } = cmd {
+                    let _ = reply.send(Ok(NetworkResponseMessage {
+                        peer,
+                        result: PrimaryResponse::EpochRecord {
+                            record: theirs.clone(),
+                            certificate: cert.clone(),
+                        },
+                    }));
+                }
+            }
+        });
+        let retained = recertify.then(RetainedEpochVotes::default);
+        if let Some(retained) = &retained {
+            retained.prune(consensus_chain.epochs(), latest).await;
+            if mark {
+                retained.mark_recertify(ours.epoch);
+            }
+        }
+        let kind = retained.as_ref().map_or(RoundKind::Current, |r| r.round_kind(ours.epoch));
+
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
+        let node_shutdown = ShutdownNotifier::new();
+        let noticer = node_shutdown.subscribe();
+        let db = consensus_chain.epochs().clone();
+
+        // no vote arrives and the sender stays open, so the windows time out into recovery
+        let (_vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+        manage_epoch_votes(
+            ours,
+            keys[0].clone(),
+            primary_network,
+            vote_rx,
+            consensus_chain,
+            node_shutdown,
+            retained,
+        )
+        .await
+        .expect("no local store failure");
+
+        let adopted = db.cert_by_digest(theirs_digest).await.is_some();
+        let lines = lines.lock().clone();
+        ConflictingRound { kind, stopped: noticer.noticed(), adopted, lines }
+    }
+
+    /// A re-certify round whose peer recovery validates a certified record that differs from this
+    /// node's own record of the epoch stops the node, as the previous record's round does: it
+    /// logs the fork at error, calls the node's shutdown and does not adopt the network's
+    /// record, whether this node picked the record to re-certify or another member's re-vote
+    /// started the round. The previous record's round and a round with `epoch_record_recertify`
+    /// off are run the same way.
+    #[tokio::test(start_paused = true)]
+    async fn test_recertify_round_stops_on_a_conflicting_record() {
+        for (recertify, latest, mark, expected) in [
+            (true, 3, true, RoundKind::Recertify),
+            (true, 3, false, RoundKind::Recertify),
+            (true, 2, false, RoundKind::Current),
+            (false, 3, false, RoundKind::Current),
+        ] {
+            let round = conflicting_record_round(recertify, latest, mark).await;
+            let case = format!("recertify={recertify} latest={latest} mark={mark}");
+            assert_eq!(round.kind, expected, "{case}");
+            assert!(round.stopped, "{case}: {:?}", round.lines);
+            assert!(!round.adopted, "{case}: the network's record must not be certified here");
+            assert!(
+                round
+                    .lines
+                    .iter()
+                    .any(|line| line.starts_with("ERROR ") && line.ends_with("we have forked!")),
+                "{case}: {:?}",
+                round.lines
+            );
+        }
     }
 }
