@@ -329,14 +329,16 @@
 //! if a tenth or more are, and each form's skips by class must equal MDBX's run's. On a difference
 //! proptest shrinks the script and prints both outcome lists. The scripts come from a new random
 //! seed each run, printed with the counts and in a failure's message (`PROPTEST_RNG_SEED` reruns
-//! it, or picks the seed); `random_scripts_skip_counts_are_pinned_at_seed_1` (and `_heavy`) runs
-//! the scripts of seed 1 and pins their counts by class, so a class whose share moved fails.
+//! it, or picks the seed); `random_scripts_skip_counts_are_pinned_at_seed_1` (and `_heavy` and
+//! `_multi_leaf`) runs the scripts of seed 1 and pins their counts by class and the dup table's
+//! cursor calls, so a class whose share moved fails.
 //! `random_scripts_match_mdbx_multi_leaf` (and `_heavy`) runs the same scripts on tables seeded
 //! with 250 rows under one `PlainStorageState` key and 250 `CanonicalHeaders`, the drawn keys and
 //! slots spread over them and the dup values in a wide encoding (subkeys that differ past their
 //! first byte, rests of several lengths), so the cursor writes and moves run inside multi-leaf
 //! nested trees and composite trees; in every run the dup table's skipped cursor calls must stay
-//! under a fifth of those run.
+//! under a fifth of those run in a heavy run, and under a quarter in a default one, whose 32
+//! scripts spread that share wide.
 //!
 //! **The crash cycles** (`killed_child_reopens_to_its_last_commit`, 5 cycles, and
 //! `killed_child_reopens_to_its_last_commit_heavy`, 200 in release; Unix only) run a child process
