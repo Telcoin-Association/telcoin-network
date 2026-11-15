@@ -730,21 +730,29 @@ fn interrupted_install_note(epoch: Epoch) -> String {
     )
 }
 
-/// Select which epochs `db repair` targets, given all `epoch-{N}` dirs (sorted ascending) and an
-/// optional `--epoch`. In all-mode (`requested == None`) the current/latest epoch — the one a
-/// running node holds open for append — is skipped and returned as the second element; `--epoch N`
-/// targets exactly N (no skip). The caller validates that a requested epoch exists.
+/// Select which epochs `db repair` targets, given all `epoch-{N}` dirs (sorted ascending), the
+/// interrupted installs (`epoch-{N}.replaced` with no `epoch-{N}`) and an optional `--epoch`. In
+/// all-mode (`requested == None`) the current/latest epoch — the one a running node holds open for
+/// append — is skipped and returned as the second element; `--epoch N` targets exactly N (no
+/// skip). The caller validates that a requested epoch exists, and leaves an interrupted install out
+/// of the targets.
 ///
-/// "Current" here is a best-effort heuristic: the highest-numbered `epoch-{N}` directory. That is
-/// the live epoch except in the brief window during an epoch transition when the next epoch's
-/// directory already exists on disk before the node has switched to it — the `LatestConsensus`
-/// slot, not the directory listing, is the authoritative current epoch. This skip is only a
-/// convenience guard against fat-fingering a repair of the live pack; the real safety requirement
-/// is that the node is stopped (a running node holds its pack mmap'd for append regardless of which
-/// epoch is "current"). Pass `--epoch N` to target an exact epoch when the heuristic would pick
-/// wrong.
-fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Option<Epoch>) {
-    let current = all.last().copied();
+/// "Current" here is a best-effort heuristic: the highest epoch with an `epoch-{N}` directory or an
+/// interrupted install, which the node's next start (and `--force`) puts back as `epoch-{N}`. So a
+/// dry run, which leaves an interrupted install in place, skips the epoch `--force` skips once it
+/// has put it back. That is the live epoch except in the brief window during an epoch transition
+/// when the next epoch's directory already exists on disk before the node has switched to it — the
+/// `LatestConsensus` slot, not the directory listing, is the authoritative current epoch. This skip
+/// is only a convenience guard against fat-fingering a repair of the live pack; the real safety
+/// requirement is that the node is stopped (a running node holds its pack mmap'd for append
+/// regardless of which epoch is "current"). Pass `--epoch N` to target an exact epoch when the
+/// heuristic would pick wrong.
+fn repair_targets(
+    all: &[Epoch],
+    interrupted: &[Epoch],
+    requested: Option<Epoch>,
+) -> (Vec<Epoch>, Option<Epoch>) {
+    let current = all.iter().chain(interrupted).copied().max();
     match requested {
         Some(e) => (vec![e], None),
         None => (all.iter().copied().filter(|e| Some(*e) != current).collect(), current),
@@ -770,7 +778,9 @@ fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Optio
 /// names. When there is one, `--force` first runs the node's own start-time step on the epochs
 /// directory (`ConsensusChain::recover_incomplete_installs`), which puts each one back (and
 /// removes an aside left beside its `epoch-N`), so the restored epoch is then checked like any
-/// other.
+/// other. Repair-all mode counts an interrupted install as the epoch it puts back when it picks
+/// the latest epoch to skip, so the dry run skips (and checks) the same epochs `--force` does: a
+/// restored latest epoch is skipped like any latest epoch.
 #[derive(Debug, Args)]
 pub struct DbRepairArgs {
     /// Repair only this epoch. Without it, every epoch except the current/latest is repaired.
@@ -829,7 +839,9 @@ impl DbRepairArgs {
                 bail!("epoch {e} not found under {}", epochs_dir.display());
             }
         }
-        let (mut targets, skipped_current) = repair_targets(&all, self.epoch);
+        // `interrupted` is what is still to put back (after `--force`'s restore, only what it
+        // failed to restore, and `all` holds what it restored), so both modes pick the same latest.
+        let (mut targets, skipped_current) = repair_targets(&all, &interrupted, self.epoch);
         targets.retain(|e| !interrupted.contains(e));
         if let Some(cur) = skipped_current {
             writeln!(
@@ -2090,14 +2102,50 @@ mod tests {
     #[test]
     fn repair_targets_skips_current_epoch_in_all_mode() {
         // All-mode: every epoch except the current/latest, which is returned as skipped.
-        assert_eq!(repair_targets(&[0, 1, 2], None), (vec![0, 1], Some(2)));
+        assert_eq!(repair_targets(&[0, 1, 2], &[], None), (vec![0, 1], Some(2)));
         // Single epoch is the current one: skipped, nothing to repair.
-        assert_eq!(repair_targets(&[5], None), (vec![], Some(5)));
+        assert_eq!(repair_targets(&[5], &[], None), (vec![], Some(5)));
         // No epochs on disk.
-        assert_eq!(repair_targets(&[], None), (vec![], None));
+        assert_eq!(repair_targets(&[], &[], None), (vec![], None));
         // Explicit --epoch targets exactly that epoch (including the current one), no skip.
-        assert_eq!(repair_targets(&[0, 1, 2], Some(2)), (vec![2], None));
-        assert_eq!(repair_targets(&[0, 1, 2], Some(0)), (vec![0], None));
+        assert_eq!(repair_targets(&[0, 1, 2], &[], Some(2)), (vec![2], None));
+        assert_eq!(repair_targets(&[0, 1, 2], &[], Some(0)), (vec![0], None));
+        // An interrupted install above every `epoch-N` is the latest epoch (the start puts it
+        // back), so the highest `epoch-N` is a target; one below them changes nothing.
+        assert_eq!(repair_targets(&[0, 1, 2], &[3], None), (vec![0, 1, 2], Some(3)));
+        assert_eq!(repair_targets(&[0, 2], &[1], None), (vec![0], Some(2)));
+        assert_eq!(repair_targets(&[], &[4], None), (vec![], Some(4)));
+    }
+
+    /// Repair-all mode skips the same latest epoch in the dry run as with `--force` when that epoch
+    /// is an interrupted install: the dry run leaves `epoch-2.replaced` in place, `--force` puts it
+    /// back as `epoch-2` first, and both skip epoch 2 and check epoch 1, so the dry run previews
+    /// what `--force` does.
+    #[test]
+    fn db_repair_skips_the_same_latest_epoch_in_both_modes_beside_an_interrupted_install() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        fs::create_dir_all(epochs.join("epoch-0")).unwrap();
+        fs::create_dir_all(epochs.join("epoch-1")).unwrap();
+        fs::create_dir_all(epochs.join("epoch-2.replaced")).unwrap();
+        for force in [false, true] {
+            let mut out = Vec::new();
+            // the bare directories hold no pack, so the checks of epochs 0 and 1 report errors;
+            // only which epochs are checked and skipped matters here
+            let _ = super::DbRepairArgs { epoch: None, force }.run(datadir.clone(), &mut out);
+            let report = String::from_utf8(out).unwrap();
+            assert!(report.contains("epoch 2: SKIPPED (current/latest epoch)"), "{report}");
+            assert!(!report.contains("epoch 1: SKIPPED"), "{report}");
+            for epoch in [0, 1] {
+                assert!(
+                    report.lines().any(|line| line.starts_with(&format!("epoch {epoch}: "))),
+                    "force {force}: epoch {epoch} is checked: {report}"
+                );
+            }
+        }
+        assert!(epochs.join("epoch-2").is_dir(), "--force put the interrupted install back");
     }
 
     #[cfg(unix)]
