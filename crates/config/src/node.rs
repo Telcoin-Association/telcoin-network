@@ -423,7 +423,9 @@ pub struct Parameters {
     /// collection stops at the first epoch the network left uncertified, on every node and
     /// across restarts. Issue #1850.
     ///
-    /// The switch does not change what a conflict does. A peer's record that validates against
+    /// The switch does not change what a conflict does. With the walk on, though, the collection
+    /// reaches epochs past an uncertified one, so it can meet, and stop on, a conflict there that
+    /// a node with the walk off never asks for. A peer's record that validates against
     /// this node's record of the epoch before, but differs from the record this node stored for
     /// the same epoch, stops the node with the walk on or off: in the record collector and its
     /// gap retry it ends the collector, in the startup sync it fails startup, and it does so again

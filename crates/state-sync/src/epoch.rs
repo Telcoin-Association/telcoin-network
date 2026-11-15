@@ -210,22 +210,25 @@ impl<'m> Collection<'m> {
     /// A [`EpochDbError::ConflictingRecord`] here is a certified record that validated against
     /// this node's record of the epoch before, with a super-quorum certificate of the committee
     /// that record hands over to, and that differs from the record this node stored for the epoch.
-    /// That shows only that this many members of the committee signed another record than this
-    /// node's: either this node's record is wrong or the signers are faulty, which the evidence
-    /// cannot tell apart. No single peer can cause it: the certificate takes more than `f` members
-    /// of the committee this node's own previous record names (see
-    /// [`tn_types::EpochRecord::committee_compatible`]).
+    /// No single peer can cause it: the certificate takes more than `f` members of the committee
+    /// this node's own previous record names (see [`tn_types::EpochRecord::committee_compatible`]).
+    /// [`stop_on_local_failure`] reads a conflict as this node's execution having diverged from
+    /// the certified chain, counts it in `tn_epoch.final_state_mismatches_total` and stops the
+    /// node. The evidence line logged before that stop lets an operator check that reading: it
+    /// names who certified the other record, and how many members of which committee.
     ///
-    /// A conflict is counted in `tn_state_sync.epoch_record_conflicts_total` and logged at error
-    /// with what an operator needs to look into it (see [`ConflictEvidence`]): both digests, the
+    /// The evidence is read first (see [`ConflictEvidence`]). Only then is the conflict counted in
+    /// `tn_state_sync.epoch_record_conflicts_total`, logged at error and handed to
+    /// [`stop_on_local_failure`], with no await between the count and the stop: an attempt
+    /// cancelled while the evidence is read (a startup pass cut short by its deadline or by
+    /// shutdown) counts nothing and logs nothing, and the attempt that meets the conflict again
+    /// counts it once. The line starts with `epoch record conflict:` and carries both digests, the
     /// peer that served the record (a relay, not necessarily a signer), the certificate's signers
     /// as authority ids, how many signed out of how many members of the committee the record
     /// before the epoch names, and the offered record's epoch, parent and final execution state.
-    /// The line starts with `epoch record conflict:`. The conflict then goes to
-    /// [`stop_on_local_failure`] like every other failed save, which stops the node on it: the
-    /// error ends the record collector (and so the node) or fails startup, and it repeats on every
-    /// restart, since the startup sync meets the same conflict. For every other failed save our own
-    /// store failing stops the node and a refusal is logged.
+    /// The stop ends the record collector (and so the node) or fails startup, and it repeats on
+    /// every restart, since the startup sync meets the same conflict. For every other failed save
+    /// our own store failing stops the node and a refusal is logged.
     async fn refused(
         &self,
         e: EpochDbError,
@@ -235,8 +238,10 @@ impl<'m> Collection<'m> {
         consensus_chain: &ConsensusChain,
     ) -> eyre::Result<()> {
         if let EpochDbError::ConflictingRecord { stored, offered, .. } = &e {
-            self.metrics.epoch_record_conflicts_total.increment(1);
+            // the only await comes before the count: a pass cancelled at it has counted nothing,
+            // and from the count on nothing can cancel the attempt before the stop
             let evidence = ConflictEvidence::read(epoch, record, cert, consensus_chain).await;
+            self.metrics.epoch_record_conflicts_total.increment(1);
             let signers = evidence.signer_ids.len();
             let committee = evidence.committee;
             error!(
@@ -558,8 +563,11 @@ fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
 /// the epoch is a gap of `collection`, which the record collector asks for again
 /// ([`retry_gaps`]). If the walk ends before that, on a record naming another parent (this node's
 /// own record differs from the one the network built on), a peer without the next record or no
-/// answer, the pass stops where it would have stopped with the walk off. A pass that walked always
-/// ends with the persist and the final-consensus publish below, a refused record included.
+/// answer, the pass stops where it would have stopped with the walk off. A pass that walked ends
+/// with the persist and the final-consensus publish below, a refused record included, unless it
+/// fails: a conflicting certified record or our own store failing to save a record ends it at
+/// once, before the persist, as it ends a pass with the walk off; a failed persist ends it before
+/// the publish.
 async fn collect_epoch_records(
     last_epoch: Epoch,
     consensus_chain: &ConsensusChain,
@@ -577,6 +585,7 @@ async fn collect_epoch_records(
     // epochs this pass walked past that no stored certified record after them confirms yet
     let mut walked: Vec<Epoch> = Vec::new();
     // whether this pass walked at all: such a pass ends at the persist below, whatever stops it
+    // short of a failure
     let mut walked_any = false;
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
@@ -2411,6 +2420,68 @@ mod tests {
             .find(|line| line.starts_with("got an invalid epoch record, epoch 1"))
             .ok_or_else(|| eyre::eyre!("no invalid-record line in {lines:?}"))?;
         assert!(invalid.contains(&format!(" peer={peer}")), "{invalid}");
+        Ok(())
+    }
+
+    /// A conflict is counted once, after its evidence is read. An attempt dropped after one poll
+    /// that left it waiting on the epoch store for the evidence (as a startup pass cut short by its
+    /// deadline or by shutdown is) counts nothing and logs nothing; the attempt that meets the
+    /// conflict again counts it once in each counter and logs the evidence line before the stop's.
+    /// If the store answers within that one poll, the attempt runs to the stop and only the counts
+    /// are checked.
+    #[tokio::test]
+    async fn test_a_conflict_cancelled_at_its_evidence_read_is_counted_once() -> eyre::Result<()> {
+        use futures::FutureExt as _;
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let (keys, signers) = keys_and_signers(&fixture);
+        let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 1).await?;
+        let mut theirs = records[1].0.clone();
+        theirs.final_state.number = 7;
+        let cert = make_cert(&theirs, &signers, &[0, 1, 2]);
+        let (stored, offered) = (records[1].0.digest(), theirs.digest());
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = ::metrics::set_default_local_recorder(&recorder);
+        let metrics = StateSyncMetrics::new_with_labels(Vec::<::metrics::Label>::new());
+        let collection = Collection::new(EpochRecordCollectSwitches::default(), &metrics);
+        let stop = "a certified epoch record from peers conflicts with this node's own record";
+
+        let conflict = EpochDbError::ConflictingRecord { epoch: 1, stored, offered };
+        let (first, lines) = lines_of(async {
+            collection.refused(conflict, 1, keys[0], (&theirs, &cert), &chain).now_or_never()
+        })
+        .await;
+        match first {
+            None => {
+                let counted = counters(&snapshotter);
+                assert_eq!(counted.get(CONFLICTS).copied().unwrap_or(0), 0, "{counted:?}");
+                assert_eq!(counted.get(FINAL_STATE_MISMATCHES).copied().unwrap_or(0), 0);
+                assert!(lines.is_empty(), "a cancelled attempt logs nothing: {lines:?}");
+
+                let conflict = EpochDbError::ConflictingRecord { epoch: 1, stored, offered };
+                let (stopped, lines) =
+                    lines_of(collection.refused(conflict, 1, keys[0], (&theirs, &cert), &chain))
+                        .await;
+                let err = stopped.expect_err("a conflict stops the node");
+                assert!(format!("{err:#}").contains("diverged"), "unexpected error: {err:#}");
+                let position =
+                    |prefix: &str| lines.iter().position(|line| line.starts_with(prefix));
+                let evidence_at = position(CONFLICT_PHRASE).expect("the evidence line is logged");
+                let stop_at = position(stop).expect("the stop's line is logged");
+                assert!(evidence_at < stop_at, "the evidence line comes first: {lines:?}");
+            }
+            // the epoch store answered within the one poll: there was no wait to cancel the
+            // attempt at, and it ran to the stop
+            Some(stopped) => {
+                let err = stopped.expect_err("a conflict stops the node");
+                assert!(format!("{err:#}").contains("diverged"), "unexpected error: {err:#}");
+            }
+        }
+        let counted = counters(&snapshotter);
+        assert_eq!(counted.get(CONFLICTS), Some(&1), "{counted:?}");
+        assert_eq!(counted.get(FINAL_STATE_MISMATCHES), Some(&1), "{counted:?}");
         Ok(())
     }
 
