@@ -256,7 +256,8 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
 torn epoch-meta is never repaired — INV2), `CorruptMetaWithData`, `MidLogCorruption`,
 `CorruptSealedRecord` (data loss). Only a `TornTrailingTail` exits `db validate` with success. Nothing
 fetches a past epoch's pack again, so each report of data loss ends with the recovery
-(`pack_validate::lost_pack_remedy`): restore `consensus-db` (or the epoch's directory) from a backup, or
+(`pack_validate::lost_pack_remedy`): put back the epoch's directory from a backup taken after that epoch
+closed (a sealed past pack never changes; a whole `consensus-db` from an older backup lacks the later packs), or
 start the node over (crates/tn-reth/README.md, "Transactions stored by position"), and never delete the
 `epoch-N` directory, which a datadir storing transactions by position needs at every start. Only the
 newest epoch's torn-empty meta or all-zero data file holds no output: the node creates (or

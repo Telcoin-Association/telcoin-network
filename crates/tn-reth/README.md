@@ -1042,7 +1042,12 @@ CHANGES.md TN-0200..0203.
   (`TxPackCoverageError`, from `RethEnv::attach_tx_packs`), naming the blocks, the epochs they
   point into, the missing ones and the recovery below.
 - **Recovery.**
-  - A missing pack (the start refused): restore `consensus-db/` from a backup. The node cannot
+  - A missing pack (the start refused): put back each missing `consensus-db/epochs/epoch-N/` from
+    a backup taken after that epoch closed (a sealed epoch's pack never changes; check the copy
+    with `db validate` first). A whole `consensus-db/` from an older backup lacks the packs of the
+    epochs since it was taken, so it fixes the gap only with the execution database restored from
+    the same stop or rebuilt, and a validator restored that way stays stopped until the network
+    has closed the epoch it was last in (its later votes are not in the backup). The node cannot
     rebuild a lost pack itself: it fetches no pack below the epoch its consensus database is at,
     and a rebuild of the execution database (`db reset-execution`) re-executes from its own packs,
     so it stops at the same gap. Without a backup the node starts over as a new one: move the
@@ -1057,8 +1062,8 @@ CHANGES.md TN-0200..0203.
     log is rebuilt from the data log in the background, as a consensus read of the epoch rebuilds
     it, and its reads answer again once that is done. With the node stopped, `telcoin-network db
     validate` reports the pack's damage and `db repair` fixes what it can
-    (crates/storage/README.md); otherwise restore `consensus-db/` from a backup, or start over as
-    above.
+    (crates/storage/README.md); otherwise put back that epoch's directory from a backup taken
+    after it closed, or start over as above.
   - `handoff_timeout`: a closed epoch's pack stayed unsealed or mid-install for a second. During
     an epoch handoff it passes; if it stays, a past epoch's pack was left unsealed: `db
     validate`.
@@ -1239,9 +1244,9 @@ of an epoch below the latest one it holds (a pack counts as the node's start fin
 log, an interrupted install's aside included), as a datadir bootstrapped with `db load-state` does
 (it holds consensus only from the restored epoch on) and one that lost a pack does. The rebuild
 re-executes every epoch from 0 from the node's own packs, and the node fetches no pack below the
-epoch its consensus database is at, so every start would stop at the gap. Such a node restores
-`consensus-db/` from a backup, or rebuilds as a new one: move `consensus-db/` aside as well, as for
-a forked record below, and it syncs from genesis.
+epoch its consensus database is at, so every start would stop at the gap. Such a node puts back
+each missing `epoch-N/` from a backup taken after that epoch closed, or rebuilds as a new one: move
+`consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
 A validator rebuilt that way stays stopped until the network has closed the last epoch it took part
 in: its votes and proposals for that epoch leave with `consensus-db/`. A validator takes the
 side-observer swap below instead, which keeps its `consensus-db/`: `--for-swap` skips this refusal,

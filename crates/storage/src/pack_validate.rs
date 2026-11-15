@@ -228,12 +228,16 @@ impl CorruptionKind {
 /// `TxPackCoverageError`).
 pub fn lost_pack_remedy(epoch_dir: impl Display) -> String {
     format!(
-        "No node or command fetches a past epoch's pack again. With the node stopped, restore \
-         `consensus-db` from a backup, or only `{epoch_dir}` from a backup taken after its epoch \
-         closed; without a backup, start the node over as the recovery steps for a missing pack in \
-         crates/tn-reth/README.md (\"Transactions stored by position\") describe. Do NOT delete \
-         `{epoch_dir}` or the chain-data directories (`db`, `static_files`, `consensus-db`): a \
-         datadir that stores transactions by position refuses every start without that pack."
+        "No node or command fetches a past epoch's pack again. A sealed past epoch's pack never \
+         changes, so with the node stopped put back only `{epoch_dir}` from a backup taken after \
+         its epoch closed (check the copy with `telcoin-network db validate` first). A whole \
+         `consensus-db` from an older backup lacks the packs of the epochs since it was taken, \
+         and a validator restored that way stays stopped until the network has closed the epoch \
+         it was last in. Without a backup, start the node over as the recovery steps for a \
+         missing pack in crates/tn-reth/README.md (\"Transactions stored by position\") \
+         describe. Do NOT delete `{epoch_dir}` or the chain-data directories (`db`, \
+         `static_files`, `consensus-db`): a datadir that stores transactions by position refuses \
+         every start without that pack."
     )
 }
 

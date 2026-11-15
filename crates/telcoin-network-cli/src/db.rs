@@ -188,7 +188,8 @@ enum DbSubcommand {
     /// in a batch of the consensus packs, so a rebuild is how an existing datadir moves to that
     /// format, and from then on the node needs every pack its rows point into. A start that finds
     /// one missing refuses, naming the epochs, and a rebuild does not get past that (it
-    /// re-executes from the same packs): restore `consensus-db` from a backup, or start over as a
+    /// re-executes from the same packs): put back each missing past `epoch-N` from a backup taken
+    /// after that epoch closed, or start over as a
     /// new node with `consensus-db` moved aside as well, or swap in an observer's execution
     /// database (`--for-swap`).
     ResetExecution(DbResetExecutionArgs),

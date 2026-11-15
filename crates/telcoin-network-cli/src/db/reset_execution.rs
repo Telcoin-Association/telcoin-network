@@ -180,7 +180,8 @@ fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
          up to epoch {latest}) lacks the pack of epoch(s) {}, so every start would stop at the \
          first missing one: the node fetches no pack below the epoch its consensus database is \
          at. A datadir bootstrapped with `db load-state` holds packs only from the restored epoch \
-         on. To rebuild it, restore `consensus-db` from a backup that holds every epoch, or move \
+         on. To rebuild it, put back each missing `epoch-N` directory from a backup taken after \
+         that epoch closed (a sealed epoch's pack never changes), or move \
          `consensus-db` aside as well, so the node syncs from genesis as a new one does (a \
          validator then stays stopped until the network has closed the last epoch it took part \
          in). For the side-observer swap, which copies a synced observer's execution database in \
@@ -595,7 +596,10 @@ mod tests {
                 err.contains("(packs up to epoch 6) lacks the pack of epoch(s) 1, 4,"),
                 "{err}"
             );
-            assert!(err.contains("restore `consensus-db` from a backup"), "{err}");
+            assert!(
+                err.contains("put back each missing `epoch-N` directory from a backup"),
+                "{err}"
+            );
             assert!(err.contains("pass `--for-swap`"), "{err}");
             assert_eq!(
                 names(root),

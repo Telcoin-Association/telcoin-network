@@ -458,7 +458,7 @@ async fn a_lost_or_damaged_pack_refuses_the_start_or_fails_the_read() -> eyre::R
     let message = err.to_string();
     for says in [
         "lacks epoch(s) 1.",
-        "Restore `consensus-db` from a backup",
+        "Put back each missing `epoch-N` directory from a backup taken after that epoch closed",
         "db load-state` from epoch 1 or a later one",
     ] {
         assert!(message.contains(says), "{message}");
