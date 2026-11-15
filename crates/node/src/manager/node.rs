@@ -1561,8 +1561,9 @@ where
         // `wait_until_sole_owner` before `close()` — and if it outlives that wait,
         // `close()` now force-seals rather than leaving the pack unsealed.) Surfacing the
         // storage error before draining (a bare `?`) would skip that drain; the `Drop`
-        // fallback is runtime-safe regardless. A storage error still takes precedence over
-        // `result`.
+        // fallback is runtime-safe regardless. On a clean stop a storage error is the exit
+        // error; when the loop failed, its own error is (`finish_stopped_epoch` logs what the
+        // stop meets then).
         let stop_result = self.finish_stopped_epoch(result.is_err()).await;
         node_task_manager.shutdown_tasks(NODE_TASK_EXIT_GRACE).await;
         stop_result?;
