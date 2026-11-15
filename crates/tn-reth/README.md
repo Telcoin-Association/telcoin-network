@@ -904,7 +904,11 @@ as its index in the consensus batch its block executed ("Transactions stored by 
   direction, the database ahead of the static files (an unwind target: static files lost, removed
   or swapped for an older copy), is refused too: TN has no stage pipeline to unwind the database,
   so the start stops with "storage consistency check found the database ahead of the static
-  files", saying to restore the datadir from a snapshot or backup.
+  files", saying to restore the execution database (`db/`, `static_files/` and any
+  `restored-state-floor`, all from one stop) from a backup or to rebuild it (`db
+  reset-execution`); a restore of the whole datadir, or into a new one from a snapshot, replaces
+  `consensus-db/` too, and a validator restored that way stays stopped until the network has
+  closed the epoch it was last in.
 
 - **Logs:** `new reth datadir: storage format` (with `layout`, `tx_bodies` and the marker's
   `version`) or `reth datadir: storage format` (with `layout` and `tx_bodies`) at each start; an
@@ -1246,11 +1250,13 @@ again. The moves are staged in `execution-reset-<UTC time>.partial/`, renamed on
 refuses to start while a `.partial` directory holding an entry is there, and running the command
 again finishes it. An empty one (left when the entries are moved back to undo it) blocks nothing.
 It refuses, dry run included, and moves nothing, a datadir whose consensus database lacks the pack
-of an epoch below the latest one it holds (a pack counts as the node's start finds it, its `data`
-log, an interrupted install's aside included), as a datadir bootstrapped with `db load-state` does
-(it holds consensus only from the restored epoch on) and one that lost a pack does. The rebuild
-re-executes every epoch from 0 from the node's own packs, and the node fetches no pack below the
-epoch its consensus database is at, so every start would stop at the gap. Such a node puts back
+of an epoch below the latest one it holds, at or below the epoch the node resumes from (its
+latest-consensus hint; a pack counts as the node's start finds it, its `data` log, an interrupted
+install's aside included), as a datadir bootstrapped with `db load-state` does (it holds consensus
+only from the restored epoch on) and one that lost a past pack does. The rebuild re-executes every
+epoch from 0 from the node's own packs, and the node fetches only the packs of the epochs after the
+one it resumes from, so every start would stop at the gap. A pack missing after that epoch does not
+refuse: the next start fetches it from peers. Such a node puts back
 each missing `epoch-N/` from a backup taken after that epoch closed, or rebuilds as a new one: move
 `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
 A validator rebuilt that way stays stopped until the network has closed the last epoch it took part

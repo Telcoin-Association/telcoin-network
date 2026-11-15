@@ -1394,7 +1394,7 @@ impl Inner {
         if records_len > digest_final && digest_final > DATA_HEADER_BYTES as u64 {
             return Err(EpochDbError::CorruptLog(format!(
                 "sealed records log is {records_len} bytes but its digest index attests only \
-                 {digest_final}; at-rest corruption, re-sync required"
+                 {digest_final}; at-rest corruption; `telcoin-network db repair` names the recovery"
             )));
         }
         if !epoch_idx.is_empty() {
@@ -1403,7 +1403,7 @@ impl Inner {
             {
                 return Err(EpochDbError::CorruptLog(format!(
                     "sealed records log: its last indexed record does not decode ({e}); at-rest \
-                     corruption, re-sync required"
+                     corruption; `telcoin-network db repair` names the recovery"
                 )));
             }
         }
@@ -1437,7 +1437,7 @@ impl Inner {
         if certs_len > digest_final && digest_final > DATA_HEADER_BYTES as u64 {
             return Err(EpochDbError::CorruptLog(format!(
                 "sealed certs log is {certs_len} bytes but its digest index attests only \
-                 {digest_final}; at-rest corruption, re-sync required"
+                 {digest_final}; at-rest corruption; `telcoin-network db repair` names the recovery"
             )));
         } else if certs_len > DATA_HEADER_BYTES as u64
             && !certs.any_content_after(DATA_HEADER_BYTES as u64)
@@ -1645,7 +1645,7 @@ impl Inner {
         if !log.opened_unclean() {
             return Err(EpochDbError::CorruptLog(format!(
                 "sealed {name} log stops decoding at offset {consistent_end} of {} ({cause}); \
-                 at-rest corruption, re-sync required",
+                 at-rest corruption; `telcoin-network db repair` names the recovery",
                 log.file_len()
             )));
         }
@@ -1825,7 +1825,8 @@ impl Inner {
         if attested_end > header && !log.is_some_and(|log| log.any_content_after(header)) {
             return Err(EpochDbError::CorruptLog(format!(
                 "the {name} log holds no record but its digest index attests {attested_end} \
-                 bytes of acked records; the log was lost, re-sync required"
+                 bytes of acked records; the log was lost; `telcoin-network db repair` names the \
+                 recovery"
             )));
         }
         Ok(())
@@ -1861,7 +1862,7 @@ impl Inner {
             let Some(cause) = stop else { return Ok(()) };
             return Err(EpochDbError::CorruptLog(format!(
                 "sealed {name} log stops decoding at offset {consistent_end} of {} ({cause}); \
-                 at-rest corruption, re-sync required",
+                 at-rest corruption; `telcoin-network db repair` names the recovery",
                 log.file_len()
             )));
         }
@@ -2012,7 +2013,8 @@ impl Inner {
         if attests && Self::acked_damage_after_tear(log, attested, name)? {
             return Err(EpochDbError::CorruptLog(format!(
                 "{name} log has an undecodable record followed by acked records (durably synced \
-                 through offset {}); at-rest corruption of acked data, re-sync required",
+                 through offset {}); at-rest corruption of acked data; \
+                 `telcoin-network db repair` names the recovery",
                 attested.end
             )));
         }
@@ -2334,7 +2336,8 @@ impl Inner {
     /// the index alone. One that is indexed but does not read back is an error carrying the cause,
     /// never "stored" (a save would be a silent no-op) nor "absent": a replacement appended after
     /// it would leave the damaged certificate in the log, where an unclean reopen's rebuild
-    /// refuses to drop the acked certificates past it, so the cure is a re-sync.
+    /// refuses to drop the acked certificates past it, so the cure is a backup of the epoch-records
+    /// files (`db repair` names the recovery).
     fn cert_stored(&mut self, digest: EpochDigest) -> Result<bool, EpochDbError> {
         self.try_cert_by_digest(digest).map(|cert| cert.is_some()).map_err(
             EpochDbError::unreadable(format!("the stored certificate for record {digest}")),

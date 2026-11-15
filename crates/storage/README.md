@@ -331,8 +331,9 @@ failure is never reported to someone else), and closing persists before the file
 epoch's record is never replaced: re-saving the same record is a no-op, and a different one is refused
 (`ConflictingRecord`), since epoch records are identical on every node. A stored certificate counts
 only if it reads back: one that does not is not certified (`first_missing_historical_cert` stops at
-it), and a re-save reports it (`Unreadable`) rather than skipping or replacing it; the cure is a
-re-sync. The by-number routing follows only what is stored: it is built at open and extended after
+it), and a re-save reports it (`Unreadable`) rather than skipping or replacing it; nothing fetches
+it again, so the cure is a backup of the epoch-records files (`db repair` names the recovery). The
+by-number routing follows only what is stored: it is built at open and extended after
 each save by the same checked read (`extend_routing`), and a stored record that does not read back
 fails the open, naming its epoch. `certificate_pack` and `exec_state_pack` are per-epoch / per-snapshot packs for
 certificate bundles and EVM state exports.

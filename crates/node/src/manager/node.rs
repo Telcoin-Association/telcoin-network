@@ -1561,8 +1561,9 @@ where
         // `wait_until_sole_owner` before `close()` — and if it outlives that wait,
         // `close()` now force-seals rather than leaving the pack unsealed.) Surfacing the
         // storage error before draining (a bare `?`) would skip that drain; the `Drop`
-        // fallback is runtime-safe regardless. A storage error still takes precedence over
-        // `result`.
+        // fallback is runtime-safe regardless. On a clean stop a storage error is the exit
+        // error; when the loop failed, its own error is (`finish_stopped_epoch` logs what the
+        // stop meets then).
         let stop_result = self.finish_stopped_epoch(result.is_err()).await;
         node_task_manager.shutdown_tasks(NODE_TASK_EXIT_GRACE).await;
         stop_result?;
@@ -1958,8 +1959,10 @@ where
                         "failed to READ the consensus store while resolving the producing \
                          consensus header for the executed tip (block {}, epoch {tip_epoch}): \
                          this is a storage error, not a missing record - do NOT delete the \
-                         chain-data directories; inspect the consensus-db epoch pack files (or \
-                         restore them from a backup or peers) and retry",
+                         chain-data directories; check the consensus-db epoch packs with \
+                         `telcoin-network db validate` and `db repair` (a dry run), put back a \
+                         damaged past `epoch-N/` from a backup taken after its epoch closed (no \
+                         peer sends a past pack again), and retry",
                         tip.number
                     )
                 })?;

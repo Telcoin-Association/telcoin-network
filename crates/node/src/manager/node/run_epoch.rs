@@ -608,27 +608,41 @@ where
     ///
     /// The loop's other ends come here as well: an epoch that ended through `finish_epoch` left no
     /// pack, and an epoch that failed before it left its pack to be sealed here. When the loop
-    /// itself failed (`loop_failed`), its error is the node's exit error: a store that failed
-    /// mid-epoch is already reported by it (`run_epoch`'s store-failure arm), so the store check
-    /// is skipped rather than reporting the same failure again as an end-of-epoch one.
+    /// itself failed (`loop_failed`), its error is the node's exit error, and this returns `Ok`:
+    /// the failure that ended the loop is often the one a barrier here would meet again (a
+    /// certificate pack whose save failed returns that latched error from its seal too; a store
+    /// that failed mid-epoch is reported by `run_epoch`'s store-failure arm). So the pack is still
+    /// sealed and the consensus pack still persisted, each failure logged, and the store check is
+    /// skipped.
     pub(super) async fn finish_stopped_epoch(&mut self, loop_failed: bool) -> eyre::Result<()> {
-        if let Some(pack) = self.certificate_pack.take() {
-            // a pack still shared after the wait is flushed, and its last handle seals it on drop
-            let _ = tokio::time::timeout(EPOCH_TASK_EXIT_GRACE, async {
-                while Arc::strong_count(&pack) > 1 {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await;
-            seal_certificate_pack(pack).await?;
+        let sealed = match self.certificate_pack.take() {
+            Some(pack) => {
+                // a pack still shared after the wait is flushed, and its last handle seals it on
+                // drop
+                let _ = tokio::time::timeout(EPOCH_TASK_EXIT_GRACE, async {
+                    while Arc::strong_count(&pack) > 1 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+                seal_certificate_pack(pack).await
+            }
+            None => Ok(()),
+        };
+        if loop_failed {
+            if let Err(e) = sealed {
+                error!(target: "epoch-manager", "the failed epoch's certificate pack did not seal: {e:#}");
+            }
+            if let Err(e) = self.consensus_chain.persist_current().await {
+                error!(target: "epoch-manager", "the failed epoch's consensus pack did not persist: {e}");
+            }
+            return Ok(());
         }
+        sealed?;
         self.consensus_chain
             .persist_current()
             .await
             .wrap_err("the consensus pack can no longer make writes durable; stopping the node")?;
-        if loop_failed {
-            return Ok(());
-        }
         ensure_stores_durable(&self.consensus_db).await
     }
 
@@ -1705,6 +1719,11 @@ pub(super) mod tests {
         // a loop that already failed (here: the store-failure arm) is the node's exit error; the
         // stop does not report the same store again as an end-of-epoch failure
         manager.finish_stopped_epoch(true).await.expect("the loop's error reports the store");
+        // nor a certificate pack that failed with the loop (its latched error is the loop's): the
+        // stop still seals it, and leaves the loop's error the node's exit error
+        manager.certificate_pack = Some(Arc::new(CertificatePack::open(blocked.path(), 0)));
+        manager.finish_stopped_epoch(true).await.expect("the loop's error reports the pack");
+        assert!(manager.certificate_pack.is_none(), "the stop took the failed pack to seal it");
         Ok(())
     }
 
