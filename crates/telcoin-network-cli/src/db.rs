@@ -174,7 +174,8 @@ enum DbSubcommand {
     /// hours on a large state. A failed run removes the chain data it created (never keys or
     /// config); a stopped one (killed, power lost) leaves a marker the node refuses, and a rerun
     /// with the same bundle removes what it created and restores again. `--verify-only` runs
-    /// those checks on the bundle and stops, writing nothing.
+    /// those checks and the consensus pack's import (in the system temp directory) on the bundle
+    /// and stops, writing nothing to the datadir.
     ///
     /// The database gets the format new datadirs get: it holds no transaction up to the pack's
     /// block, and in the default build stores each later transaction as its position in the
@@ -1308,9 +1309,13 @@ pub struct DbLoadStateArgs {
     )]
     pub allow_faucet_on_chain: bool,
 
-    /// Check the bundle and stop, writing nothing: the checks a restore runs before its first
-    /// write (the bundle's parts and closed epoch, its whole certificate chain against the genesis
-    /// committee, and its state against the last epoch record), then exit 0 if all pass.
+    /// Check the bundle and stop, writing nothing to the datadir: the checks a restore runs before
+    /// its first write (the bundle's parts and closed epoch, its whole certificate chain against
+    /// the genesis committee, and its state against the last epoch record), and the restore's
+    /// import of the consensus pack (`consensus_data`) against the last epoch records, then exit 0
+    /// if all pass. The consensus pack is imported into a directory under the system temp
+    /// directory, which needs about its size free and is removed afterwards. The state data's own
+    /// records are read only by the restore itself.
     ///
     /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
     /// is used, as a restore would), never written. It takes no datadir lock, so it can vet a
@@ -1408,10 +1413,14 @@ impl DbLoadStateArgs {
         // target is still untouched, instead of after a multi-GB import has already committed.
         check_state_pack_matches_record(&self.pack, last_epoch_record)?;
         if self.verify_only {
+            // The restore imports the consensus pack only after the state, which can take hours:
+            // check it now, as the restore will, outside the datadir.
+            verify_bundle_consensus(&std::env::temp_dir(), &bundle_consensus, &records)?;
             println!(
                 "verified: the bundle at {} restores epoch {} (block {}): its certificate chain \
-                 verifies against the genesis committee and its state matches the epoch record; \
-                 nothing was written",
+                 verifies against the genesis committee, its state matches the epoch record, and \
+                 its consensus pack imports up to the epoch's certified final output; nothing was \
+                 written to the datadir",
                 self.pack.display(),
                 last_epoch_record.epoch,
                 last_epoch_record.final_state.number,
@@ -1885,54 +1894,16 @@ fn restore_consensus_and_records(
                  bootstrap from a later epoch's complete bundle instead"
             );
         }
-        let previous = &records[(n - 1) as usize];
         let final_record = &records[n as usize];
-        let epoch_dir = epochs_dir.join(format!("epoch-{n}"));
-        let file = tokio::fs::File::open(bundle_consensus).await.map_err(|e| {
-            eyre!("failed to open consensus data {}: {e}", bundle_consensus.display())
-        })?;
         // Landing directly at `epochs_dir` (not a temp) is safe here: this is an offline, single
         // writer restore into a fresh datadir, so the online rename/install-lock dance is unneeded.
-        // No free-space floor: the floor guards the node's live stores against peer-supplied
-        // bytes, and this is the operator's own bundle into a datadir nothing else is using; a
-        // real shortage surfaces as the write error.
-        let pack = ConsensusPack::stream_import_with_floor(
+        import_bundle_consensus(
             epochs_dir,
-            file,
-            n,
-            previous,
-            final_record.final_consensus,
-            STREAM_IMPORT_TIMEOUT,
-            0,
+            bundle_consensus,
+            &records[(n - 1) as usize],
+            final_record,
         )
-        .await
-        .map_err(|e| {
-            let _ = fs::remove_dir_all(&epoch_dir);
-            eyre!("consensus stream import for epoch {n} failed: {e}")
-        })?;
-        pack.persist().await.map_err(|e| eyre!("failed to persist consensus pack: {e}"))?;
-        // The chain was verified as it streamed; confirm the rebuilt tip is exactly the epoch's
-        // final consensus header before declaring success.
-        let tip = pack.latest_consensus_header().await;
-        pack.close().await;
-        // Read-back failure and tip mismatch are different diagnoses and get different messages: a
-        // mismatch means the bundle rebuilt into the wrong chain, whereas an `Err` means the pack
-        // could not be read at all. Both roll the epoch dir back, matching the import error path
-        // above, since this restore wrote that directory itself and owns the cleanup.
-        let tip = tip.map_err(|e| {
-            let _ = fs::remove_dir_all(&epoch_dir);
-            eyre!("failed to read back the rebuilt consensus pack tip for epoch {n}: {e}")
-        })?;
-        let tip_ok = matches!(
-            &tip,
-            Some(header)
-                if header.number == final_record.final_consensus.number
-                    && header.digest() == final_record.final_consensus.hash
-        );
-        if !tip_ok {
-            let _ = fs::remove_dir_all(&epoch_dir);
-            bail!("rebuilt consensus pack tip does not match epoch {n} final consensus: {tip:?}");
-        }
+        .await?;
 
         // Point the consensus "latest" slot hint at this epoch's final consensus so a node started
         // on this datadir resumes syncing from here instead of from genesis.
@@ -1951,6 +1922,119 @@ fn restore_consensus_and_records(
         epochs_dir.display()
     );
     Ok(())
+}
+
+/// Import the bundle's `consensus_data` at `bundle_consensus` as the pack of the bundle's last
+/// epoch N (`final_record.epoch`) under `epochs_dir`, verified as it streams against `previous`
+/// (the record of epoch N - 1) up to `final_record`'s certified final output, and confirm that the
+/// pack's tip reads back as that output. A failed import or check removes the `epoch-N` directory
+/// it created. The restore and `--verify-only` both run this, so the check a verify-only run makes
+/// is the restore's own.
+async fn import_bundle_consensus(
+    epochs_dir: &Path,
+    bundle_consensus: &Path,
+    previous: &EpochRecord,
+    final_record: &EpochRecord,
+) -> eyre::Result<()> {
+    let n = final_record.epoch;
+    let epoch_dir = epochs_dir.join(format!("epoch-{n}"));
+    let file = tokio::fs::File::open(bundle_consensus)
+        .await
+        .map_err(|e| eyre!("failed to open consensus data {}: {e}", bundle_consensus.display()))?;
+    // No free-space floor: the floor guards the node's live stores against peer-supplied bytes,
+    // and this is the operator's own bundle into a directory nothing else is using; a real
+    // shortage surfaces as the write error.
+    let pack = ConsensusPack::stream_import_with_floor(
+        epochs_dir,
+        file,
+        n,
+        previous,
+        final_record.final_consensus,
+        STREAM_IMPORT_TIMEOUT,
+        0,
+    )
+    .await
+    .map_err(|e| {
+        let _ = fs::remove_dir_all(&epoch_dir);
+        eyre!("consensus stream import for epoch {n} failed: {e}")
+    })?;
+    pack.persist().await.map_err(|e| eyre!("failed to persist consensus pack: {e}"))?;
+    // The chain was verified as it streamed; confirm the rebuilt tip is exactly the epoch's
+    // final consensus header before declaring success.
+    let tip = pack.latest_consensus_header().await;
+    pack.close().await;
+    // Read-back failure and tip mismatch are different diagnoses and get different messages: a
+    // mismatch means the bundle rebuilt into the wrong chain, whereas an `Err` means the pack
+    // could not be read at all. Both roll the epoch dir back, matching the import error path
+    // above, since the caller's run wrote that directory itself and owns the cleanup.
+    let tip = tip.map_err(|e| {
+        let _ = fs::remove_dir_all(&epoch_dir);
+        eyre!("failed to read back the rebuilt consensus pack tip for epoch {n}: {e}")
+    })?;
+    let tip_ok = matches!(
+        &tip,
+        Some(header)
+            if header.number == final_record.final_consensus.number
+                && header.digest() == final_record.final_consensus.hash
+    );
+    if !tip_ok {
+        let _ = fs::remove_dir_all(&epoch_dir);
+        bail!("rebuilt consensus pack tip does not match epoch {n} final consensus: {tip:?}");
+    }
+    Ok(())
+}
+
+/// `db load-state --verify-only`'s check of the bundle's consensus pack: the restore's own import
+/// ([`import_bundle_consensus`]) of `bundle_consensus` against the last two of the verified
+/// `records`, run in a new staging directory under `staging_root` (the system temp directory,
+/// outside the datadir), which is removed whatever the outcome. Needs about the pack's size free
+/// there.
+fn verify_bundle_consensus(
+    staging_root: &Path,
+    bundle_consensus: &Path,
+    records: &[EpochRecord],
+) -> eyre::Result<()> {
+    let [.., previous, final_record] = records else {
+        bail!("the bundle's consensus pack needs the records of its epoch and the one before it");
+    };
+    let staging = tempfile::Builder::new()
+        .prefix("tn-load-state-verify-")
+        .tempdir_in(staging_root)
+        .map_err(|e| {
+            eyre!(
+                "cannot create a staging directory under {} to check the bundle's consensus \
+                 pack: {e}",
+                staging_root.display()
+            )
+        })?;
+    // The runtime is dropped, and with it every blocking task the import ran, before the staging
+    // directory is removed.
+    let checked = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(eyre::Report::from)
+        .and_then(|runtime| {
+            runtime.block_on(import_bundle_consensus(
+                staging.path(),
+                bundle_consensus,
+                previous,
+                final_record,
+            ))
+        });
+    let staged = staging.path().to_path_buf();
+    if let Err(e) = staging.close() {
+        eprintln!(
+            "warning: could not remove the staging directory {} of the consensus pack check: {e}",
+            staged.display()
+        );
+    }
+    checked.map_err(|e| {
+        e.wrap_err(format!(
+            "the bundle's consensus pack {} does not restore",
+            bundle_consensus.display()
+        ))
+    })
 }
 
 /// Verify each bundle record against its certificate and save it into `db`, rebuilding the indexed
@@ -4015,9 +4099,60 @@ mod tests {
         listing
     }
 
-    /// A bundle of epoch `last_epoch` signed by `signers`, whose state pack is bound to its tip
-    /// record: one every check of `db load-state` before its first write accepts against a genesis
-    /// committee of `signers`.
+    /// The consensus pack of `epoch` under a committee of `signers`, as an export's
+    /// `consensus_data` holds it (the data log up to its last complete output): three outputs
+    /// chained to a record of `epoch - 1` whose final state and consensus are the defaults, as
+    /// [`signed_chain`] gives every record before its tip. Returns the bytes and the final output.
+    fn bundle_consensus_data(
+        signers: &[TestSigner],
+        epoch: u32,
+    ) -> (Vec<u8>, tn_types::ConsensusNumHash) {
+        use tn_types::{
+            Certificate, CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+            EpochSeedChainValue, ReputationScores,
+        };
+        let mut committee = tn_types::CommitteeBuilder::new(epoch);
+        for (i, signer) in signers.iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        let committee = committee.build();
+        let dir = tempfile::tempdir().expect("pack dir");
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let final_consensus = runtime.block_on(async {
+            let chain = super::ConsensusChain::new_for_test(dir.path().to_path_buf(), committee)
+                .await
+                .expect("open the epoch's pack");
+            let mut parent = ConsensusHeaderDigest::default();
+            for number in 1..=3_u64 {
+                let mut leader = Certificate::default();
+                leader.update_header_epoch_for_test(epoch);
+                leader.update_header_round_for_test(number as u32);
+                let sub_dag = CommittedSubDag::new(
+                    vec![leader.clone()],
+                    leader,
+                    number,
+                    ReputationScores::default(),
+                    None,
+                    EpochSeedChainValue::genesis_placeholder(),
+                );
+                let output = ConsensusOutput::new_with_subdag(sub_dag, parent, number);
+                parent = output.consensus_header_hash();
+                chain.save_consensus_output(output).await.expect("save output");
+            }
+            chain.persist_current().await.expect("persist");
+            chain.close().await;
+            ConsensusNumHash::new(3, parent)
+        });
+        let data = dir.path().join(format!("epoch-{epoch}")).join(super::DATA_NAME);
+        let end = tn_storage::consensus_pack::wal_consistent_end(&data, epoch).expect("pack end");
+        let mut bytes = fs::read(&data).expect("read pack");
+        bytes.truncate(usize::try_from(end).expect("pack end fits"));
+        (bytes, final_consensus)
+    }
+
+    /// A bundle of epoch `last_epoch` (1 or more) signed by `signers`, whose state pack and
+    /// consensus pack are bound to its tip record: one every check of `db load-state` accepts
+    /// against a genesis committee of `signers`.
     fn write_verifiable_bundle(bundle: &Path, signers: &[TestSigner], last_epoch: u32) {
         use tn_storage::{
             epoch_records::{CERTS_NAME, RECORDS_NAME},
@@ -4034,20 +4169,35 @@ mod tests {
             let reader = ExecStatePackReader::open(bundle).expect("open pack");
             BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash)
         };
-        let (records, certs) = signed_chain(last_epoch, signers, pack_final_state);
+        let (consensus_data, final_consensus) = bundle_consensus_data(signers, last_epoch);
+        let (mut records, mut certs) =
+            signed_chain(last_epoch - 1, signers, BlockNumHash::default());
+        let (mut tip, _) = signed_pair_with_final_state(
+            last_epoch,
+            signers,
+            records.last().expect("the record before the tip").digest(),
+            pack_final_state,
+        );
+        tip.final_consensus = final_consensus;
+        let cert = cert_over(&tip, signers);
+        certs.insert(cert.epoch_hash, cert);
+        records.push(tip);
         let records_src = tempfile::tempdir().expect("records src");
         write_signed_bundle(records_src.path(), &records, &certs);
         fs::copy(records_src.path().join(RECORDS_NAME), bundle.join("epoch_records"))
             .expect("copy records");
         fs::copy(records_src.path().join(CERTS_NAME), bundle.join("epoch_certs"))
             .expect("copy certs");
-        fs::write(bundle.join("consensus_data"), b"x").expect("write consensus data");
+        fs::write(bundle.join("consensus_data"), consensus_data).expect("write consensus data");
     }
 
-    /// `db load-state --verify-only` runs the restore's checks on a bundle and writes nothing: a
-    /// bundle that passes them is reported and leaves the datadir byte-identical, beside a node
-    /// holding the datadir (it takes no lock); with `--chain` and no committee in the datadir it
-    /// verifies against the chain's bundled committee held in memory, writing no `genesis/`.
+    /// `db load-state --verify-only` runs the restore's checks on a bundle and writes nothing to
+    /// the datadir: a bundle that passes them is reported and leaves the datadir byte-identical,
+    /// beside a node holding the datadir (it takes no lock); its consensus pack is imported as the
+    /// restore imports it, in a staging directory removed whatever the outcome, so a bundle whose
+    /// `consensus_data` would fail the restore fails here; with `--chain` and no committee in the
+    /// datadir it verifies against the chain's bundled committee held in memory, writing no
+    /// `genesis/`.
     #[cfg(unix)]
     #[test]
     fn load_state_verify_only_checks_the_bundle_and_writes_nothing() {
@@ -4081,6 +4231,31 @@ mod tests {
             .execute(datadir_path.clone())
             .expect("a bundle that passes every check verifies");
         assert_eq!(tree_listing(&datadir_path), before, "a verify-only run changed the datadir");
+
+        // the consensus pack is imported as the restore imports it, in a staging directory that
+        // is removed whatever the outcome
+        let consensus_data = bundle.path().join("consensus_data");
+        let records = EpochRecordDb::read_records_from_pack(bundle.path().join("epoch_records"))
+            .expect("bundle records");
+        let staging = tempfile::tempdir().expect("staging root");
+        super::verify_bundle_consensus(staging.path(), &consensus_data, &records)
+            .expect("the bundle's pack imports");
+        assert_eq!(tree_listing(staging.path()), Default::default(), "staging left behind");
+        // a pack that is not one, and one cut short before the tip's final output
+        let real = fs::read(&consensus_data).expect("read consensus data");
+        let cut_short = &real[..real.len() - 1];
+        for (bytes, what) in [(&b"x"[..], "not a pack"), (cut_short, "cut short")] {
+            fs::write(&consensus_data, bytes).expect("write consensus data");
+            let err = super::verify_bundle_consensus(staging.path(), &consensus_data, &records)
+                .expect_err(what);
+            assert!(format!("{err:#}").contains("consensus stream import"), "{what}: {err:#}");
+            assert_eq!(tree_listing(staging.path()), Default::default(), "{what}: staging left");
+            let err =
+                args(Some(super::NamedChain::Adiri)).execute(datadir_path.clone()).expect_err(what);
+            assert!(format!("{err:#}").contains("consensus pack"), "{what}: {err:#}");
+            assert_eq!(tree_listing(&datadir_path), before, "{what}: the datadir changed");
+        }
+        fs::write(&consensus_data, &real).expect("restore consensus data");
 
         // no committee in the datadir: the bundled one, held in memory, refuses another chain's
         // bundle, and no committee is written
