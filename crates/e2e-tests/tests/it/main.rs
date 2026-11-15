@@ -7,9 +7,11 @@ mod basefee;
 mod clock_skew;
 mod common;
 mod eject;
+mod epoch_record_walk;
 mod epochs;
 #[cfg(feature = "faucet")]
 mod faucet;
+mod fleet;
 mod forward_txs;
 mod genesis_tests;
 mod governance_safe_fork;
