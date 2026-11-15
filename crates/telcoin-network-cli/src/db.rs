@@ -2477,15 +2477,16 @@ mod tests {
     fn db_validate_gives_no_interrupted_install_hint_beside_a_live_epoch() {
         use tn_config::TelcoinDirs as _;
         let dir = tempfile::tempdir().unwrap();
-        let epochs = dir.path().to_path_buf().epochs_db_path();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
         fs::create_dir_all(epochs.join("epoch-2")).unwrap();
         let aside = epochs.join("epoch-2.replaced");
         fs::create_dir_all(&aside).unwrap();
         fs::write(aside.join(tn_storage::consensus_pack::DATA_NAME), b"stale copy").unwrap();
 
         let data = epochs.join("epoch-2").join(tn_storage::consensus_pack::DATA_NAME);
-        let err = super::DbValidateArgs { path: data.clone(), epoch: None }
-            .execute()
+        let err = super::DbValidateArgs { path: Some(data.clone()), epoch: None, all: false }
+            .execute(&datadir)
             .expect_err("the epoch's data log is missing");
         let err = format!("{err:#}");
         assert!(err.contains("path does not exist"), "{err}");
@@ -2494,8 +2495,8 @@ mod tests {
 
         // with `epoch-2` itself missing, the aside is an interrupted install and the hint is given
         fs::remove_dir(epochs.join("epoch-2")).unwrap();
-        let err = super::DbValidateArgs { path: data, epoch: None }
-            .execute()
+        let err = super::DbValidateArgs { path: Some(data), epoch: None, all: false }
+            .execute(&datadir)
             .expect_err("the epoch's directory is missing");
         assert!(format!("{err:#}").contains("INTERRUPTED INSTALL"), "{err:#}");
     }
