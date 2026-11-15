@@ -42,6 +42,22 @@ pub(crate) struct StateSyncMetrics {
     /// genesis anchor). A certificate stored past a gap does not move it until the gap is filled.
     /// Read from the epoch store by the record collector after each pass and by the startup sync.
     pub(crate) epoch_records_certified_through: Gauge,
+    /// Epochs a record collection walked past: each epoch this node holds as its own uncertified
+    /// record that a pass skipped once a certified record after it was stored, counted when the
+    /// collection opens it as a gap. The startup sync and the record collector keep separate gap
+    /// sets, and both start empty after a restart, so one epoch can count more than once. Only
+    /// with `epoch_record_collect_past_uncertified` on.
+    pub(crate) epoch_record_gap_walks_total: Counter,
+    /// Walks that ended on the next epoch's record naming another parent: this node's own
+    /// uncertified record differs from the one the network built on, and the walk stops there.
+    /// Counted on every pass that meets it; any peer can send such a record, so this alone proves
+    /// nothing.
+    pub(crate) epoch_record_walk_parent_mismatches_total: Counter,
+    /// Certified records that validated against this node's record of the epoch before, with a
+    /// super-quorum certificate, and differ from the record this node stored for the same epoch:
+    /// this node forked from the network. Each one stops the node right after it is counted here,
+    /// and is counted again in `tn_epoch_final_state_mismatches_total`.
+    pub(crate) epoch_record_conflicts_total: Counter,
 }
 
 #[cfg(test)]
