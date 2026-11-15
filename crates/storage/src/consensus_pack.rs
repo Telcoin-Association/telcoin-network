@@ -1954,12 +1954,17 @@ pub fn legacy_migration_dry_run(data_path: &Path, epoch: Epoch) -> Result<u64, S
 }
 
 /// Whether `epoch` is a past epoch of the pack tree in `epochs_dir`: an `epoch-{M}` directory with
-/// `M > epoch` exists there (the same "newest is current" rule `db repair` skips by). A past
-/// epoch's pack was complete when the next one began, so its legacy migration expects the whole
-/// log (see `Inner::migrate_consistent_end`); only the newest epoch can carry an unacked tail.
+/// `M > epoch` exists there, or an interrupted install of such an `M` (`epoch-{M}.replaced` with no
+/// `epoch-{M}`: [`interrupted_installs`](crate::consensus::ConsensusChain::interrupted_installs)),
+/// which the node's next start puts back (the same "newest is current" rule `db repair` skips
+/// by). A past epoch's pack was complete when the next one began, so its legacy migration expects
+/// the whole log (see `Inner::migrate_consistent_end`); only the newest epoch can carry an unacked
+/// tail.
 fn has_later_epoch(epochs_dir: &Path, epoch: Epoch) -> io::Result<bool> {
     let epochs_dir = if epochs_dir.as_os_str().is_empty() { Path::new(".") } else { epochs_dir };
-    Ok(ConsensusPack::epoch_dirs(epochs_dir)?.last().is_some_and(|&newest| newest > epoch))
+    let later = |epochs: Vec<Epoch>| epochs.last().is_some_and(|&newest| newest > epoch);
+    Ok(later(ConsensusPack::epoch_dirs(epochs_dir)?)
+        || later(crate::consensus::ConsensusChain::interrupted_installs(epochs_dir)?))
 }
 
 /// The byte offset just past the last COMPLETE consensus output in a pack's data log, computed by a
@@ -12197,6 +12202,28 @@ pub(crate) mod test {
             1 << 20,
             "repair must not mutate the unwritten data file"
         );
+    }
+
+    /// A later epoch left only as an interrupted install (`epoch-1.replaced` with no `epoch-1`,
+    /// which the node's next start puts back) makes epoch 0 a past epoch: its all-zero data file
+    /// lost its outputs, and the dry run never calls it the newest epoch that needs nothing.
+    #[tokio::test]
+    async fn test_repair_epoch_counts_an_interrupted_install_as_a_later_epoch() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_repair_aside").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; 1 << 20]).expect("zeros");
+        std::fs::create_dir(temp_dir.path().join("epoch-1.replaced")).expect("aside");
+        assert!(super::has_later_epoch(temp_dir.path(), 0).expect("look"));
+        assert!(!super::has_later_epoch(temp_dir.path(), 1).expect("look"));
+
+        let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, false).await.expect("repair");
+        let EpochRepair::Unrepairable(msg) = res else {
+            panic!("a past epoch's unwritten file must be Unrepairable, got {res:?}")
+        };
+        assert!(msg.contains("outputs are lost"), "a past epoch lost its outputs: {msg}");
+        assert!(!msg.contains("nothing needs to be done"), "it is not the newest epoch: {msg}");
+        assert!(msg.contains("from a backup"), "must name a backup: {msg}");
     }
 
     /// A torn trailing tail (stray bytes appended past the sealed data) is truncated back to the
