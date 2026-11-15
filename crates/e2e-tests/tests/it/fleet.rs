@@ -8,8 +8,8 @@
 //! certified records.
 
 use super::common::{
-    address_from_word, call_rpc, get_block, get_block_number, get_key, node_log_lines, send_tel,
-    start_validator_with_overrides, ProcessGuard,
+    address_from_word, call_rpc, get_block, get_block_number, get_key, node_log_lines,
+    scrape_metric_value, send_tel, start_validator_with_overrides, ProcessGuard,
 };
 use alloy::{primitives::utils::parse_ether, providers::ProviderBuilder};
 use e2e_tests::{
@@ -31,14 +31,22 @@ use std::{
 use tn_test_utils::wait_until_blocking;
 use tn_types::{get_available_tcp_port, Address, GenesisAccount, U256};
 
+/// Environment variable of the engine's execution-delay test hook
+/// (`tn_types::test_hooks::execution_delay`).
+pub(crate) const EXECUTION_DELAY_ENV: &str = "TN_TEST_EXECUTION_DELAY_MS";
+
 /// Time limit for the first transfers of every load thread to be accepted.
-const LOAD_START_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const LOAD_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Time limit for every node to execute up to the highest head seen when the load stopped.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Time limit for a node's `node switches` line to appear once it was started.
 const SWITCHES_LINE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The error a voter logs when a header names a block its own execution contradicts: the canary
+/// the proposer fix must keep alive and silent.
+pub(crate) const CANARY_LOG: &str = "unexpected execution result received";
 
 /// The error the replay guard of `write_epoch_record` logs before it stops the node: a stored
 /// epoch record whose `final_state` is not the closing block this node executed.
@@ -76,11 +84,23 @@ pub(crate) const FATAL_LOGS: [&str; 5] =
 /// The passphrase [`start_validator_with_overrides`] gives every node.
 pub(crate) const PASSPHRASE: &str = "restart_test";
 
-/// Every runtime switch of the node at its default, as the `node switches` line renders it, in the
-/// order of the node's `runtime_switches!` list (`crates/config/src/node.rs`).
+/// Every runtime switch of the node turned on, as `parameters.yaml` entries, in the order of the
+/// node's `runtime_switches!` list (`crates/config/src/node.rs`).
 ///
-/// A switch that arrives later adds its entry here, in that order.
-pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 3] = [
+/// A switch that arrives later adds its entry at the end, here and in [`STACK_SWITCHES_OFF`].
+pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 5] = [
+    ("quorum_exec_block", "true"),
+    ("quorum_exec_block_starved_rounds", "4"),
+    ("epoch_record_recertify", "true"),
+    ("epoch_record_collect_past_uncertified", "true"),
+    ("vote_queue_fix", "true"),
+];
+
+/// Every runtime switch of the node at its default, as the `node switches` line renders it, in the
+/// order of [`STACK_SWITCHES_ON`].
+pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 5] = [
+    ("quorum_exec_block", "false"),
+    ("quorum_exec_block_starved_rounds", "0"),
     ("epoch_record_recertify", "false"),
     ("epoch_record_collect_past_uncertified", "false"),
     ("vote_queue_fix", "false"),
@@ -208,6 +228,15 @@ impl Fleet {
         )
     }
 
+    /// The number of lines in each node's run-0 log: marks to measure a window from.
+    pub(crate) fn log_marks(&self) -> eyre::Result<[usize; 4]> {
+        let mut marks = [0; 4];
+        for (node, mark) in marks.iter_mut().enumerate() {
+            *mark = node_log_lines(&self.test, node, 0)?.len();
+        }
+        Ok(marks)
+    }
+
     /// Wait until every node has executed up to the highest head any node reports now.
     pub(crate) fn settle(&self) -> eyre::Result<u64> {
         let mut target = 0;
@@ -256,6 +285,14 @@ impl Fleet {
             hits.len(),
             hits.first()
         );
+        Ok(())
+    }
+
+    /// Node `node`'s epoch-record collector has found no certified record of the network that
+    /// differs from its own ([`RECORD_CONFLICTS`] is zero) since the node last started.
+    pub(crate) fn assert_no_record_conflicts(&self, node: usize) -> eyre::Result<()> {
+        let conflicts = scrape_metric_value(&self.metrics[node], RECORD_CONFLICTS)?;
+        eyre::ensure!(conflicts == 0.0, "node {node} counted {conflicts} epoch record conflicts");
         Ok(())
     }
 
@@ -512,3 +549,7 @@ pub(crate) fn assert_epoch_records(
         Ok(())
     })
 }
+
+/// The prometheus counter of the certified records of the network a node's epoch-record collector
+/// found to differ from its own stored record.
+const RECORD_CONFLICTS: &str = "tn_state_sync_epoch_record_conflicts_total";
