@@ -459,6 +459,7 @@ async fn a_lost_or_damaged_pack_refuses_the_start_or_fails_the_read() -> eyre::R
     for says in [
         "lacks epoch(s) 1.",
         "Put back each missing `epoch-N` directory from a backup taken after that epoch closed",
+        "`telcoin-network db import-epoch --epoch N --from <copy>` verifies a copy",
         "db load-state` from epoch 1 or a later one",
     ] {
         assert!(message.contains(says), "{message}");
@@ -529,6 +530,77 @@ async fn a_lost_or_damaged_pack_refuses_the_start_or_fails_the_read() -> eyre::R
         "a damaged record is a read error: {damaged}"
     );
     assert_eq!(read(&env, first1)?, first1.encoded, "the other batches still read");
+    Ok(())
+}
+
+/// A lost pack is imported at rest from another datadir's sealed copy of it, as `db import-epoch`
+/// does with the node stopped: the start's coverage check then passes, and every transaction
+/// stored in the epoch reads again. A dry run first leaves the gap, so the start still refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_pack_imported_from_a_sealed_copy_passes_the_start() -> eyre::Result<()> {
+    let mut run = Run::new(&[TxBodies::Pointers], 0, 3, |_, _| Box::new(|| ())).await?;
+    let stored = read_all(run.env(TxBodies::Pointers))?;
+    run.close(TxBodies::Pointers);
+    let epochs_dir = run.epochs_dir();
+    // the certified records the node saved as epochs 0 and 1 closed
+    let mut parent = EpochRecord::default().digest();
+    for epoch in 0..2 {
+        let closing = run
+            .outputs
+            .iter()
+            .rfind(|load| load.output.leader().epoch() == epoch)
+            .expect("the closing output");
+        let mut closed = record(
+            epoch,
+            &run.committees[epoch as usize],
+            &run.committees[epoch as usize + 1],
+            closing,
+        );
+        closed.parent_hash = parent;
+        parent = closed.digest();
+        let cert = tn_types::EpochCertificate {
+            epoch_hash: closed.digest(),
+            signature: Default::default(),
+            signed_authorities: Default::default(),
+        };
+        run.consensus.epochs().save(closed, cert).await?;
+    }
+    run.consensus.epochs().persist().await?;
+    // the node stops: every pack and the records are sealed
+    run.consensus.clone().close().await;
+
+    // another datadir's sealed copy of epoch 1, and this one's lost
+    let copy = run.tmp.path().join("other-datadir-epoch-1");
+    copy_dir(&epochs_dir.join("epoch-1"), &copy)?;
+    fs::remove_dir_all(epochs_dir.join("epoch-1"))?;
+    let import = |install| {
+        ConsensusChain::import_epoch_at_rest(
+            &epochs_dir,
+            1,
+            &copy,
+            install,
+            std::time::Duration::from_secs(30),
+        )
+    };
+    // a node start: the chain opens, then the execution database attaches its packs
+    let start = || async {
+        let chain = ConsensusChain::new(epochs_dir.clone(), run.committees[0].clone())?;
+        let (env, tasks) = run.reopen_unattached(0)?;
+        let attached = env.attach_tx_packs(&chain, epochs_dir.clone());
+        eyre::Ok((attached.map(|()| (env, tasks)), chain))
+    };
+    assert!(!import(false).await?.installed);
+    let (attached, chain) = start().await?;
+    let Err(err) = attached else { panic!("a dry run leaves the pack lost") };
+    assert_eq!(err.downcast_ref::<TxPackCoverageError>().expect("coverage").missing, vec![1]);
+    chain.close().await;
+
+    assert!(import(true).await?.installed);
+    let (attached, chain) = start().await?;
+    let (env, _tasks) = attached?;
+    assert_eq!(read_all(&env)?, stored, "every transaction reads from the imported pack");
+    drop(env);
+    chain.close().await;
     Ok(())
 }
 

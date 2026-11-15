@@ -1,0 +1,596 @@
+//! Re-import one past epoch's pack at rest from a copy (`telcoin-network db import-epoch`).
+//!
+//! The copy is a pack's data log: this node's backup of `epoch-N/`, or another node's sealed
+//! `epoch-N/`. Its bytes are untrusted. They go through the import a peer's stream takes
+//! ([`ConsensusChain::import_sealed`], which authenticates the epoch's final output against the
+//! local record of the epoch and every earlier one by its parent links), and only a copy that
+//! verified, sealed and read back sealed is installed, by the install that peer imports use
+//! ([`ConsensusChain::install_imported_epoch_dir`], rename-aside). Nothing outside the import's
+//! own `import-N` directory is written before that, and a dry run leaves nothing behind.
+//!
+//! It runs with the node stopped and opens no [`ConsensusChain`]: a chain's open writes (it opens
+//! the live epoch for append and puts back interrupted installs), and the chain's import keeps a
+//! pack in place that still serves the epoch's final output, wherever else its log is damaged.
+
+use std::{
+    fmt::{self, Display},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use tn_types::{Epoch, EpochRecord};
+use tokio::io::AsyncReadExt as _;
+
+use super::{ConsensusChain, ConsensusChainError};
+use crate::{
+    consensus_pack::{
+        legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, ConsensusPack,
+        DATA_NAME, IMPORT_MIN_FREE_BYTES,
+    },
+    epoch_records::{EpochRecordDb, CERTS_NAME, RECORDS_NAME},
+    pack_validate::{classify_physical_corruption, validate_pack_file, Verdict},
+};
+
+/// What held the place of the epoch's pack when [`ConsensusChain::import_epoch_at_rest`] ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochPackState {
+    /// Neither `epoch-N` nor `epoch-N.replaced`.
+    Missing,
+    /// `epoch-N`, whose data log does not validate (why).
+    Damaged(String),
+    /// An interrupted install: `epoch-N.replaced` with no `epoch-N`, whose data log does not
+    /// validate (why). The install puts the aside back first, then replaces it, as every install
+    /// does.
+    InterruptedInstall(String),
+}
+
+impl Display for EpochPackState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => write!(f, "a missing pack"),
+            Self::Damaged(why) => write!(f, "a damaged pack ({why})"),
+            Self::InterruptedInstall(why) => {
+                write!(f, "an interrupted install whose last copy is damaged ({why})")
+            }
+        }
+    }
+}
+
+/// A verified import of [`ConsensusChain::import_epoch_at_rest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochImport {
+    /// The epoch imported.
+    pub epoch: Epoch,
+    /// What held the epoch's place.
+    pub replaces: EpochPackState,
+    /// The bytes of the copy's data log that were imported.
+    pub bytes: u64,
+    /// Whether the verified copy was installed as `epoch-N` (else a dry run, which left nothing).
+    pub installed: bool,
+}
+
+/// Why [`ConsensusChain::import_epoch_at_rest`] refused, or failed.
+#[derive(Debug)]
+pub enum EpochImportError {
+    /// Epoch 0's pack is verified against the pre-genesis descriptor, which no copy carries.
+    EpochZero,
+    /// Not a past epoch: `resume` is the epoch the node opens for append when it starts (the
+    /// latest-consensus hint, else the newest `epoch-N`), and its pack is the node's to write.
+    NotPast {
+        /// The epoch asked for.
+        epoch: Epoch,
+        /// The epoch the node resumes.
+        resume: Epoch,
+    },
+    /// The local epoch records lack what the copy is verified against: the record of the epoch
+    /// and its certificate, and the record before it (why).
+    Records(String),
+    /// The epoch's pack (or an interrupted install's copy of it) validates: nothing to import.
+    NothingToImport {
+        /// The epoch asked for.
+        epoch: Epoch,
+        /// The directory holding the pack that validates.
+        dir: PathBuf,
+    },
+    /// The copy does not read as a data log of the epoch's pack (why).
+    Source(String),
+    /// The copy failed the import's verification, or the import or the install failed.
+    Import(ConsensusChainError),
+}
+
+impl Display for EpochImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EpochZero => write!(
+                f,
+                "epoch 0 cannot be imported: its pack is verified against the pre-genesis \
+                 descriptor, which a copy does not carry; restore `epoch-0` from a backup"
+            ),
+            Self::NotPast { epoch, resume } => write!(
+                f,
+                "epoch {epoch} is not a past epoch: the node resumes epoch {resume}, whose pack \
+                 it writes (a restart or `db repair --epoch {resume} --force` repairs it); only \
+                 an epoch below {resume} can be imported"
+            ),
+            Self::Records(why) => write!(f, "cannot verify the copy: {why}"),
+            Self::NothingToImport { epoch, dir } => write!(
+                f,
+                "nothing to import: the pack of epoch {epoch} at {} validates (`db repair \
+                 --epoch {epoch}` repairs its indexes and puts back an interrupted install)",
+                dir.display()
+            ),
+            Self::Source(why) => write!(f, "{why}"),
+            Self::Import(e) => write!(f, "the copy did not import, and nothing was installed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for EpochImportError {}
+
+impl ConsensusChain {
+    /// Re-import the pack of past epoch `epoch` under the epochs directory `base_path` from the
+    /// copy at `source` (a pack's `data` file, or a directory holding one), with the node
+    /// stopped (see the [module docs](self)). Without `install` it is a dry run: the copy is
+    /// imported and verified in `import-N`, which is then removed, and nothing else is written.
+    ///
+    /// Refuses, before anything is written: epoch 0 ([`EpochImportError::EpochZero`]); an
+    /// epoch the node does not only read ([`EpochImportError::NotPast`]); local records that
+    /// lack the record of `epoch`, its certificate, or the record of `epoch - 1` it chains to
+    /// ([`EpochImportError::Records`]); and a pack in place that validates, as `epoch-N` or as an
+    /// interrupted install's `epoch-N.replaced` ([`EpochImportError::NothingToImport`]). What it
+    /// replaces is a missing pack, a damaged one, or an interrupted install whose copy is damaged
+    /// ([`EpochPackState`]).
+    ///
+    /// The stream is the copy's data log up to the end of its last complete output (a sealed log
+    /// ends with its clean-close sentinel, a live one with padding, neither of which a peer
+    /// serves), and it leaves [`IMPORT_MIN_FREE_BYTES`] free on the filesystem as a peer import
+    /// does: the node's stores share it.
+    pub async fn import_epoch_at_rest(
+        base_path: &Path,
+        epoch: Epoch,
+        source: &Path,
+        install: bool,
+        timeout: Duration,
+    ) -> Result<EpochImport, EpochImportError> {
+        if epoch == 0 {
+            return Err(EpochImportError::EpochZero);
+        }
+        let resume = Self::resume_epoch(base_path).or_else(|| {
+            ConsensusPack::epoch_dirs(base_path).ok().and_then(|epochs| epochs.last().copied())
+        });
+        match resume {
+            Some(resume) if epoch < resume => {}
+            resume => {
+                return Err(EpochImportError::NotPast { epoch, resume: resume.unwrap_or_default() })
+            }
+        }
+        let (record, previous) = local_records(base_path, epoch)?;
+        let replaces = pack_in_place(base_path, epoch, &previous)?;
+
+        let data = if source.is_dir() { source.join(DATA_NAME) } else { source.to_path_buf() };
+        let len = {
+            let data = data.clone();
+            tokio::task::spawn_blocking(move || wal_consistent_end(&data, epoch))
+                .await
+                .map_err(|e| EpochImportError::Source(format!("the copy's check stopped: {e}")))?
+        }
+        .map_err(|e| {
+            EpochImportError::Source(format!(
+                "{} does not read as a data log of epoch {epoch}'s pack: {e}",
+                data.display()
+            ))
+        })?;
+        let file = tokio::fs::File::open(&data).await.map_err(|e| {
+            EpochImportError::Source(format!("cannot open {}: {e}", data.display()))
+        })?;
+        let Some((import_path, path)) = Self::import_sealed(
+            base_path,
+            file.take(len),
+            &record,
+            &previous,
+            timeout,
+            IMPORT_MIN_FREE_BYTES,
+        )
+        .await
+        .map_err(EpochImportError::Import)?
+        else {
+            return Err(EpochImportError::Import(ConsensusChainError::IO(std::io::Error::other(
+                format!("this process is already importing epoch {epoch}"),
+            ))));
+        };
+        if install {
+            Self::install_imported_epoch_dir(
+                base_path,
+                epoch,
+                &path.join(format!("epoch-{epoch}")),
+            )
+            .map_err(EpochImportError::Import)?;
+        }
+        drop(import_path);
+        Ok(EpochImport { epoch, replaces, bytes: len, installed: install })
+    }
+}
+
+/// The local records of `epoch` and `epoch - 1`, read from the records log at rest (no index,
+/// nothing written): the record of `epoch` must carry a certificate in the local certificates
+/// log, and chain to the record before it.
+fn local_records(
+    base_path: &Path,
+    epoch: Epoch,
+) -> Result<(EpochRecord, EpochRecord), EpochImportError> {
+    let unreadable = |what: &str, path: PathBuf, e: &dyn Display| {
+        EpochImportError::Records(format!(
+            "the local epoch {what} at {} do not read ({e}); with the node stopped, `db repair \
+             --force` heals them",
+            path.display()
+        ))
+    };
+    let records_path = base_path.join(RECORDS_NAME);
+    let records = EpochRecordDb::read_records_from_pack(&records_path)
+        .map_err(|e| unreadable("records", records_path, &e))?;
+    let find = |epoch: Epoch| {
+        records.iter().find(|record| record.epoch == epoch).cloned().ok_or_else(|| {
+            EpochImportError::Records(format!("this node holds no record of epoch {epoch}"))
+        })
+    };
+    let (record, previous) = (find(epoch)?, find(epoch - 1)?);
+    if record.parent_hash != previous.digest() {
+        return Err(EpochImportError::Records(format!(
+            "the local record of epoch {epoch} does not chain to the record of epoch {}",
+            epoch - 1
+        )));
+    }
+    let certs_path = base_path.join(CERTS_NAME);
+    let certs = EpochRecordDb::read_certs_from_pack(&certs_path)
+        .map_err(|e| unreadable("certificates", certs_path, &e))?;
+    if !certs.iter().any(|cert| cert.epoch_hash == record.digest()) {
+        return Err(EpochImportError::Records(format!(
+            "the local record of epoch {epoch} is not certified yet"
+        )));
+    }
+    Ok((record, previous))
+}
+
+/// What holds the place of `epoch`'s pack under `base_path`; refused when it validates.
+fn pack_in_place(
+    base_path: &Path,
+    epoch: Epoch,
+    previous: &EpochRecord,
+) -> Result<EpochPackState, EpochImportError> {
+    let live = base_path.join(format!("epoch-{epoch}"));
+    let aside = base_path.join(format!("epoch-{epoch}.replaced"));
+    let (dir, state): (_, fn(String) -> EpochPackState) = if live.exists() {
+        (live, EpochPackState::Damaged)
+    } else if aside.exists() {
+        (aside, EpochPackState::InterruptedInstall)
+    } else {
+        return Ok(EpochPackState::Missing);
+    };
+    match pack_damage(&dir.join(DATA_NAME), epoch, previous) {
+        Some(why) => Ok(state(why)),
+        None => Err(EpochImportError::NothingToImport { epoch, dir }),
+    }
+}
+
+/// Why the data log at `data` of past `epoch` does not validate as `db validate` judges it
+/// (`previous` is the record of the epoch before it); `None` when it validates. Read-only.
+fn pack_damage(data: &Path, epoch: Epoch, previous: &EpochRecord) -> Option<String> {
+    if !data.exists() {
+        return Some("no data log".to_string());
+    }
+    match pack_unsealed_version(data, epoch) {
+        None => return Some("its data log does not open".to_string()),
+        // a legacy v0 pack is only ever read by its migration to v2
+        Some((0, _)) => {
+            return legacy_migration_dry_run(data, epoch)
+                .err()
+                .map(|why| format!("its migration to v2 refuses: {why}"))
+        }
+        // a past epoch's pack was sealed when the next epoch began
+        Some((_, true)) => return Some("its data log is not sealed".to_string()),
+        Some(_) => {}
+    }
+    match classify_physical_corruption(data, epoch) {
+        Err(e) => return Some(format!("its data log does not read: {e}")),
+        Ok(Some(corruption)) => {
+            return Some(format!("{:?} at byte {}", corruption.kind, corruption.offset))
+        }
+        Ok(None) => {}
+    }
+    match validate_pack_file(data, epoch, Some(previous)) {
+        Ok(report) if report.verdict != Verdict::Invalid => None,
+        Ok(_) => Some(format!("`db validate --epoch {epoch}` finds it INVALID")),
+        Err(e) => Some(format!("its validation failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use tempfile::TempDir;
+    use tn_reth::RethChainSpec;
+    use tn_test_utils::CommitteeFixture;
+    use tn_types::{
+        test_genesis, BlsSignature, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+        EpochCertificate, EpochRecord,
+    };
+
+    use super::{EpochImportError, EpochPackState};
+    use crate::{
+        consensus::ConsensusChain,
+        consensus_pack::{test::make_test_output, ConsensusPack, DATA_NAME},
+        mem_db::MemDatabase,
+    };
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A node's epochs directory, closed: epochs 0 and 1 sealed with three outputs each, the
+    /// live epoch 2 the latest-consensus hint names, and the records of epochs 0 and 1, each
+    /// certified. Returns the outputs of epoch 1.
+    async fn closed_epochs(dir: &Path) -> Vec<ConsensusOutput> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let spec: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committees = [
+            fixture.committee(),
+            fixture.committee().advance_epoch_for_test(1),
+            fixture.committee().advance_epoch_for_test(2),
+        ];
+        let keys = |epoch: usize| committees[epoch].bls_keys().iter().copied().collect::<Vec<_>>();
+        std::fs::create_dir_all(dir).unwrap();
+        let chain = ConsensusChain::new(dir.to_owned(), committees[0].clone()).unwrap();
+        let mut previous = EpochRecord {
+            epoch: 0,
+            committee: keys(0),
+            next_committee: keys(0),
+            ..Default::default()
+        };
+        chain.new_epoch(previous.clone(), committees[0].clone()).await.unwrap();
+        let mut parent = ConsensusHeaderDigest::default();
+        let mut epoch1 = Vec::new();
+        for epoch in 0..2_usize {
+            for n in (epoch as u64 * 3 + 1)..=(epoch as u64 * 3 + 3) {
+                let output =
+                    make_test_output(&committees[epoch], n as usize % 4, spec.clone(), n, parent);
+                parent = output.consensus_header_hash();
+                if epoch == 1 {
+                    epoch1.push(output.clone());
+                }
+                chain.save_consensus_output(output).await.unwrap();
+            }
+            chain.persist_current().await.unwrap();
+            let record = EpochRecord {
+                epoch: epoch as u32,
+                committee: keys(epoch),
+                next_committee: keys(epoch + 1),
+                parent_hash: previous.digest(),
+                final_consensus: ConsensusNumHash { number: epoch as u64 * 3 + 3, hash: parent },
+                ..Default::default()
+            };
+            let cert = EpochCertificate {
+                epoch_hash: record.digest(),
+                signature: BlsSignature::default(),
+                signed_authorities: Default::default(),
+            };
+            chain.epochs().save(record.clone(), cert).await.unwrap();
+            chain.new_epoch(record.clone(), committees[epoch + 1].clone()).await.unwrap();
+            previous = record;
+        }
+        chain.epochs().persist().await.unwrap();
+        chain.close().await;
+        ConsensusChain::write_latest_consensus_hint(dir, 2, 6).unwrap();
+        epoch1
+    }
+
+    /// Every file under `dir` with its bytes, for proving a run left the directory as it found it.
+    fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut tree = BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(at) = pending.pop() {
+            for entry in std::fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(dir).unwrap().to_path_buf();
+                if path.is_dir() {
+                    tree.insert(relative, None);
+                    pending.push(path);
+                } else {
+                    tree.insert(relative, Some(std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        tree
+    }
+
+    /// Copy the files of directory `from` into a new directory `to`.
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// Flip one byte in the middle of the file at `path`.
+    fn flip_middle_byte(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xFF;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Epoch 1's installed pack holds exactly `outputs`, read back as the node reads a past epoch.
+    async fn assert_holds(base: &Path, outputs: &[ConsensusOutput]) {
+        let pack = ConsensusPack::open_static(base, 1).expect("the installed pack opens sealed");
+        for output in outputs {
+            let read = pack.get_consensus_output(output.number()).await.expect("output reads");
+            crate::consensus_pack::test::compare_outputs(&read, output);
+        }
+        pack.close().await;
+        assert!(ConsensusChain::pack_data_at_start(base, 1).unwrap(), "a start finds the pack");
+        for leftover in ["import-1", "epoch-1.replaced"] {
+            assert!(!base.join(leftover).exists(), "{leftover} left behind");
+        }
+    }
+
+    /// The import refuses, before writing anything, what it cannot verify or need not import:
+    /// epoch 0, the live epoch and later, local records missing the epoch or its certificate, a
+    /// pack in place that validates (as `epoch-N` or an interrupted install's aside), and a copy
+    /// of another epoch, one with a flipped byte, or one that is not a pack.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_epoch_at_rest_refuses_what_it_cannot_verify_or_need_not_import() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("epochs");
+        closed_epochs(&base).await;
+        let copy = tmp.path().join("copy");
+        copy_dir(&base.join("epoch-1"), &copy);
+        let import = |epoch, source: PathBuf| {
+            let base = base.clone();
+            async move {
+                ConsensusChain::import_epoch_at_rest(&base, epoch, &source, true, TIMEOUT).await
+            }
+        };
+        let before = tree(&base);
+
+        let err = import(0, copy.clone()).await.unwrap_err();
+        assert!(matches!(err, EpochImportError::EpochZero), "{err}");
+        for epoch in [2, 3] {
+            let err = import(epoch, copy.clone()).await.unwrap_err();
+            assert!(
+                matches!(err, EpochImportError::NotPast { epoch: e, resume: 2 } if e == epoch),
+                "{err}"
+            );
+        }
+        let err = import(1, copy.clone()).await.unwrap_err();
+        assert!(matches!(err, EpochImportError::NothingToImport { epoch: 1, .. }), "{err}");
+        std::fs::rename(base.join("epoch-1"), base.join("epoch-1.replaced")).unwrap();
+        let err = import(1, copy.clone()).await.unwrap_err();
+        assert!(matches!(err, EpochImportError::NothingToImport { epoch: 1, .. }), "{err}");
+        std::fs::rename(base.join("epoch-1.replaced"), base.join("epoch-1")).unwrap();
+        assert_eq!(tree(&base), before, "a refusal wrote nothing");
+
+        // the copy, with epoch 1's pack missing: another epoch's, a flipped byte, not a pack
+        let aside = tmp.path().join("aside");
+        std::fs::rename(base.join("epoch-1"), &aside).unwrap();
+        let before = tree(&base);
+        let err = import(1, base.join("epoch-0")).await.unwrap_err();
+        assert!(matches!(err, EpochImportError::Source(_)), "another epoch's pack: {err}");
+        let flipped = tmp.path().join("flipped");
+        copy_dir(&copy, &flipped);
+        flip_middle_byte(&flipped.join(DATA_NAME));
+        let err = import(1, flipped).await.unwrap_err();
+        assert!(
+            matches!(err, EpochImportError::Import(_) | EpochImportError::Source(_)),
+            "a flipped byte: {err}"
+        );
+        let err = import(1, tmp.path().join("no-such-copy")).await.unwrap_err();
+        assert!(matches!(err, EpochImportError::Source(_)), "{err}");
+        assert_eq!(tree(&base), before, "a refused copy left nothing behind");
+
+        // the records: the epoch's certificate, then the records themselves
+        let certs = base.join(crate::epoch_records::CERTS_NAME);
+        let certs_bytes = std::fs::read(&certs).unwrap();
+        std::fs::remove_file(&certs).unwrap();
+        let err = import(1, copy.clone()).await.unwrap_err();
+        assert!(matches!(err, EpochImportError::Records(_)), "{err}");
+        std::fs::write(&certs, certs_bytes).unwrap();
+        std::fs::remove_file(base.join(crate::epoch_records::RECORDS_NAME)).unwrap();
+        let err = import(1, copy.clone()).await.unwrap_err();
+        assert!(matches!(err, EpochImportError::Records(_)), "{err}");
+    }
+
+    /// The local records must hold the epoch, certified, and the epoch before it, linked.
+    #[tokio::test]
+    async fn import_epoch_at_rest_needs_the_certified_record_and_its_parent() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::epoch_records::EpochRecordDb::open(tmp.path()).unwrap();
+        let record0 = EpochRecord::default();
+        let record1 = EpochRecord { epoch: 1, parent_hash: record0.digest(), ..Default::default() };
+        let cert = |record: &EpochRecord| EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: BlsSignature::default(),
+            signed_authorities: Default::default(),
+        };
+        db.save(record0.clone(), cert(&record0)).await.unwrap();
+        db.save_record(record1.clone()).await.unwrap();
+        db.persist().await.unwrap();
+        db.close().await;
+        let err = super::local_records(tmp.path(), 1).unwrap_err();
+        assert!(err.to_string().contains("not certified"), "{err}");
+        let err = super::local_records(tmp.path(), 3).unwrap_err();
+        assert!(err.to_string().contains("no record of epoch 3"), "{err}");
+        let db = crate::epoch_records::EpochRecordDb::open(tmp.path()).unwrap();
+        db.save_certificate(record1.digest(), cert(&record1)).await.unwrap();
+        // certified, but not the child of the record before it
+        let record2 = EpochRecord { epoch: 2, parent_hash: record0.digest(), ..Default::default() };
+        db.save(record2.clone(), cert(&record2)).await.unwrap();
+        db.persist().await.unwrap();
+        db.close().await;
+        assert_eq!(super::local_records(tmp.path(), 1).unwrap(), (record1, record0));
+        let err = super::local_records(tmp.path(), 2).unwrap_err();
+        assert!(err.to_string().contains("does not chain"), "{err}");
+    }
+
+    /// A dry run verifies a copy and leaves the epochs directory byte-identical; the install puts
+    /// a verified copy in place of a missing pack, a damaged one, and an interrupted install whose
+    /// aside is damaged, and the node then reads every output of the epoch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_epoch_at_rest_installs_a_verified_copy() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("epochs");
+        let outputs = closed_epochs(&base).await;
+        let copy = tmp.path().join("copy");
+        copy_dir(&base.join("epoch-1"), &copy);
+        let import = |source: &Path, install| {
+            let (base, source) = (base.clone(), source.to_path_buf());
+            async move {
+                ConsensusChain::import_epoch_at_rest(&base, 1, &source, install, TIMEOUT).await
+            }
+        };
+
+        // missing: the dry run leaves nothing, the install puts it back
+        std::fs::remove_dir_all(base.join("epoch-1")).unwrap();
+        let before = tree(&base);
+        let dry = import(&copy, false).await.expect("the copy verifies");
+        assert_eq!((dry.replaces.clone(), dry.installed), (EpochPackState::Missing, false));
+        // what a peer serves: the sealed log without its clean-close sentinel
+        let sealed = std::fs::metadata(copy.join(DATA_NAME)).unwrap().len();
+        assert_eq!(dry.bytes, sealed - crate::archive::data_file::SENTINEL_LEN);
+        assert_eq!(tree(&base), before, "a dry run changed the epochs directory");
+        let done = import(&copy.join(DATA_NAME), true).await.expect("installed");
+        assert_eq!(
+            (done.replaces, done.installed, done.bytes),
+            (EpochPackState::Missing, true, dry.bytes)
+        );
+        assert_holds(&base, &outputs).await;
+
+        // damaged in place: replaced
+        flip_middle_byte(&base.join("epoch-1").join(DATA_NAME));
+        let before = tree(&base);
+        let dry = import(&copy, false).await.expect("the copy verifies");
+        assert!(matches!(dry.replaces, EpochPackState::Damaged(_)), "{:?}", dry.replaces);
+        assert_eq!(tree(&base), before, "a dry run changed the epochs directory");
+        let done = import(&copy, true).await.expect("installed");
+        assert!(matches!(done.replaces, EpochPackState::Damaged(_)), "{:?}", done.replaces);
+        assert_holds(&base, &outputs).await;
+
+        // an interrupted install whose aside is damaged: put back, then replaced
+        std::fs::rename(base.join("epoch-1"), base.join("epoch-1.replaced")).unwrap();
+        flip_middle_byte(&base.join("epoch-1.replaced").join(DATA_NAME));
+        let done = import(&copy, true).await.expect("installed");
+        assert!(
+            matches!(done.replaces, EpochPackState::InterruptedInstall(_)),
+            "{:?}",
+            done.replaces
+        );
+        assert_holds(&base, &outputs).await;
+    }
+}

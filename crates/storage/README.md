@@ -257,7 +257,8 @@ torn epoch-meta is never repaired — INV2), `CorruptMetaWithData`, `MidLogCorru
 `CorruptSealedRecord` (data loss). Only a `TornTrailingTail` exits `db validate` with success. Nothing
 fetches a past epoch's pack again, so each report of data loss ends with the recovery
 (`pack_validate::lost_pack_remedy`): put back the epoch's directory from a backup taken after that epoch
-closed (a sealed past pack never changes; a whole `consensus-db` from an older backup lacks the later packs), or
+closed or another node's sealed copy, verified by `db import-epoch` (a sealed past pack never changes; a
+whole `consensus-db` from an older backup lacks the later packs), or
 start the node over (crates/tn-reth/README.md, "Transactions stored by position"), and never delete the
 `epoch-N` directory, which a datadir storing transactions by position needs at every start. Only the
 newest epoch's torn-empty meta or all-zero data file holds no output: the node creates (or
@@ -504,8 +505,21 @@ interrupted install (`epoch-N.replaced` with no `epoch-N`: an install or migrati
 its two renames) is reported by `db repair`, `db migrate` and `db validate` of the missing `epoch-N`,
 never read as "not found" or healthy; the node's next start puts it back
 (`ConsensusChain::recover_incomplete_installs`), and `db repair --force` runs that same step first,
-then checks the restored epoch with the others. `db repair`,
-`db migrate`, `db load-state`, `db tndb-stat`, `db reset-execution`, `db migrate-execution` and,
+then checks the restored epoch with the others. `telcoin-network db import-epoch --epoch N --from
+<copy> [--force]` puts back one past epoch's pack from a copy at rest
+(`ConsensusChain::import_epoch_at_rest`, `consensus/at_rest_import.rs`): the copy's data log up to
+its last complete output (`wal_consistent_end`; a sealed log ends with its sentinel, which no peer
+serves) goes through the peer import's own staged path (`ConsensusChain::import_sealed`, the
+`import-N` directory, the checked seal and its read-back) against the local records of epochs N-1
+and N, read from their logs without opening the records DB (N certified, N chaining to N-1), and
+only a verified copy is installed (`install_imported_epoch_dir`, rename-aside, which also puts back
+an interrupted install's aside first). It opens no `ConsensusChain`: an open writes (the live
+epoch's append open, `recover_incomplete_installs`, the sweep), and `stream_import`'s idempotency
+guard keeps a pack that still serves its final output, however damaged the rest of its log. It
+refuses epoch 0, the epoch the latest-consensus hint resumes and later ones, and a pack in place
+(or an interrupted install's aside) that validates; a dry run (no `--force`) removes its `import-N`
+and changes nothing else. `db repair`, `db migrate`, `db import-epoch`, `db load-state` (except
+`--verify-only`), `db tndb-stat`, `db reset-execution`, `db migrate-execution` and,
 on the default (tn-lmdb) build, `db stats` and `db check` refuse to run while a live node holds the
 `<datadir>/telcoin.pid` lock, and hold it while they run (intentional-design item 9); `db validate`
 takes no lock.

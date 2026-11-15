@@ -142,6 +142,24 @@ enum DbSubcommand {
     /// non-zero when a pack could not be migrated.
     Migrate(DbMigrateArgs),
 
+    /// Re-import one past epoch's consensus pack from a copy (dry run unless --force).
+    ///
+    /// Puts back the pack of past epoch N (`<datadir>/consensus-db/epochs/epoch-N`) from a copy:
+    /// this node's backup of `epoch-N`, or another node's sealed `epoch-N` (only its `data` file
+    /// is read). The copy is not trusted: it goes through the import a peer's stream takes,
+    /// which checks its last output against this node's certified record of epoch N and every
+    /// earlier one by its parent links, and it is installed only once verified, sealed and
+    /// read back, renamed into place as the node installs an import. It replaces a missing
+    /// pack, a damaged one, or an interrupted install whose copy is damaged. It refuses epoch
+    /// 0, the epoch the node resumes and any later one, an epoch whose certified record (or
+    /// the record before it) this node lacks, and a pack in place that validates. The node
+    /// MUST be stopped: it refuses while a node holds the datadir, and holds the datadir while
+    /// it runs. Without `--force` it verifies the copy in `import-N` under the epochs
+    /// directory, removes that, and changes nothing else. It needs about the pack's size free
+    /// on the datadir's filesystem, beyond the margin a peer's import leaves. Exits non-zero
+    /// when it refuses or the copy fails.
+    ImportEpoch(DbImportEpochArgs),
+
     /// Restore a state-export bundle into a fresh datadir.
     ///
     /// Loads an EVM state export (an `epoch-N` directory written by `--enable-state-export`) into
@@ -191,8 +209,8 @@ enum DbSubcommand {
     /// format, and from then on the node needs every pack its rows point into. A start that finds
     /// one missing refuses, naming the epochs, and a rebuild does not get past that (it
     /// re-executes from the same packs): put back each missing past `epoch-N` from a backup taken
-    /// after that epoch closed, or start over as a
-    /// new node with `consensus-db` moved aside as well, or swap in an observer's execution
+    /// after that epoch closed or another node's sealed copy (`db import-epoch`), or start over as
+    /// a new node with `consensus-db` moved aside as well, or swap in an observer's execution
     /// database (`--for-swap`).
     ResetExecution(DbResetExecutionArgs),
 }
@@ -408,6 +426,7 @@ impl DbCommand {
             DbSubcommand::Validate(args) => args.execute(&datadir)?,
             DbSubcommand::Repair(args) => args.execute(datadir)?,
             DbSubcommand::Migrate(args) => args.execute(datadir)?,
+            DbSubcommand::ImportEpoch(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
             DbSubcommand::TndbStat => tndb_stat(&datadir)?,
             DbSubcommand::ResetExecution(args) => args.execute(datadir)?,
@@ -1142,6 +1161,80 @@ impl DbMigrateArgs {
             }
             Ok::<(), eyre::Report>(())
         })?;
+        Ok(())
+    }
+}
+
+/// Re-import one past epoch's consensus pack from a copy (`db import-epoch`), through
+/// [`ConsensusChain::import_epoch_at_rest`].
+#[derive(Debug, Args)]
+pub struct DbImportEpochArgs {
+    /// The past epoch whose pack to put back.
+    #[arg(long)]
+    pub epoch: Epoch,
+
+    /// The copy: an `epoch-N` directory (this node's backup, or another node's sealed one), or
+    /// its `data` file.
+    #[arg(long, value_name = "PATH")]
+    pub from: PathBuf,
+
+    /// Install the verified copy. Without it, verify the copy only and change nothing.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl DbImportEpochArgs {
+    /// Verify (and with `--force` install) the copy into the datadir, and print what it did.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        self.run(datadir, &mut std::io::stdout())
+    }
+
+    /// [`Self::execute`], printing the report to `out`.
+    fn run(&self, datadir: PathBuf, out: &mut impl std::io::Write) -> eyre::Result<()> {
+        let epochs_dir = datadir.epochs_db_path();
+        if !epochs_dir.is_dir() {
+            bail!("no consensus epochs directory at {}", epochs_dir.display());
+        }
+        if !self.force {
+            eprintln!("(dry run: verifying the copy only; re-run with `--force` to install it)");
+        }
+        // The install replaces files a running node reads: refuse while a node holds the datadir,
+        // and hold it so a node cannot start mid-import; released when this returns.
+        let _pid_lock = PidLock::acquire(&datadir)?;
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+        let import = runtime
+            .block_on(ConsensusChain::import_epoch_at_rest(
+                &epochs_dir,
+                self.epoch,
+                &self.from,
+                self.force,
+                STREAM_IMPORT_TIMEOUT,
+            ))
+            .map_err(|e| eyre!("epoch {}: {e}", self.epoch))?;
+        if import.installed {
+            writeln!(
+                out,
+                "epoch {}: installed the copy from {} ({} bytes of data log, verified against the \
+                 certified record of epoch {}) in place of {}",
+                import.epoch,
+                self.from.display(),
+                import.bytes,
+                import.epoch,
+                import.replaces,
+            )?;
+        } else {
+            writeln!(
+                out,
+                "dry run: epoch {}: the copy at {} ({} bytes of data log) verifies against the \
+                 certified record of epoch {}; it would replace {}; pass --force to install it",
+                import.epoch,
+                self.from.display(),
+                import.bytes,
+                import.epoch,
+                import.replaces,
+            )?;
+        }
         Ok(())
     }
 }
@@ -2320,7 +2413,7 @@ mod tests {
             assert!(about.len() <= 80, "{name}'s summary fits one line: {about:?}");
             assert!(command.get_long_about().is_some(), "{name} has details");
         }
-        assert_eq!(names.len(), 9, "{names:?}");
+        assert_eq!(names.len(), 10, "{names:?}");
         let validate = db.find_subcommand("validate").unwrap();
         let details = validate.get_long_about().unwrap().to_string();
         assert!(details.contains("only with the node STOPPED"), "{details}");
@@ -2342,6 +2435,11 @@ mod tests {
             }),
             super::DbSubcommand::Repair(super::DbRepairArgs { epoch: None, force: false }),
             super::DbSubcommand::Migrate(super::DbMigrateArgs { epoch: None, force: false }),
+            super::DbSubcommand::ImportEpoch(super::DbImportEpochArgs {
+                epoch: 1,
+                from: "copy".into(),
+                force: false,
+            }),
             super::DbSubcommand::LoadState(super::DbLoadStateArgs {
                 pack: "bundle".into(),
                 chain: None,
@@ -2391,6 +2489,11 @@ mod tests {
             super::DbSubcommand::TndbStat,
             super::DbSubcommand::Repair(super::DbRepairArgs { epoch: None, force: false }),
             super::DbSubcommand::Migrate(super::DbMigrateArgs { epoch: None, force: false }),
+            super::DbSubcommand::ImportEpoch(super::DbImportEpochArgs {
+                epoch: 1,
+                from: dir.path().join("copy"),
+                force: true,
+            }),
             super::DbSubcommand::LoadState(super::DbLoadStateArgs {
                 pack: dir.path().join("bundle"),
                 chain: None,
@@ -3969,5 +4072,69 @@ mod tests {
             let parsed = Cli::<NoArgs>::try_parse_args_from([&["tn", "db"][..], args].concat());
             assert!(parsed.is_err(), "{args:?} must not parse");
         }
+    }
+
+    /// `db import-epoch` parses its epoch, copy and `--force`, needs both of the first two, and
+    /// says in its help that it needs the node stopped and writes only with `--force`.
+    #[test]
+    fn parse_db_import_epoch_subcommand() {
+        let cli = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "import-epoch",
+            "--epoch",
+            "3",
+            "--from",
+            "/backup/epoch-3",
+            "--force",
+        ])
+        .expect("parsed");
+        let Commands::Db(db) = cli.command else { panic!("expected the db subcommand") };
+        let super::DbSubcommand::ImportEpoch(args) = db.command else { panic!("import-epoch") };
+        assert_eq!((args.epoch, args.from, args.force), (3, "/backup/epoch-3".into(), true));
+        for args in [&["--epoch", "3"][..], &["--from", "/backup/epoch-3"]] {
+            let parsed = Cli::<NoArgs>::try_parse_args_from(
+                [&["tn", "db", "import-epoch"][..], args].concat(),
+            );
+            assert!(parsed.is_err(), "{args:?} must not parse");
+        }
+        use clap::CommandFactory as _;
+        let cli = Cli::<NoArgs>::command();
+        let help = cli
+            .find_subcommand("db")
+            .and_then(|db| db.find_subcommand("import-epoch"))
+            .and_then(|command| command.get_long_about())
+            .expect("import-epoch's details")
+            .to_string();
+        assert!(help.contains("The node MUST be stopped"), "{help}");
+        assert!(help.contains("Without `--force` it"), "{help}");
+    }
+
+    /// `db import-epoch` refuses while a node holds the datadir, before reading anything; with
+    /// the lock free it refuses epoch 0 (verified against the pre-genesis descriptor, which no
+    /// copy carries) and a datadir with no epochs directory, and writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn db_import_epoch_refuses_a_running_node_and_what_it_cannot_verify() {
+        use tn_config::{PidLock, TelcoinDirs as _};
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let import =
+            |epoch| super::DbImportEpochArgs { epoch, from: dir.path().join("copy"), force: true };
+        let err = import(1).execute(datadir.clone()).expect_err("no epochs directory");
+        assert!(format!("{err:#}").contains("no consensus epochs directory"), "{err:#}");
+
+        let epochs = datadir.epochs_db_path();
+        fs::create_dir_all(&epochs).unwrap();
+        let held = PidLock::acquire(&datadir).expect("a node holds the datadir");
+        let err = import(1).execute(datadir.clone()).expect_err("refused while a node runs");
+        assert!(err.to_string().contains("another telcoin process"), "{err}");
+        drop(held);
+        let before = tree_listing(&epochs);
+        let err = import(0).execute(datadir.clone()).expect_err("epoch 0");
+        assert!(format!("{err:#}").contains("epoch 0 cannot be imported"), "{err:#}");
+        let err = import(1).execute(datadir.clone()).expect_err("nothing to verify against");
+        assert!(format!("{err:#}").contains("not a past epoch"), "{err:#}");
+        assert_eq!(tree_listing(&epochs), before, "a refusal wrote nothing");
     }
 }
