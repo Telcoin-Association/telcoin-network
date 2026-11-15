@@ -494,13 +494,16 @@ build with the legacy `mdbx` feature refuses it.
 and `restored-state-floor`) into `execution-reset-<UTC time>/` under the datadir, so the next start
 rebuilds it from genesis in the storage layout new datadirs get; without `--force` it prints what
 would move. It refuses while a node holds the datadir. It also refuses, dry run included, a
-datadir whose consensus database lacks the pack of an epoch below the latest one it holds (a pack
-counts as the node's start finds it: the epoch's `data` log), as a datadir bootstrapped with `db
-load-state` does (it holds consensus only from the restored epoch on) and one that lost a pack does:
-the rebuild re-executes every epoch from 0 from the node's own packs, so every start would stop at
-the gap. Such a node puts back each missing past `epoch-N/` from a backup taken after that epoch
-closed (a sealed epoch's pack never changes; check the copy with `db validate` first), or rebuilds
-as a new one, with `consensus-db/` moved aside first. A validator whose whole `consensus-db/` is
+datadir whose consensus database lacks the pack of an epoch below the latest one it holds, at or
+below the epoch the node resumes from (its latest-consensus hint; a pack counts as the node's start
+finds it: the epoch's `data` log), as a datadir bootstrapped with `db load-state` does (it holds
+consensus only from the restored epoch on) and one that lost a past pack does: the rebuild
+re-executes every epoch from 0 from the node's own packs, and the node fetches only the packs of
+the epochs after the one it resumes from, so every start would stop at the gap. A pack missing
+after that epoch (a catch-up stopped while several pack imports ran) does not refuse: the next start
+fetches it from peers. Such a node puts back each missing past `epoch-N/` from a backup taken
+after that epoch closed (a sealed epoch's pack never changes; check the copy with `db validate`
+first), or rebuilds as a new one, with `consensus-db/` moved aside first. A validator whose whole `consensus-db/` is
 restored from a backup, or moved aside to rebuild as a new one, stays stopped until the network has
 closed the last epoch it took part in: the votes and proposals it made since the backup (or all of
 them) leave with the `consensus-db/` it replaces ([Consensus database
