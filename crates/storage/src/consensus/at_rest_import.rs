@@ -95,8 +95,16 @@ pub enum EpochImportError {
     },
     /// The copy does not read as a data log of the epoch's pack (why).
     Source(String),
-    /// The copy failed the import's verification, or the import or the install failed.
+    /// The copy failed the import's verification, or the import failed; nothing was installed.
     Import(ConsensusChainError),
+    /// The copy verified, but its install as `epoch-N` failed, possibly part way (see the
+    /// message): the node's next start settles what it left (`recover_incomplete_installs`).
+    Install {
+        /// The epoch asked for.
+        epoch: Epoch,
+        /// Why the install failed.
+        error: ConsensusChainError,
+    },
 }
 
 impl Display for EpochImportError {
@@ -123,6 +131,17 @@ impl Display for EpochImportError {
             ),
             Self::Source(why) => write!(f, "{why}"),
             Self::Import(e) => write!(f, "the copy did not import, and nothing was installed: {e}"),
+            Self::Install { epoch, error } => write!(
+                f,
+                "the copy verified, but its install did not complete ({error}). It may have \
+                 stopped part way: `epoch-{epoch}` may already be the verified copy, with the pack \
+                 it replaced at `epoch-{epoch}.replaced`, or `epoch-{epoch}` may be missing, with \
+                 that pack at `epoch-{epoch}.replaced`. The node's next start settles either \
+                 (`recover_incomplete_installs` keeps `epoch-{epoch}` and removes the aside, or \
+                 puts the aside back), and so does a rerun of this import, which puts an \
+                 interrupted install back first and finds nothing to import once the copy is in \
+                 place"
+            ),
         }
     }
 }
@@ -207,7 +226,7 @@ impl ConsensusChain {
                 epoch,
                 &path.join(format!("epoch-{epoch}")),
             )
-            .map_err(EpochImportError::Import)?;
+            .map_err(|error| EpochImportError::Install { epoch, error })?;
         }
         drop(import_path);
         Ok(EpochImport { epoch, replaces, bytes: len, installed: install })
@@ -709,5 +728,33 @@ mod test {
             );
             assert_holds(&base, &epoch1.outputs).await;
         }
+    }
+
+    /// An install that fails after the copy verified is reported as an install failure, naming
+    /// what it may have left and that the node's next start settles it, never as a copy that
+    /// changed nothing; a rerun then installs the copy.
+    #[tokio::test]
+    async fn import_epoch_at_rest_reports_a_failed_install_as_one() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("epochs");
+        let epoch1 = closed_epochs(&base).await;
+        let copy = tmp.path().join("copy");
+        copy_dir(&base.join("epoch-1"), &copy);
+        flip_middle_byte(&base.join("epoch-1").join(DATA_NAME));
+        // the install runs on this (current-thread) test's thread
+        crate::consensus_pack::FAIL_NEXT_INSTALL.with(|fail| fail.set(true));
+        let err =
+            ConsensusChain::import_epoch_at_rest(&base, 1, &copy, true, TIMEOUT).await.unwrap_err();
+        assert!(matches!(err, EpochImportError::Install { epoch: 1, .. }), "{err}");
+        let text = err.to_string();
+        for named in ["recover_incomplete_installs", "`epoch-1.replaced`", "part way"] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
+        assert!(!text.contains("nothing was installed"), "{text}");
+        let done = ConsensusChain::import_epoch_at_rest(&base, 1, &copy, true, TIMEOUT)
+            .await
+            .expect("a rerun installs the copy");
+        assert!(matches!(done.replaces, EpochPackState::Damaged(_)), "{:?}", done.replaces);
+        assert_holds(&base, &epoch1.outputs).await;
     }
 }
