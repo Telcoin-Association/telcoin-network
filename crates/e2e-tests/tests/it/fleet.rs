@@ -57,6 +57,12 @@ pub(crate) const CONFLICT_STOP_LOG: &str = "a certified epoch record from peers 
                                             execution diverged from the certified chain, \
                                             stopping the node";
 
+/// The error the leftover-output drain at an epoch close logs before it stops the node: an output
+/// that does not follow the last one forwarded to the engine.
+pub(crate) const LEFTOVER_GAP_LOG: &str = "leftover consensus output does not follow the last \
+                                           output forwarded to the engine: stopping the node \
+                                           before the engine executes past the gap";
+
 /// The error the closing-block check logs before it stops the node: an epoch record's
 /// `final_state` is not the block where the epoch-closing calls ran for its `final_consensus`.
 pub(crate) const CLOSING_BLOCK_HALT_LOG: &str =
@@ -64,8 +70,8 @@ pub(crate) const CLOSING_BLOCK_HALT_LOG: &str =
 
 /// Every error a node logs as it stops because its chain or its epoch records went wrong; no test
 /// here passes while a node logged one of them.
-pub(crate) const FATAL_LOGS: [&str; 4] =
-    [HALT_LOG, CONFLICT_LOG, CONFLICT_STOP_LOG, CLOSING_BLOCK_HALT_LOG];
+pub(crate) const FATAL_LOGS: [&str; 5] =
+    [HALT_LOG, CONFLICT_LOG, CONFLICT_STOP_LOG, LEFTOVER_GAP_LOG, CLOSING_BLOCK_HALT_LOG];
 
 /// The passphrase [`start_validator_with_overrides`] gives every node.
 pub(crate) const PASSPHRASE: &str = "restart_test";
