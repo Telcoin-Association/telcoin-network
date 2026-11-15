@@ -286,7 +286,7 @@ A full disk does not damage the node's files: once there is room, a start resume
    - the execution database grows its file by up to one growth step at a time, each step allocated when it is taken: `--db.growth-step`, 1 GiB by default;
    - each consensus file the node writes (the open epoch's pack, the epoch records, the tndb logs) allocates up to 128 MiB ahead of its data as it grows;
    - a consensus database compaction starts only with the size of the database it compacts plus 384 MiB free, and gives way below 256 MiB;
-   - a node catching up whole epochs from peers stops a pack import when free space is under 256 MiB plus 320 MiB for each import running (576 MiB for one);
+   - a node catching up whole epochs from peers stops a pack import when free space is under one growth step plus 512 MiB, plus 320 MiB for each import running (about 1.8 GiB for one with the default step);
    - a node still to move its execution database from MDBX to tn-lmdb refuses to start without the database's live pages plus a quarter plus 1 GiB (or the growth step, if larger) free.
 
    Free at least the growth step plus 2 GiB (3 GiB with the default step), and grow the volume as soon as you can.
