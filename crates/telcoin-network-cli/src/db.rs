@@ -154,7 +154,8 @@ enum DbSubcommand {
     /// the genesis committee, and the state against the last epoch record. The import can run for
     /// hours on a large state. A failed run removes the chain data it created (never keys or
     /// config); a stopped one (killed, power lost) leaves a marker the node refuses, and a rerun
-    /// with the same bundle removes what it created and restores again.
+    /// with the same bundle removes what it created and restores again. `--verify-only` runs
+    /// those checks on the bundle and stops, writing nothing.
     ///
     /// The database gets the format new datadirs get: it holds no transaction up to the pack's
     /// block, and in the default build stores each later transaction as its position in the
@@ -1119,6 +1120,17 @@ pub struct DbLoadStateArgs {
         hide_short_help = true
     )]
     pub allow_faucet_on_chain: bool,
+
+    /// Check the bundle and stop, writing nothing: the checks a restore runs before its first
+    /// write (the bundle's parts and closed epoch, its whole certificate chain against the genesis
+    /// committee, and its state against the last epoch record), then exit 0 if all pass.
+    ///
+    /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
+    /// is used, as a restore would), never written. It takes no datadir lock, so it can vet a
+    /// bundle beside a running node; the restore itself still needs the node stopped and a datadir
+    /// whose execution database holds no blocks past genesis, which this does not check.
+    #[arg(long)]
+    pub verify_only: bool,
 }
 
 impl DbLoadStateArgs {
@@ -1135,7 +1147,8 @@ impl DbLoadStateArgs {
         // released when this returns. Every config load below needs the datadir to exist, and so
         // does the lockfile: say so directly rather than through the lockfile's open error.
         require_datadir(&datadir)?;
-        let _pid_lock = PidLock::acquire(&datadir)?;
+        // A verify-only run writes nothing, so it needs no lock and can vet a bundle beside a node.
+        let _pid_lock = (!self.verify_only).then(|| PidLock::acquire(&datadir)).transpose()?;
 
         // An unfinished `db reset-execution` holds part of the execution database in its staging
         // directory: a restore beside it would leave the datadir holding two, and the reset's rerun
@@ -1178,18 +1191,17 @@ impl DbLoadStateArgs {
         // checks above have passed. This is loaded here, not inside the import closure, because the
         // pre-import chain walk below needs it — and a datadir missing its committee should fail
         // before the import, not after it.
-        if let Some(chain) = self.chain {
-            chain.write_committee(&datadir)?;
-        }
-        let genesis_committee =
-            Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML)
-                .map_err(|e| {
-                    eyre!(
-                        "failed to load genesis committee from {} (needed to verify epoch \
-                         records): {e}",
-                        datadir.committee_path().display()
-                    )
-                })?;
+        let genesis_committee = match self.chain {
+            // the committee `write_committee` would write, held in memory instead
+            Some(chain) if self.verify_only && !datadir.committee_path().exists() => {
+                chain.bundled_committee()?
+            }
+            Some(chain) if !self.verify_only => {
+                chain.write_committee(&datadir)?;
+                load_genesis_committee(&datadir)?
+            }
+            _ => load_genesis_committee(&datadir)?,
+        };
 
         // Verify the WHOLE certificate chain before any chain data is created. This is the
         // expensive check in trust terms and the cheap one in wall-clock: one super-quorum BLS
@@ -1208,6 +1220,17 @@ impl DbLoadStateArgs {
         // `state_data` and `epoch_records` copied from different exports — is refused while the
         // target is still untouched, instead of after a multi-GB import has already committed.
         check_state_pack_matches_record(&self.pack, last_epoch_record)?;
+        if self.verify_only {
+            println!(
+                "verified: the bundle at {} restores epoch {} (block {}): its certificate chain \
+                 verifies against the genesis committee and its state matches the epoch record; \
+                 nothing was written",
+                self.pack.display(),
+                last_epoch_record.epoch,
+                last_epoch_record.final_state.number,
+            );
+            return Ok(());
+        }
 
         // `RethConfig::new` is the only public constructor; `RethCommand` has no `Default`, so
         // parse an empty arg list for its defaults (rpc/txpool are irrelevant to a one-shot
@@ -1307,6 +1330,17 @@ impl DbLoadStateArgs {
         );
         Ok(())
     }
+}
+
+/// Load the genesis committee from `datadir`, the trust root `db load-state` verifies a bundle's
+/// epoch records against, as the node loads it.
+fn load_genesis_committee(datadir: &PathBuf) -> eyre::Result<Committee> {
+    Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML).map_err(|e| {
+        eyre!(
+            "failed to load genesis committee from {} (needed to verify epoch records): {e}",
+            datadir.committee_path().display()
+        )
+    })
 }
 
 /// The chain-data directories a state import creates under `datadir`: the reth db, its static
@@ -2256,6 +2290,7 @@ mod tests {
                 pack: "bundle".into(),
                 chain: None,
                 allow_faucet_on_chain: false,
+                verify_only: false,
             }),
             super::DbSubcommand::TndbStat,
             super::DbSubcommand::ResetExecution(super::DbResetExecutionArgs {
@@ -2296,6 +2331,7 @@ mod tests {
                 pack: dir.path().join("bundle"),
                 chain: None,
                 allow_faucet_on_chain: false,
+                verify_only: false,
             }),
             super::DbSubcommand::ResetExecution(super::DbResetExecutionArgs {
                 force: true,
@@ -2379,6 +2415,7 @@ mod tests {
             pack: dir.path().join("bundle"),
             chain: None,
             allow_faucet_on_chain: false,
+            verify_only: false,
         }
         .execute(datadir)
         .expect_err("load-state must refuse while a node holds the lock");
@@ -2422,6 +2459,7 @@ mod tests {
             pack: dir.path().join("bundle"),
             chain: None,
             allow_faucet_on_chain: false,
+            verify_only: false,
         }
         .execute(datadir.clone())
         .expect_err("an unfinished reset");
@@ -2451,6 +2489,7 @@ mod tests {
                 pack: dir.path().join("bundle"),
                 chain: None,
                 allow_faucet_on_chain: false,
+                verify_only: false,
             }
             .execute(datadir.clone())
         };
@@ -3546,6 +3585,7 @@ mod tests {
             pack: bundle.path().to_path_buf(),
             chain: Some(super::NamedChain::Mainnet),
             allow_faucet_on_chain: false,
+            verify_only: false,
         };
         // a faucet build stops at the mainnet refusal, any other build at the bundle check
         for (faucet_enabled, expected) in [(true, "refuses mainnet"), (false, "state-only pack")] {
@@ -3612,6 +3652,7 @@ mod tests {
             pack: bundle.path().to_path_buf(),
             chain: Some(super::NamedChain::Adiri),
             allow_faucet_on_chain: false,
+            verify_only: false,
         };
         let err = args
             .execute(datadir_path.clone())
@@ -3672,5 +3713,106 @@ mod tests {
         assert!(stat.execute(datadir.clone()).is_err(), "the node has it open");
         drop(db);
         let _ = fs::remove_dir_all(&datadir);
+    }
+
+    /// Every file under `dir` with its size and a CRC of its bytes, for the tests that prove a
+    /// command left a datadir as it found it.
+    fn tree_listing(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (u64, u32)> {
+        let mut listing = std::collections::BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(at) = pending.pop() {
+            for entry in fs::read_dir(&at).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                let relative = path.strip_prefix(dir).expect("under dir").to_path_buf();
+                if path.is_dir() {
+                    listing.insert(relative, (u64::MAX, 0));
+                    pending.push(path);
+                } else {
+                    let bytes = fs::read(&path).expect("read file");
+                    listing.insert(relative, (bytes.len() as u64, crc32fast::hash(&bytes)));
+                }
+            }
+        }
+        listing
+    }
+
+    /// A bundle of epoch `last_epoch` signed by `signers`, whose state pack is bound to its tip
+    /// record: one every check of `db load-state` before its first write accepts against a genesis
+    /// committee of `signers`.
+    fn write_verifiable_bundle(bundle: &Path, signers: &[TestSigner], last_epoch: u32) {
+        use tn_storage::{
+            epoch_records::{CERTS_NAME, RECORDS_NAME},
+            exec_state_pack::{ExecStatePackReader, ExecStatePackWriter},
+        };
+        use tn_types::{BlockNumHash, ExecHeader, B256};
+        let root = B256::from([7u8; 32]);
+        let snapshot = ExecHeader { number: 1, state_root: root, ..Default::default() };
+        ExecStatePackWriter::create(bundle, root, std::slice::from_ref(&snapshot))
+            .expect("create pack")
+            .finish()
+            .expect("finish pack");
+        let pack_final_state = {
+            let reader = ExecStatePackReader::open(bundle).expect("open pack");
+            BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash)
+        };
+        let (records, certs) = signed_chain(last_epoch, signers, pack_final_state);
+        let records_src = tempfile::tempdir().expect("records src");
+        write_signed_bundle(records_src.path(), &records, &certs);
+        fs::copy(records_src.path().join(RECORDS_NAME), bundle.join("epoch_records"))
+            .expect("copy records");
+        fs::copy(records_src.path().join(CERTS_NAME), bundle.join("epoch_certs"))
+            .expect("copy certs");
+        fs::write(bundle.join("consensus_data"), b"x").expect("write consensus data");
+    }
+
+    /// `db load-state --verify-only` runs the restore's checks on a bundle and writes nothing: a
+    /// bundle that passes them is reported and leaves the datadir byte-identical, beside a node
+    /// holding the datadir (it takes no lock); with `--chain` and no committee in the datadir it
+    /// verifies against the chain's bundled committee held in memory, writing no `genesis/`.
+    #[cfg(unix)]
+    #[test]
+    fn load_state_verify_only_checks_the_bundle_and_writes_nothing() {
+        use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo, PidLock, TelcoinDirs as _};
+
+        let signers = test_signers(31, 4);
+        let bundle = tempfile::tempdir().expect("bundle");
+        write_verifiable_bundle(bundle.path(), &signers, 2);
+        let args = |chain| super::DbLoadStateArgs {
+            pack: bundle.path().to_path_buf(),
+            chain,
+            allow_faucet_on_chain: false,
+            verify_only: true,
+        };
+
+        // a datadir whose genesis committee is the bundle's signers, held by a running node
+        let datadir = tempfile::tempdir().expect("datadir");
+        let datadir_path = datadir.path().to_path_buf();
+        Config::write_to_path(datadir_path.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)
+            .expect("seed node info");
+        let mut committee = tn_types::CommitteeBuilder::new(0);
+        for (i, signer) in signers.iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        Config::write_to_path(datadir_path.committee_path(), committee.build(), ConfigFmt::YAML)
+            .expect("seed genesis committee");
+        let _node = PidLock::acquire(&datadir_path).expect("a node holds the datadir");
+        let before = tree_listing(&datadir_path);
+        // the datadir's committee is used, as a restore with `--chain` keeps one already there
+        args(Some(super::NamedChain::Adiri))
+            .execute(datadir_path.clone())
+            .expect("a bundle that passes every check verifies");
+        assert_eq!(tree_listing(&datadir_path), before, "a verify-only run changed the datadir");
+
+        // no committee in the datadir: the bundled one, held in memory, refuses another chain's
+        // bundle, and no committee is written
+        let fresh = tempfile::tempdir().expect("fresh datadir");
+        let fresh_path = fresh.path().to_path_buf();
+        Config::write_to_path(fresh_path.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)
+            .expect("seed node info");
+        let err = args(Some(super::NamedChain::Adiri))
+            .execute(fresh_path.clone())
+            .expect_err("a bundle of another committee must be refused");
+        assert!(format!("{err:#}").contains("failed certificate verification"), "{err:#}");
+        assert!(!fresh_path.genesis_path().exists(), "a verify-only run wrote genesis/");
     }
 }
