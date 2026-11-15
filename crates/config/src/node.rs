@@ -409,11 +409,12 @@ pub struct Parameters {
     /// stored, the skipped epoch is a gap (at most 16 at a time) that the record collector asks
     /// for again until its certificate is stored: at most once per 5 s retry interval, after a
     /// pass a peer answered, one record request (up to three peers in turn) per gap, the whole
-    /// retry cut off after 5 s or at shutdown. A walk that ends before a certified record after
-    /// it is stored is tried again at most once per retry interval, not on every pass. A node
-    /// without its own record of the epoch does not walk. The default `false` keeps the
-    /// previous behaviour: collection stops at the first epoch the network left uncertified, on
-    /// every node and across restarts. Issue #1850.
+    /// retry cut off after 5 s or at shutdown. The record collector tries a walk that ended
+    /// before a certified record after it was stored again at most once per retry interval, not
+    /// on every pass; the startup sync walks on each of its passes. A node without its own
+    /// record of the epoch does not walk. The default `false` keeps the previous behaviour:
+    /// collection stops at the first epoch the network left uncertified, on every node and
+    /// across restarts. Issue #1850.
     ///
     /// The switch does not change what a conflict does. A peer's record that validates against
     /// this node's record of the epoch before, but differs from the record this node stored for
@@ -422,7 +423,9 @@ pub struct Parameters {
     /// on every restart. The collection first logs a line starting with `epoch record conflict:`
     /// that names the certificate's signers and the offered record, and counts the conflict in
     /// `tn_state_sync.epoch_record_conflicts_total`; the stop then logs its own line and counts it
-    /// in `tn_epoch.final_state_mismatches_total`.
+    /// in `tn_epoch.final_state_mismatches_total`. Both are counters of the running process, and
+    /// the node stops right after it counts, so a scrape may never see either; the two log lines
+    /// are what remains of a conflict.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_collect_past_uncertified: bool,
 
