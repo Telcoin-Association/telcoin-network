@@ -460,7 +460,7 @@ notified is only logged, which is why `finish_epoch` re-checks the packs and sto
 
 ```
 <datadir>/
-  db/                          reth execution DB (MDBX)
+  db/                          reth execution DB (tn-lmdb.dat; mdbx.dat on the mdbx build)
   static_files/                reth static file segments
   consensus-db/                tndb/{epoch,kad,cache} (one tndb log per environment) + the epochs/ tree below
     epochs/
