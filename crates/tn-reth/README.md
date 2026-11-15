@@ -904,7 +904,11 @@ as its index in the consensus batch its block executed ("Transactions stored by 
   direction, the database ahead of the static files (an unwind target: static files lost, removed
   or swapped for an older copy), is refused too: TN has no stage pipeline to unwind the database,
   so the start stops with "storage consistency check found the database ahead of the static
-  files", saying to restore the datadir from a snapshot or backup.
+  files", saying to restore the execution database (`db/`, `static_files/` and any
+  `restored-state-floor`, all from one stop) from a backup or to rebuild it (`db
+  reset-execution`); a restore of the whole datadir, or into a new one from a snapshot, replaces
+  `consensus-db/` too, and a validator restored that way stays stopped until the network has
+  closed the epoch it was last in.
 
 - **Logs:** `new reth datadir: storage format` (with `layout`, `tx_bodies` and the marker's
   `version`) or `reth datadir: storage format` (with `layout` and `tx_bodies`) at each start; an

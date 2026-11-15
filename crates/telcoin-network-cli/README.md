@@ -498,11 +498,15 @@ datadir whose consensus database lacks the pack of an epoch below the latest one
 counts as the node's start finds it: the epoch's `data` log), as a datadir bootstrapped with `db
 load-state` does (it holds consensus only from the restored epoch on) and one that lost a pack does:
 the rebuild re-executes every epoch from 0 from the node's own packs, so every start would stop at
-the gap. Such a node restores `consensus-db/` from a backup, or rebuilds as a new one, with
-`consensus-db/` moved aside first; a validator rebuilt that way stays stopped until the network has
-closed the last epoch it took part in, because its votes and proposals for that epoch leave with
-`consensus-db/`. `--for-swap` skips this refusal for the side-observer swap, which copies a synced
-observer's execution database in and keeps `consensus-db/`. Both modes refuse a datadir an
+the gap. Such a node puts back each missing past `epoch-N/` from a backup taken after that epoch
+closed (a sealed epoch's pack never changes; check the copy with `db validate` first), or rebuilds
+as a new one, with `consensus-db/` moved aside first. A validator whose whole `consensus-db/` is
+restored from a backup, or moved aside to rebuild as a new one, stays stopped until the network has
+closed the last epoch it took part in: the votes and proposals it made since the backup (or all of
+them) leave with the `consensus-db/` it replaces ([Consensus database
+backups](../../docs/src/getting-started/validator-operations.md#consensus-database-backups)).
+`--for-swap` skips this refusal for the side-observer swap, which copies a synced observer's
+execution database in and keeps `consensus-db/`. Both modes refuse a datadir an
 unfinished `db load-state` left (its `load-state-in-progress` marker), with the node's message:
 rerun `db load-state` with the same bundle instead. While a reset is unfinished (an `execution-reset-*.partial`
 directory holding an entry), the node, `db load-state`, `db stats`, `db check` and `db
