@@ -400,6 +400,19 @@ pub struct Parameters {
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub epoch_record_recertify: bool,
 
+    /// Let the epoch record collection walk past an epoch this node holds as its own uncertified
+    /// record.
+    ///
+    /// When a peer answers that it holds no certified record for an epoch this node closed and
+    /// stored itself without a certificate, the record collector and the startup sync go on to the
+    /// next epoch, anchored on this node's own record, and the record collector asks for the
+    /// skipped epoch again on every later pass until its certificate is stored (at most 16 such
+    /// epochs at a time). A node without its own record of the epoch does not walk. The default
+    /// `false` keeps the previous behaviour: collection stops at the first epoch the network left
+    /// uncertified, on every node and across restarts. Issue #1850.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub epoch_record_collect_past_uncertified: bool,
+
     /// Keep vote requests queued on the voter's per-author lock from each waiting out the
     /// execution wait in turn.
     ///
@@ -525,6 +538,7 @@ impl Default for Parameters {
             allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
             // ---- runtime switches: begin ----
             epoch_record_recertify: false,
+            epoch_record_collect_past_uncertified: false,
             vote_queue_fix: false,
             // ---- runtime switches: end ----
         }
@@ -726,6 +740,7 @@ runtime_switches! {
     // ---- runtime switches: begin ----
     // one entry per switch field, in the order the node lists them
     epoch_record_recertify,
+    epoch_record_collect_past_uncertified,
     vote_queue_fix,
     // ---- runtime switches: end ----
 }
