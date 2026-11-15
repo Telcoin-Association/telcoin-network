@@ -56,10 +56,21 @@ const STARTUP_SYNC_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const STARTUP_SYNC_UNANSWERED_BUDGET: Duration = Duration::from_secs(2);
 
 /// Most epochs a record collection holds open as walked-past gaps at a time (see
-/// [`Collection::gaps`]). It bounds the record collector's gap retry to this many requests per
-/// retry interval; past it, collection stops at the next uncertified epoch as it does with the walk
-/// off.
+/// [`Collection::gaps`]). It bounds the record collector's gap retry to this many record requests
+/// per retry interval; past it, collection stops at the next uncertified epoch as it does with the
+/// walk off.
 const MAX_UNCERTIFIED_GAPS: usize = 16;
+
+/// Longest one gap retry may hold the record collector loop (see [`retry_gaps`]): one retry
+/// interval.
+///
+/// The retry runs at most once per retry interval, so with this bound the pass after it (and with
+/// it the certified-record republish and the certified-prefix gauge) starts at most one interval
+/// late, never later than the retry timer would have started it. A single record request can take
+/// far longer: `request_epoch_cert` asks up to three peers in turn, each bounded only by the
+/// request-response timeout of 10 s. So the retry stops at this deadline even mid-request, and the
+/// next retry starts at the gap after the one it stopped at.
+const GAP_RETRY_DEADLINE: Duration = Duration::from_secs(EPOCH_COLLECT_RETRY_SECS);
 
 /// Where a collection pass stopped (see [`collect_epoch_records`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +125,10 @@ struct Collection<'m> {
     /// (the collector, this node's vote round, a re-vote) stores its certificate. At most
     /// [`MAX_UNCERTIFIED_GAPS`]; empty with the walk off.
     gaps: BTreeSet<Epoch>,
+    /// The gap the next [`retry_gaps`] asks for first (or the first gap after it): the gap after
+    /// the one the previous retry stopped at, so the retry's deadline cannot keep one gap from
+    /// ever being asked by sorting it last.
+    retry_from: Epoch,
     /// Where the walk and conflict counters go.
     metrics: &'m StateSyncMetrics,
 }
@@ -121,7 +136,7 @@ struct Collection<'m> {
 impl<'m> Collection<'m> {
     /// A collection with no gap open yet.
     fn new(switches: EpochRecordCollectSwitches, metrics: &'m StateSyncMetrics) -> Self {
-        Self { switches, gaps: BTreeSet::new(), metrics }
+        Self { switches, gaps: BTreeSet::new(), retry_from: 0, metrics }
     }
 
     /// Whether a pass told by a peer that it holds no certified record of `epoch` may go on to the
@@ -641,12 +656,7 @@ async fn collect_epoch_records(
     Ok(CollectedPass { epoch: result_epoch, definitive })
 }
 
-/// Ask a peer for `epoch`'s record and certificate, validate them against this node's anchor and
-/// store them.
-///
-/// Fails only where [`Collection::refused`] does: our own store failing, or a certified record
-/// that conflicts with this node's own. A stored pair is published on
-/// [`ConsensusBusApp::certified_record_epoch`].
+/// Ask a peer for `epoch`'s record and certificate, then [`store_epoch_record`] the answer.
 async fn fetch_epoch_record(
     epoch: Epoch,
     consensus_chain: &ConsensusChain,
@@ -654,7 +664,24 @@ async fn fetch_epoch_record(
     consensus_bus: &ConsensusBusApp,
     collection: &Collection<'_>,
 ) -> eyre::Result<Fetched> {
-    let (epoch_rec, cert, peer) = match primary_handle.request_epoch_cert(Some(epoch), None).await {
+    let answer = primary_handle.request_epoch_cert(Some(epoch), None).await;
+    store_epoch_record(epoch, answer, consensus_chain, consensus_bus, collection).await
+}
+
+/// Validate a peer's `answer` to a request for `epoch`'s record and certificate against this
+/// node's anchor and store them.
+///
+/// Fails only where [`Collection::refused`] does: our own store failing, or a certified record
+/// that conflicts with this node's own. A stored pair is published on
+/// [`ConsensusBusApp::certified_record_epoch`].
+async fn store_epoch_record(
+    epoch: Epoch,
+    answer: Result<(EpochRecord, EpochCertificate, BlsPublicKey), NetworkError>,
+    consensus_chain: &ConsensusChain,
+    consensus_bus: &ConsensusBusApp,
+    collection: &Collection<'_>,
+) -> eyre::Result<Fetched> {
+    let (epoch_rec, cert, peer) = match answer {
         Ok(answer) => answer,
         Err(err) => return Ok(Fetched::Missing(err)),
     };
@@ -707,44 +734,69 @@ async fn fetch_epoch_record(
 /// Ask once for the certified record of every gap of `collection`, the record collector's retry
 /// (see [`spawn_epoch_record_collector_with`]).
 ///
+/// Each gap's request is one `request_epoch_cert`, which asks up to three peers in turn. The retry
+/// stops at [`GAP_RETRY_DEADLINE`] or when `node_shutdown` fires, mid-request too (only the wait
+/// for peers is cut short, never a validation or a save), and the gaps not asked wait for the next
+/// retry. A retry starts at [`Collection::retry_from`] and wraps around, so every open gap is
+/// asked for at least once in as many retries as there are gaps, however slow the peers are on
+/// the others.
+///
 /// A gap whose certificate is stored already, by whatever path, is dropped without a request; so
 /// is one whose certificate this request stores, and the store is persisted then. Fails where
-/// [`fetch_epoch_record`] does, and when that persist fails.
+/// [`store_epoch_record`] does, and when that persist fails.
 async fn retry_gaps(
     consensus_chain: &ConsensusChain,
     primary_handle: &PrimaryNetworkHandle,
     consensus_bus: &ConsensusBusApp,
     collection: &mut Collection<'_>,
+    node_shutdown: &Noticer,
 ) -> eyre::Result<()> {
-    let open: Vec<Epoch> = collection.gaps.iter().copied().collect();
+    let deadline = tokio::time::Instant::now() + GAP_RETRY_DEADLINE;
+    let from = collection.retry_from;
+    let open: Vec<Epoch> =
+        collection.gaps.range(from..).chain(collection.gaps.range(..from)).copied().collect();
     let mut stored = false;
     for epoch in open {
         let uncertified =
             matches!(consensus_chain.epochs().get_epoch_by_number(epoch).await, Some((_, None)));
-        let closed = !uncertified
-            || match fetch_epoch_record(
-                epoch,
-                consensus_chain,
-                primary_handle,
-                consensus_bus,
-                collection,
-            )
-            .await?
-            {
-                Fetched::Stored(_) => {
-                    stored = true;
-                    true
-                }
-                Fetched::Refused { .. } => false,
-                Fetched::Missing(err) => {
-                    debug!(
-                        target: "epoch-manager",
-                        epoch,
-                        "no peer returned the certified record of an uncertified epoch walked past: {err}",
-                    );
-                    false
-                }
-            };
+        if !uncertified {
+            collection.gaps.remove(&epoch);
+            continue;
+        }
+        let answer = tokio::select! {
+            biased;
+            _ = node_shutdown => None,
+            _ = tokio::time::sleep_until(deadline) => None,
+            answer = primary_handle.request_epoch_cert(Some(epoch), None) => Some(answer),
+        };
+        let Some(answer) = answer else {
+            // the next retry starts after the gap this one stopped at
+            collection.retry_from = epoch.saturating_add(1);
+            break;
+        };
+        let closed = match store_epoch_record(
+            epoch,
+            answer,
+            consensus_chain,
+            consensus_bus,
+            collection,
+        )
+        .await?
+        {
+            Fetched::Stored(_) => {
+                stored = true;
+                true
+            }
+            Fetched::Refused { .. } => false,
+            Fetched::Missing(err) => {
+                debug!(
+                    target: "epoch-manager",
+                    epoch,
+                    "no peer returned the certified record of an uncertified epoch walked past: {err}",
+                );
+                false
+            }
+        };
         if closed {
             collection.gaps.remove(&epoch);
         }
@@ -792,8 +844,10 @@ pub async fn spawn_epoch_record_collector(
 /// next wake-up too (see [`certified_prefix_end`]). The collector keeps one [`Collection`] for its
 /// life. Since a pass starts at the last collected epoch, the gaps a pass walked past are asked for
 /// only by [`retry_gaps`], which runs after a pass that ended on a peer's answer, at most once per
-/// retry interval however often the collector wakes: one request per open gap, after the pass so
-/// the pass's own work (the certified-record and republish signals) never waits on it.
+/// retry interval however often the collector wakes: one `request_epoch_cert` per open gap (each
+/// asks up to three peers in turn), after the pass and under [`GAP_RETRY_DEADLINE`] and the
+/// shutdown signal, so the next pass's work (the certified-record and republish signals), the
+/// gauge and the shutdown select wait at most one retry interval on it.
 async fn spawn_epoch_record_collector_with(
     consensus_chain: ConsensusChain,
     primary_handle: PrimaryNetworkHandle,
@@ -838,9 +892,15 @@ async fn spawn_epoch_record_collector_with(
                 && !collection.gaps.is_empty()
                 && gaps_retried_at.elapsed() >= retry_interval
             {
-                retry_gaps(&consensus_chain, &primary_handle, &consensus_bus, &mut collection)
-                    .await
-                    .map_err(|e| TaskError::from_message(format!("{e:#}")))?;
+                retry_gaps(
+                    &consensus_chain,
+                    &primary_handle,
+                    &consensus_bus,
+                    &mut collection,
+                    &node_shutdown,
+                )
+                .await
+                .map_err(|e| TaskError::from_message(format!("{e:#}")))?;
                 gaps_retried_at = tokio::time::Instant::now();
             }
             certified_prefix_end(&consensus_chain, &metrics).await;
@@ -1961,27 +2021,32 @@ mod tests {
         let (metrics, _snapshotter) = local_metrics();
         let mut collection = Collection::new(WALK, &metrics);
         collection.gaps.insert(1);
+        let shutdown = tn_types::ShutdownNotifier::new();
 
-        retry_gaps(&chain, &handle, bus.app(), &mut collection).await?;
+        retry_gaps(&chain, &handle, bus.app(), &mut collection, &shutdown.subscribe()).await?;
         assert_eq!(collection.gaps, BTreeSet::from([1]), "no peer holds it yet");
 
         let (record1, cert1) = records[1].clone();
         chain.epochs().save_certificate(record1.digest(), cert1).await?;
-        retry_gaps(&chain, &handle, bus.app(), &mut collection).await?;
+        retry_gaps(&chain, &handle, bus.app(), &mut collection, &shutdown.subscribe()).await?;
         assert!(collection.gaps.is_empty());
         Ok(())
     }
 
     /// A mock peer network that answers each epoch record request from `served` as it is at the
-    /// time of the request ("not held" for an epoch it lacks) and then sends the requested epoch on
-    /// `requests`.
+    /// time of the request ("not held" for an epoch it lacks), or not at all for an epoch in
+    /// `silent` at that time, and then sends the requested epoch on `requests`.
     fn mock_changing_network(
         served: std::sync::Arc<parking_lot::Mutex<HashMap<Epoch, (EpochRecord, EpochCertificate)>>>,
+        silent: std::sync::Arc<parking_lot::Mutex<BTreeSet<Epoch>>>,
         peer: BlsPublicKey,
         requests: mpsc::UnboundedSender<Epoch>,
     ) -> PrimaryNetworkHandle {
         let (tx, mut rx) = mpsc::channel(100);
         tokio::spawn(async move {
+            // a silent request's reply is held, so its requester waits as on a peer that accepted
+            // the request and never answers
+            let mut held = Vec::new();
             while let Some(cmd) = rx.recv().await {
                 let NetworkCommand::SendRequestAny { request, reply } = cmd else {
                     continue;
@@ -1989,14 +2054,18 @@ mod tests {
                 let PrimaryRequest::EpochRecord { epoch: Some(epoch), .. } = request else {
                     continue;
                 };
-                let pair = served.lock().get(&epoch).cloned();
-                let result = match pair {
-                    Some((record, certificate)) => {
-                        PrimaryResponse::EpochRecord { record, certificate }
-                    }
-                    None => PrimaryResponse::unavailable_epoch_record(Some(epoch), None),
-                };
-                let _ = reply.send(Ok(NetworkResponseMessage { peer, result }));
+                if silent.lock().contains(&epoch) {
+                    held.push(reply);
+                } else {
+                    let pair = served.lock().get(&epoch).cloned();
+                    let result = match pair {
+                        Some((record, certificate)) => {
+                            PrimaryResponse::EpochRecord { record, certificate }
+                        }
+                        None => PrimaryResponse::unavailable_epoch_record(Some(epoch), None),
+                    };
+                    let _ = reply.send(Ok(NetworkResponseMessage { peer, result }));
+                }
                 let _ = requests.send(epoch);
             }
         });
@@ -2030,7 +2099,7 @@ mod tests {
         let peer = keys_and_signers(&fixture).0[0];
         let answers = std::sync::Arc::new(parking_lot::Mutex::new(served(&records, &[2, 3])));
         let (requests_tx, mut requests) = mpsc::unbounded_channel();
-        let handle = mock_changing_network(answers.clone(), peer, requests_tx);
+        let handle = mock_changing_network(answers.clone(), Default::default(), peer, requests_tx);
         let bus = ConsensusBus::new();
         let shutdown = tn_types::ShutdownNotifier::new();
         let task_manager = tn_types::TaskManager::default();
@@ -2101,7 +2170,8 @@ mod tests {
 
         let mut walking = Collection::new(WALK, &metrics);
         walking.gaps.insert(1);
-        let err = retry_gaps(&chain, &handle, bus.app(), &mut walking)
+        let shutdown = tn_types::ShutdownNotifier::new();
+        let err = retry_gaps(&chain, &handle, bus.app(), &mut walking, &shutdown.subscribe())
             .await
             .expect_err("a conflicting certified record ends a gap retry");
         assert!(diverged(&err), "unexpected error: {err:#}");
@@ -2303,6 +2373,62 @@ mod tests {
             .find(|line| line.starts_with("got an invalid epoch record, epoch 1"))
             .ok_or_else(|| eyre::eyre!("no invalid-record line in {lines:?}"))?;
         assert!(invalid.contains(&format!(" peer={peer}")), "{invalid}");
+        Ok(())
+    }
+
+    /// The gap retry cannot hold the record collector loop. With the peers silent on a gap's
+    /// request, the retry lets go at its deadline, so the pass after it starts within
+    /// [`GAP_RETRY_DEADLINE`], and a shutdown during the retry ends the collector at once. The
+    /// clock is paused and, while the retry waits, its own deadline is the only timer pending,
+    /// so the measured times are exact.
+    #[tokio::test(start_paused = true)]
+    async fn test_gap_retry_lets_go_at_its_deadline_and_on_shutdown() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 3).await?;
+        let peer = keys_and_signers(&fixture).0[0];
+        let answers = std::sync::Arc::new(parking_lot::Mutex::new(served(&records, &[2, 3])));
+        let silent = std::sync::Arc::new(parking_lot::Mutex::new(BTreeSet::new()));
+        let (requests_tx, mut requests) = mpsc::unbounded_channel();
+        let handle = mock_changing_network(answers, silent.clone(), peer, requests_tx);
+        let bus = ConsensusBus::new();
+        let collector_shutdown = tn_types::ShutdownNotifier::new();
+        // never notified: the task manager reports the collector's own exit
+        let manager_shutdown = tn_types::ShutdownNotifier::new();
+        let mut task_manager = tn_types::TaskManager::default();
+        let (metrics, _snapshotter) = local_metrics();
+        spawn_epoch_record_collector_with(
+            chain.clone(),
+            handle,
+            bus.app().clone(),
+            task_manager.get_spawner(),
+            collector_shutdown.subscribe(),
+            WALK,
+            metrics,
+        )
+        .await?;
+
+        // the first pass opens epoch 1 as a gap; from then on no peer answers a request for it
+        expect_requests(&mut requests, &[1, 1, 1, 2, 3, 4, 4, 4]).await?;
+        silent.lock().insert(1);
+        // the timer's next pass, then the retry, held on its first request
+        expect_requests(&mut requests, &[4, 4, 4, 1]).await?;
+        let retry_asked = tokio::time::Instant::now();
+        // a requested epoch wakes the loop as soon as the retry lets go of it
+        bus.app().requested_missing_epoch().send_replace(4);
+        expect_requests(&mut requests, &[4]).await?;
+        assert!(retry_asked.elapsed() <= GAP_RETRY_DEADLINE, "{:?}", retry_asked.elapsed());
+        expect_requests(&mut requests, &[4, 4]).await?;
+
+        // the timer's pass after that and the next retry, held again: shutdown ends the collector
+        expect_requests(&mut requests, &[4, 4, 4, 1]).await?;
+        let notified = tokio::time::Instant::now();
+        collector_shutdown.notify();
+        let ended = task_manager.until_task_ends(manager_shutdown).await;
+        let Err(tn_types::TaskJoinError::CriticalExitOk(name)) = ended else {
+            panic!("expected the record collector's own exit, got {ended:?}");
+        };
+        assert_eq!(name, "Epoch Record Collector");
+        assert!(notified.elapsed() < GAP_RETRY_DEADLINE, "{:?}", notified.elapsed());
         Ok(())
     }
 }
