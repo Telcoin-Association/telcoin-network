@@ -17,7 +17,7 @@ use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
 use human_bytes::human_bytes;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -464,7 +464,9 @@ pub struct DbValidateArgs {
     pub epoch: Option<Epoch>,
 
     /// Validate every epoch's pack under `<datadir>/consensus-db/epochs`, in order, and fail if
-    /// any fails. It warns on the newest epoch, which a running node writes.
+    /// any fails. It warns on the newest epoch, which a running node writes. For an interrupted
+    /// install it validates the last good copy (`epoch-N.replaced`) the node's next start puts
+    /// back as the missing `epoch-N`.
     #[arg(long, conflicts_with_all = ["path", "epoch"])]
     pub all: bool,
 }
@@ -484,21 +486,36 @@ impl DbValidateArgs {
     }
 }
 
-/// `db validate --all`: validate every epoch's pack under `epochs_dir` in order, reporting each
-/// interrupted install, and fail naming the epochs that failed.
+/// `db validate --all`: validate every epoch's pack under `epochs_dir` in order, and fail naming
+/// the epochs that failed. An interrupted install's epoch is reported as one, and its last good
+/// copy (`epoch-N.replaced`), which the node's next start puts back as `epoch-N`, is validated
+/// in its place.
 fn validate_all(epochs_dir: &Path) -> eyre::Result<()> {
     if !epochs_dir.is_dir() {
         bail!("no consensus epochs directory at {}", epochs_dir.display());
     }
-    for epoch in interrupted_installs(epochs_dir)? {
-        println!("epoch {epoch}: {}", interrupted_install_note(epoch));
-    }
+    let interrupted = interrupted_installs(epochs_dir)?;
     let epochs = ConsensusPack::epoch_dirs(epochs_dir)
         .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
+    // an interrupted install has no `epoch-N`, so no epoch is in both lists
+    let packs: BTreeMap<Epoch, PathBuf> = epochs
+        .iter()
+        .map(|&epoch| (epoch, epochs_dir.join(format!("epoch-{epoch}"))))
+        .chain(
+            interrupted
+                .iter()
+                .map(|&epoch| (epoch, epochs_dir.join(format!("epoch-{epoch}.replaced")))),
+        )
+        .collect();
     let mut failed = Vec::new();
-    for &epoch in &epochs {
-        println!("epoch {epoch}:");
-        if let Err(e) = validate_pack(&epochs_dir.join(format!("epoch-{epoch}")), Some(epoch)) {
+    for (&epoch, pack) in &packs {
+        if interrupted.contains(&epoch) {
+            println!("epoch {epoch}: {}", interrupted_install_note(epoch));
+            println!("epoch {epoch} (its last good copy, {}):", pack.display());
+        } else {
+            println!("epoch {epoch}:");
+        }
+        if let Err(e) = validate_pack(pack, Some(epoch)) {
             println!("epoch {epoch}: FAILED: {e:#}");
             failed.push(epoch.to_string());
         }
@@ -507,12 +524,12 @@ fn validate_all(epochs_dir: &Path) -> eyre::Result<()> {
         bail!(
             "{} of {} epoch pack(s) under {} failed: epoch(s) {} (see the reports above)",
             failed.len(),
-            epochs.len(),
+            packs.len(),
             epochs_dir.display(),
             failed.join(", ")
         );
     }
-    println!("{} epoch pack(s) under {} validated", epochs.len(), epochs_dir.display());
+    println!("{} epoch pack(s) under {} validated", packs.len(), epochs_dir.display());
     Ok(())
 }
 
@@ -4353,6 +4370,38 @@ mod tests {
             let parsed = Cli::<NoArgs>::try_parse_args_from([&["tn", "db"][..], args].concat());
             assert!(parsed.is_err(), "{args:?} must not parse");
         }
+    }
+
+    /// `db validate --all` validates an interrupted install's last good copy, which the node's
+    /// next start puts back, in place of its missing `epoch-N`, and fails naming the epoch when
+    /// that copy does not validate, as `--epoch N` fails for it.
+    #[test]
+    fn db_validate_all_validates_an_interrupted_installs_copy() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        for epoch in 0..3 {
+            write_meta_only_pack(&epochs, epoch);
+        }
+        fs::rename(epochs.join("epoch-1"), epochs.join("epoch-1.replaced")).unwrap();
+        let validate = |epoch, all| {
+            let args = super::DbValidateArgs { path: None, epoch, all };
+            super::DbCommand { command: super::DbSubcommand::Validate(args) }
+                .execute(datadir.clone())
+        };
+        validate(None, true).expect("every epoch validates, the interrupted install's copy too");
+
+        // damage the copy past its meta: `--all` fails naming epoch 1, as `--epoch 1` does
+        let data = epochs.join("epoch-1.replaced").join(super::DATA_NAME);
+        let mut bytes = fs::read(&data).unwrap();
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 10]);
+        fs::write(&data, &bytes).unwrap();
+        let err = validate(None, true).expect_err("the interrupted install's copy is damaged");
+        assert!(format!("{err:#}").contains("1 of 3 epoch pack(s)"), "{err:#}");
+        assert!(format!("{err:#}").contains("epoch(s) 1 "), "{err:#}");
+        let _ = validate(Some(1), false).expect_err("epoch 1 is an interrupted install");
     }
 
     /// `db import-epoch` parses its epoch, copy and `--force`, needs both of the first two, and
