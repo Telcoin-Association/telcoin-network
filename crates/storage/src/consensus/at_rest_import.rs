@@ -25,7 +25,7 @@ use super::{ConsensusChain, ConsensusChainError};
 use crate::{
     consensus_pack::{
         legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, ConsensusPack,
-        DATA_NAME, IMPORT_MIN_FREE_BYTES, SENTINEL_MIN_VERSION,
+        DATA_NAME, SENTINEL_MIN_VERSION,
     },
     epoch_records::{EpochRecordDb, CERTS_NAME, RECORDS_NAME},
     pack_validate::{classify_physical_corruption, validate_pack_file, Verdict},
@@ -167,14 +167,18 @@ impl ConsensusChain {
     ///
     /// The stream is the copy's data log up to the end of its last complete output (a sealed log
     /// ends with its clean-close sentinel, a live one with padding, neither of which a peer
-    /// serves), and it leaves [`IMPORT_MIN_FREE_BYTES`] free on the filesystem as a peer import
-    /// does: the node's stores share it.
+    /// serves), and it stops before free space on the filesystem drops below `min_free`, as a peer
+    /// import does: the node's stores share it. Pass the node's own floor
+    /// ([`import_min_free`](crate::consensus_pack::import_min_free) of its execution database's
+    /// growth step; [`IMPORT_MIN_FREE_BYTES`](crate::consensus_pack::IMPORT_MIN_FREE_BYTES) for the
+    /// default step).
     pub async fn import_epoch_at_rest(
         base_path: &Path,
         epoch: Epoch,
         source: &Path,
         install: bool,
         timeout: Duration,
+        min_free: u64,
     ) -> Result<EpochImport, EpochImportError> {
         if let Some(why) = source_inside(base_path, source) {
             return Err(EpochImportError::Source(why));
@@ -210,16 +214,10 @@ impl ConsensusChain {
         let file = tokio::fs::File::open(&data).await.map_err(|e| {
             EpochImportError::Source(format!("cannot open {}: {e}", data.display()))
         })?;
-        let Some((import_path, path)) = Self::import_sealed(
-            base_path,
-            file.take(len),
-            &record,
-            &previous,
-            timeout,
-            IMPORT_MIN_FREE_BYTES,
-        )
-        .await
-        .map_err(EpochImportError::Import)?
+        let Some((import_path, path)) =
+            Self::import_sealed(base_path, file.take(len), &record, &previous, timeout, min_free)
+                .await
+                .map_err(EpochImportError::Import)?
         else {
             return Err(EpochImportError::Import(ConsensusChainError::IO(std::io::Error::other(
                 format!("this process is already importing epoch {epoch}"),
@@ -413,7 +411,7 @@ mod test {
     use super::{EpochImportError, EpochPackState};
     use crate::{
         consensus::ConsensusChain,
-        consensus_pack::{test::make_test_output, ConsensusPack, DATA_NAME},
+        consensus_pack::{test::make_test_output, ConsensusPack, DATA_NAME, IMPORT_MIN_FREE_BYTES},
         mem_db::MemDatabase,
     };
 
@@ -587,7 +585,15 @@ mod test {
         let import = |epoch, source: PathBuf| {
             let base = base.clone();
             async move {
-                ConsensusChain::import_epoch_at_rest(&base, epoch, &source, true, TIMEOUT).await
+                ConsensusChain::import_epoch_at_rest(
+                    &base,
+                    epoch,
+                    &source,
+                    true,
+                    TIMEOUT,
+                    IMPORT_MIN_FREE_BYTES,
+                )
+                .await
             }
         };
         let before = tree(&base);
@@ -684,13 +690,28 @@ mod test {
         let import = |source: &Path, install| {
             let (base, source) = (base.clone(), source.to_path_buf());
             async move {
-                ConsensusChain::import_epoch_at_rest(&base, 1, &source, install, TIMEOUT).await
+                ConsensusChain::import_epoch_at_rest(
+                    &base,
+                    1,
+                    &source,
+                    install,
+                    TIMEOUT,
+                    IMPORT_MIN_FREE_BYTES,
+                )
+                .await
             }
         };
 
         // missing: the dry run leaves nothing, the install puts it back
         std::fs::remove_dir_all(base.join("epoch-1")).unwrap();
         let before = tree(&base);
+        // the floor it is given: one no filesystem meets stops the import, writing nothing
+        let err =
+            ConsensusChain::import_epoch_at_rest(&base, 1, &copy, true, TIMEOUT, u64::MAX / 2)
+                .await
+                .expect_err("an unmet floor stops the import");
+        assert!(format!("{err}").contains("free"), "{err}");
+        assert_eq!(tree(&base), before, "a stopped import changed the epochs directory");
         let dry = import(&copy, false).await.expect("the copy verifies");
         assert_eq!((dry.replaces.clone(), dry.installed), (EpochPackState::Missing, false));
         // what a peer serves: the sealed log without its clean-close sentinel
@@ -737,7 +758,16 @@ mod test {
         let epoch1 = closed_epochs(&base).await;
         let copy = tmp.path().join("copy");
         copy_dir(&base.join("epoch-1"), &copy);
-        let import = || ConsensusChain::import_epoch_at_rest(&base, 1, &copy, true, TIMEOUT);
+        let import = || {
+            ConsensusChain::import_epoch_at_rest(
+                &base,
+                1,
+                &copy,
+                true,
+                TIMEOUT,
+                IMPORT_MIN_FREE_BYTES,
+            )
+        };
         for version in [0_u16, 1, 2] {
             rebuild_epoch1(&base, &epoch1, version, 3).await;
             let err = import().await.unwrap_err();
@@ -769,17 +799,32 @@ mod test {
         flip_middle_byte(&base.join("epoch-1").join(DATA_NAME));
         // the install runs on this (current-thread) test's thread
         crate::consensus_pack::FAIL_NEXT_INSTALL.with(|fail| fail.set(true));
-        let err =
-            ConsensusChain::import_epoch_at_rest(&base, 1, &copy, true, TIMEOUT).await.unwrap_err();
+        let err = ConsensusChain::import_epoch_at_rest(
+            &base,
+            1,
+            &copy,
+            true,
+            TIMEOUT,
+            IMPORT_MIN_FREE_BYTES,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, EpochImportError::Install { epoch: 1, .. }), "{err}");
         let text = err.to_string();
         for named in ["recover_incomplete_installs", "`epoch-1.replaced`", "part way"] {
             assert!(text.contains(named), "{named}: {text}");
         }
         assert!(!text.contains("nothing was installed"), "{text}");
-        let done = ConsensusChain::import_epoch_at_rest(&base, 1, &copy, true, TIMEOUT)
-            .await
-            .expect("a rerun installs the copy");
+        let done = ConsensusChain::import_epoch_at_rest(
+            &base,
+            1,
+            &copy,
+            true,
+            TIMEOUT,
+            IMPORT_MIN_FREE_BYTES,
+        )
+        .await
+        .expect("a rerun installs the copy");
         assert!(matches!(done.replaces, EpochPackState::Damaged(_)), "{:?}", done.replaces);
         assert_holds(&base, &epoch1.outputs).await;
     }
@@ -801,9 +846,16 @@ mod test {
             (base.join("import-1").join(DATA_NAME), true),
             (spelled, true),
         ] {
-            let err = ConsensusChain::import_epoch_at_rest(&base, 1, &source, install, TIMEOUT)
-                .await
-                .unwrap_err();
+            let err = ConsensusChain::import_epoch_at_rest(
+                &base,
+                1,
+                &source,
+                install,
+                TIMEOUT,
+                IMPORT_MIN_FREE_BYTES,
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(&err, EpochImportError::Source(why) if why.contains("inside the epochs")),
                 "{}: {err}",

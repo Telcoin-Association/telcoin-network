@@ -158,8 +158,10 @@ enum DbSubcommand {
     /// refuses while a node holds the datadir, and holds the datadir while it runs. Without
     /// `--force` it imports and verifies the copy in a directory of its own under the epochs
     /// directory (`import-N`), removes that, and changes nothing else. It needs about the pack's
-    /// size free on the datadir's filesystem, beyond the margin a peer's import leaves. Exits
-    /// non-zero when it refuses or the copy fails.
+    /// size free on the datadir's filesystem beyond the floor a peer's import keeps free (one
+    /// growth step of the execution database plus a margin; pass the node's `--db.growth-step` if
+    /// it runs with one), and stops before free space drops below that floor. Exits non-zero when
+    /// it refuses or the copy fails.
     ImportEpoch(DbImportEpochArgs),
 
     /// Restore a state-export bundle into a fresh datadir.
@@ -1240,9 +1242,24 @@ pub struct DbImportEpochArgs {
     /// Install the verified copy. Without it, verify the copy only and change nothing.
     #[arg(long)]
     pub force: bool,
+
+    /// The node's `--db.growth-step`, when it runs with one (`4GB`, `512MB`, a number of bytes).
+    /// The import keeps free what the node keeps free for a peer's import: one growth step of
+    /// the execution database plus a margin. Unset, the step is the backend's default, as the
+    /// node's is.
+    #[arg(long = "db.growth-step", value_name = "SIZE", value_parser = tn_reth::parse_db_growth_step)]
+    pub growth_step: Option<u64>,
 }
 
 impl DbImportEpochArgs {
+    /// The free-space floor the import keeps: the node's own for a peer's import, from its
+    /// execution database's growth step (`--db.growth-step`, else the backend's default).
+    fn min_free(&self) -> u64 {
+        tn_storage::consensus_pack::import_min_free(
+            self.growth_step.unwrap_or_else(tn_reth::default_execution_db_growth_step),
+        )
+    }
+
     /// Verify (and with `--force` install) the copy into the datadir, and print what it did.
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
         self.run(datadir, &mut std::io::stdout())
@@ -1269,6 +1286,7 @@ impl DbImportEpochArgs {
                 &self.from,
                 self.force,
                 STREAM_IMPORT_TIMEOUT,
+                self.min_free(),
             ))
             .map_err(|e| eyre!("epoch {}: {e}", self.epoch))?;
         if import.installed {
@@ -1332,8 +1350,10 @@ pub struct DbLoadStateArgs {
     /// its first write (the bundle's parts and closed epoch, its whole certificate chain against
     /// the genesis committee, and its state against the last epoch record), and the restore's
     /// import of the consensus pack (`consensus_data`) against the last epoch records, then exit 0
-    /// if all pass. The consensus pack is imported into a directory under the system temp
-    /// directory, which needs about its size free and is removed afterwards. The state data's own
+    /// if all pass. The consensus pack is imported into a directory under the temp directory
+    /// (`$TMPDIR` when set, else the system's: `/tmp` on Linux), which needs about the pack's size
+    /// free and is removed afterwards. On many Linux hosts `/tmp` is a RAM-backed tmpfs or a small
+    /// root partition: set `TMPDIR` to a directory on a disk with room. The state data's own
     /// records are read only by the restore itself.
     ///
     /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
@@ -2033,9 +2053,9 @@ fn verify_only_lock_warning(datadir: &impl TelcoinDirs) -> Option<String> {
 
 /// `db load-state --verify-only`'s check of the bundle's consensus pack: the restore's own import
 /// ([`import_bundle_consensus`]) of `bundle_consensus` against the last two of the verified
-/// `records`, run in a new staging directory under `staging_root` (the system temp directory,
-/// outside the datadir), which is removed whatever the outcome. Needs about the pack's size free
-/// there.
+/// `records`, run in a new staging directory under `staging_root` (the temp directory, `$TMPDIR`
+/// when set, outside the datadir), which is removed whatever the outcome. Needs about the pack's
+/// size free there, so a failure names where it staged and that `TMPDIR` moves it.
 fn verify_bundle_consensus(
     staging_root: &Path,
     bundle_consensus: &Path,
@@ -2050,7 +2070,7 @@ fn verify_bundle_consensus(
         .map_err(|e| {
             eyre!(
                 "cannot create a staging directory under {} to check the bundle's consensus \
-                 pack: {e}",
+                 pack (set TMPDIR to stage it elsewhere): {e}",
                 staging_root.display()
             )
         })?;
@@ -2076,10 +2096,14 @@ fn verify_bundle_consensus(
             staged.display()
         );
     }
+    // A shortage of space in the staging directory fails the import as a bad pack would, so the
+    // error says where it staged.
     checked.map_err(|e| {
         e.wrap_err(format!(
-            "the bundle's consensus pack {} does not restore",
-            bundle_consensus.display()
+            "the bundle's consensus pack {} does not restore (imported in a staging directory \
+             under {}, which needs about the pack's size free; set TMPDIR to stage it elsewhere)",
+            bundle_consensus.display(),
+            staging_root.display()
         ))
     })
 }
@@ -2676,6 +2700,7 @@ mod tests {
                 epoch: 1,
                 from: "copy".into(),
                 force: false,
+                growth_step: None,
             }),
             super::DbSubcommand::LoadState(super::DbLoadStateArgs {
                 pack: "bundle".into(),
@@ -2730,6 +2755,7 @@ mod tests {
                 epoch: 1,
                 from: dir.path().join("copy"),
                 force: true,
+                growth_step: None,
             }),
             super::DbSubcommand::LoadState(super::DbLoadStateArgs {
                 pack: dir.path().join("bundle"),
@@ -4478,6 +4504,30 @@ mod tests {
         assert!(help.contains("Without `--force` it"), "{help}");
     }
 
+    /// `db import-epoch` keeps free the floor the node keeps for a peer's import: from the node's
+    /// default growth step when `--db.growth-step` is unset, else from the one given, read as
+    /// the node reads it; a size the node refuses is refused.
+    #[test]
+    fn db_import_epoch_keeps_the_nodes_import_floor() {
+        use clap::Parser as _;
+        use tn_storage::consensus_pack::import_min_free;
+        let floor = |extra: &[&str]| {
+            let args = ["db", "import-epoch", "--epoch", "1", "--from", "copy"];
+            let command = super::DbCommand::try_parse_from(args.iter().chain(extra))?;
+            let super::DbSubcommand::ImportEpoch(import) = command.command else {
+                panic!("not import-epoch");
+            };
+            Ok::<_, clap::Error>(import.min_free())
+        };
+        assert_eq!(
+            floor(&[]).unwrap(),
+            import_min_free(tn_reth::default_execution_db_growth_step())
+        );
+        assert_eq!(floor(&["--db.growth-step", "4GB"]).unwrap(), import_min_free(4 << 30));
+        let err = floor(&["--db.growth-step", "4XB"]).expect_err("an unknown unit");
+        assert!(err.to_string().contains("Invalid unit"), "{err}");
+    }
+
     /// `db import-epoch` refuses while a node holds the datadir, before reading anything; with
     /// the lock free it refuses epoch 0 (verified against the pre-genesis descriptor, which no
     /// copy carries) and a datadir with no epochs directory, and writes nothing.
@@ -4487,8 +4537,12 @@ mod tests {
         use tn_config::{PidLock, TelcoinDirs as _};
         let dir = tempfile::tempdir().unwrap();
         let datadir = dir.path().to_path_buf();
-        let import =
-            |epoch| super::DbImportEpochArgs { epoch, from: dir.path().join("copy"), force: true };
+        let import = |epoch| super::DbImportEpochArgs {
+            epoch,
+            from: dir.path().join("copy"),
+            force: true,
+            growth_step: None,
+        };
         let err = import(1).execute(datadir.clone()).expect_err("no epochs directory");
         assert!(format!("{err:#}").contains("no consensus epochs directory"), "{err:#}");
 

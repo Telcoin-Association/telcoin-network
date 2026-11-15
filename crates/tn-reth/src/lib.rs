@@ -149,8 +149,8 @@ pub mod system_calls;
 mod types;
 pub mod worker;
 pub use cli::{
-    init_reth_defaults, RethCommand, RethConfig, DEFAULT_DB_GAP_FILL,
-    TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
+    default_execution_db_growth_step, init_reth_defaults, parse_db_growth_step, RethCommand,
+    RethConfig, DEFAULT_DB_GAP_FILL, TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
 };
 pub use env::{
     database::{

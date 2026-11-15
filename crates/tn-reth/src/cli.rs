@@ -141,6 +141,33 @@ pub struct RethCommand {
     pub db_gap_fill: Option<GapFill>,
 }
 
+/// The execution database's largest single growth step when `--db.growth-step` is unset: the
+/// backend's default (tn-lmdb's `MAX_GROWTH`, 1 GiB; reth's 4 GiB for MDBX). A command that keeps
+/// the node's import floor (`db import-epoch`) starts from this, as the node does
+/// ([`RethConfig::execution_db_growth_step`]).
+pub fn default_execution_db_growth_step() -> u64 {
+    #[cfg(not(feature = "mdbx"))]
+    let default = tn_lmdb_reth::MAX_GROWTH;
+    #[cfg(feature = "mdbx")]
+    let default = 4 << 30;
+    default
+}
+
+/// Parse a size the way the node's `--db.growth-step` is parsed (`4GB`, `512MB`, a number of
+/// bytes): by reth's own parser, so a command that takes the node's value reads it the same way.
+pub fn parse_db_growth_step(size: &str) -> Result<u64, String> {
+    #[derive(Parser)]
+    struct Parse {
+        #[command(flatten)]
+        db: DatabaseArgs,
+    }
+    let parsed =
+        Parse::try_parse_from(["telcoin-network", "--db.growth-step", size]).map_err(|e| {
+            std::error::Error::source(&e).map_or_else(|| e.to_string(), |e| e.to_string())
+        })?;
+    Ok(parsed.db.growth_step.map_or(0, |step| u64::try_from(step).unwrap_or(u64::MAX)))
+}
+
 /// The gap fill a node runs with when `--db.gap-fill` is unset.
 ///
 /// [`GapFill::Auto`] on the tn-lmdb build on Linux: a completed commit leaves the same bytes on
@@ -615,11 +642,9 @@ impl RethConfig {
     /// the backend's default (tn-lmdb's `MAX_GROWTH`, 1 GiB; reth's 4 GiB for MDBX). The consensus
     /// chain keeps this much free beside its own stores when it imports a peer's pack.
     pub fn execution_db_growth_step(&self) -> u64 {
-        #[cfg(not(feature = "mdbx"))]
-        let default = tn_lmdb_reth::MAX_GROWTH;
-        #[cfg(feature = "mdbx")]
-        let default = 4 << 30;
-        self.0.db.growth_step.map_or(default, |step| u64::try_from(step).unwrap_or(u64::MAX))
+        self.0.db.growth_step.map_or_else(default_execution_db_growth_step, |step| {
+            u64::try_from(step).unwrap_or(u64::MAX)
+        })
     }
 
     /// This config, with tn-lmdb's gap fill at `gap_fill`: for benches.
@@ -995,6 +1020,13 @@ mod tests {
         let default = 4 << 30;
         assert_eq!(config(&[])?.execution_db_growth_step(), default);
         assert_eq!(config(&["--db.growth-step", "4GB"])?.execution_db_growth_step(), 4 << 30);
+        assert_eq!(default_execution_db_growth_step(), default);
+        // the parser a command reuses reads what the node reads, and refuses what it refuses
+        assert_eq!(parse_db_growth_step("4GB"), Ok(4 << 30));
+        assert_eq!(parse_db_growth_step("512MB"), Ok(512 << 20));
+        assert_eq!(parse_db_growth_step("4096"), Ok(4096));
+        let err = parse_db_growth_step("4XB").expect_err("an unknown unit");
+        assert!(err.contains("Invalid unit"), "{err}");
         Ok(())
     }
 
