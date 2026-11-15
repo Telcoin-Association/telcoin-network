@@ -455,6 +455,10 @@ Complete tree after the node has run:
     epochs/                       #   per-epoch consensus packs, epoch records, certificate packs
 ```
 
+[Database commands](../../docs/src/getting-started/validator-operations.md#database-commands) lists
+the `telcoin-network db` commands: what each does and checks, whether it needs the node stopped, and
+whether it writes. Each prints the datadir it acts on to stderr first.
+
 `telcoin-network db stats` prints the static files and each table of the execution database:
 rows, pages and size. The default (tn-lmdb) build needs the node stopped: it refuses while a node
 holds the datadir, and holds the datadir while it runs, so a node started meanwhile is refused
