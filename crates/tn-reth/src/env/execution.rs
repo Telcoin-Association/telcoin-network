@@ -314,7 +314,8 @@ impl RethEnv {
     /// digest for it (`get_batch_digest(i)`, which the block's header names as `ommers_hash`), and
     /// none otherwise: the positions name transactions of the batch with that digest, so they are
     /// stored only where the digest finds the batch they came from. The digest (blake3 over the
-    /// batch's encoding) runs on the batch's own rayon task, beside its signer recovery. A mismatch
+    /// batch's encoding) is the other half of a `rayon::join` with the batch's signer recovery, so
+    /// an idle pool thread hashes while the transactions recover instead of after them. A mismatch
     /// occurs on adiri's duplicate-batch epochs, where the digest list is longer than the batches
     /// and so pairs block `i` with another batch's digest; there the block's transactions are
     /// stored inline.
@@ -342,9 +343,12 @@ impl RethEnv {
                 // later; here the missing digest only labels the error line of a dropped
                 // transaction, and the batch gets no positions
                 let digest = output.get_batch_digest(batch_index);
-                let (txs, positions) =
-                    recover_batch_signers(&batch.transactions, digest.unwrap_or_default());
-                let named = digest.is_some_and(|digest| batch.digest() == digest);
+                // join, not sequence: the second closure is the first job thieves take, so the
+                // hash runs beside the recovery rather than as a serial tail after it
+                let ((txs, positions), named) = rayon::join(
+                    || recover_batch_signers(&batch.transactions, digest.unwrap_or_default()),
+                    || digest.is_some_and(|digest| batch.digest() == digest),
+                );
                 RecoveredBatch { txs, positions: named.then_some(positions) }
             })
             .collect();
