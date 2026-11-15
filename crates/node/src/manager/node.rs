@@ -1562,13 +1562,17 @@ where
         // `close()` now force-seals rather than leaving the pack unsealed.) Surfacing the
         // storage error before draining (a bare `?`) would skip that drain; the `Drop`
         // fallback is runtime-safe regardless. On a clean stop a storage error is the exit
-        // error; when the loop failed, its own error is (`finish_stopped_epoch` logs what the
-        // stop meets then).
+        // error, and after it a critical task that failed as it stopped (the engine's drain
+        // failing to execute or persist what it held); when the loop failed, its own error is
+        // (`finish_stopped_epoch` and the drain log what the stop meets then).
         let stop_result = self.finish_stopped_epoch(result.is_err()).await;
-        node_task_manager.shutdown_tasks(NODE_TASK_EXIT_GRACE).await;
+        let stopped = node_task_manager.shutdown_tasks(NODE_TASK_EXIT_GRACE).await;
         stop_result?;
-
-        result
+        result?;
+        match stopped.failed {
+            Some(e) => Err(eyre!("a node task failed as the node stopped: {e}")),
+            None => Ok(()),
+        }
     }
 
     /// Gracefully close storage handles that would otherwise block a tokio worker on `Drop`.

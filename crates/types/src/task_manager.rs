@@ -411,7 +411,7 @@ impl TaskManager {
     /// Will resolve once all tasks have shutdown or timeout is reached.
     /// Can be used after until_exit to split up the join.
     pub async fn wait_for_task_shutdown(&mut self) {
-        self.wait_for_task_shutdown_internal().await;
+        let _ = self.wait_for_task_shutdown_internal().await;
     }
 
     /// Give the tasks up to `grace` to exit on their own (after their shutdown was signalled), so
@@ -419,7 +419,7 @@ impl TaskManager {
     /// [`Self::wait_for_task_shutdown`], tasks still running when the grace lapses are not
     /// reported as a failure: the caller is expected to abort them next.
     pub async fn wait_for_exit(&mut self, grace: Duration) -> bool {
-        self.join_tasks_within(grace).await
+        self.join_tasks_within(grace).await.all_exited
     }
 
     /// Signal every task this manager spawned to exit, as dropping the manager does, and keep the
@@ -435,14 +435,18 @@ impl TaskManager {
     /// The tasks first get up to `grace` to exit on their own, so their graceful exits run. Then
     /// the manager signals its own shutdown ([`Self::signal_shutdown`]), which ends the tasks
     /// that follow only this manager (reth's tasks), and joins them for up to the join wait. Only
-    /// a task still running after both is logged as an error. True when every task exited.
-    pub async fn shutdown_tasks(&mut self, grace: Duration) -> bool {
+    /// a task still running after both is logged as an error. The result says whether every task
+    /// exited and names the first critical task that failed as it stopped: a stop is where a task
+    /// that holds work (the engine's drain) finishes it, so its error is the stop's.
+    pub async fn shutdown_tasks(&mut self, grace: Duration) -> TasksStopped {
         self.update_tasks();
-        if self.join_tasks_within(grace).await {
-            return true;
+        let first = self.join_tasks_within(grace).await;
+        if first.all_exited {
+            return first;
         }
         self.signal_shutdown();
-        self.wait_for_task_shutdown_internal().await
+        let rest = self.wait_for_task_shutdown_internal().await;
+        TasksStopped { all_exited: rest.all_exited, failed: first.failed.or(rest.failed) }
     }
 
     /// Abort all of our direct tasks (not sub task managers though).
@@ -537,22 +541,24 @@ impl TaskManager {
         result
     }
 
-    /// Attempt to wait for all the tasks to complete or timeout waiting on them. True when all
-    /// of them did; otherwise the ones still running are logged.
-    async fn wait_for_task_shutdown_internal(&mut self) -> bool {
+    /// Attempt to wait for all the tasks to complete or timeout waiting on them. When some did
+    /// not, the ones still running are logged.
+    async fn wait_for_task_shutdown_internal(&mut self) -> TasksStopped {
         let task_name = self.name.clone();
         let join_wait = Duration::from_millis(self.join_wait_millis);
-        if self.join_tasks_within(join_wait).await {
-            return true;
+        let stopped = self.join_tasks_within(join_wait).await;
+        if !stopped.all_exited {
+            let running: Vec<&str> =
+                self.tasks.iter().map(|task| task.info.name.as_str()).collect();
+            tracing::error!(target:"tn::tasks", ?running, "{}: All tasks NOT shutdown", task_name);
         }
-        let running: Vec<&str> = self.tasks.iter().map(|task| task.info.name.as_str()).collect();
-        tracing::error!(target:"tn::tasks", ?running, "{}: All tasks NOT shutdown", task_name);
-        false
+        stopped
     }
 
-    /// Join the tasks as they finish, logging each, for up to `wait`. True when all of them did.
-    async fn join_tasks_within(&mut self, wait: Duration) -> bool {
-        tokio::time::timeout(wait, async move {
+    /// Join the tasks as they finish, logging each, for up to `wait`.
+    async fn join_tasks_within(&mut self, wait: Duration) -> TasksStopped {
+        let mut failed = None;
+        let all_exited = tokio::time::timeout(wait, async {
             tracing::debug!(target: "tn::tasks", "awaiting shutdown for task manager\n{self:?}");
             while let Some(res) = self.tasks.next().await {
                 match res {
@@ -581,14 +587,16 @@ impl TaskManager {
                             "{}: {} shutdown with error {err}",
                             self.name,
                             info.name,
-                        )
+                        );
+                        failed.get_or_insert(err);
                     }
                 }
             }
             tracing::info!(target: "tn::tasks", "{}: All tasks shutdown", self.name);
         })
         .await
-        .is_ok()
+        .is_ok();
+        TasksStopped { all_exited, failed }
     }
 
     /// Implements the join logic for the manager.
@@ -598,7 +606,7 @@ impl TaskManager {
         do_exit: bool,
     ) -> Result<(), TaskJoinError> {
         let result = self.until_exit_internal(shutdown, do_exit).await;
-        self.wait_for_task_shutdown_internal().await;
+        let _ = self.wait_for_task_shutdown_internal().await;
         result
     }
 
@@ -718,6 +726,18 @@ impl reth_tasks::TaskSpawner for NonCriticalTaskSpawner {
     ) -> JoinHandle<()> {
         self.0.spawn_reth_task(name, fut, false, true)
     }
+}
+
+/// How a manager's tasks stopped ([`TaskManager::shutdown_tasks`]).
+#[derive(Debug)]
+#[must_use = "a critical task that failed as it stopped is an error of the stop"]
+pub struct TasksStopped {
+    /// Every task ended within the waits.
+    pub all_exited: bool,
+    /// The first critical task that ended with an error (or panicked) as it stopped; each is also
+    /// logged. A task ended by the manager's own shutdown ends `Ok`, and a cancelled one is not
+    /// counted.
+    pub failed: Option<TaskJoinError>,
 }
 
 /// Indicate a non-normal exit on a a taskmanager join.
@@ -1072,11 +1092,38 @@ mod test {
         RethTaskSpawner::spawn_blocking_task(&spawner, Box::pin(std::future::pending()));
 
         node_shutdown.notify();
-        assert!(
-            task_manager.shutdown_tasks(Duration::from_millis(300)).await,
-            "every task exits within the grace and the join wait: {task_manager}"
-        );
+        let stopped = task_manager.shutdown_tasks(Duration::from_millis(300)).await;
+        assert!(stopped.all_exited, "every task exits within the grace and the join wait");
+        assert!(stopped.failed.is_none(), "a task the manager ends is no failure: {stopped:?}");
         assert!(done_rx.try_recv().is_ok(), "the graceful exit ran");
+    }
+
+    /// A critical task whose graceful exit fails (the engine failing to persist what it drains)
+    /// is named in `shutdown_tasks`' result, so the node's stop can exit with it; a non-critical
+    /// task's failure is not.
+    #[tokio::test]
+    async fn shutdown_tasks_names_a_critical_task_that_failed_as_it_stopped() {
+        let mut task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::default();
+        let rx_drain = node_shutdown.subscribe();
+        task_manager.spawn_critical_task("drains on the node shutdown", async move {
+            rx_drain.await;
+            Err(TaskError::from_message("the drain could not persist"))
+        });
+        let rx_side = node_shutdown.subscribe();
+        task_manager.spawn_task("not critical", async move {
+            rx_side.await;
+            Err(TaskError::from_message("ignored"))
+        });
+
+        node_shutdown.notify();
+        let stopped = task_manager.shutdown_tasks(Duration::from_secs(5)).await;
+        assert!(stopped.all_exited);
+        let Some(TaskJoinError::CriticalExitError(name, err)) = stopped.failed else {
+            panic!("expected the draining task's error, got {:?}", stopped.failed);
+        };
+        assert_eq!(name, "drains on the node shutdown");
+        assert!(err.to_string().contains("the drain could not persist"), "{err}");
     }
 
     /// A task spawned through a spawner whose manager has ended (a spawn racing a node stop) ends
