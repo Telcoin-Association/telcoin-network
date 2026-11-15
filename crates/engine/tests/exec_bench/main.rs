@@ -24,33 +24,45 @@
 //!    samply profile of the peak profile (Mac M1 Max, storage v2, at 2ef5c7f90, 2026-11-10); with
 //!    one they are disabled at their call sites, as on a node. Numbers from before the subscriber
 //!    are not like for like.
-//! 2. The base: [`build_base`] builds the prefilled genesis once per spec, backend, storage layout
-//!    and page size in `CACHE_DIR`, with `--db.page-size` set to `PAGE_SIZE` and reth's storage
-//!    layout `LAYOUT` ([`StorageLayout`]): both are fixed when the datadir is created, so the base,
-//!    the aged base and every clone share them. The layout is selected in one place,
-//!    `StorageLayout::select`, which sets it on the env's config (v2 needs the tn-lmdb build).
+//! 2. The base: [`build_base`] builds the prefilled genesis once per spec, backend, storage layout,
+//!    transaction format and page size in `CACHE_DIR`, with `--db.page-size` set to `PAGE_SIZE`,
+//!    reth's storage layout `LAYOUT` ([`StorageLayout`]) and the transaction format `TX_BODIES`
+//!    ([`TxBodies`]): all are fixed when the datadir is created, so the base, the aged base and
+//!    every clone share them. The layout and the format are each selected in one place,
+//!    `StorageLayout::select` and `TxBodies::select`, which set them on the env's config (v2 needs
+//!    the tn-lmdb build, pointers need v2).
 //! 3. The aged base: `AGING` outputs executed on a clone of the base, closed and cached beside it
 //!    under [`base_dir_name`] with an `extra` that keys the aging ([`Aging::extra`]). It is built
 //!    in a `.building` dir, its meta ([`AgedMeta`]) synced, and becomes the aged base by one
 //!    rename. An existing aged base whose meta does not match, or a dir without a meta, is an
-//!    error, never rebuilt over. `AGING=0` runs on the base itself.
+//!    error, never rebuilt over. `AGING=0` runs on the base itself. With `TX_BODIES=pointers` the
+//!    aged base's `Transactions` rows name positions in the aging's batches, which a node reads
+//!    back from its consensus packs; the bench has none, so the aged base keeps those batches in
+//!    [`BATCHES_FILE`] ([`BatchFile`]), and the run reads them into a
+//!    `MemoryBatches::filled_by_caller` its env resolves pointer rows from.
 //! 4. The run: the aged base is cloned into a fresh dir under `TMPDIR` (refused on tmpfs, and when
 //!    it is on another file system than the cache: the clone would copy every byte) and opened with
 //!    [`slim_chain`] and the production `--db.*` flags for `SYNC` and `PAGE_SIZE`; a clone whose
 //!    database has another page size ([`db_page_size`]), or that holds another storage layout than
-//!    `LAYOUT` ([`StorageLayout::of`]), stops the run. Worker 0's transaction pool and HTTP RPC
-//!    methods are built on it as the node builds them ([`BenchNode::serve`]), so the pool's
-//!    maintenance follows every executed output, side load or not. `WARMUP` outputs execute
-//!    untimed, then all `OUTPUTS` outputs are built and signed up front, then the timed loop
-//!    executes them. Each output runs on a blocking task, as `ExecutorEngine` runs it, while a task
-//!    drains the engine-update channel. Just before and just after each output's call, outside its
-//!    wall time, the bench reads the database's own counters ([`db_counters`]), the process's disk
-//!    bytes written ([`disk_bytes_written`]) and its page faults ([`page_faults`]: a write into a
-//!    mapped page the page cache dropped waits for a read, a major fault), and after it the data
-//!    file's length (one `stat`, [`db_file_bytes`]): the database commit completes inside the call
-//!    on both backends (`persist_executed_output` commits in line, and neither backend defers its
-//!    sync to another thread), and nothing else writes the database, so the differences are the
-//!    output's.
+//!    `LAYOUT` ([`StorageLayout::of`]) or keeps its transactions otherwise than `TX_BODIES`
+//!    ([`TxBodies::of`]), stops the run. Worker 0's transaction pool and HTTP RPC methods are built
+//!    on it as the node builds them ([`BenchNode::serve`]), so the pool's maintenance follows every
+//!    executed output, side load or not. `WARMUP` outputs execute untimed, then all `OUTPUTS`
+//!    outputs are built and signed up front, then the timed loop executes them. With
+//!    `TX_BODIES=pointers` each built output's batches go into the run's `MemoryBatches` before it
+//!    executes, outside the timed loop ([`BenchNode::remember`]), so a timed output pays what a
+//!    node's does: the decoded-batch cache's fill on a blocking task, and no copy of its own;
+//!    pointer rows then resolve from that cache or those batches, never from a pack (the bench has
+//!    none; `tx_body_read_bench` in tn-reth prices pack reads). The batches stay in memory for the
+//!    run (about 120 KiB per batch at the peak profile's 30M gas), which the inline side does not
+//!    hold. Each output runs on a blocking task, as `ExecutorEngine` runs it, while a task drains
+//!    the engine-update channel. Just before and just after each output's call, outside its wall
+//!    time, the bench reads the database's own counters ([`db_counters`]), the process's disk bytes
+//!    written ([`disk_bytes_written`]) and its page faults ([`page_faults`]: a write into a mapped
+//!    page the page cache dropped waits for a read, a major fault), and after it the data file's
+//!    length (one `stat`, [`db_file_bytes`]): the database commit completes inside the call on both
+//!    backends (`persist_executed_output` commits in line, and neither backend defers its sync to
+//!    another thread), and nothing else writes the database, so the differences are the output's.
 //!
 //!    With `EPOCH_EVERY`, every `EPOCH_EVERY`-th timed output closes its epoch
 //!    ([`OutputFactory::next_output_closing`]) and is timed like any other. No output can be built
@@ -142,6 +154,9 @@
 //!   Its dir must exist; it is checked before the run.
 //! - `TN_EXEC_BENCH_LAYOUT` (`v1`): reth's storage layout of the bases and the run, `v1` or `v2`;
 //!   each layout has its own bases. `v2` needs the tn-lmdb build (an MDBX build refuses it).
+//! - `TN_EXEC_BENCH_TX_BODIES` (`inline`): where the bases and the run keep their transactions,
+//!   `inline` (in the `Transactions` static files) or `pointers` (each one's position in its batch,
+//!   phases 3 and 4); each format has its own bases. `pointers` needs `LAYOUT=v2`.
 //! - `TN_EXEC_BENCH_READ_MIX` (`rpc`): the readers' kinds: `rpc` (balance, token balance, receipt,
 //!   logs, block, all at the tip), `history` (balances and storage slots at past blocks of the
 //!   chain and of the last epoch, an epoch being `EPOCH_EVERY` outputs, or 50 with none;
@@ -156,7 +171,8 @@
 //! done: elapsed_s=<seconds>` (`etc/reth-exec-bench.sh`'s system sampler places the loop's end by
 //! it); the report follows once the run has closed. A header with the backend, sync mode, metrics
 //! mode, pacing, every knob, the page size (the open clone's, read with [`db_page_size`], and
-//! `PAGE_SIZE` as set or `default`), the storage layout (the open clone's, and `LAYOUT`), where
+//! `PAGE_SIZE` as set or `default`), the storage layout (the open clone's, and `LAYOUT`), the
+//! transaction format (the open clone's, and `TX_BODIES`, with the batches in memory), where
 //! the disk bytes come from ([`DISK_BYTES_SOURCE`], with
 //! the first failed read's reason), the host and the date (the base's `db` size is its data file's
 //! allocated bytes, then its length, which MDBX preallocates), the chain (the genesis hash, the
@@ -242,8 +258,10 @@
 //! the tn-lmdb build `mdbx` and `commit mdbx` time tn-lmdb.
 //!
 //! **JSON report.** One object, its names snake_case with the unit in the name, for scripts that
-//! aggregate runs: `report_version` (6); `header` (backend, sync, `page_size_bytes` (the open
-//! clone's), `layout` (the open clone's storage layout, `v1` or `v2`), `disk_bytes_source`
+//! aggregate runs: `report_version` (7); `header` (backend, sync, `page_size_bytes` (the open
+//! clone's), `layout` (the open clone's storage layout, `v1` or `v2`), `tx_bodies` (the open
+//! clone's transaction format, `inline` or `pointers`), `memory_batches` (the batches its env
+//! resolves pointer rows from at the end of the run, null for inline), `disk_bytes_source`
 //! (`"proc_pid_rusage"`, `"/proc/self/io"` or null), `disk_bytes_error` (the first failed read's
 //! reason, or null), `db_counter_names` (the database counters' names in the build's order: JSON
 //! objects come out with their keys sorted), metrics, pacing, host, date, base, aged,
@@ -292,8 +310,9 @@
 //! output measured the static files' syncs, else [`sf_sync_json`]'s; and `differential`, null
 //! without `DIFF`, else [`differential_json`]'s. The stage keys are [`STAGES`]'s. Version 6 added
 //! the layout, the readers' mix and the differential knobs, the history kinds under `readers`
-//! (the report lists the mix's kinds), `static_file_segments`, `sf_sync` and `differential`. It is
-//! written to a temp file, synced and renamed into place.
+//! (the report lists the mix's kinds), `static_file_segments`, `sf_sync` and `differential`;
+//! version 7 the transaction format (`tx_bodies`, in the header and its knobs) and
+//! `memory_batches`. It is written to a temp file, synced and renamed into place.
 //!
 //! **Durable sync on macOS.** Both backends make a commit durable by `msync`, and neither flushes
 //! the drive's cache. libmdbx, in the write-map mode reth opens it in, msyncs its whole used span
@@ -337,17 +356,18 @@ use tn_reth::{
         base::{base_dir_name, BACKEND, META_FILE},
         build_base, clone_datadir, db_counters, db_file_bytes, db_page_size,
         differential::{self, DiffComparison, DiffHeader, DiffSummary, DIFF_VERSION},
-        dir_bytes, open_production_env_with_layout, poll_addresses,
+        dir_bytes, open_production_env_with_format, poll_addresses,
         readers::{KindSamples, PollSamples, POLL_INTERVAL},
         sf_sync::PhaseTiming,
         slim_chain, static_file_sizes,
         workload::WorkloadConfig,
         BaseMeta, CaptureRecorder, LoadOutput, OutputConfig, OutputFactory, PrefillSpec, ReadKind,
         ReadMix, ReadSamples, Readers, SegmentFiles, SfSyncSource as _, SfSyncStats, StorageLayout,
-        SubmitSamples, Submitter,
+        SubmitSamples, Submitter, TxBodies,
     },
     worker::WorkerNetwork,
-    DbTableStat, GapFill, RethChainSpec, RethDb, RethEnv, WorkerTxPool, DEFAULT_DB_GAP_FILL,
+    DbTableStat, GapFill, MemoryBatches, RethChainSpec, RethDb, RethEnv, WorkerTxPool,
+    DEFAULT_DB_GAP_FILL,
 };
 use tn_storage::{
     disk::{fsync_directory, fsync_file},
@@ -360,6 +380,17 @@ use tn_types::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
+/// A datadir's storage layout and transaction format.
+type Format = (StorageLayout, TxBodies);
+
+/// Each batch of `output` with its digest, in order.
+fn output_batches(output: &LoadOutput) -> impl Iterator<Item = (B256, &tn_types::Batch)> {
+    (0..output.batches.len()).map(|index| {
+        let digest = output.output.get_batch_digest(index).expect("a digest per batch");
+        (digest, output.batch(index))
+    })
+}
+
 /// A reth env opened as the node opens it, with the gas accumulator the engine credits.
 struct BenchNode {
     env: RethEnv,
@@ -367,6 +398,8 @@ struct BenchNode {
     db: RethDb,
     /// The datadir's `db` dir, holding the database's data file ([`db_file_bytes`]).
     db_dir: PathBuf,
+    /// The batches the env resolves pointer rows from, when it stores transactions by position.
+    batches: Option<Arc<MemoryBatches>>,
     gas_accumulator: GasAccumulator,
     _tasks: TaskManager,
     _tmp: Option<TempDir>,
@@ -378,30 +411,52 @@ impl BenchNode {
         let tmp = tempfile::tempdir()?;
         let datadir = tmp.path().to_path_buf();
         let chain = Arc::new(spec.genesis().into());
-        Self::open_at(&datadir, chain, &[], StorageLayout::default(), Some(tmp))
+        Self::open_at(&datadir, chain, &[], Format::default(), None, Some(tmp))
     }
 
-    /// Open the datadir `datadir` on `chain` with the `--db.*` flags `db_flags` in the storage
-    /// `layout` (which the datadir must hold, [`open_production_env_with_layout`]) and one
-    /// worker's accumulator, keeping `tmp` (the dir holding `datadir`, if any) until the env
-    /// closes.
+    /// Open the datadir `datadir` on `chain` with the `--db.*` flags `db_flags` in `format` (which
+    /// the datadir must hold, [`open_production_env_with_format`]) and one worker's accumulator,
+    /// keeping `tmp` (the dir holding `datadir`, if any) until the env closes. A datadir storing
+    /// transactions by position resolves them from `batches`, which it must be given (a new
+    /// empty one when `None`).
     fn open_at(
         datadir: &Path,
         chain: Arc<RethChainSpec>,
         db_flags: &[&str],
-        layout: StorageLayout,
+        format: Format,
+        batches: Option<MemoryBatches>,
         tmp: Option<TempDir>,
     ) -> eyre::Result<Self> {
+        let batches = (format.1 == TxBodies::Pointers)
+            .then(|| Arc::new(batches.unwrap_or_else(MemoryBatches::filled_by_caller)));
         let tasks = TaskManager::default();
-        let (env, db) = open_production_env_with_layout(datadir, chain, db_flags, layout, &tasks)?;
+        let (env, db) = open_production_env_with_format(
+            datadir,
+            chain,
+            db_flags,
+            format,
+            batches.clone(),
+            &tasks,
+        )?;
         Ok(Self {
             env,
             db,
             db_dir: datadir.join("db"),
+            batches,
             gas_accumulator: GasAccumulator::new(1),
             _tasks: tasks,
             _tmp: tmp,
         })
+    }
+
+    /// Put every batch of `outputs` into the env's batches, when it stores transactions by
+    /// position: before they execute, so their pointer rows resolve as soon as they are written,
+    /// and outside any timed output.
+    fn remember(&self, outputs: &[LoadOutput]) {
+        let Some(batches) = &self.batches else { return };
+        for (digest, batch) in outputs.iter().flat_map(output_batches) {
+            batches.insert(digest, batch);
+        }
     }
 
     /// A factory after the env's last executed output, with its committee (if any) set on the
@@ -459,8 +514,8 @@ impl BenchNode {
     /// service runs on the blocking pool, which only the shutdown signal ends, and dropping the
     /// manager would signal without waiting.
     async fn close(self) -> eyre::Result<()> {
-        let Self { env, db, db_dir: _, gas_accumulator, _tasks: mut tasks, _tmp } = self;
-        drop((env, db, gas_accumulator));
+        let Self { env, db, db_dir: _, batches, gas_accumulator, _tasks: mut tasks, _tmp } = self;
+        drop((env, db, batches, gas_accumulator));
         tasks.update_tasks();
         tasks.signal_shutdown();
         tasks.abort();
@@ -546,6 +601,54 @@ impl BenchNode {
         assert_eq!(expected_hashes.next(), None, "every raw transaction executed");
         Ok(parent)
     }
+}
+
+/// On a v2 datadir that stores transactions by position, the bench's outputs write rows naming
+/// batch positions, which resolve from the batches the bench remembers: reopened without them, a
+/// block's transactions do not read; reopened with the batches its batch file kept, every block
+/// reads back whole. A short record in the file is refused by name.
+#[tokio::test]
+async fn test_pointer_rows_resolve_from_the_remembered_batches() -> eyre::Result<()> {
+    if TxBodies::Pointers.selectable(StorageLayout::V2).is_err() {
+        return Ok(()); // pointers need layout v2, which is tn-lmdb only
+    }
+    let spec = PrefillSpec { accounts: 2_000, senders: 8, pools: 2, seed: 23, registry: true };
+    let config = OutputConfig { batches: 2, batch_gas: 3_000_000, ..OutputConfig::default() };
+    let tmp = tempfile::tempdir()?;
+    let datadir = tmp.path().join("datadir");
+    let file_path = tmp.path().join(BATCHES_FILE);
+    let chain: Arc<RethChainSpec> = Arc::new(spec.genesis().into());
+    let format = (StorageLayout::V2, TxBodies::Pointers);
+    let node = BenchNode::open_at(&datadir, chain.clone(), &[], format, None, None)?;
+    let genesis = node.env.canonical_tip().hash();
+    let outputs = node.factory(spec, WorkloadConfig::default(), config)?.generate(2);
+    let mut file = BatchFile::create(&file_path)?;
+    file.append(&outputs)?;
+    assert_eq!(file.finish()?, 4, "two outputs of two batches");
+    node.remember(&outputs);
+    assert_eq!(node.batches.as_ref().map(|batches| batches.len()), Some(4), "remembered");
+    for load in &outputs {
+        node.execute(load).await?;
+    }
+    node.close().await?;
+
+    let bare = BenchNode::open_at(&datadir, chain.clone(), &[], format, None, None)?;
+    assert!(bare.env.sealed_block_by_number(1).is_err(), "the rows name positions");
+    bare.close().await?;
+    let (batches, records) = BatchFile::read(&file_path)?;
+    assert_eq!((batches.len(), records), (4, 4));
+    let node = BenchNode::open_at(&datadir, chain, &[], format, Some(batches), None)?;
+    let mut parent = genesis;
+    for (load, first) in outputs.iter().zip([1, 3]) {
+        parent = node.assert_blocks(load, first, parent)?;
+    }
+    node.close().await?;
+
+    let bytes = std::fs::read(&file_path)?;
+    std::fs::write(&file_path, &bytes[..bytes.len() - 1])?;
+    let err = BatchFile::read(&file_path).expect_err("a short record");
+    assert!(err.to_string().contains("record 3 is short"), "{err}");
+    Ok(())
 }
 
 /// Three outputs of three batches from an `OutputFactory` execute through
@@ -674,7 +777,7 @@ async fn test_load_outputs_close_three_epochs_through_execute_consensus_output()
 const KNOB_PREFIX: &str = "TN_EXEC_BENCH_";
 
 /// The knob names this build reads, after [`KNOB_PREFIX`].
-const KNOB_NAMES: [&str; 27] = [
+const KNOB_NAMES: [&str; 28] = [
     "OUTPUTS",
     "BATCHES",
     "GAS",
@@ -698,6 +801,7 @@ const KNOB_NAMES: [&str; 27] = [
     "CACHE_DIR",
     "REPORT",
     "LAYOUT",
+    "TX_BODIES",
     "READ_MIX",
     "DIFF",
     "DIFF_AGAINST",
@@ -804,6 +908,8 @@ struct Knobs {
     report: Option<PathBuf>,
     /// reth's storage layout of the bases and the run ([`StorageLayout`]).
     layout: StorageLayout,
+    /// Where the bases and the run keep their transactions ([`TxBodies`]).
+    tx_bodies: TxBodies,
     read_mix: ReadMixKnob,
     /// Where the differential is written ([`Differential`]), or `None` for none.
     diff: Option<PathBuf>,
@@ -856,8 +962,9 @@ impl Knobs {
 
     /// The knobs from the `TN_EXEC_BENCH_*` variables in `vars` (others are ignored), the
     /// defaults for those absent. Refuses an unknown knob, a malformed value, a `PAGE_SIZE` that
-    /// is not a power of two from 4096 to 65536, `EPOCH_EVERY` without `REGISTRY=1`, and
-    /// `DIFF_AGAINST` without `DIFF` or naming the same file.
+    /// is not a power of two from 4096 to 65536, `EPOCH_EVERY` without `REGISTRY=1`,
+    /// `TX_BODIES=pointers` without `LAYOUT=v2`, and `DIFF_AGAINST` without `DIFF` or naming the
+    /// same file.
     fn parse(vars: impl IntoIterator<Item = (String, String)>) -> eyre::Result<Self> {
         let mut set = BTreeMap::new();
         for (name, value) in vars {
@@ -948,6 +1055,12 @@ impl Knobs {
         };
         let report = path("REPORT")?;
         let layout = StorageLayout::parse(choice("LAYOUT", &["v1", "v2"])?)?;
+        let tx_bodies = TxBodies::parse(choice("TX_BODIES", &["inline", "pointers"])?)?;
+        eyre::ensure!(
+            tx_bodies == TxBodies::Inline || layout == StorageLayout::V2,
+            "{KNOB_PREFIX}TX_BODIES=pointers stores transactions by position, which needs \
+             {KNOB_PREFIX}LAYOUT=v2"
+        );
         let read_mix = match choice("READ_MIX", &["rpc", "history", "all"])? {
             "rpc" => ReadMixKnob::Rpc,
             "history" => ReadMixKnob::History,
@@ -990,6 +1103,7 @@ impl Knobs {
             cache_dir,
             report,
             layout,
+            tx_bodies,
             read_mix,
             diff,
             diff_against,
@@ -1069,7 +1183,7 @@ impl Knobs {
             "outputs={} batches={} gas={} warmup={} aging={} prefill={} senders={} pools={} \
              seed={} registry={} pace_ms={} metrics={} sync={} page_size={} gap_fill={} readers={} \
              submit_fraction={} window={} epoch_every={} export={} cache_dir={} report={} \
-             layout={} read_mix={} diff={} diff_against={} diff_queries={}",
+             layout={} tx_bodies={} read_mix={} diff={} diff_against={} diff_queries={}",
             self.outputs,
             self.batches,
             self.gas,
@@ -1093,6 +1207,7 @@ impl Knobs {
             self.cache_dir.display(),
             path_text(self.report.as_deref()),
             self.layout.label(),
+            self.tx_bodies.label(),
             self.read_mix.label(),
             path_text(self.diff.as_deref()),
             path_text(self.diff_against.as_deref()),
@@ -1122,6 +1237,74 @@ const AGED_VERSION: u32 = 1;
 
 /// The aged base's meta file inside its datadir.
 const AGED_META_FILE: &str = "bench-aged.json";
+
+/// The aged base's batches inside its datadir, when it stores transactions by position
+/// ([`BatchFile`]).
+const BATCHES_FILE: &str = "bench-batches.bin";
+
+/// A file of batches, the stand-in for consensus packs of an aged base that stores its
+/// transactions by position: each batch's BCS encoding after its length (a little-endian `u64`),
+/// in the order written, synced before the aged base is renamed into place. Read back, each
+/// batch goes into a [`MemoryBatches`] under the digest computed again from its content.
+struct BatchFile {
+    file: std::io::BufWriter<File>,
+    batches: u64,
+}
+
+impl BatchFile {
+    /// A new, empty file at `path`.
+    fn create(path: &Path) -> eyre::Result<Self> {
+        Ok(Self { file: std::io::BufWriter::new(File::create(path)?), batches: 0 })
+    }
+
+    /// Append every batch of `outputs`.
+    fn append(&mut self, outputs: &[LoadOutput]) -> eyre::Result<()> {
+        for (_, batch) in outputs.iter().flat_map(output_batches) {
+            let bytes = tn_types::encode(batch);
+            self.file.write_all(&(bytes.len() as u64).to_le_bytes())?;
+            self.file.write_all(&bytes)?;
+            self.batches += 1;
+        }
+        Ok(())
+    }
+
+    /// Flush and sync the file; the batches written.
+    fn finish(self) -> eyre::Result<u64> {
+        let file = self.file.into_inner().map_err(|e| e.into_error())?;
+        fsync_file(&file)?;
+        Ok(self.batches)
+    }
+
+    /// The batches of the file at `path`, each under its digest, in a [`MemoryBatches`] their
+    /// caller fills (`MemoryBatches::filled_by_caller`), and the records read; a short or
+    /// undecodable record is an error naming the file.
+    fn read(path: &Path) -> eyre::Result<(MemoryBatches, u64)> {
+        use std::io::Read as _;
+        let refuse = |what: String| eyre::eyre!("the batch file {}: {what}", path.display());
+        let mut file = std::io::BufReader::new(
+            File::open(path).map_err(|e| refuse(format!("cannot be opened ({e})")))?,
+        );
+        let memory = MemoryBatches::filled_by_caller();
+        let mut len = [0; 8];
+        let mut bytes = Vec::new();
+        let mut records = 0;
+        loop {
+            match file.read_exact(&mut len) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(refuse(format!("read failed ({e})"))),
+            }
+            bytes.resize(usize::try_from(u64::from_le_bytes(len))?, 0);
+            file.read_exact(&mut bytes)
+                .map_err(|e| refuse(format!("record {records} is short ({e})")))?;
+            let batch: tn_types::Batch = tn_types::try_decode(&bytes)
+                .map_err(|e| refuse(format!("record {records} does not decode ({e})")))?;
+            memory.insert(batch.digest(), &batch);
+            records += 1;
+        }
+        Ok((memory, records))
+    }
+}
 
 /// What shapes an aged base's state beyond its base: `outputs` outputs of `output_config` drawn
 /// by `workload`.
@@ -1216,6 +1399,9 @@ struct AgedMeta {
     output_config: String,
     /// The `Debug` text of the aging's [`WorkloadConfig`].
     workload: String,
+    /// The batches kept in [`BATCHES_FILE`] (none when the base stores transactions inline).
+    #[serde(default)]
+    batches: u64,
     /// The canonical tip after the aging.
     tip_number: u64,
     /// The hash of the canonical tip after the aging.
@@ -1237,6 +1423,8 @@ struct AgedMeta {
 /// A closed datadir a run clones: the base or an aged base, with the tip it holds.
 struct Source {
     dir: PathBuf,
+    /// The batches it keeps in [`BATCHES_FILE`], when it stores transactions by position.
+    batches: u64,
     tip_number: u64,
     tip_hash: B256,
     /// Whether this run built it.
@@ -1284,7 +1472,8 @@ async fn aged_base(
     aging: &Aging,
     recorder: &CaptureRecorder,
 ) -> eyre::Result<Source> {
-    let name = base_dir_name(&base.spec, base.layout, base.page_size, &aging.extra()?)?;
+    let name =
+        base_dir_name(&base.spec, base.layout, base.tx_bodies, base.page_size, &aging.extra()?)?;
     let dir = cache_dir.join(&name);
     if dir.symlink_metadata().is_ok() {
         let meta_path = dir.join(AGED_META_FILE);
@@ -1301,6 +1490,7 @@ async fn aged_base(
         aging.check(&meta, base, &dir)?;
         return Ok(Source {
             dir,
+            batches: meta.batches,
             tip_number: meta.tip_number,
             tip_hash: meta.tip_hash,
             built: false,
@@ -1316,22 +1506,32 @@ async fn aged_base(
     clone_datadir(base_dir, &building)?;
     // the copied base meta would make the aged dir look like a base; the aged meta embeds it
     std::fs::remove_file(building.join(META_FILE))?;
-    let tip = {
+    let (tip, batches) = {
         let page_text = base.page_size.to_string();
         let flags = db_flags(SyncMode::Durable, &page_text);
-        let node = BenchNode::open_at(&building, slim_chain(base), &flags, base.layout, None)?;
+        let format = (base.layout, base.tx_bodies);
+        let node = BenchNode::open_at(&building, slim_chain(base), &flags, format, None, None)?;
+        // the stand-in for the packs that the aged base's pointer rows name
+        let mut batch_file = (base.tx_bodies == TxBodies::Pointers)
+            .then(|| BatchFile::create(&building.join(BATCHES_FILE)))
+            .transpose()?;
         let mut factory = node.factory(base.spec, aging.workload, aging.output_config)?;
         let updates = EngineUpdates::spawn();
         let mut left = aging.outputs;
         while left > 0 {
             let chunk = left.min(AGING_CHUNK);
             let outputs = factory.generate(chunk);
+            node.remember(&outputs);
+            if let Some(file) = &mut batch_file {
+                file.append(&outputs)?;
+            }
             run_outputs(&node, &updates, recorder, outputs, &mut Timed::default()).await?;
             left -= chunk;
         }
         let sent = updates.close().await?;
         eyre::ensure!(sent == aging.outputs, "{sent} engine updates for {} outputs", aging.outputs);
-        node.env.canonical_tip()
+        let batches = batch_file.map(BatchFile::finish).transpose()?.unwrap_or(0);
+        (node.env.canonical_tip(), batches)
         // the env, then its tasks, drop here: the database closes before it is measured or moved
     };
     let blocks = (aging.outputs * aging.output_config.batches) as u64;
@@ -1349,6 +1549,7 @@ async fn aged_base(
         aging: aging.outputs,
         output_config: aging.output_text(),
         workload: aging.workload_text(),
+        batches,
         tip_number: tip.number,
         tip_hash: tip.hash(),
         built_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -1363,6 +1564,7 @@ async fn aged_base(
     fsync_directory(cache_dir)?;
     Ok(Source {
         dir,
+        batches,
         tip_number: tip.number,
         tip_hash: tip.hash(),
         built: true,
@@ -2814,6 +3016,10 @@ struct Header {
     page_size: u32,
     /// The run's storage layout, read from the open clone ([`StorageLayout::of`]).
     layout: StorageLayout,
+    /// Where the run keeps its transactions, read from the open clone ([`TxBodies::of`]).
+    tx_bodies: TxBodies,
+    /// The batches the run's env resolved pointer rows from, at its end (`None`: inline).
+    memory_batches: Option<usize>,
     host: String,
     date: String,
     base: String,
@@ -2868,6 +3074,14 @@ fn report(
     );
     out +=
         &format!("  storage layout: {} (LAYOUT={})\n", header.layout.label(), knobs.layout.label());
+    out += &format!(
+        "  transactions: {} (TX_BODIES={}){}\n",
+        header.tx_bodies.label(),
+        knobs.tx_bodies.label(),
+        header.memory_batches.map_or_else(String::new, |batches| format!(
+            ", resolved from {batches} batches in memory (no packs)"
+        ))
+    );
     out += &disk_bytes_line(DISK_BYTES_SOURCE, header.disk_error.as_deref());
     out += &format!("  host: {}  date: {}\n", header.host, header.date);
     if cfg!(target_os = "macos") && knobs.sync == SyncMode::Durable {
@@ -3435,7 +3649,7 @@ fn export_report(export: Option<&Result<ExportRun, String>>, rows: &[OutputRow])
 
 /// The JSON report's layout version, bumped when a field is added, changes meaning or goes away:
 /// `etc/reth-exec-bench.sh` reads this version only.
-const JSON_REPORT_VERSION: u32 = 6;
+const JSON_REPORT_VERSION: u32 = 7;
 
 /// The JSON report of the timed `rows`, the clone's `footprint` and the `side` load, if it ran
 /// (see the module docs). Its field names stay stable for the scripts that aggregate runs:
@@ -3567,6 +3781,7 @@ fn json_report(
         "cache_dir": knobs.cache_dir.display().to_string(),
         "report": knobs.report.as_ref().map(|path| path.display().to_string()),
         "layout": knobs.layout.label(),
+        "tx_bodies": knobs.tx_bodies.label(),
         "read_mix": knobs.read_mix.label(),
         "diff": knobs.diff.as_ref().map(|path| path.display().to_string()),
         "diff_against": knobs.diff_against.as_ref().map(|path| path.display().to_string()),
@@ -3580,6 +3795,8 @@ fn json_report(
             "sync": knobs.sync.label(),
             "page_size_bytes": header.page_size,
             "layout": header.layout.label(),
+            "tx_bodies": header.tx_bodies.label(),
+            "memory_batches": header.memory_batches,
             "disk_bytes_source": DISK_BYTES_SOURCE,
             "disk_bytes_error": header.disk_error,
             "db_counter_names": counter_names,
@@ -4008,8 +4225,10 @@ async fn exec_bench() -> eyre::Result<()> {
     let spec = knobs.spec();
     let page_size = knobs.page_size();
     let layout = knobs.layout;
-    let base_cached = knobs.cache_dir.join(base_dir_name(&spec, layout, page_size, "")?).exists();
-    let (base_dir, base) = build_base(&spec, layout, page_size, &knobs.cache_dir)?;
+    let tx_bodies = knobs.tx_bodies;
+    let base_name = base_dir_name(&spec, layout, tx_bodies, page_size, "")?;
+    let base_cached = knobs.cache_dir.join(base_name).exists();
+    let (base_dir, base) = build_base(&spec, layout, tx_bodies, page_size, &knobs.cache_dir)?;
     let base_line = format!(
         "{} ({}, {} accounts, db {} MiB allocated of {} MiB)",
         base_dir.display(),
@@ -4022,6 +4241,7 @@ async fn exec_bench() -> eyre::Result<()> {
     let source = if aging.outputs == 0 {
         Source {
             dir: base_dir.clone(),
+            batches: 0,
             tip_number: base.genesis_header.number,
             tip_hash: base.genesis_hash,
             built: false,
@@ -4057,9 +4277,25 @@ async fn exec_bench() -> eyre::Result<()> {
     let page_text = page_size.to_string();
     let gap_text = knobs.gap_fill.to_string();
     let flags = run_db_flags(knobs.sync, &page_text, &gap_text);
-    let node = BenchNode::open_at(&datadir, slim_chain(&base), &flags, layout, None)?;
+    // the aged base's batches, which its pointer rows name, read before the env opens
+    let batches = (tx_bodies == TxBodies::Pointers && source.batches > 0)
+        .then(|| BatchFile::read(&source.dir.join(BATCHES_FILE)))
+        .transpose()?
+        .map(|(batches, records)| {
+            eyre::ensure!(
+                records == source.batches,
+                "{} holds {records} batches, its meta says {}",
+                source.dir.join(BATCHES_FILE).display(),
+                source.batches
+            );
+            Ok(batches)
+        })
+        .transpose()?;
+    let format = (layout, tx_bodies);
+    let node = BenchNode::open_at(&datadir, slim_chain(&base), &flags, format, batches, None)?;
     let effective_page_size = db_page_size(&node.db)?;
     let effective_layout = StorageLayout::of(&node.env)?;
+    let effective_tx_bodies = TxBodies::of(&node.env);
     eyre::ensure!(
         effective_page_size == page_size,
         "the clone's database has {effective_page_size}-byte pages, the run asked for {page_size}"
@@ -4079,6 +4315,7 @@ async fn exec_bench() -> eyre::Result<()> {
     let mut factory = node.factory(spec, knobs.run_workload(), knobs.output_config())?;
     let updates = EngineUpdates::spawn();
     let warmup = factory.generate(knobs.warmup);
+    node.remember(&warmup);
     // the readers' by-hash lookups draw from every executed transaction, the warm-up's included
     let warmup_hashes: Vec<B256> =
         if knobs.readers > 0 { warmup.iter().flat_map(tx_hashes).collect() } else { Vec::new() };
@@ -4096,6 +4333,8 @@ async fn exec_bench() -> eyre::Result<()> {
         if closes {
             outputs.push(factory.next_output_closing()?);
         }
+        // between segments: neither the pacing nor the loop's wall clock counts it
+        node.remember(&outputs);
         if timed.next == 0 {
             sizes.before_timed = Sizes::of(&datadir)?;
             if knobs.export {
@@ -4140,6 +4379,7 @@ async fn exec_bench() -> eyre::Result<()> {
     );
     // the pool and the RPC methods hold the database too
     drop((methods, pool));
+    let node_batches = node.batches.as_ref().map(|batches| batches.len());
     let closed = node.close().await;
     if let Some(upkeep) = upkeep {
         upkeep.abort();
@@ -4171,6 +4411,8 @@ async fn exec_bench() -> eyre::Result<()> {
         knobs,
         page_size: effective_page_size,
         layout: effective_layout,
+        tx_bodies: effective_tx_bodies,
+        memory_batches: node_batches,
         host: host(),
         date,
         base: base_line,
@@ -4274,6 +4516,7 @@ mod tests {
             cache_dir: default_cache_dir(),
             report: None,
             layout: StorageLayout::V1,
+            tx_bodies: TxBodies::Inline,
             read_mix: ReadMixKnob::Rpc,
             diff: None,
             diff_against: None,
@@ -4340,6 +4583,7 @@ mod tests {
             ("CACHE_DIR", "/some/cache"),
             ("REPORT", "/some/report.json"),
             ("LAYOUT", "v2"),
+            ("TX_BODIES", "pointers"),
             ("READ_MIX", "history"),
             ("DIFF", "/some/b.jsonl"),
             ("DIFF_AGAINST", "/some/a.jsonl"),
@@ -4370,13 +4614,14 @@ mod tests {
         );
         assert!(
             knobs.line().ends_with(
-                " report=/some/report.json layout=v2 read_mix=history diff=/some/b.jsonl \
-                 diff_against=/some/a.jsonl diff_queries=600"
+                " report=/some/report.json layout=v2 tx_bodies=pointers read_mix=history \
+                 diff=/some/b.jsonl diff_against=/some/a.jsonl diff_queries=600"
             ),
             "{}",
             knobs.line()
         );
         assert_eq!(knobs.layout, StorageLayout::V2);
+        assert_eq!(knobs.tx_bodies, TxBodies::Pointers);
         assert_eq!(knobs.read_mix(), ReadMix::history(50 * 2), "50 outputs of 2 blocks");
         let epochs = Knobs::parse(vars(&[("READ_MIX", "all"), ("EPOCH_EVERY", "10")])).unwrap();
         assert_eq!(epochs.read_mix(), ReadMix::all(10 * 8), "an epoch of 10 outputs of 8 blocks");
@@ -4388,7 +4633,7 @@ mod tests {
     /// A malformed value and an unknown knob are refused, each by name.
     #[test]
     fn test_knobs_refused() {
-        let cases: [(&str, &str, &str); 25] = [
+        let cases: [(&str, &str, &str); 27] = [
             ("OUTPUTS", "many", "OUTPUTS=\"many\" is not a whole number"),
             ("OUTPUTS", "0", "OUTPUTS=0 is below 1"),
             ("BATCHES", "0", "BATCHES=0 is below 1"),
@@ -4409,6 +4654,12 @@ mod tests {
             ("EXPORT", "2", "EXPORT=\"2\" is not one of 0, 1"),
             ("READER", "1", "unknown knob TN_EXEC_BENCH_READER"),
             ("LAYOUT", "v3", "LAYOUT=\"v3\" is not one of v1, v2"),
+            ("TX_BODIES", "ptr", "TX_BODIES=\"ptr\" is not one of inline, pointers"),
+            (
+                "TX_BODIES",
+                "pointers",
+                "TX_BODIES=pointers stores transactions by position, which needs",
+            ),
             ("READ_MIX", "past", "READ_MIX=\"past\" is not one of rpc, history, all"),
             ("DIFF", "", "DIFF is empty"),
             ("DIFF_AGAINST", "", "DIFF_AGAINST is empty"),
@@ -4659,7 +4910,7 @@ mod tests {
 
         let rows = export_rows();
         let plain = json_report(&header(defaults()), &rows, &footprint(), None);
-        assert_eq!(plain["report_version"], 6);
+        assert_eq!(plain["report_version"], 7);
         assert_eq!(plain["epoch_closes"], Value::Null);
         assert_eq!(plain["export"], Value::Null);
         assert_eq!(plain["header"]["knobs"]["epoch_every"], 0);
@@ -4778,6 +5029,7 @@ mod tests {
             layout_version: 1,
             backend: BACKEND.to_owned(),
             layout: StorageLayout::V1,
+            tx_bodies: TxBodies::Inline,
             page_size: 4096,
             spec: defaults().spec(),
             slim_genesis_hash: B256::ZERO,
@@ -4806,6 +5058,7 @@ mod tests {
             aging: 200,
             output_config: aging.output_text(),
             workload: aging.workload_text(),
+            batches: 0,
             tip_number: 1_600,
             tip_hash: B256::ZERO,
             built_at: 9,
@@ -5021,6 +5274,8 @@ mod tests {
             knobs,
             page_size: 16_384,
             layout: StorageLayout::V1,
+            tx_bodies: TxBodies::Inline,
+            memory_batches: None,
             host: "host (cpu)".to_owned(),
             date: "today".to_owned(),
             base: "base".to_owned(),
@@ -5236,6 +5491,7 @@ mod tests {
         assert!(report.starts_with(&first), "{report}");
         assert!(report.contains("\n  page size: 16384 bytes (PAGE_SIZE=default)\n"), "{report}");
         assert!(report.contains("\n  storage layout: v1 (LAYOUT=v1)\n"), "{report}");
+        assert!(report.contains("\n  transactions: inline (TX_BODIES=inline)\n"), "{report}");
         let segments = "\nstatic files by segment, closed (MiB allocated; db file 14.0 allocated \
                         of 4096.0):\n";
         assert!(report.contains(segments), "{report}");
@@ -5402,10 +5658,13 @@ mod tests {
         let at = |pointer: &str| {
             json.pointer(pointer).unwrap_or_else(|| panic!("no {pointer} in {json:#}")).clone()
         };
-        assert_eq!(at("/report_version"), 6);
+        assert_eq!(at("/report_version"), 7);
         assert_eq!(at("/header/backend"), BACKEND);
         assert_eq!(at("/header/layout"), "v1");
         assert_eq!(at("/header/knobs/layout"), "v1");
+        assert_eq!(at("/header/tx_bodies"), "inline");
+        assert_eq!(at("/header/memory_batches"), serde_json::Value::Null);
+        assert_eq!(at("/header/knobs/tx_bodies"), "inline");
         assert_eq!(at("/header/knobs/read_mix"), "rpc");
         assert_eq!(at("/header/knobs/diff"), serde_json::Value::Null);
         assert_eq!(at("/header/knobs/diff_against"), serde_json::Value::Null);

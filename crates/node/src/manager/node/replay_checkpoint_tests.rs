@@ -340,3 +340,24 @@ async fn replay_anchored_on_block1_stops_at_the_epoch_close() -> eyre::Result<()
     manager.consensus_chain.clone().close().await;
     Ok(())
 }
+
+/// Restart replay makes the current pack durable before the first output reaches the engine:
+/// execution may store a replayed block's transactions as positions in its batches, so a power loss
+/// after that block's commit must find the batches in the pack. With the pack's sync failing
+/// (`poison_current_pack_for_test`), the replay fails before it sends anything.
+#[tokio::test]
+async fn replay_persists_the_pack_before_the_first_output_reaches_the_engine() -> eyre::Result<()> {
+    let temp = TempDir::new()?;
+    let (mut manager, fixture, _) = fresh_manager_with_saved_outputs(&temp, false).await?;
+    manager.consensus_chain.poison_current_pack_for_test();
+    let (to_engine, mut engine_rx) = mpsc::channel(8);
+    let Err(err) = manager.replay_missed_consensus(fixture.committee(), &to_engine).await else {
+        panic!("the pack's sync fails, so the replay must fail");
+    };
+    assert!(
+        engine_rx.try_recv().is_err(),
+        "no output may reach the engine before the persist: {err}"
+    );
+    manager.consensus_chain.clone().close().await;
+    Ok(())
+}

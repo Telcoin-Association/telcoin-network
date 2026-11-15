@@ -9,8 +9,8 @@
 
 use crate::{duration_ms, metrics::EngineMetrics};
 use std::time::Instant;
-use tn_reth::RethEnv;
-use tn_types::{ConsensusOutput, Recovered, TaskSpawner, TransactionSigned};
+use tn_reth::{RecoveredBatch, RethEnv};
+use tn_types::{ConsensusOutput, TaskSpawner};
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
@@ -19,10 +19,10 @@ use tracing::{debug, warn};
 /// Memory: a handle holds its output's recovered transactions from the moment its job finishes
 /// until the execution task takes them. Each `Recovered<TransactionSigned>` owns a decoded copy
 /// of its transaction, calldata included, so that is about the output's raw transaction bytes
-/// again plus 0.3 kB per transaction (5-7.5 MB for a 12.5 k-transaction output of transfers). Only
-/// outputs in the engine queue and the one executing have a handle (outputs still in the
-/// `to_engine` channel have no job), so at most `MAX_QUEUED_OUTPUTS + 1` outputs' signers are held
-/// at once.
+/// again plus 0.3 kB per transaction (5-7.5 MB for a 12.5 k-transaction output of transfers), and
+/// 4 bytes for its batch position. Only outputs in the engine queue and the one executing have a
+/// handle (outputs still in the `to_engine` channel have no job), so at most
+/// `MAX_QUEUED_OUTPUTS + 1` outputs' signers are held at once.
 ///
 /// Dropping a handle (an output dropped from the queue at shutdown or an epoch close) discards
 /// the job's result: the job's send fails silently, and nothing panics or logs.
@@ -89,9 +89,10 @@ impl RecoveryHandle {
     }
 }
 
-/// The recovered transactions of one consensus output: one `Vec` per batch, in
-/// [`ConsensusOutput::flatten_batches`] order (see [`RethEnv::recover_output_signers`]).
-pub(crate) type OutputSigners = Vec<Vec<Recovered<TransactionSigned>>>;
+/// The recovered transactions of one consensus output, with their batch positions: one
+/// [`RecoveredBatch`] per batch, in [`ConsensusOutput::flatten_batches`] order (see
+/// [`RethEnv::recover_output_signers`]).
+pub(crate) type OutputSigners = Vec<RecoveredBatch>;
 
 /// Recover `output`'s signers on the calling thread, timing the work.
 ///
@@ -286,7 +287,7 @@ mod tests {
 
         assert_eq!(signers, expected);
         assert_eq!(signers.len(), output.flatten_batches().len());
-        let recovered: Vec<usize> = signers.iter().map(Vec::len).collect();
+        let recovered: Vec<usize> = signers.iter().map(RecoveredBatch::len).collect();
         let handed: Vec<usize> = output
             .batches()
             .iter()

@@ -88,8 +88,11 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     // update execution address
     tn_config.node_info.execution_address = address;
 
+    // a datadir that stores transactions by position resolves them from the process-wide memory
+    // batches: a test node attaches no consensus packs
     let node_config =
-        RethConfig::new(reth_command, instance, tmp_dir, true, Arc::new(tn_config.chain_spec()));
+        RethConfig::new(reth_command, instance, tmp_dir, true, Arc::new(tn_config.chain_spec()))
+            .with_memory_batches(true);
     // create engine node
     let reth_db = RethEnv::new_database(&node_config, tmp_dir.join("db"))?;
     let mut builder = TnBuilder::new(node_config, tn_config, reth_db);

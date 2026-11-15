@@ -6,6 +6,7 @@
 #
 # Usage: etc/reth-exec-bench.sh <dir on the disk under test> [before-commit]
 #        etc/reth-exec-bench.sh --layout <dir on the disk under test>
+#        etc/reth-exec-bench.sh --tx-bodies <dir on the disk under test>
 #        etc/reth-exec-bench.sh --report-only <bench dir>
 #   Report-only mode: no builds, no runs; renders the report again from the bench dir's
 #                    reports/ into reth-exec-report-<host>-<time>.txt in the repo root, with the
@@ -25,6 +26,13 @@
 #                    first's (TN_EXEC_BENCH_DIFF_AGAINST; the comparison is symmetric, and with the
 #                    rounds' alternating order it is v2's in odd rounds and v1's in even ones). One
 #                    load on two layouts must answer alike: the bench fails a run with a mismatch.
+#   Tx-bodies mode (--tx-bodies): as layout mode, one tn-lmdb build of this checkout run on both
+#                    sides, both on storage layout v2 (TN_EXEC_BENCH_LAYOUT=v2): transactions
+#                    stored inline (A, TN_EXEC_BENCH_TX_BODIES=inline) against stored by their batch
+#                    position (B, =pointers), with the same differential and its comparison (its tx
+#                    and receipt reads answer through each side's own rows). The pointer side's
+#                    rows resolve from the batches the bench holds in memory (it has no consensus
+#                    packs; the bench's module docs say how).
 #   Commit mode (a before-commit): one backend, the commit against this checkout. The commit must
 #                    have the bench (`crates/engine/tests/exec_bench/main.rs`). Each side is built
 #                    with the flags its own tn-reth manifest needs for the backend: an `mdbx`
@@ -32,17 +40,26 @@
 #                    default, before), so a before commit from either side of that change works.
 #                    The before commit's bench may write report version 5 (it has no layout knob,
 #                    and its runs have no layout, readers' mix, differential or static-file rows).
-#   EXEC_BACKEND=tn-lmdb  commit mode's backend: `mdbx` or `tn-lmdb` (the default); layout mode
-#                    takes tn-lmdb only
+#   EXEC_BACKEND=tn-lmdb  commit mode's backend: `mdbx` or `tn-lmdb` (the default); layout and
+#                    tx-bodies modes take tn-lmdb only
 #   EXEC_LAYOUT_BEFORE=<v1|v2>, EXEC_LAYOUT_AFTER=<v1|v2>  commit mode only (refused otherwise):
 #                    the storage layout of every run on that side (TN_EXEC_BENCH_LAYOUT on its
 #                    command line); unset, a side takes TN_EXEC_BENCH_LAYOUT from the environment,
 #                    else its bench's default (v1). A before bench without the knob (report version
 #                    5) refuses it as unknown: leave EXEC_LAYOUT_BEFORE and TN_EXEC_BENCH_LAYOUT
 #                    unset for such a commit
+#   EXEC_TX_BODIES_BEFORE=<inline|pointers>, EXEC_TX_BODIES_AFTER=<inline|pointers>  commit mode
+#                    only (refused otherwise): where every run on that side keeps its transactions
+#                    (TN_EXEC_BENCH_TX_BODIES on its command line; pointers need that side's layout
+#                    v2); unset, a side takes TN_EXEC_BENCH_TX_BODIES from the environment, else
+#                    its bench's default (inline). A before bench without the knob (report version
+#                    5 or 6) refuses it as unknown: leave EXEC_TX_BODIES_BEFORE and
+#                    TN_EXEC_BENCH_TX_BODIES unset for such a commit. Each format has its own bases
+#                    (their names say so), so EXEC_SHARED_BASE=1 is refused when the sides' formats
+#                    differ: each side ages its own
 #   EXEC_ROUNDS=2    pairs per profile; round 1 runs A then B, round 2 B then A, and so on (the
-#                    default 2 is A B B A, 1 is A B), where A is mdbx, v1 or before and B
-#                    tn-lmdb, v2 or after
+#                    default 2 is A B B A, 1 is A B), where A is mdbx, v1, inline or before and B
+#                    tn-lmdb, v2, pointers or after
 #   EXEC_PROFILES="busy busy-readers peak busy-metrics"  the profiles to run, in order, each once:
 #                    busy          the bench's defaults
 #                    busy-readers  TN_EXEC_BENCH_READERS=4
@@ -94,14 +111,17 @@
 #   settings win over them. The script sets TN_EXEC_BENCH_CACHE_DIR and TN_EXEC_BENCH_REPORT
 #   itself, per run, over any in the environment, TN_EXEC_BENCH_PAGE_SIZE when the run's backend
 #   has an EXEC_PAGE_SIZE_* set, TN_EXEC_BENCH_LAYOUT when the run's side has a layout (layout
-#   mode's v1 and v2, EXEC_LAYOUT_*), and in layout mode TN_EXEC_BENCH_DIFF and
-#   TN_EXEC_BENCH_DIFF_AGAINST (a round's first run without any).
+#   mode's v1 and v2, tx-bodies mode's v2, EXEC_LAYOUT_*), TN_EXEC_BENCH_TX_BODIES when the run's
+#   side has a transaction format (tx-bodies mode's inline and pointers, EXEC_TX_BODIES_*), and in
+#   layout and tx-bodies modes TN_EXEC_BENCH_DIFF and TN_EXEC_BENCH_DIFF_AGAINST (a round's first
+#   run without any).
 #   The variables the node's own code reads (TN_PARALLEL_*, TN_EXEC_CACHE_*, RUST_LOG) pass through
 #   to both sides too, as they are: CONFIG's "node variables" lists them. A before commit may read
 #   none of them.
 #
 # Each test binary is run directly (not through cargo), its md5 and test count recorded, and the run
-# refused if the two binaries match (layout mode's one binary runs both sides) or either lacks the
+# refused if the two binaries match (layout and tx-bodies modes' one binary runs both sides) or
+# either lacks the
 # ignored `exec_bench` test. Each build has its own target dir under the bench dir: cargo names a
 # workspace's crates by their path within it and judges freshness by mtime, so two trees or two
 # feature sets sharing one would reuse or rebuild each other's artifacts. The before tree is an
@@ -113,15 +133,17 @@
 # line, never exported. A profile whose run fails is named in the report and its remaining runs
 # skipped; the other profiles still run, and the script then exits 1. Each profile prints each
 # side's chain (the genesis, aged tip and final tip hashes of its runs' JSON headers): execution is
-# deterministic, so in backend and layout modes, and in commit mode with EXEC_SHARED_BASE=1, the two
-# sides must match, and a profile whose runs differ is marked CHAINS DIFFER and makes the script
+# deterministic, so in backend, layout and tx-bodies modes, and in commit mode with
+# EXEC_SHARED_BASE=1, the two sides must match, and a profile whose runs differ is marked CHAINS DIFFER and makes the script
 # exit 1 after the report.
 #
 # The report has the host, the knobs each run's JSON header records, the binaries, one line per run,
-# and per profile: each side's page size and storage layout (as requested and as its database has
-# them), each side's median over the rounds of the total's p50, p90, p99 and mean, each stage's
-# mean, Mgas/s, tx/s, the database growth per output (allocated and logical), the closed database's
-# and each static-file segment's allocated MiB, and each static-file sync phase's ms per output once
+# and per profile: each side's page size, storage layout and transaction format (as requested and
+# as its database has them), each side's median over the rounds of the total's p50, p90, p99 and
+# mean, each stage's mean, Mgas/s, tx/s, the database growth per output (allocated and logical), the
+# closed database's and each static-file segment's allocated MiB, the transactions segment's
+# length (apparent MiB) and its growth per output (allocated and apparent KiB), and each static-file
+# sync phase's ms per output once
 # the bench measures them; with readers on, the writer's total mean with them on over off and each
 # read's p50 and p99; with a differential (TN_EXEC_BENCH_DIFF), its errors and, compared against an
 # earlier run's (TN_EXEC_BENCH_DIFF_AGAINST), its mismatches, also listed above the table one line
@@ -158,15 +180,17 @@
 # bench's cached bases (--report-only needs only git and python3); EXEC_SYS_SAMPLE=1 also needs
 # awk, stat, and findmnt or df, and uses lsblk and filefrag when installed (it installs nothing).
 # In the bench dir the script writes only:
-#   target-mdbx/, target-tn-lmdb/           this checkout's builds (layout mode's and commit
+#   target-mdbx/, target-tn-lmdb/           this checkout's builds (layout, tx-bodies and commit
 #                                          mode's after side's too)
 #   target-before-<commit>-<backend>/      commit mode's before build
 #   build-<label>.log                      each build's output
-#   cache/ (backend and layout modes), cache-before-<commit>/ and cache-after/ (commit mode)
+#   cache/ (backend, layout and tx-bodies modes), cache-before-<commit>/ and cache-after/ (commit
+#   mode)
 #                                          the bench's cached bases, kept for reruns; remove one
 #                                          when the bench refuses its base as built by other code
 #   reports/<profile>-<side>-<round>.json  each run's JSON report, replaced by a rerun
-#   reports/<profile>-<side>-<round>.diff  each run's differential (layout mode), replaced by a
+#   reports/<profile>-<side>-<round>.diff  each run's differential (layout and tx-bodies modes),
+#                                          replaced by a
 #                                          rerun
 #   reports/<profile>-<side>-<round>.sys.tsv and .frag.tsv
 #                                          each run's samples (EXEC_SYS_SAMPLE=1), replaced by a
@@ -186,14 +210,14 @@ set -euo pipefail
 die() { echo "$*" >&2; exit 1; }
 # The bench's JSON_REPORT_VERSION, which this checkout's bench must write, and every version the
 # report reads, which commit mode's before bench must write (both checked before the builds).
-# Version 6 only added fields (the layout, the readers' mix, the differential, the static-file
-# rows), which a version 5 run renders as -.
-report_version=6
-report_versions="5 6"
+# Versions 6 and 7 only added fields (6 the layout, the readers' mix, the differential, the
+# static-file rows; 7 the transaction format), which an older run renders as -.
+report_version=7
+report_versions="5 6 7"
 # The report's per-profile sections. Std-lib Python, read from stdin and run isolated (-I), so
 # nothing beside it is imported. `render_report run <manifest> <side a> <side b>` renders the runs
 # of a manifest; `render_report dir <bench dir>` those of a bench dir (--report-only). It exits 3,
-# after rendering everything, when backend or layout mode's two sides, or a shared-base commit
+# after rendering everything, when backend, layout or tx-bodies mode's two sides, or a shared-base commit
 # run's (reports/shared-base beside the manifest), ran different chains, or a shared-base run's
 # after side did not run on the before side's aged base (BASE NOT SHARED), and else, in `dir` mode,
 # 4 when a run failed or a differential mismatched or failed (in `run` mode the caller fails
@@ -217,10 +241,10 @@ STAGES = {
     "write_state": 3, "write_hashed_state": 3, "write_trie_updates": 3,
     "update_history_indices": 3, "save_blocks_sf": 2, "commit_sf": 1, "commit_mdbx": 1, "other": 1,
 }
-SIDE_PAIRS = (("mdbx", "tn-lmdb"), ("v1", "v2"), ("before", "after"))
+SIDE_PAIRS = (("mdbx", "tn-lmdb"), ("v1", "v2"), ("inline", "pointers"), ("before", "after"))
 # The modes whose two sides run one load, by side A, and what differs between their sides: their
 # runs must run one chain.
-SAME_LOAD = {"mdbx": "backends", "v1": "layouts"}
+SAME_LOAD = {"mdbx": "backends", "v1": "layouts", "inline": "transaction formats"}
 # Commit mode's sides on one base (EXEC_SHARED_BASE=1, marked by reports/shared-base beside the
 # manifest) compare a change that writes the same data: they must run one chain too.
 SHARED_BASE_LOAD = "before and after sides on one shared base"
@@ -293,6 +317,12 @@ def metrics(doc):
     out.append(("db closed alloc MiB", mib(closed.get("db_allocated_bytes"))))
     for name, segment in (sizes.get("static_file_segments") or {}).items():
         out.append((f"  sf {name} alloc MiB", mib(segment.get("total_allocated_bytes"))))
+        if name == "transactions":  # what storing transactions by position changes
+            out += [(f"  sf {name} len MiB", mib(segment.get("total_len_bytes"))),
+                    (f"  sf {name} alloc KiB/output",
+                     kib(segment.get("growth_per_output_allocated_bytes"))),
+                    (f"  sf {name} len KiB/output",
+                     kib(segment.get("growth_per_output_len_bytes")))]
     for phase in (doc.get("sf_sync") or {}).get("phases", []):  # once the provider times them
         out.append((f"sf sync {phase['segment']}.{phase['phase']} ms", phase.get("mean_ms")))
     side = doc.get("side_load")  # readers and the submitter beside the writer
@@ -374,10 +404,12 @@ def ratio(over, under):
 
 
 def load_knobs(knobs):
-    # the page size is each backend's own (EXEC_PAGE_SIZE_*) and the layout each side's, both
-    # printed per side; the differential's files are each run's own: none is a load knob
+    # the page size is each backend's own (EXEC_PAGE_SIZE_*) and the layout and transaction
+    # format each side's, all printed per side; the differential's files are each run's own: none
+    # is a load knob
     return {k: v for k, v in knobs.items()
-            if k not in ("report", "cache_dir", "page_size", "layout", "diff", "diff_against")}
+            if k not in ("report", "cache_dir", "page_size", "layout", "tx_bodies", "diff",
+                         "diff_against")}
 
 
 def knob_text(knobs):
@@ -387,6 +419,13 @@ def knob_text(knobs):
 def layout_text(header):
     return (f"{header.get('layout', '-')} "
             f"(requested {header.get('knobs', {}).get('layout', '-')})")
+
+
+def tx_bodies_text(header):
+    batches = header.get("memory_batches")
+    return (f"{header.get('tx_bodies', '-')} "
+            f"(requested {header.get('knobs', {}).get('tx_bodies', '-')})"
+            f"{'' if batches is None else f', {batches} batches in memory'}")
 
 
 def page_text(header):
@@ -809,6 +848,7 @@ for profile in profiles:
         print(f"{side} knobs: {knob_text(first.get('knobs', {}))}")
         print(f"{side} page size: {page_text(first)}")
         print(f"{side} storage layout: {layout_text(first)}")
+        print(f"{side} transactions: {tx_bodies_text(first)}")
         print(f"{side} aged base: {first.get('aged', '-')}")
         for rnd, header in headers[1:]:
             if knob_text(header.get("knobs", {})) != knob_text(first.get("knobs", {})):
@@ -817,6 +857,8 @@ for profile in profiles:
                 print(f"{side} round {rnd} PAGE SIZE DIFFERS: {page_text(header)}")
             if layout_text(header) != layout_text(first):
                 print(f"{side} round {rnd} LAYOUT DIFFERS: {layout_text(header)}")
+            if header.get("tx_bodies") != first.get("tx_bodies"):
+                print(f"{side} round {rnd} TRANSACTIONS DIFFER: {tx_bodies_text(header)}")
     # an older bench records fewer knobs (commit mode on a version 5 before commit): the runs
     # compare on the knobs they all record, and the others are named
     knob_sets = [load_knobs(doc["header"].get("knobs", {})) for doc in docs.values()]
@@ -829,7 +871,8 @@ for profile in profiles:
                    for knobs in knob_sets}
     if len(sides_knobs) > 1:
         print(f"KNOBS DIFFER between runs of {profile}: the ratios compare different loads")
-    # execution is deterministic: one load on two backends or two layouts runs one chain
+    # execution is deterministic: one load on two backends, layouts or transaction formats runs
+    # one chain
     chains = {key: tuple(doc["header"][k] for k in ("genesis_hash", "aged_tip_hash",
                                                      "final_tip_hash"))
               for key, doc in docs.items()}
@@ -946,12 +989,16 @@ if [ "${1:-}" = --report-only ]; then # re-render a bench dir's reports: no buil
     exit 0
 fi
 
-usage="usage: $0 <dir on the disk under test> [before-commit] | --layout <dir> | --report-only <bench dir>"
-layout_mode=0
+usage="usage: $0 <dir on the disk under test> [before-commit] | --layout <dir> | --tx-bodies <dir> | --report-only <bench dir>"
+layout_mode=0 tx_bodies_mode=0
 if [ "${1:-}" = --layout ]; then # one build, its runs on storage layout v1 against v2
     layout_mode=1
     shift
     [ $# = 1 ] || die "usage: $0 --layout <dir on the disk under test>"
+elif [ "${1:-}" = --tx-bodies ]; then # one build, its runs on v2 inline against pointers
+    tx_bodies_mode=1
+    shift
+    [ $# = 1 ] || die "usage: $0 --tx-bodies <dir on the disk under test>"
 fi
 bench_dir="${1:?$usage}"
 before="${2:-}"
@@ -982,6 +1029,13 @@ for var in EXEC_LAYOUT_BEFORE EXEC_LAYOUT_AFTER; do
     case "${!var:-}" in
         '' | v1 | v2) ;;
         *) die "$var must be v1 or v2, not '${!var}'" ;;
+    esac
+    [ -z "${!var:-}" ] || [ -n "$before" ] || die "$var is commit mode's (a before-commit)"
+done
+for var in EXEC_TX_BODIES_BEFORE EXEC_TX_BODIES_AFTER; do
+    case "${!var:-}" in
+        '' | inline | pointers) ;;
+        *) die "$var must be inline or pointers, not '${!var}'" ;;
     esac
     [ -z "${!var:-}" ] || [ -n "$before" ] || die "$var is commit mode's (a before-commit)"
 done
@@ -1100,13 +1154,19 @@ backend_flags() {
 }
 
 layout_a="" layout_b="" # each side's TN_EXEC_BENCH_LAYOUT, when the script sets it
-if [ "$layout_mode" = 1 ]; then
+tx_bodies_a="" tx_bodies_b="" # each side's TN_EXEC_BENCH_TX_BODIES, when the script sets it
+if [ "$layout_mode" = 1 ] || [ "$tx_bodies_mode" = 1 ]; then
     mode="layout"
-    backend="${EXEC_BACKEND:-tn-lmdb}"
-    [ "$backend" = tn-lmdb ] \
-        || die "layout mode runs tn-lmdb only (storage v2 is tn-lmdb only), not EXEC_BACKEND=$backend"
     side_a="v1"
     side_b="v2"
+    if [ "$tx_bodies_mode" = 1 ]; then
+        mode="tx-bodies"
+        side_a="inline"
+        side_b="pointers"
+    fi
+    backend="${EXEC_BACKEND:-tn-lmdb}"
+    [ "$backend" = tn-lmdb ] \
+        || die "$mode mode runs tn-lmdb only (storage v2 is tn-lmdb only), not EXEC_BACKEND=$backend"
     tree_a="$repo"
     tree_b="$repo"
     flags_a="$(backend_flags "$(cat "$repo/$tn_reth_manifest")" tn-lmdb)" || die "$flags_a"
@@ -1115,6 +1175,11 @@ if [ "$layout_mode" = 1 ]; then
     page_b="$page_a"
     layout_a="v1"
     layout_b="v2"
+    if [ "$mode" = tx-bodies ]; then # both on v2: pointers need it
+        layout_a="v2"
+        tx_bodies_a="inline"
+        tx_bodies_b="pointers"
+    fi
     target_a="$bench_dir/target-tn-lmdb"
     target_b="$target_a"
     cache_a="$bench_dir/cache"
@@ -1160,6 +1225,8 @@ else
     page_b="$page_a"
     layout_a="${EXEC_LAYOUT_BEFORE:-}"
     layout_b="${EXEC_LAYOUT_AFTER:-}"
+    tx_bodies_a="${EXEC_TX_BODIES_BEFORE:-}"
+    tx_bodies_b="${EXEC_TX_BODIES_AFTER:-}"
     target_a="$bench_dir/target-before-$before_key-$backend"
     target_b="$bench_dir/target-$backend"
     cache_a="$bench_dir/cache-before-$before_key"
@@ -1171,7 +1238,9 @@ fi
 case "${EXEC_SHARED_BASE:-}" in
     "") ;;
     1) [ "$mode" = commit ] \
-        || die "EXEC_SHARED_BASE=1 is for commit mode: $mode mode's sides already share one cache dir, and their bases differ by what they compare" ;;
+        || die "EXEC_SHARED_BASE=1 is for commit mode: $mode mode's sides already share one cache dir, and their bases differ by what they compare"
+       [ "${tx_bodies_a:-${TN_EXEC_BENCH_TX_BODIES:-inline}}" = "${tx_bodies_b:-${TN_EXEC_BENCH_TX_BODIES:-inline}}" ] \
+        || die "EXEC_SHARED_BASE=1 shares the before side's bases, but the sides keep their transactions in different formats (EXEC_TX_BODIES_*), and each format has its own bases" ;;
     *) die "EXEC_SHARED_BASE must be 1 or unset, not '$EXEC_SHARED_BASE'" ;;
 esac
 
@@ -1201,7 +1270,9 @@ mkdir -p "$bench_dir/reports" "$bench_dir/logs" "$cache_a" "$cache_b"
 if [ "$mode" = commit ]; then
     mkdir "$src_before"
     : >"$src_before/$marker"
-    git -C "$repo" archive "$before" | tar -x -C "$src_before"
+    # bsdtar (macOS) stops reading at the archive's end marker, before git has written its
+    # trailing padding: drain the rest, or git dies of SIGPIPE and pipefail fails the run
+    git -C "$repo" archive "$before" | { tar -x -C "$src_before" && cat >/dev/null; }
     rm -rf "$src_before/tn-contracts"
     ln -s "$repo/tn-contracts" "$src_before/tn-contracts"
 fi
@@ -1253,8 +1324,12 @@ kv "bench dir" "$bench_dir"
 if [ "$mode" = backend ]; then
     kv mode "backend: mdbx (A, --features tn-reth/mdbx) against tn-lmdb (B, default features)"
     kv checkout "$(describe_checkout)"
-elif [ "$mode" = layout ]; then
-    kv mode "layout: storage v1 (A) against v2 (B), one tn-lmdb build (default features)"
+elif [ "$mode" = layout ] || [ "$mode" = tx-bodies ]; then
+    if [ "$mode" = layout ]; then
+        kv mode "layout: storage v1 (A) against v2 (B), one tn-lmdb build (default features)"
+    else
+        kv mode "tx-bodies: storage v2, transactions inline (A) against stored by batch position (B), one tn-lmdb build (default features); B resolves them from batches the bench holds in memory"
+    fi
     kv checkout "$(describe_checkout)"
     kv differential "each run's reports/<run>.diff (TN_EXEC_BENCH_DIFF); each round's second run compares its own to the first's (TN_EXEC_BENCH_DIFF_AGAINST)"
 else
@@ -1281,6 +1356,7 @@ kv rounds "$rounds ($order per profile)"
 kv profiles "${profiles[*]}"
 owned="CACHE_DIR|REPORT" # the knobs the script sets on every run
 [ "$mode" != layout ] || owned="$owned|LAYOUT|DIFF|DIFF_AGAINST"
+[ "$mode" != tx-bodies ] || owned="$owned|LAYOUT|TX_BODIES|DIFF|DIFF_AGAINST"
 caller_knobs="$(env | grep -E '^TN_EXEC_BENCH_' | grep -vE "^TN_EXEC_BENCH_($owned)=" \
     | sort | tr '\n' ' ' | sed 's/ $//' || true)"
 kv "caller knobs" "${caller_knobs:-(none)}"
@@ -1295,6 +1371,8 @@ unset_page="(TN_EXEC_BENCH_PAGE_SIZE or the default)"
 kv "page sizes" "$side_a ${page_a:-$unset_page}, $side_b ${page_b:-$unset_page}"
 unset_layout="(TN_EXEC_BENCH_LAYOUT or the default)"
 kv layouts "$side_a ${layout_a:+TN_EXEC_BENCH_LAYOUT=}${layout_a:-$unset_layout}, $side_b ${layout_b:+TN_EXEC_BENCH_LAYOUT=}${layout_b:-$unset_layout}"
+unset_tx_bodies="(TN_EXEC_BENCH_TX_BODIES or the default)"
+kv "tx bodies" "$side_a ${tx_bodies_a:+TN_EXEC_BENCH_TX_BODIES=}${tx_bodies_a:-$unset_tx_bodies}, $side_b ${tx_bodies_b:+TN_EXEC_BENCH_TX_BODIES=}${tx_bodies_b:-$unset_tx_bodies}"
 if [ "$(uname -s)" = "Darwin" ]; then
     kv "sync note" "macOS: both backends' durable commits are msync (libmdbx its used span, tn-lmdb its dirty pages), neither a drive-cache flush"
 fi
@@ -1322,7 +1400,7 @@ build() { # <label> <source tree> <target dir> <cargo flags>: prints the test bi
 if [ "$mode" = backend ]; then
     label_a="mdbx"
     label_b="tn-lmdb"
-elif [ "$mode" = layout ]; then
+elif [ "$mode" = layout ] || [ "$mode" = tx-bodies ]; then
     label_a="tn-lmdb"
     label_b="$label_a"
 else
@@ -1331,7 +1409,8 @@ else
 fi
 bin_a="$(build "$label_a" "$tree_a" "$target_a" "$flags_a")"
 bin_b="$bin_a"
-[ "$mode" = layout ] || bin_b="$(build "$label_b" "$tree_b" "$target_b" "$flags_b")"
+[ "$mode" = layout ] || [ "$mode" = tx-bodies ] \
+    || bin_b="$(build "$label_b" "$tree_b" "$target_b" "$flags_b")"
 tests() { "$1" --list 2>/dev/null | grep -c ': test$' || true; }
 md5_a="$(digest "$bin_a")"
 md5_b="$(digest "$bin_b")"
@@ -1339,7 +1418,8 @@ md5_b="$(digest "$bin_b")"
     echo
     echo "### BINARIES"
 } >>"$report"
-if [ "$mode" = layout ]; then # one binary by design: the layout is each run's knob
+if [ "$mode" = layout ] || [ "$mode" = tx-bodies ]; then # one binary by design: the layout or
+    # the transaction format is each run's knob
     kv "$side_a and $side_b" "$bin_a $md5_a ($(tests "$bin_a") tests)"
 else
     kv "$side_a" "$bin_a $md5_a ($(tests "$bin_a") tests)"
@@ -1448,29 +1528,34 @@ sampler() { # <samples file> <extents file> <run log>
     done
 }
 # <profile> <side> [earlier side]: runs the side's binary once with the profile's settings; in
-# layout mode the earlier side is the round's first run, whose differential this run's is compared
-# to.
+# layout and tx-bodies modes the earlier side is the round's first run, whose differential this
+# run's is compared to.
 run() {
-    local profile="$1" side="$2" earlier="${3:-}" bin tree cache page layout settings name json log
-    local diff_file start when load status=0 busy_now unset_env=()
+    local profile="$1" side="$2" earlier="${3:-}" bin tree cache page layout tx_bodies settings
+    local name json log diff_file start when load status=0 busy_now unset_env=()
     if [ "$side" = "$side_a" ]; then
         bin="$bin_a" tree="$tree_a" cache="$cache_a" page="$page_a" layout="$layout_a"
+        tx_bodies="$tx_bodies_a"
     else
         bin="$bin_b" tree="$tree_b" cache="$cache_b" page="$page_b" layout="$layout_b"
+        tx_bodies="$tx_bodies_b"
     fi
     read -r -a settings <<<"$(profile_settings "$profile")"
-    # the side's page size and layout, after the caller's environment and before the profile's
-    # settings
+    # the side's page size, layout and transaction format, after the caller's environment and
+    # before the profile's settings
     [ -z "$page" ] || settings=("TN_EXEC_BENCH_PAGE_SIZE=$page" ${settings[@]+"${settings[@]}"})
     [ -z "$layout" ] || settings=("TN_EXEC_BENCH_LAYOUT=$layout" ${settings[@]+"${settings[@]}"})
+    [ -z "$tx_bodies" ] \
+        || settings=("TN_EXEC_BENCH_TX_BODIES=$tx_bodies" ${settings[@]+"${settings[@]}"})
     name="$profile-$side-$round"
     json="$bench_dir/reports/$name.json"
     diff_file="${json%.json}.diff"
     log="$bench_dir/logs/$name.log"
     rm -f "$json" "$diff_file" "${json%.json}.sys.tsv" "${json%.json}.frag.tsv"
-    # layout mode: every run records its differential, and a round's second run compares it to the
-    # first's; the first compares it to nothing (a caller's DIFF_AGAINST is unset)
-    if [ "$mode" = layout ]; then
+    # layout and tx-bodies modes: every run records its differential, and a round's second run
+    # compares it to the first's; the first compares it to nothing (a caller's DIFF_AGAINST is
+    # unset)
+    if [ "$mode" = layout ] || [ "$mode" = tx-bodies ]; then
         unset_env=(-u TN_EXEC_BENCH_DIFF_AGAINST)
         settings=("TN_EXEC_BENCH_DIFF=$diff_file" ${settings[@]+"${settings[@]}"})
         [ -z "$earlier" ] || settings=(
@@ -1496,7 +1581,7 @@ run() {
         "$bin" --ignored --exact exec_bench --nocapture) >"$log" 2>&1 || status=$?
     stop_sampler
     [ "$status" = 0 ] && [ ! -f "$json" ] && status="no-json"
-    printf '%-14s %-7s round %s  %s  load %-16s %5ss  %s%s\n' "$profile" "$side" "$round" \
+    printf '%-14s %-8s round %s  %s  load %-16s %5ss  %s%s\n' "$profile" "$side" "$round" \
         "$when" "$load" "$((SECONDS - start))" "$([ "$status" = 0 ] && echo ok || echo "FAILED ($status)")" \
         "${busy_now:+  (rustc/cargo running: $busy_now)}" >>"$report"
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$profile" "$side" "$round" "$status" "$json" "$log" \

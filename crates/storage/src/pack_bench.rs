@@ -46,7 +46,9 @@
 //!   `[0, end)`), the full state-sync serve (`full_stream` = sequential read to EOF), and the
 //!   receive side (`stream_import` = replay a whole epoch into a fresh pack).
 //! - **lifecycle** — `reopen_static` opens the finished pack (the pack-cache-miss + index-load
-//!   cost), its files still in the page cache from being written.
+//!   cost), its files still in the page cache from being written; `batch_now static` opens it with
+//!   a `PackReader` and reads the `batch_by_digest` sample through it on one blocking thread, as
+//!   the transaction-body resolver reads a past epoch (no blocking-pool dispatch per read).
 //!
 //! ## Caveats (printed with the results too)
 //!
@@ -85,6 +87,10 @@
 //!   production. The same reads then run alone, with no saves, for comparison.
 //! - **Compression**: for a sample of outputs, every record is BCS-encoded and zstd-compressed
 //!   outside the save, as the pack's append does, to show how much of a save is compression.
+//! - **Closed-pack reads**, after the last save closes the chain: a `PackReader` opens the sealed
+//!   epoch and reads up to [`BATCH_SAMPLE`] batches of the newest [`RECENT_OUTPUTS`] outputs by
+//!   digest, one at a time on one blocking thread, as the transaction-body resolver reads a past
+//!   epoch (the `closed pack:` rows). The files are in the page cache.
 //!
 //! Knobs (environment):
 //!
@@ -152,7 +158,7 @@ use tokio::{
 use crate::{
     consensus::ConsensusChain,
     consensus_pack::{
-        test::make_wide_test_output, ConsensusPack, PackError, PackRecord, DATA_NAME,
+        test::make_wide_test_output, ConsensusPack, PackError, PackReader, PackRecord, DATA_NAME,
     },
     mem_db::MemDatabase,
 };
@@ -523,6 +529,35 @@ async fn bench_reopen_static<P: BenchPack>(path: &Path, epoch: Epoch) -> Duratio
     elapsed
 }
 
+/// A resolver's reads of a closed epoch: how long a [`PackReader`] took to open on `epoch`'s
+/// pack under `dir`, and how long each of `digests` took to read through it, all on one blocking
+/// thread as the resolver runs (no dispatch per read). Every digest must be stored there.
+async fn closed_pack_reads(
+    dir: &Path,
+    epoch: Epoch,
+    digests: Vec<BlockHash>,
+) -> (Duration, Vec<Duration>) {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
+        let reader = PackReader::open(&dir, epoch).expect("open the closed pack");
+        let open = start.elapsed();
+        let reads = digests
+            .iter()
+            .map(|digest| {
+                let start = Instant::now();
+                let batch = reader.batch(*digest).expect("read a batch");
+                let elapsed = start.elapsed();
+                assert!(batch.is_some(), "a saved batch is found");
+                elapsed
+            })
+            .collect();
+        (open, reads)
+    })
+    .await
+    .expect("closed pack reads")
+}
+
 /// One report column: the ordered rows plus the on-disk size of the populated pack.
 struct Column {
     rows: Vec<(&'static str, Duration)>,
@@ -571,6 +606,8 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, width: usize) -> Column {
     // and fail.
     pack.close().await;
     let reopen_static = bench_reopen_static::<P>(dir.path(), fx.committee.epoch()).await;
+    let (open, reads) = closed_pack_reads(dir.path(), fx.committee.epoch(), batch_digests).await;
+    let batch_now_static = open + reads.iter().sum::<Duration>();
     drop(dir);
 
     Column {
@@ -589,6 +626,7 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, width: usize) -> Column {
             ("full_stream", full_stream),
             ("stream_import", stream_import),
             ("reopen_static", reopen_static),
+            ("batch_now static", batch_now_static),
         ],
         data_len,
     }
@@ -1677,7 +1715,7 @@ fn run_configuration(
     };
     let committee = committee_rx.recv().expect("the builder's committee");
     let epoch = committee.epoch();
-    let (writer, reads, data_len) = rt.block_on(async {
+    let (writer, reads, data_len, closed) = rt.block_on(async {
         let chain = ConsensusChain::new_for_test(dir.path().to_path_buf(), committee)
             .await
             .expect("open the consensus chain");
@@ -1716,15 +1754,24 @@ fn run_configuration(
             reads.push(reader.await.expect("reader"));
         }
         let data_len = chain.current_data_len(epoch).await.expect("pack data length");
+        let sample: Vec<BlockHash> = recent
+            .read()
+            .iter()
+            .flat_map(|saved| saved.batches.iter().copied())
+            .take(BATCH_SAMPLE)
+            .collect();
         chain.close().await;
-        (writer, reads, data_len)
+        let closed = closed_pack_reads(dir.path(), epoch, sample).await;
+        (writer, reads, data_len, closed)
     });
     let totals = builder.join().expect("output builder");
     drop(dir);
-    workload_column(knobs, shape, outputs, writer, reads, data_len, totals)
+    workload_column(knobs, shape, outputs, writer, reads, data_len, totals, closed)
 }
 
-/// Turn one configuration's measurements into its report column.
+/// Turn one configuration's measurements into its report column (`closed`: the closed-pack
+/// reads' open and per-read times, see [`closed_pack_reads`]).
+#[allow(clippy::too_many_arguments)]
 fn workload_column(
     knobs: &WorkloadKnobs,
     shape: OutputShape,
@@ -1733,6 +1780,7 @@ fn workload_column(
     mut reads: Vec<[Vec<Duration>; 2]>,
     data_len: u64,
     totals: BuildTotals,
+    (closed_open, mut closed_reads): (Duration, Vec<Duration>),
 ) -> WorkloadColumn {
     const MB: f64 = (1 << 20) as f64;
     let per_output = |total: u64| total as f64 / outputs as f64;
@@ -1780,6 +1828,8 @@ fn workload_column(
             format!("{:.1} / {:.1}", rates[0], rates[1]),
         ));
     }
+    latencies.push(("closed pack: open ms".to_string(), Unit::Ms, [closed_open; 3]));
+    latencies.push(("closed pack: batch_now us".to_string(), Unit::Us, spread(&mut closed_reads)));
     let batches = (outputs * shape.batches() as u64).max(1);
     values.extend([
         (

@@ -21,15 +21,26 @@
 //! - TN's own marker ([`TN_LAYOUT_KEY`]) records the layout and a format version beside reth's row,
 //!   so a later change to TN's format (packed trie keys, a different transaction-hash index) is an
 //!   explicit conversion or refusal, never a silent misread.
+//! - The marker's version also records where the datadir keeps its transactions ([`TxBodies`]):
+//!   version 1 ([`LAYOUT_VERSION_INLINE_TXS`]) stores each one in the `Transactions` static files;
+//!   version 2 ([`LAYOUT_VERSION_TX_POINTERS`], layout v2 only) stores its position in the
+//!   consensus batch its block executed, every `Transactions` jar with tagged values (`NippyJar`
+//!   version 3). A new datadir gets version 2 when its layout is v2 and pointers are requested
+//!   ([`crate::RethConfig::new_datadir_tx_bodies`], by default [`TxBodies::for_new_datadirs`]); an
+//!   existing one keeps its version, and [`settle`] sets the static files' jar policy
+//!   (`set_tx_pointer_jars`) from it at every open.
 //!
 //! Refused, before reth's consistency check or anything after it touches the datadir (the
 //! database's own open runs first and may already have created or migrated `db/`):
 //! - a `storage_settings` row or a marker that does not parse;
-//! - a marker of a format version this binary does not know (a newer binary wrote it);
+//! - a marker of a format version this binary does not know (a newer binary wrote it), or of
+//!   version 2 with layout v1 (no TN build writes it);
 //! - a marker whose layout disagrees with `storage_settings`;
 //! - an existing v2 datadir without the marker (no TN build wrote it);
 //! - a v1 datadir whose static files hold v2-only segments, or a v2 datadir whose static files hold
 //!   none (another datadir's static files);
+//! - a version-1 datadir holding a `Transactions` jar with tagged values, or a version-2 datadir
+//!   holding one without ([`refuse_mixed_tx_jars`]: a half-done swap of `db` and `static_files`);
 //! - static files holding a chain beside a database that holds none: reth's consistency check would
 //!   prune them down to the empty database. The one exception is healed: a creation stopped inside
 //!   genesis's commit (TN's marker, no `storage_settings` row, static files holding only this
@@ -39,10 +50,10 @@ use std::fmt;
 
 use reth_chainspec::EthChainSpec as _;
 use reth_provider::{
-    providers::ProviderFactory, BlockHashReader as _, ChainSpecProvider as _, DBProvider as _,
-    DatabaseProviderFactory as _, MetadataProvider as _, MetadataWriter as _,
-    StageCheckpointReader as _, StaticFileProviderFactory as _, StaticFileSegment, StorageSettings,
-    StorageSettingsCache as _,
+    providers::{JarFormat, ProviderFactory},
+    BlockHashReader as _, ChainSpecProvider as _, DBProvider as _, DatabaseProviderFactory as _,
+    MetadataProvider as _, MetadataWriter as _, StageCheckpointReader as _,
+    StaticFileProviderFactory as _, StaticFileSegment, StorageSettings, StorageSettingsCache as _,
 };
 use reth_stages_types::StageId;
 use serde::{Deserialize, Serialize};
@@ -58,12 +69,23 @@ const NEW_DATADIR_LAYOUT_TN_LMDB: StorageLayout = StorageLayout::V2;
 /// The `Metadata` key of TN's layout marker ([`LayoutMarker`]).
 pub(crate) const TN_LAYOUT_KEY: &str = "tn_storage_layout";
 
-/// The format version of TN's reth database that this binary writes and reads.
+/// Format version 1 of TN's reth database: reth's v1 or v2 layout on the vendored reth's table
+/// formats, every transaction stored in the `Transactions` static files ([`TxBodies::Inline`]).
+pub(crate) const LAYOUT_VERSION_INLINE_TXS: u32 = 1;
+
+/// Format version 2 of TN's reth database: reth's v2 layout on tn-lmdb, every `Transactions` jar
+/// with tagged values (`NippyJar` version 3), whose rows store each transaction's position in the
+/// consensus batch its block executed ([`TxBodies::Pointers`]), resolved through the consensus
+/// packs. No TN build writes it with layout v1.
+pub(crate) const LAYOUT_VERSION_TX_POINTERS: u32 = 2;
+
+/// The newest format version of TN's reth database, which this binary reads with every older one
+/// ([`stored_marker`]) and writes for a new datadir that stores transactions by position.
 ///
-/// 1: reth's v1 or v2 layout on the vendored reth's table formats. A change to how TN stores any
-/// table (for example packed trie keys, or transaction hashes in a separate index) takes the next
-/// version, and an open of an older version converts it or refuses it.
-pub(crate) const TN_LAYOUT_VERSION: u32 = 1;
+/// A change to how TN stores any table (for example packed trie keys, or transaction hashes in a
+/// separate index) takes the next version, and an open of an older version converts it or refuses
+/// it.
+pub(crate) const TN_LAYOUT_VERSION: u32 = LAYOUT_VERSION_TX_POINTERS;
 
 /// The `Metadata` key of reth's storage settings:
 /// `reth_storage_api::metadata::keys::STORAGE_SETTINGS`, which `reth_provider` does not re-export.
@@ -130,20 +152,98 @@ impl fmt::Display for StorageLayout {
     }
 }
 
+/// Where a reth execution datadir keeps its transactions, fixed when the datadir is created and
+/// recorded by its marker's version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxBodies {
+    /// Each transaction in the `Transactions` static files ([`LAYOUT_VERSION_INLINE_TXS`]).
+    Inline,
+    /// Each transaction's position in the consensus batch its block executed, read back from the
+    /// consensus packs ([`LAYOUT_VERSION_TX_POINTERS`]). Layout v2 only.
+    Pointers,
+}
+
+impl TxBodies {
+    /// What this build requests for a new datadir: [`Self::Pointers`] on the tn-lmdb build, and
+    /// [`Self::Inline`] on the MDBX build, whose datadirs are layout v1 (pointers need v2).
+    pub const fn for_new_datadirs() -> Self {
+        if V2_SUPPORTED {
+            Self::Pointers
+        } else {
+            Self::Inline
+        }
+    }
+
+    /// The marker version that records this.
+    const fn marker_version(self) -> u32 {
+        match self {
+            Self::Inline => LAYOUT_VERSION_INLINE_TXS,
+            Self::Pointers => LAYOUT_VERSION_TX_POINTERS,
+        }
+    }
+}
+
+impl fmt::Display for TxBodies {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Inline => "inline",
+            Self::Pointers => "pointers",
+        })
+    }
+}
+
+/// A reth execution datadir's format: its storage layout and where it keeps its transactions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatadirFormat {
+    /// reth's storage layout.
+    pub layout: StorageLayout,
+    /// Where the transactions are kept.
+    pub tx_bodies: TxBodies,
+}
+
+impl DatadirFormat {
+    /// The format a new datadir gets for this request: the request, except that pointers on
+    /// layout v1 fall back to inline (version 2 needs layout v2).
+    pub const fn for_new_datadir(self) -> Self {
+        match (self.layout, self.tx_bodies) {
+            (StorageLayout::V1, TxBodies::Pointers) => {
+                Self { layout: StorageLayout::V1, tx_bodies: TxBodies::Inline }
+            }
+            _ => self,
+        }
+    }
+}
+
+impl fmt::Display for DatadirFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "layout {}, transactions {}", self.layout, self.tx_bodies)
+    }
+}
+
 /// TN's layout marker, the JSON value of [`TN_LAYOUT_KEY`] in reth's `Metadata` table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LayoutMarker {
-    /// The format version ([`TN_LAYOUT_VERSION`]).
+    /// The format version: [`LAYOUT_VERSION_INLINE_TXS`] or [`LAYOUT_VERSION_TX_POINTERS`].
     pub(crate) version: u32,
     /// The layout, which must agree with reth's `storage_settings`.
     pub(crate) layout: StorageLayout,
 }
 
 impl LayoutMarker {
-    /// This binary's marker for `layout`.
-    const fn current(layout: StorageLayout) -> Self {
-        Self { version: TN_LAYOUT_VERSION, layout }
+    /// The marker that records `format`.
+    pub(crate) const fn of(format: DatadirFormat) -> Self {
+        Self { version: format.tx_bodies.marker_version(), layout: format.layout }
+    }
+
+    /// Where the datadir keeps its transactions, by the marker's version. Only a marker
+    /// [`stored_marker`] accepted is asked.
+    pub(crate) const fn tx_bodies(self) -> TxBodies {
+        if self.version == LAYOUT_VERSION_TX_POINTERS {
+            TxBodies::Pointers
+        } else {
+            TxBodies::Inline
+        }
     }
 
     /// The marker's bytes in the `Metadata` table.
@@ -152,14 +252,15 @@ impl LayoutMarker {
     }
 }
 
-/// Settle the layout of the datadir `factory` opens, as the module docs say, and return it.
+/// Settle the format of the datadir `factory` opens, as the module docs say, and return it.
 ///
-/// `requested` is the layout for a new datadir. On return the factory's cached settings are the
-/// datadir's layout.
+/// `requested` is the format for a new datadir. On return the factory's cached settings are the
+/// datadir's layout, and its static files create `Transactions` jars with tagged values exactly
+/// when the datadir stores transactions by position.
 pub(super) fn settle(
     factory: &ProviderFactory<TelcoinNode>,
-    requested: StorageLayout,
-) -> eyre::Result<StorageLayout> {
+    requested: DatadirFormat,
+) -> eyre::Result<DatadirFormat> {
     let (stored, marker, db_tip) = {
         let provider = factory.provider()?;
         (
@@ -171,7 +272,7 @@ pub(super) fn settle(
     let static_files = factory.static_file_provider();
     let sf_tip = static_files.get_highest_static_file_block(StaticFileSegment::Headers);
 
-    let layout = match (db_tip, sf_tip) {
+    let format = match (db_tip, sf_tip) {
         (None, Some(_)) if stored.is_none() && marker.is_some() && holds_only_genesis(factory)? => {
             remove_unfinished_genesis(factory)?;
             create(factory, requested)?
@@ -189,8 +290,10 @@ pub(super) fn settle(
         (None, None) => create(factory, requested)?,
         (Some(_), _) => existing(factory, stored, marker, requested)?,
     };
-    factory.set_storage_settings_cache(layout.settings());
-    Ok(layout)
+    factory.set_storage_settings_cache(format.layout.settings());
+    // before genesis writes a new datadir's first jar, and at every open of an existing one
+    static_files.set_tx_pointer_jars(format.tx_bodies == TxBodies::Pointers);
+    Ok(format)
 }
 
 /// Whether the datadir's static files hold this chain's genesis block and nothing past it: every
@@ -246,8 +349,8 @@ pub(crate) fn stored_layout(row: Option<Vec<u8>>) -> eyre::Result<Option<Storage
     .transpose()
 }
 
-/// TN's layout marker, or `None` without the row. A row that does not parse, or of a format
-/// version this binary does not know, is an error.
+/// TN's layout marker, or `None` without the row. A row that does not parse, of a format version
+/// this binary does not know, or of version 2 with layout v1 is an error.
 pub(crate) fn stored_marker(row: Option<Vec<u8>>) -> eyre::Result<Option<LayoutMarker>> {
     let Some(bytes) = row else { return Ok(None) };
     let marker = serde_json::from_slice::<LayoutMarker>(&bytes).map_err(|e| {
@@ -258,13 +361,20 @@ pub(crate) fn stored_marker(row: Option<Vec<u8>>) -> eyre::Result<Option<LayoutM
             String::from_utf8_lossy(&bytes)
         )
     })?;
-    if marker.version != TN_LAYOUT_VERSION {
-        eyre::bail!(
-            "the reth database is in TN's storage format version {} ({TN_LAYOUT_KEY}), and this \
-             binary reads only version {TN_LAYOUT_VERSION}: run the binary that wrote this datadir, \
-             or rebuild the execution database (`telcoin-network db reset-execution`)",
-            marker.version,
-        );
+    match (marker.version, marker.layout) {
+        (LAYOUT_VERSION_INLINE_TXS, _) | (LAYOUT_VERSION_TX_POINTERS, StorageLayout::V2) => {}
+        (LAYOUT_VERSION_TX_POINTERS, StorageLayout::V1) => eyre::bail!(
+            "the reth database is in TN's storage format version {LAYOUT_VERSION_TX_POINTERS} \
+             ({TN_LAYOUT_KEY}) with layout v1, which no TN build writes: version \
+             {LAYOUT_VERSION_TX_POINTERS} needs layout v2. Restore the datadir from a backup, or \
+             rebuild the execution database (`telcoin-network db reset-execution`)"
+        ),
+        (version, _) => eyre::bail!(
+            "the reth database is in TN's storage format version {version} ({TN_LAYOUT_KEY}), and \
+             this binary reads versions {LAYOUT_VERSION_INLINE_TXS} to {TN_LAYOUT_VERSION}: a newer \
+             binary may have written it. Run the binary that wrote this datadir, or rebuild the \
+             execution database (`telcoin-network db reset-execution`)"
+        ),
     }
     Ok(Some(marker))
 }
@@ -280,29 +390,36 @@ fn refuse_unsupported(layout: StorageLayout, what: &str) -> eyre::Result<()> {
     Ok(())
 }
 
-/// A new datadir: record `layout` in the marker, before genesis writes reth's row with it.
+/// A new datadir: record the format `requested` gives it ([`DatadirFormat::for_new_datadir`]) in
+/// the marker, before genesis writes reth's row with its layout.
 ///
 /// The marker commits first, in its own transaction. A stop before genesis commits leaves a
 /// database without a chain, which the next open takes for a new datadir again and overwrites.
 fn create(
     factory: &ProviderFactory<TelcoinNode>,
-    layout: StorageLayout,
-) -> eyre::Result<StorageLayout> {
-    refuse_unsupported(layout, "a new datadir")?;
+    requested: DatadirFormat,
+) -> eyre::Result<DatadirFormat> {
+    refuse_unsupported(requested.layout, "a new datadir")?;
+    let format = requested.for_new_datadir();
+    if format != requested {
+        info!(target: "tn::reth", layout = %format.layout, "a new reth datadir in storage layout v1 stores its transactions inline: storing them by batch position needs layout v2");
+    }
+    let marker = LayoutMarker::of(format);
     let provider = factory.database_provider_rw()?;
-    provider.write_metadata(TN_LAYOUT_KEY, LayoutMarker::current(layout).to_bytes()?)?;
+    provider.write_metadata(TN_LAYOUT_KEY, marker.to_bytes()?)?;
     provider.commit()?;
-    info!(target: "tn::reth", %layout, version = TN_LAYOUT_VERSION, "new reth datadir: storage layout");
-    Ok(layout)
+    info!(target: "tn::reth", layout = %format.layout, tx_bodies = %format.tx_bodies, version = marker.version, "new reth datadir: storage format");
+    Ok(format)
 }
 
-/// An existing datadir: its stored layout, checked against TN's marker and its static files.
+/// An existing datadir: its stored layout and TN's marker's version, checked against each other
+/// and against its static files.
 fn existing(
     factory: &ProviderFactory<TelcoinNode>,
     stored: Option<StorageLayout>,
     marker: Option<LayoutMarker>,
-    requested: StorageLayout,
-) -> eyre::Result<StorageLayout> {
+    requested: DatadirFormat,
+) -> eyre::Result<DatadirFormat> {
     let layout = stored.unwrap_or(StorageLayout::V1);
     refuse_unsupported(layout, "this datadir")?;
     match marker {
@@ -321,23 +438,70 @@ fn existing(
              reset-execution`)"
         ),
         None => {
-            // A datadir from before the marker: every one is v1.
+            // A datadir from before the marker: every one is v1 and stores transactions inline.
+            let marker = LayoutMarker::of(DatadirFormat { layout, tx_bodies: TxBodies::Inline });
             let provider = factory.database_provider_rw()?;
-            provider.write_metadata(TN_LAYOUT_KEY, LayoutMarker::current(layout).to_bytes()?)?;
+            provider.write_metadata(TN_LAYOUT_KEY, marker.to_bytes()?)?;
             provider.commit()?;
-            info!(target: "tn::reth", %layout, version = TN_LAYOUT_VERSION, "recorded TN's storage layout marker in an existing reth datadir");
+            info!(target: "tn::reth", %layout, version = marker.version, "recorded TN's storage layout marker in an existing reth datadir");
         }
     }
+    let format = DatadirFormat {
+        layout,
+        tx_bodies: marker.map_or(TxBodies::Inline, LayoutMarker::tx_bodies),
+    };
     match layout {
         StorageLayout::V1 => refuse_v2_segments(factory)?,
         StorageLayout::V2 => refuse_v1_static_files(factory)?,
     }
-    if layout == requested {
-        info!(target: "tn::reth", %layout, "reth datadir: storage layout");
+    refuse_mixed_tx_jars(factory, format.tx_bodies)?;
+    let new_datadirs = requested.for_new_datadir();
+    if format == new_datadirs {
+        info!(target: "tn::reth", layout = %format.layout, tx_bodies = %format.tx_bodies, "reth datadir: storage format");
     } else {
-        warn!(target: "tn::reth", %layout, new_datadirs = %requested, "this reth datadir keeps its storage layout: `telcoin-network db reset-execution` rebuilds it in the layout new datadirs get");
+        warn!(target: "tn::reth", %format, %new_datadirs, "this reth datadir keeps its storage format: `telcoin-network db reset-execution` rebuilds it in the format new datadirs get");
     }
-    Ok(layout)
+    Ok(format)
+}
+
+/// Refuse a datadir whose `Transactions` jars do not match where its marker says it keeps its
+/// transactions ([`TxBodies`]): a version-1 datadir holding a jar with tagged values, written by
+/// a datadir whose transactions live in consensus packs, or a version-2 datadir holding a jar
+/// without them. Either is a half-done swap of `db` and `static_files`, and reading on would
+/// misread its transactions. Reads each jar's configuration, nothing else.
+fn refuse_mixed_tx_jars(
+    factory: &ProviderFactory<TelcoinNode>,
+    tx_bodies: TxBodies,
+) -> eyre::Result<()> {
+    let static_files = factory.static_file_provider();
+    let foreign: Vec<String> = static_files
+        .jar_formats(StaticFileSegment::Transactions)?
+        .into_iter()
+        .filter(|(_, format)| (*format == JarFormat::TaggedTx) != (tx_bodies == TxBodies::Pointers))
+        .map(|(range, _)| format!("blocks {}..={}", range.start(), range.end()))
+        .collect();
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    let (marked, found) = match tx_bodies {
+        TxBodies::Inline => (
+            "stores its transactions inline",
+            "with tagged values, written by a datadir whose transactions live in consensus packs",
+        ),
+        TxBodies::Pointers => (
+            "stores its transactions by their position in consensus batches",
+            "without tagged values, which are another datadir's static files",
+        ),
+    };
+    eyre::bail!(
+        "the reth database {marked} ({TN_LAYOUT_KEY} version {}), but its static files ({}) hold \
+         {} jars ({}) {found}. Restore this datadir's own `static_files`, or swap `db` and \
+         `static_files` together",
+        tx_bodies.marker_version(),
+        static_files.directory().display(),
+        StaticFileSegment::Transactions,
+        foreign.join(", "),
+    )
 }
 
 /// Refuse the static files of a v1 datadir that hold a segment only v2 writes: they are another
@@ -424,6 +588,34 @@ mod tests {
         f(&env)
     }
 
+    /// Open the datadir `path` with `format` for a new datadir, run `f` on the env, then close it.
+    fn with_format<T>(
+        chain: &Arc<RethChainSpec>,
+        path: &Path,
+        format: DatadirFormat,
+        f: impl FnOnce(&RethEnv) -> eyre::Result<T>,
+    ) -> eyre::Result<T> {
+        let tm = TaskManager::new("format test");
+        let env = RethEnv::new_for_temp_chain_with_format(chain.clone(), path, &tm, format)?;
+        f(&env)
+    }
+
+    /// The format `layout` and `tx_bodies` make.
+    const fn format(layout: StorageLayout, tx_bodies: TxBodies) -> DatadirFormat {
+        DatadirFormat { layout, tx_bodies }
+    }
+
+    /// The marker of a datadir in `layout` that stores its transactions inline.
+    const fn inline(layout: StorageLayout) -> LayoutMarker {
+        LayoutMarker::of(format(layout, TxBodies::Inline))
+    }
+
+    /// The format a new temp chain datadir in `layout` gets.
+    fn temp_chain_format(layout: StorageLayout) -> eyre::Result<DatadirFormat> {
+        let tx_bodies = crate::env::genesis::temp_chain_new_datadir_tx_bodies()?;
+        Ok(format(layout, tx_bodies).for_new_datadir())
+    }
+
     /// Open the datadir `path` with `layout` for a new datadir, and return the open's error.
     fn open_err(chain: &Arc<RethChainSpec>, path: &Path, layout: StorageLayout) -> String {
         match with_env(chain, path, layout, |_| Ok(())) {
@@ -482,17 +674,26 @@ mod tests {
         use clap::Parser as _;
 
         let expected = if cfg!(feature = "mdbx") { StorageLayout::V1 } else { StorageLayout::V2 };
+        // the MDBX build stores transactions inline (marker version 1), tn-lmdb by position
+        let (tx_bodies, version) = if cfg!(feature = "mdbx") {
+            (TxBodies::Inline, LAYOUT_VERSION_INLINE_TXS)
+        } else {
+            (TxBodies::Pointers, LAYOUT_VERSION_TX_POINTERS)
+        };
         assert_eq!(StorageLayout::for_new_datadirs(), expected, "for_new_datadirs");
+        assert_eq!(TxBodies::for_new_datadirs(), tx_bodies, "TxBodies::for_new_datadirs");
         let tmp = TempDir::new()?;
         let command = crate::RethCommand::try_parse_from(["tn-reth"])?;
         let config = RethConfig::new(command, None, tmp.path(), true, chain());
         assert_eq!(config.new_datadir_layout(), expected, "the node's config");
+        assert_eq!(config.new_datadir_tx_bodies(), tx_bodies, "the node's config");
         let tm = TaskManager::new("default layout");
         let database = RethEnv::new_database(&config, tmp.path().join("db"))?;
         let env = RethEnv::new(&config, &tm, database, None, Default::default())?;
         let (stored, marker) = recorded(&env)?;
         assert_eq!(stored, Some(expected), "reth's row");
-        assert_eq!(marker, Some(LayoutMarker::current(expected)), "TN's marker");
+        assert_eq!(marker, Some(LayoutMarker { version, layout: expected }), "TN's marker");
+        assert_eq!(env.datadir_format(), format(expected, tx_bodies));
         Ok(())
     }
 
@@ -511,12 +712,14 @@ mod tests {
         if cfg!(feature = "mdbx") {
             assert_eq!(layout, StorageLayout::V1, "the MDBX build gives v1");
         }
+        let expected = temp_chain_format(layout)?;
         for run in ["new", "reopened"] {
             let tm = TaskManager::new(run);
             let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
             let (stored, marker) = recorded(&env)?;
             assert_eq!(stored, Some(layout), "{run}");
-            assert_eq!(marker, Some(LayoutMarker::current(layout)), "{run}");
+            assert_eq!(marker, Some(LayoutMarker::of(expected)), "{run}");
+            assert_eq!(env.datadir_format(), expected, "{run}");
         }
         Ok(())
     }
@@ -529,7 +732,7 @@ mod tests {
         for requested in [StorageLayout::V1, StorageLayout::V2] {
             let (stored, marker) = with_env(&chain, tmp.path(), requested, recorded)?;
             assert_eq!(stored, Some(StorageLayout::V1), "asked for {requested}");
-            assert_eq!(marker, Some(LayoutMarker::current(StorageLayout::V1)));
+            assert_eq!(marker, Some(inline(StorageLayout::V1)));
         }
         Ok(())
     }
@@ -540,10 +743,11 @@ mod tests {
     async fn tn_lmdb_creates_a_v2_datadir_and_keeps_it() -> eyre::Result<()> {
         let chain = chain();
         let tmp = TempDir::new()?;
+        let expected = temp_chain_format(StorageLayout::V2)?;
         for requested in [StorageLayout::V2, StorageLayout::V1] {
             let (stored, marker) = with_env(&chain, tmp.path(), requested, recorded)?;
             assert_eq!(stored, Some(StorageLayout::V2), "asked for {requested}");
-            assert_eq!(marker, Some(LayoutMarker::current(StorageLayout::V2)));
+            assert_eq!(marker, Some(LayoutMarker::of(expected)));
         }
         Ok(())
     }
@@ -570,7 +774,7 @@ mod tests {
         let tmp = TempDir::new()?;
         with_env(&chain, tmp.path(), StorageLayout::V1, |env| {
             set_row(env, RETH_SETTINGS_KEY, Some(serde_json::to_vec(&StorageSettings::v2())?))?;
-            set_row(env, TN_LAYOUT_KEY, Some(LayoutMarker::current(StorageLayout::V2).to_bytes()?))
+            set_row(env, TN_LAYOUT_KEY, Some(inline(StorageLayout::V2).to_bytes()?))
         })?;
         let err = open_err(&chain, tmp.path(), StorageLayout::V1);
         assert!(err.contains("for this datadir needs the tn-lmdb backend"), "{err}");
@@ -588,7 +792,7 @@ mod tests {
         })?;
         let (stored, marker) = with_env(&chain, tmp.path(), StorageLayout::V2, recorded)?;
         assert_eq!(stored, None, "the open does not write reth's row into an existing datadir");
-        assert_eq!(marker, Some(LayoutMarker::current(StorageLayout::V1)));
+        assert_eq!(marker, Some(inline(StorageLayout::V1)));
         Ok(())
     }
 
@@ -604,13 +808,16 @@ mod tests {
         Ok(())
     }
 
-    /// A marker of an unknown format version, one that does not parse, and one with a field this
-    /// binary does not know are all refused.
+    /// A marker of an unknown format version, one of version 2 with layout v1 (no TN build writes
+    /// it), one that does not parse, and one with a field this binary does not know are all
+    /// refused.
     #[tokio::test]
     async fn an_unknown_marker_is_refused() -> eyre::Result<()> {
         let chain = chain();
-        let cases: [(&[u8], &str); 4] = [
-            (br#"{"version":2,"layout":"v1"}"#, "format version 2"),
+        let cases: [(&[u8], &str); 6] = [
+            (br#"{"version":2,"layout":"v1"}"#, "with layout v1, which no TN build writes"),
+            (br#"{"version":3,"layout":"v1"}"#, "format version 3"),
+            (br#"{"version":3,"layout":"v2"}"#, "a newer binary may have written it"),
             (br#"{"version":0,"layout":"v1"}"#, "format version 0"),
             (br#"{"version":1,"layout":"v1","packed_trie_keys":true}"#, "does not parse"),
             (b"not json", "does not parse"),
@@ -633,7 +840,7 @@ mod tests {
         let chain = chain();
         let tmp = TempDir::new()?;
         with_env(&chain, tmp.path(), StorageLayout::V1, |env| {
-            set_row(env, TN_LAYOUT_KEY, Some(LayoutMarker::current(StorageLayout::V2).to_bytes()?))
+            set_row(env, TN_LAYOUT_KEY, Some(inline(StorageLayout::V2).to_bytes()?))
         })?;
         let err = open_err(&chain, tmp.path(), StorageLayout::V1);
         assert!(err.contains("storage_settings say layout v1, but TN's marker"), "{err}");
@@ -723,7 +930,7 @@ mod tests {
             let tx = database.tx_mut()?;
             tx.put::<tables::Metadata>(
                 TN_LAYOUT_KEY.to_string(),
-                LayoutMarker::current(layout).to_bytes()?,
+                LayoutMarker::of(temp_chain_format(layout)?).to_bytes()?,
             )?;
             tx.commit()?;
         }
@@ -744,7 +951,8 @@ mod tests {
         let layout = crate::env::genesis::temp_chain_new_datadir_layout()?;
 
         with_env(&chain, &path, layout, |env| {
-            assert_eq!(recorded(env)?, (Some(layout), Some(LayoutMarker::current(layout))));
+            let marker = LayoutMarker::of(temp_chain_format(layout)?);
+            assert_eq!(recorded(env)?, (Some(layout), Some(marker)));
             assert_eq!(env.last_block_number()?, 0);
             let output = consensus_output_for_tests(2, 0, 1, false);
             let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
@@ -855,5 +1063,141 @@ mod tests {
             assert_eq!(env.last_block_number()?, 1);
             Ok(())
         })
+    }
+
+    /// Execute blocks 1..=`blocks` on `env`'s chain.
+    fn execute_blocks(env: &RethEnv, chain: &Arc<RethChainSpec>, blocks: u64) -> eyre::Result<()> {
+        let mut parent = chain.sealed_genesis_header();
+        for number in 1..=blocks {
+            let output = consensus_output_for_tests(2 * number as u32, 0, number, false);
+            let payload = TNPayload::new_for_test(parent, &output);
+            let executed = execute_payload_and_update_canonical_chain(env, payload, vec![])?;
+            parent = executed.recovered_block.clone_sealed_header();
+        }
+        Ok(())
+    }
+
+    /// The formats of `env`'s `Transactions` jars, and whether new ones get tagged values.
+    fn tx_jars(env: &RethEnv) -> eyre::Result<(Vec<JarFormat>, bool)> {
+        let static_files = env.blockchain_provider().static_file_provider();
+        let formats = static_files
+            .jar_formats(StaticFileSegment::Transactions)?
+            .into_iter()
+            .map(|(_, format)| format)
+            .collect();
+        Ok((formats, static_files.tx_pointer_jars(StaticFileSegment::Transactions)))
+    }
+
+    /// A new v2 datadir asked for pointers records marker version 2, and its `Transactions` jars
+    /// (genesis's and those after it) have tagged values. A reopen asked for inline keeps all of
+    /// it, the jar policy included.
+    #[cfg(not(feature = "mdbx"))]
+    #[tokio::test]
+    async fn a_pointer_datadir_gets_version_2_and_keeps_it() -> eyre::Result<()> {
+        let chain = chain();
+        let tmp = TempDir::new()?;
+        let pointers = format(StorageLayout::V2, TxBodies::Pointers);
+        for requested in [pointers, format(StorageLayout::V2, TxBodies::Inline)] {
+            with_format(&chain, tmp.path(), requested, |env| {
+                assert_eq!(env.datadir_format(), pointers, "asked for {requested}");
+                let (_, marker) = recorded(env)?;
+                assert_eq!(
+                    marker,
+                    Some(LayoutMarker {
+                        version: LAYOUT_VERSION_TX_POINTERS,
+                        layout: StorageLayout::V2
+                    })
+                );
+                if requested == pointers {
+                    execute_blocks(env, &chain, 1)?;
+                }
+                assert_eq!(
+                    tx_jars(env)?,
+                    (vec![JarFormat::TaggedTx], true),
+                    "asked for {requested}"
+                );
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A new v2 datadir asked for inline records marker version 1 and has no tagged jars; a reopen
+    /// asked for pointers keeps it inline. A new v1 datadir asked for pointers falls back to
+    /// inline, which is what the MDBX build always does.
+    #[tokio::test]
+    async fn an_inline_datadir_keeps_version_1() -> eyre::Result<()> {
+        let chain = chain();
+        let layouts: &[StorageLayout] = if cfg!(feature = "mdbx") {
+            &[StorageLayout::V1]
+        } else {
+            &[StorageLayout::V1, StorageLayout::V2]
+        };
+        for &layout in layouts {
+            let tmp = TempDir::new()?;
+            let first =
+                if layout == StorageLayout::V1 { TxBodies::Pointers } else { TxBodies::Inline };
+            for (run, tx_bodies) in [first, TxBodies::Pointers].into_iter().enumerate() {
+                with_format(&chain, tmp.path(), format(layout, tx_bodies), |env| {
+                    assert_eq!(env.datadir_format(), format(layout, TxBodies::Inline));
+                    assert_eq!(recorded(env)?.1, Some(inline(layout)), "{layout} {tx_bodies}");
+                    if run == 0 {
+                        execute_blocks(env, &chain, 1)?;
+                    }
+                    let (jars, policy) = tx_jars(env)?;
+                    assert!(!jars.is_empty() && !jars.contains(&JarFormat::TaggedTx), "{jars:?}");
+                    assert!(!policy, "{layout} {tx_bodies}: no tagged jars from now on");
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A pointer datadir's database beside an inline datadir's static files is refused, and the
+    /// other way round: each is a half-done swap. Both are left as they were.
+    #[cfg(not(feature = "mdbx"))]
+    #[tokio::test]
+    async fn mixed_tx_jars_are_refused_both_ways() -> eyre::Result<()> {
+        let chain = chain();
+        let tmp = TempDir::new()?;
+        let (inline_dir, pointer_dir) = (tmp.path().join("inline"), tmp.path().join("pointers"));
+        for (path, tx_bodies) in
+            [(&inline_dir, TxBodies::Inline), (&pointer_dir, TxBodies::Pointers)]
+        {
+            with_format(&chain, path, format(StorageLayout::V2, tx_bodies), |env| {
+                execute_blocks(env, &chain, 1)
+            })?;
+        }
+        let cases = [
+            (
+                "pointers db, inline static files",
+                &pointer_dir,
+                &inline_dir,
+                "without tagged values",
+            ),
+            ("inline db, pointer static files", &inline_dir, &pointer_dir, "with tagged values"),
+        ];
+        for (case, db_from, static_files_from, expected) in cases {
+            let swapped = tmp.path().join(case.replace([' ', ','], "-"));
+            copy_tree(db_from, &swapped, &["static_files"])?;
+            copy_tree(&static_files_from.join("static_files"), &swapped.join("static_files"), &[])?;
+            let before = listing(&swapped.join("static_files"));
+            for requested in [TxBodies::Inline, TxBodies::Pointers] {
+                let err = match with_format(
+                    &chain,
+                    &swapped,
+                    format(StorageLayout::V2, requested),
+                    |_| Ok(()),
+                ) {
+                    Ok(()) => panic!("{case}: the open was not refused"),
+                    Err(e) => format!("{e:#}"),
+                };
+                assert!(err.contains(expected), "{case}: {err}");
+                assert!(err.contains("Transactions jars (blocks 0..=499999)"), "{case}: {err}");
+            }
+            assert_eq!(listing(&swapped.join("static_files")), before, "{case}: left as they were");
+        }
+        Ok(())
     }
 }
