@@ -227,11 +227,12 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
 pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Inspect, check and repair the execution and consensus databases.
     ///
-    /// Every command but `validate` (which takes a pack path, not `--datadir`) refuses while a
-    /// node holds the datadir, and holds it while it runs (on a build with the `mdbx` feature,
-    /// `stats` reads beside a running node and `check` refuses). `migrate-execution` and
-    /// `load-state` write; `repair`, `migrate` and `reset-execution` are dry runs that write
-    /// only with `--force`; the others change no file.
+    /// Every command prints the datadir it acts on first (to stderr); `validate` takes a pack path
+    /// instead, and prints that. Every command but `validate` refuses while a node holds the
+    /// datadir, and holds it while it runs (on a build with the `mdbx` feature, `stats` reads
+    /// beside a running node and `check` refuses). `migrate-execution` and `load-state` write;
+    /// `repair`, `migrate` and `reset-execution` are dry runs that write only with `--force`; the
+    /// others change no file.
     #[command(name = "db")]
     Db(db::DbCommand),
 

@@ -312,9 +312,7 @@ pub(crate) fn reset_execution(
     force: bool,
     mode: ResetMode,
 ) -> eyre::Result<ResetPlan> {
-    if !datadir.is_dir() {
-        bail!("datadir {} does not exist", datadir.display());
-    }
+    super::require_datadir(datadir)?;
     let _pid_lock = PidLock::acquire(&datadir.to_path_buf())?;
     // the node refuses this datadir until `db load-state` is rerun, which redoes the restore
     refuse_interrupted_load_state(datadir)?;

@@ -100,8 +100,8 @@ enum DbSubcommand {
     /// reservation and growth step the node runs with: pass the node's. Refuses while a node
     /// holds the datadir, and holds the datadir while it runs. Finishes a migration a stopped
     /// start left after its commit point, refuses what the node's start refuses (too little
-    /// free disk, an unfinished `db reset-execution` included), and with no MDBX database has
-    /// nothing to do. Prints the rows migrated per table.
+    /// free disk, an unfinished `db reset-execution` or `db load-state` included), and with no
+    /// MDBX database has nothing to do. Prints the rows migrated per table.
     MigrateExecution(DbMigrateExecutionArgs),
 
     /// Check one consensus epoch pack for damage.
@@ -194,6 +194,27 @@ enum DbSubcommand {
     ResetExecution(DbResetExecutionArgs),
 }
 
+impl DbSubcommand {
+    /// The line naming what the command acts on, which it prints first: the datadir, made
+    /// absolute, or for `validate`, which takes a pack path and ignores `--datadir`, that path.
+    fn target(&self, datadir: &Path) -> String {
+        let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.into());
+        match self {
+            Self::Validate(args) => format!("pack: {}", absolute(&args.path).display()),
+            _ => format!("datadir: {}", absolute(datadir).display()),
+        }
+    }
+}
+
+/// Refuse a `datadir` that is not a directory, before the datadir lock: its lockfile cannot be
+/// created there, and the lock's error would not say why.
+fn require_datadir(datadir: &Path) -> eyre::Result<()> {
+    if !datadir.is_dir() {
+        bail!("datadir {} does not exist", datadir.display());
+    }
+    Ok(())
+}
+
 /// Move the execution database aside (`db reset-execution`).
 #[derive(Debug, Args)]
 pub struct DbResetExecutionArgs {
@@ -226,9 +247,21 @@ impl DbResetExecutionArgs {
             reset_execution::ResetMode::Rebuild
         };
         let plan = reset_execution::reset_execution(&datadir, self.force, mode)?;
+        self.report(&datadir, &plan, &mut std::io::stdout(), &mut std::io::stderr())
+    }
+
+    /// Print what the reset of `datadir` did (or would do) to `out`, and its warnings to `warn`,
+    /// as the other `db` commands keep warnings off their reports.
+    fn report(
+        &self,
+        datadir: &Path,
+        plan: &reset_execution::ResetPlan,
+        out: &mut impl std::io::Write,
+        warn: &mut impl std::io::Write,
+    ) -> eyre::Result<()> {
         let moves = plan.moves.iter().map(|m| m.display().to_string()).collect::<Vec<_>>();
         if let Some(partial) = &plan.resumes {
-            println!("finishing the unfinished execution reset in {}", partial.display());
+            writeln!(out, "finishing the unfinished execution reset in {}", partial.display())?;
         }
         if self.force {
             let next = if self.for_swap {
@@ -236,43 +269,48 @@ impl DbResetExecutionArgs {
             } else {
                 "the next start rebuilds it from genesis"
             };
-            println!(
+            writeln!(
+                out,
                 "moved the execution database ({}) aside to {}; {next}. To undo, stop the node and \
                  move the entries back into {}",
                 moves.join(", "),
                 plan.target.display(),
                 datadir.display(),
-            );
+            )?;
         } else {
-            println!(
+            writeln!(
+                out,
                 "dry run: would move {} into {}; pass --force to apply",
                 moves.join(", "),
                 plan.target.display(),
-            );
+            )?;
         }
         for (link, to) in &plan.links {
-            println!(
+            writeln!(
+                warn,
                 "warning: {} is a link to {}: the reset moves the link, not what it points to, \
                  and the next start creates a new {} in the datadir, on the datadir's filesystem",
                 link.display(),
                 to.display(),
                 link.display(),
-            );
+            )?;
         }
         let available = plan
             .available_bytes
             .map_or_else(|| "an unknown amount".to_owned(), |bytes| human_bytes(bytes as f64));
-        println!(
+        writeln!(
+            out,
             "the moved-aside execution database holds {} until {} is deleted; the new one needs \
              about as much again, and the datadir's filesystem has {available} free",
             human_bytes(plan.moved_bytes as f64),
             plan.target.display(),
-        );
+        )?;
         if plan.available_bytes.is_some_and(|free| free < plan.moved_bytes) {
-            println!(
+            writeln!(
+                warn,
                 "warning: less is free than the moved-aside database holds: free space before the \
                  next start, or the new database may fill the filesystem"
-            );
+            )?;
         }
         Ok(())
     }
@@ -296,6 +334,8 @@ impl DbMigrateExecutionArgs {
         let _pid_lock = PidLock::acquire(&datadir)?;
         // an unfinished `db reset-execution` may hold `db/` in its staging directory
         refuse_interrupted_reset(&datadir)?;
+        // the node refuses this datadir until `db load-state` is rerun, which redoes the restore
+        refuse_interrupted_load_state(&datadir)?;
         let db = datadir.reth_db_path();
         match migrate_reth_db(&db, &self.db)? {
             Some(marker) => print!("the reth database at {}: {marker}", db.display()),
@@ -332,6 +372,13 @@ impl DbCommand {
     /// subcommand (reth-style, `telcoin-network db --datadir PATH stats`), or after the
     /// subcommand.
     pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        // Say what this acts on before anything else, so an omitted or mistyped `--datadir` (the
+        // default is the OS data directory) shows at once; on stderr, beside the other warnings,
+        // so the reports on stdout stay as they are.
+        eprintln!("{}", self.command.target(&datadir));
+        if !matches!(self.command, DbSubcommand::Validate(_)) {
+            require_datadir(&datadir)?;
+        }
         match &self.command {
             DbSubcommand::Stats => {
                 // Held for the whole report when the reth database cannot be read beside a
@@ -1086,9 +1133,7 @@ impl DbLoadStateArgs {
         // datadir PID lock, and take it for our own run so a node cannot start mid-import;
         // released when this returns. Every config load below needs the datadir to exist, and so
         // does the lockfile: say so directly rather than through the lockfile's open error.
-        if !datadir.is_dir() {
-            bail!("datadir {} does not exist", datadir.display());
-        }
+        require_datadir(&datadir)?;
         let _pid_lock = PidLock::acquire(&datadir)?;
 
         // An unfinished `db reset-execution` holds part of the execution database in its staging
@@ -2191,6 +2236,84 @@ mod tests {
         assert!(!details.contains("see the arg help"), "{details}");
     }
 
+    /// Every command names what it acts on, made absolute: the datadir, or for `validate`, which
+    /// ignores `--datadir`, the pack's path.
+    #[cfg(unix)]
+    #[test]
+    fn every_db_command_names_what_it_acts_on() {
+        let cwd = std::env::current_dir().unwrap();
+        let datadir = Path::new("relative-datadir");
+        let commands = [
+            super::DbSubcommand::Stats,
+            super::DbSubcommand::Check,
+            super::DbSubcommand::MigrateExecution(super::DbMigrateExecutionArgs {
+                db: Default::default(),
+            }),
+            super::DbSubcommand::Repair(super::DbRepairArgs { epoch: None, force: false }),
+            super::DbSubcommand::Migrate(super::DbMigrateArgs { epoch: None, force: false }),
+            super::DbSubcommand::LoadState(super::DbLoadStateArgs {
+                pack: "bundle".into(),
+                chain: None,
+                allow_faucet_on_chain: false,
+            }),
+            super::DbSubcommand::TndbStat,
+            super::DbSubcommand::ResetExecution(super::DbResetExecutionArgs {
+                force: false,
+                for_swap: false,
+            }),
+        ];
+        for command in commands {
+            assert_eq!(
+                command.target(datadir),
+                format!("datadir: {}", cwd.join(datadir).display()),
+                "{command:?}"
+            );
+        }
+        let validate = super::DbSubcommand::Validate(super::DbValidateArgs {
+            path: "/packs/epoch-3".into(),
+            epoch: None,
+        });
+        assert_eq!(validate.target(datadir), "pack: /packs/epoch-3");
+    }
+
+    /// A datadir that does not exist is refused by name before the datadir lock (whose lockfile
+    /// could not be created there), and nothing is created.
+    #[test]
+    fn db_commands_refuse_a_missing_datadir_before_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().join("no-such-datadir");
+        let commands = [
+            super::DbSubcommand::Stats,
+            super::DbSubcommand::Check,
+            super::DbSubcommand::MigrateExecution(super::DbMigrateExecutionArgs {
+                db: Default::default(),
+            }),
+            super::DbSubcommand::TndbStat,
+            super::DbSubcommand::Repair(super::DbRepairArgs { epoch: None, force: false }),
+            super::DbSubcommand::Migrate(super::DbMigrateArgs { epoch: None, force: false }),
+            super::DbSubcommand::LoadState(super::DbLoadStateArgs {
+                pack: dir.path().join("bundle"),
+                chain: None,
+                allow_faucet_on_chain: false,
+            }),
+            super::DbSubcommand::ResetExecution(super::DbResetExecutionArgs {
+                force: true,
+                for_swap: false,
+            }),
+        ];
+        for command in commands {
+            let name = format!("{command:?}");
+            let err =
+                super::DbCommand { command }.execute(datadir.clone()).expect_err("no datadir");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("datadir {} does not exist", datadir.display()),
+                "{name}"
+            );
+            assert!(!datadir.exists(), "{name} created nothing");
+        }
+    }
+
     /// A torn tail is only self-healing in the current epoch; whether a pack is a past epoch is
     /// read from the epochs directory beside it.
     #[test]
@@ -2379,6 +2502,60 @@ mod tests {
         }
         assert!(!datadir.reth_db_path().exists(), "no reth database is created");
         drop(PidLock::acquire(&datadir).expect("migrate-execution must release the lock on exit"));
+    }
+
+    /// `db migrate-execution` refuses a datadir an unfinished `db load-state` left, with the node's
+    /// own message, and leaves the marker; once the restore is finished it runs.
+    #[test]
+    fn db_migrate_execution_refuses_an_unfinished_load_state() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        super::load_state_marker::write(&datadir, &[]).unwrap();
+        let node = format!("{:#}", super::refuse_interrupted_load_state(&datadir).unwrap_err());
+        let migrate =
+            || super::DbMigrateExecutionArgs { db: Default::default() }.execute(datadir.clone());
+
+        let err = format!("{:#}", migrate().expect_err("an unfinished load-state"));
+        assert_eq!(err, node, "the node's refusal");
+        assert!(super::load_state_marker::present(&datadir).unwrap(), "the marker stays");
+        assert!(!datadir.reth_db_path().exists(), "nothing is migrated or created");
+
+        super::load_state_marker::remove(&datadir).unwrap();
+        let run = migrate();
+        if tn_reth::BACKEND == "MDBX" {
+            let err = format!("{:#}", run.expect_err("the MDBX build never migrates"));
+            assert!(err.contains("build without the `mdbx` feature"), "unexpected error: {err}");
+        } else {
+            run.expect("nothing to migrate");
+        }
+    }
+
+    /// `db reset-execution` prints its report on stdout and its warnings (a linked entry, too
+    /// little free space) on stderr, as the other `db` commands do.
+    #[test]
+    fn db_reset_execution_warns_on_stderr() {
+        use std::path::PathBuf;
+        let plan = super::reset_execution::ResetPlan {
+            moves: vec![PathBuf::from("db"), PathBuf::from("static_files")],
+            target: PathBuf::from("/datadir/execution-reset-20261114T000000Z"),
+            resumes: None,
+            moved_bytes: 2 << 30,
+            available_bytes: Some(1 << 30),
+            links: vec![(PathBuf::from("db"), PathBuf::from("/elsewhere/db"))],
+        };
+        for force in [false, true] {
+            let args = super::DbResetExecutionArgs { force, for_swap: false };
+            let (mut out, mut warn) = (Vec::new(), Vec::new());
+            args.report(Path::new("/datadir"), &plan, &mut out, &mut warn).unwrap();
+            let (out, warn) = (String::from_utf8(out).unwrap(), String::from_utf8(warn).unwrap());
+            assert!(!out.contains("warning"), "the report holds no warning: {out}");
+            assert!(out.contains("db, static_files") && out.contains("free"), "{out}");
+            let warnings: Vec<_> = warn.lines().collect();
+            assert_eq!(warnings.len(), 2, "{warn}");
+            assert!(warnings[0].starts_with("warning: db is a link to /elsewhere/db"), "{warn}");
+            assert!(warnings[1].starts_with("warning: less is free"), "{warn}");
+        }
     }
 
     /// `db migrate-execution` takes the node's `--db.*` flags.
