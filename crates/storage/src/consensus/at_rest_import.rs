@@ -154,7 +154,9 @@ impl ConsensusChain {
     /// stopped (see the [module docs](self)). Without `install` it is a dry run: the copy is
     /// imported and verified in `import-N`, which is then removed, and nothing else is written.
     ///
-    /// Refuses, before anything is written: epoch 0 ([`EpochImportError::EpochZero`]); an
+    /// Refuses, before anything is written: a copy inside `base_path`, whose directories the
+    /// import and the node's start remove ([`EpochImportError::Source`]); epoch 0
+    /// ([`EpochImportError::EpochZero`]); an
     /// epoch the node does not only read ([`EpochImportError::NotPast`]); local records that
     /// lack the record of `epoch`, its certificate, or the record of `epoch - 1` it chains to
     /// ([`EpochImportError::Records`]); and a pack in place that validates and ends with the
@@ -174,6 +176,9 @@ impl ConsensusChain {
         install: bool,
         timeout: Duration,
     ) -> Result<EpochImport, EpochImportError> {
+        if let Some(why) = source_inside(base_path, source) {
+            return Err(EpochImportError::Source(why));
+        }
         if epoch == 0 {
             return Err(EpochImportError::EpochZero);
         }
@@ -231,6 +236,27 @@ impl ConsensusChain {
         drop(import_path);
         Ok(EpochImport { epoch, replaces, bytes: len, installed: install })
     }
+}
+
+/// Why the copy at `source` cannot be read where it is: inside the epochs directory `base_path`,
+/// whose directories the import and the node's start remove or replace (the import removes a
+/// leftover `import-N` before it reads the copy, and the start sweeps `import-*` and `staging-*`
+/// and settles `epoch-N.replaced`). Both are compared resolved (symlinks and `..` followed); a
+/// copy that does not exist is left to the read that reports it, which runs before anything is
+/// removed.
+fn source_inside(base_path: &Path, source: &Path) -> Option<String> {
+    let (Ok(source_real), Ok(base_real)) = (source.canonicalize(), base_path.canonicalize()) else {
+        return None;
+    };
+    source_real.starts_with(&base_real).then(|| {
+        format!(
+            "the copy at {} is inside the epochs directory {}, whose directories the import and \
+             the node remove or replace: copy it outside the datadir's consensus database and \
+             pass that path",
+            source.display(),
+            base_path.display()
+        )
+    })
 }
 
 /// The local records of `epoch` and `epoch - 1`, read from the records log at rest (no index,
@@ -756,5 +782,34 @@ mod test {
             .expect("a rerun installs the copy");
         assert!(matches!(done.replaces, EpochPackState::Damaged(_)), "{:?}", done.replaces);
         assert_holds(&base, &epoch1.outputs).await;
+    }
+
+    /// A copy inside the epochs directory is refused before anything is read or removed: the
+    /// import's own `import-N`, which it would remove before reading the copy, or any other
+    /// directory there, however the path is spelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_epoch_at_rest_refuses_a_copy_inside_the_epochs_directory() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("epochs");
+        closed_epochs(&base).await;
+        std::fs::rename(base.join("epoch-1"), base.join("import-1")).unwrap();
+        copy_dir(&base.join("import-1"), &base.join("copy-1"));
+        let before = tree(&base);
+        let spelled = tmp.path().join("epochs").join("..").join("epochs").join("copy-1");
+        for (source, install) in [
+            (base.join("import-1"), false),
+            (base.join("import-1").join(DATA_NAME), true),
+            (spelled, true),
+        ] {
+            let err = ConsensusChain::import_epoch_at_rest(&base, 1, &source, install, TIMEOUT)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, EpochImportError::Source(why) if why.contains("inside the epochs")),
+                "{}: {err}",
+                source.display()
+            );
+        }
+        assert_eq!(tree(&base), before, "a refused copy was touched");
     }
 }

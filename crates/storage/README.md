@@ -517,9 +517,14 @@ only a verified copy is installed (`install_imported_epoch_dir`, rename-aside, w
 an interrupted install's aside first). It opens no `ConsensusChain`: an open writes (the live
 epoch's append open, `recover_incomplete_installs`, the sweep), and `stream_import`'s idempotency
 guard keeps a pack that still serves its final output, however damaged the rest of its log. It
-refuses epoch 0, the epoch the latest-consensus hint resumes and later ones, and a pack in place
-(or an interrupted install's aside) that validates; a dry run (no `--force`) removes its `import-N`
-and changes nothing else. `db repair`, `db migrate`, `db import-epoch`, `db load-state` (except
+refuses epoch 0, the epoch the latest-consensus hint resumes and later ones, a copy inside the
+epochs directory (whose directories the import and the node's start remove or replace), and a pack
+in place (or an interrupted install's aside) that validates and ends with the epoch's certified
+final output (`pack_damage`: a v2 pack must also be sealed; a legacy v0 or v1 pack, which predates
+the sentinel, is judged by the dry run of its migration to v2, as the node reads it); a dry run (no
+`--force`) removes its `import-N` and changes nothing else. A failed install says what it may have
+left (`epoch-N` the copy with the old pack aside, or `epoch-N` missing with the old pack aside),
+which the node's next start settles. `db repair`, `db migrate`, `db import-epoch`, `db load-state` (except
 `--verify-only`), `db tndb-stat`, `db reset-execution`, `db migrate-execution` and,
 on the default (tn-lmdb) build, `db stats` and `db check` refuse to run while a live node holds the
 `<datadir>/telcoin.pid` lock, and hold it while they run (intentional-design item 9); `db validate`

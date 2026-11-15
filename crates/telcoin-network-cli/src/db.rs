@@ -152,12 +152,14 @@ enum DbSubcommand {
     /// read back, renamed into place as the node installs an import. It replaces a missing
     /// pack, a damaged one, or an interrupted install whose copy is damaged. It refuses epoch
     /// 0, the epoch the node resumes and any later one, an epoch whose certified record (or
-    /// the record before it) this node lacks, and a pack in place that validates. The node
-    /// MUST be stopped: it refuses while a node holds the datadir, and holds the datadir while
-    /// it runs. Without `--force` it verifies the copy in `import-N` under the epochs
-    /// directory, removes that, and changes nothing else. It needs about the pack's size free
-    /// on the datadir's filesystem, beyond the margin a peer's import leaves. Exits non-zero
-    /// when it refuses or the copy fails.
+    /// the record before it) this node lacks, a copy inside the epochs directory (put it
+    /// elsewhere: the import and the node remove directories there), and a pack in place that
+    /// validates and ends with the epoch's certified final output. The node MUST be stopped: it
+    /// refuses while a node holds the datadir, and holds the datadir while it runs. Without
+    /// `--force` it imports and verifies the copy in a directory of its own under the epochs
+    /// directory (`import-N`), removes that, and changes nothing else. It needs about the pack's
+    /// size free on the datadir's filesystem, beyond the margin a peer's import leaves. Exits
+    /// non-zero when it refuses or the copy fails.
     ImportEpoch(DbImportEpochArgs),
 
     /// Restore a state-export bundle into a fresh datadir.
@@ -1231,7 +1233,7 @@ pub struct DbImportEpochArgs {
     pub epoch: Epoch,
 
     /// The copy: an `epoch-N` directory (this node's backup, or another node's sealed one), or
-    /// its `data` file.
+    /// its `data` file, outside `<datadir>/consensus-db/epochs`.
     #[arg(long, value_name = "PATH")]
     pub from: PathBuf,
 
