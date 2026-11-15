@@ -252,7 +252,7 @@ A command exits with status 1 when it fails or finds damage that needs action. T
 | `db repair [--epoch <N>] [--force]` | Repairs consensus packs: truncates a torn tail, rebuilds indexes, puts back an install that stopped half-way, and heals the epoch records. Without `--epoch` it skips the newest epoch | Yes | Only with `--force`; without it, reports what it would do |
 | `db migrate [--epoch <N>] [--force]` | Rewrites consensus packs from before v2 in the v2 format | Yes | Only with `--force`; without it, reports what it would do |
 | `db migrate-execution` | Moves the execution database from MDBX to tn-lmdb now, instead of at the node's next start; pass the node's `--db.*` flags | Yes | Yes |
-| `db load-state <bundle>` | Restores a state-export bundle into a fresh datadir (the tn-reth README's "Snapshot export / restore") | Yes | Yes |
+| `db load-state <bundle> [--verify-only]` | Restores a state-export bundle into a fresh datadir (the tn-reth README's "Snapshot export / restore"); `--verify-only` runs the checks a restore runs before it writes, and stops | Yes, except `--verify-only` | Yes, except `--verify-only` |
 | `db reset-execution [--force] [--for-swap]` | Moves `db/`, `static_files/` and `restored-state-floor` into `<datadir>/execution-reset-<UTC time>/`, so the next start rebuilds the execution database | Yes | Only with `--force` (renames, never deletes); without it, reports what it would move |
 
 `telcoin-network db <command> --help` says what each refuses and why.
