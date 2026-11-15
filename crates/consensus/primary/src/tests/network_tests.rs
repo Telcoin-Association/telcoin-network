@@ -4473,6 +4473,21 @@ fn test_import_fault_is_peer_caused_whitelist() {
         Some(Penalty::Severe)
     ));
 
+    // An import whose stream stores under its progress bound is the sender's (Mild: the cut also
+    // marks the peer for the epoch).
+    let stalled =
+        || PackError::ImportStalled { written: 0, window: std::time::Duration::from_secs(300) };
+    assert!(peer_caused(cc(stalled())));
+    assert!(matches!(
+        PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(stalled())),
+        Some(Penalty::Mild)
+    ));
+    // An import stopped at the free-space floor is this node's disk: never charged.
+    let full = || Arc::new(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    assert!(!peer_caused(cc(PackError::IO(full()))));
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(PackError::IO(full())))
+        .is_none());
+
     // Local / ambiguous errors -> NEVER charge the peer.
     assert!(!peer_caused(cc(PackError::CorruptPack("local recovery".into()))));
     assert!(!peer_caused(cc(PackError::PersistError("disk full".into()))));
