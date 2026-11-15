@@ -764,6 +764,26 @@ fn repair_targets(
     }
 }
 
+/// What recovers an epoch-records DB (`epochs.pack`, `epoch_certs.pack` and their indexes) that
+/// will not open, for `db repair`'s report. Nothing fetches its records into an existing datadir
+/// again, and a node past epoch 0 refuses to start without them, so the recovery is the disk or a
+/// backup of those files. They hold no vote or proposal of the validator's (those are in
+/// `consensus-db/tndb`), so putting back only them needs no wait; a whole `consensus-db` does.
+fn records_db_recovery() -> &'static str {
+    "If the error names a read or I/O failure (the disk, permissions, free space, the open-file \
+     limit), fix that and run this again: the open cut nothing. Otherwise records or certificates \
+     it had acknowledged are damaged, and nothing fetches them again into this datadir (removing \
+     the files does not help: a node past epoch 0 refuses to start without its epoch records). \
+     With the node stopped, move `epochs.pack`, `epoch_certs.pack`, `epochs.idx`, `epochs.hash` \
+     and `epoch_certs.hash` out of `consensus-db/epochs/` (never delete them) and copy in those \
+     five from a backup of `consensus-db/` taken with the node stopped; the node then fetches the \
+     certified records after the backup's from peers, checking each against the one before it. \
+     They hold none of a validator's votes or proposals, so it needs no wait; a validator whose \
+     whole `consensus-db/` is restored instead stays stopped until the network has closed the \
+     epoch it was last in. Without a backup, start the node over as a new one (a validator then \
+     stays stopped until the network has closed the last epoch it took part in)"
+}
+
 /// Repair consensus epoch pack files at rest.
 ///
 /// Truncates a torn `data`-file tail and rebuilds missing/corrupt sidecar indexes from the data log
@@ -936,8 +956,8 @@ impl DbRepairArgs {
                         errored += 1;
                         writeln!(
                             out,
-                            "epoch-records DB: could not open to heal ({e}); re-sync/restore may be \
-                             required"
+                            "epoch-records DB: could not open to heal ({e}). {}",
+                            records_db_recovery()
                         )?;
                     }
                 }
@@ -954,8 +974,9 @@ impl DbRepairArgs {
                         errored += 1;
                         writeln!(
                             out,
-                            "epoch-records DB: would fail to open ({e}); re-sync/restore may be \
-                             required"
+                            "epoch-records DB: would fail to open ({e}), and the node's start \
+                             fails the same way. {}",
+                            records_db_recovery()
                         )?;
                     }
                 }
@@ -969,9 +990,10 @@ impl DbRepairArgs {
                 "\nsummary: {actionable} epoch(s) {verb}{records_db}, {unrepairable} unrepairable \
                  (see each epoch's reason), {errored} error(s)."
             )?;
-            // Non-zero exit when anything could not be made healthy, so automation can distinguish a
-            // clean datadir from one needing attention (a dry run that only found `WouldRepair` items
-            // is still success — nothing is wrong yet that this tool refused to handle).
+            // Non-zero exit when anything could not be made healthy, so automation can distinguish
+            // a clean datadir from one needing attention (a dry run that only found
+            // `WouldRepair` items is still success — nothing is wrong yet that this
+            // tool refused to handle).
             if unrepairable > 0 || errored > 0 {
                 bail!(
                     "{unrepairable} epoch(s) unrepairable, {errored} error(s) (see report above)"
