@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs as _};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs};
 use tn_reth::{
     db_check, db_table_stats, iter_static_files, migrate_reth_db, refuse_pending_migration,
     snapshot::SnapshotRestorer, DatabaseArgs, DbCheckReport, DbTableStat, RethCommand, RethConfig,
@@ -1338,8 +1338,9 @@ pub struct DbLoadStateArgs {
     ///
     /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
     /// is used, as a restore would), never written. It takes no datadir lock, so it can vet a
-    /// bundle beside a running node; the restore itself still needs the node stopped and a datadir
-    /// whose execution database holds no blocks past genesis, which this does not check.
+    /// bundle beside a running node, and warns when one holds the datadir: the restore itself
+    /// still needs the node stopped and a datadir whose execution database holds no blocks past
+    /// genesis, which this does not check.
     #[arg(long)]
     pub verify_only: bool,
 }
@@ -1358,8 +1359,14 @@ impl DbLoadStateArgs {
         // released when this returns. Every config load below needs the datadir to exist, and so
         // does the lockfile: say so directly rather than through the lockfile's open error.
         require_datadir(&datadir)?;
-        // A verify-only run writes nothing, so it needs no lock and can vet a bundle beside a node.
+        // A verify-only run writes nothing, so it needs no lock and can vet a bundle beside a node;
+        // it says when a node is there, since the restore itself cannot run beside one.
         let _pid_lock = (!self.verify_only).then(|| PidLock::acquire(&datadir)).transpose()?;
+        if self.verify_only {
+            if let Some(warning) = verify_only_lock_warning(&datadir) {
+                eprintln!("{warning}");
+            }
+        }
 
         // An unfinished `db reset-execution` holds part of the execution database in its staging
         // directory: a restore beside it would leave the datadir holding two, and the reset's rerun
@@ -2001,6 +2008,27 @@ async fn import_bundle_consensus(
         bail!("rebuilt consensus pack tip does not match epoch {n} final consensus: {tip:?}");
     }
     Ok(())
+}
+
+/// `db load-state --verify-only`'s note that a process holds the datadir lock (a running node):
+/// the check goes on beside it, but the restore itself refuses while it runs. `None` when nobody
+/// holds the lock; a lock that cannot be probed is said so, and the check goes on.
+fn verify_only_lock_warning(datadir: &impl TelcoinDirs) -> Option<String> {
+    match PidLock::holder(datadir) {
+        Ok(None) => None,
+        Ok(Some(pid)) => {
+            let who = if pid.is_empty() { String::new() } else { format!(" (pid {pid})") };
+            Some(format!(
+                "warning: a running telcoin process{who} holds this data directory ({}); the \
+                 bundle is checked beside it, but the restore itself needs that process stopped \
+                 and a datadir whose execution database holds no blocks past genesis",
+                datadir.node_pid_path().display()
+            ))
+        }
+        Err(e) => {
+            Some(format!("warning: could not tell whether a node holds this data directory: {e:#}"))
+        }
+    }
 }
 
 /// `db load-state --verify-only`'s check of the bundle's consensus pack: the restore's own import
@@ -4212,11 +4240,11 @@ mod tests {
 
     /// `db load-state --verify-only` runs the restore's checks on a bundle and writes nothing to
     /// the datadir: a bundle that passes them is reported and leaves the datadir byte-identical,
-    /// beside a node holding the datadir (it takes no lock); its consensus pack is imported as the
-    /// restore imports it, in a staging directory removed whatever the outcome, so a bundle whose
-    /// `consensus_data` would fail the restore fails here; with `--chain` and no committee in the
-    /// datadir it verifies against the chain's bundled committee held in memory, writing no
-    /// `genesis/`.
+    /// beside a node holding the datadir (it takes no lock, and warns that the node is there); its
+    /// consensus pack is imported as the restore imports it, in a staging directory removed
+    /// whatever the outcome, so a bundle whose `consensus_data` would fail the restore fails here;
+    /// with `--chain` and no committee in the datadir it verifies against the chain's bundled
+    /// committee held in memory, writing no `genesis/`.
     #[cfg(unix)]
     #[test]
     fn load_state_verify_only_checks_the_bundle_and_writes_nothing() {
@@ -4250,6 +4278,13 @@ mod tests {
             .execute(datadir_path.clone())
             .expect("a bundle that passes every check verifies");
         assert_eq!(tree_listing(&datadir_path), before, "a verify-only run changed the datadir");
+        // and it says a node holds the datadir, which the restore itself needs stopped
+        let warning = super::verify_only_lock_warning(&datadir_path).expect("a held lock warns");
+        assert!(
+            warning.contains(&format!("(pid {})", std::process::id()))
+                && warning.contains("needs that process stopped"),
+            "{warning}"
+        );
 
         // the consensus pack is imported as the restore imports it, in a staging directory that
         // is removed whatever the outcome
@@ -4287,6 +4322,7 @@ mod tests {
             .expect_err("a bundle of another committee must be refused");
         assert!(format!("{err:#}").contains("failed certificate verification"), "{err:#}");
         assert!(!fresh_path.genesis_path().exists(), "a verify-only run wrote genesis/");
+        assert_eq!(super::verify_only_lock_warning(&fresh_path), None, "no lock, no warning");
     }
 
     /// A sealed v2 pack of `epoch` under `epochs` holding only its meta: one that validates.
