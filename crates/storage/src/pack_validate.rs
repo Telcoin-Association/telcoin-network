@@ -359,6 +359,9 @@ pub struct PackValidationReport {
     pub first_consensus_number: Option<u64>,
     /// Consensus number of the last header in the file, if any.
     pub last_consensus_number: Option<u64>,
+    /// Digest of the last header in the file, if any: with `last_consensus_number`, what a caller
+    /// compares against a certified epoch record's `final_consensus`.
+    pub last_consensus_digest: Option<ConsensusHeaderDigest>,
     /// Every issue found, in file order (capped at `MAX_ISSUES`; see `dropped_issues`).
     pub issues: Vec<PackIssue>,
     /// Count of issues found beyond `MAX_ISSUES` and therefore not retained in `issues` (a
@@ -1039,6 +1042,7 @@ fn verify_v1_data(
     let mut meta_overflow_reported = false;
     let mut first_consensus_number: Option<u64> = None;
     let mut last_consensus_number: Option<u64> = None;
+    let mut last_consensus_digest: Option<ConsensusHeaderDigest> = None;
 
     // Persistent, never-cleared set of every batch digest seen anywhere in the file: it lets the
     // deferred `MissingBatch` classification tell an *absent* digest (a real gap) apart from a
@@ -1121,7 +1125,9 @@ fn verify_v1_data(
                         });
                     }
                 }
-                expected_parent = Some(consensus_header.digest());
+                let digest = consensus_header.digest();
+                expected_parent = Some(digest);
+                last_consensus_digest = Some(digest);
                 open_header = Some(consensus_header);
             }
         }
@@ -1138,6 +1144,7 @@ fn verify_v1_data(
         consensus_count,
         first_consensus_number,
         last_consensus_number,
+        last_consensus_digest,
         issues,
         &all_batch_digests,
     ))
@@ -1209,6 +1216,7 @@ fn finalize_report(
     consensus_count: u64,
     first_consensus_number: Option<u64>,
     last_consensus_number: Option<u64>,
+    last_consensus_digest: Option<ConsensusHeaderDigest>,
     mut issues: BoundedIssues,
     all_batch_digests: &HashSet<BlockHash>,
 ) -> PackValidationReport {
@@ -1231,6 +1239,7 @@ fn finalize_report(
         consensus_count,
         first_consensus_number,
         last_consensus_number,
+        last_consensus_digest,
         issues,
         dropped_issues: dropped,
         // Filled in by `validate_pack_file` after the data-stream walk (the builder only sees the
@@ -1957,6 +1966,7 @@ mod test {
             consensus_count: 1,
             first_consensus_number: Some(1),
             last_consensus_number: Some(1),
+            last_consensus_digest: None,
             issues: Vec::new(),
             dropped_issues: 0,
             index_scan: Some(IndexBucketScan {
@@ -1982,6 +1992,7 @@ mod test {
             consensus_count: 0,
             first_consensus_number: None,
             last_consensus_number: None,
+            last_consensus_digest: None,
             issues,
             dropped_issues: 0,
             index_scan: None,

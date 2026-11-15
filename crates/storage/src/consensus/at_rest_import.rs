@@ -25,7 +25,7 @@ use super::{ConsensusChain, ConsensusChainError};
 use crate::{
     consensus_pack::{
         legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, ConsensusPack,
-        DATA_NAME, IMPORT_MIN_FREE_BYTES,
+        DATA_NAME, IMPORT_MIN_FREE_BYTES, SENTINEL_MIN_VERSION,
     },
     epoch_records::{EpochRecordDb, CERTS_NAME, RECORDS_NAME},
     pack_validate::{classify_physical_corruption, validate_pack_file, Verdict},
@@ -85,7 +85,8 @@ pub enum EpochImportError {
     /// The local epoch records lack what the copy is verified against: the record of the epoch
     /// and its certificate, and the record before it (why).
     Records(String),
-    /// The epoch's pack (or an interrupted install's copy of it) validates: nothing to import.
+    /// The epoch's pack (or an interrupted install's copy of it) validates and holds the epoch's
+    /// certified final output: nothing to import.
     NothingToImport {
         /// The epoch asked for.
         epoch: Epoch,
@@ -115,8 +116,9 @@ impl Display for EpochImportError {
             Self::Records(why) => write!(f, "cannot verify the copy: {why}"),
             Self::NothingToImport { epoch, dir } => write!(
                 f,
-                "nothing to import: the pack of epoch {epoch} at {} validates (`db repair \
-                 --epoch {epoch}` repairs its indexes and puts back an interrupted install)",
+                "nothing to import: the pack of epoch {epoch} at {} validates and ends with the \
+                 epoch's certified final output (`db repair --epoch {epoch}` repairs its indexes \
+                 and puts back an interrupted install)",
                 dir.display()
             ),
             Self::Source(why) => write!(f, "{why}"),
@@ -136,10 +138,11 @@ impl ConsensusChain {
     /// Refuses, before anything is written: epoch 0 ([`EpochImportError::EpochZero`]); an
     /// epoch the node does not only read ([`EpochImportError::NotPast`]); local records that
     /// lack the record of `epoch`, its certificate, or the record of `epoch - 1` it chains to
-    /// ([`EpochImportError::Records`]); and a pack in place that validates, as `epoch-N` or as an
-    /// interrupted install's `epoch-N.replaced` ([`EpochImportError::NothingToImport`]). What it
-    /// replaces is a missing pack, a damaged one, or an interrupted install whose copy is damaged
-    /// ([`EpochPackState`]).
+    /// ([`EpochImportError::Records`]); and a pack in place that validates and ends with the
+    /// epoch's certified final output, as `epoch-N` or as an interrupted install's
+    /// `epoch-N.replaced` ([`EpochImportError::NothingToImport`]; each pack version judged by its
+    /// own rule, see `pack_damage`). What it replaces is a missing pack, a damaged or short one,
+    /// or an interrupted install whose copy is damaged ([`EpochPackState`]).
     ///
     /// The stream is the copy's data log up to the end of its last complete output (a sealed log
     /// ends with its clean-close sentinel, a live one with padding, neither of which a peer
@@ -165,7 +168,7 @@ impl ConsensusChain {
             }
         }
         let (record, previous) = local_records(base_path, epoch)?;
-        let replaces = pack_in_place(base_path, epoch, &previous)?;
+        let replaces = pack_in_place(base_path, &record, &previous)?;
 
         let data = if source.is_dir() { source.join(DATA_NAME) } else { source.to_path_buf() };
         let len = {
@@ -251,12 +254,14 @@ fn local_records(
     Ok((record, previous))
 }
 
-/// What holds the place of `epoch`'s pack under `base_path`; refused when it validates.
+/// What holds the place of the pack of `record`'s epoch under `base_path`; refused when it
+/// validates and holds the epoch's certified final output.
 fn pack_in_place(
     base_path: &Path,
-    epoch: Epoch,
+    record: &EpochRecord,
     previous: &EpochRecord,
 ) -> Result<EpochPackState, EpochImportError> {
+    let epoch = record.epoch;
     let live = base_path.join(format!("epoch-{epoch}"));
     let aside = base_path.join(format!("epoch-{epoch}.replaced"));
     let (dir, state): (_, fn(String) -> EpochPackState) = if live.exists() {
@@ -266,29 +271,52 @@ fn pack_in_place(
     } else {
         return Ok(EpochPackState::Missing);
     };
-    match pack_damage(&dir.join(DATA_NAME), epoch, previous) {
+    match pack_damage(&dir.join(DATA_NAME), record, previous) {
         Some(why) => Ok(state(why)),
         None => Err(EpochImportError::NothingToImport { epoch, dir }),
     }
 }
 
-/// Why the data log at `data` of past `epoch` does not validate as `db validate` judges it
-/// (`previous` is the record of the epoch before it); `None` when it validates. Read-only.
-fn pack_damage(data: &Path, epoch: Epoch, previous: &EpochRecord) -> Option<String> {
+/// Why the data log at `data` of the past epoch of `record` (certified; `previous` is the record
+/// of the epoch before it) is not a whole, healthy pack of the epoch, or `None` when it is: it
+/// validates as `db validate` judges it, as the node reads a pack of its version, and it holds
+/// the epoch's certified final output (`record.final_consensus`) as its last. Read-only.
+///
+/// Each pack version is judged by its own rule. A v2 pack carries the clean-close sentinel, and a
+/// past epoch's pack was sealed when the next epoch began, so one without it is damaged. A legacy
+/// pack (v0 or v1, [`SENTINEL_MIN_VERSION`]) predates the sentinel, so its absence says nothing:
+/// the node reads such a pack only through its migration to v2, which for a past epoch refuses
+/// any damage in the log, so the dry run of that migration judges it. A v0 (batches-first) pack
+/// is read by nothing else, so its outputs are counted against the record's; a v1 pack has v2's
+/// layout and is then walked as a v2 pack is.
+fn pack_damage(data: &Path, record: &EpochRecord, previous: &EpochRecord) -> Option<String> {
+    let epoch = record.epoch;
     if !data.exists() {
         return Some("no data log".to_string());
     }
-    match pack_unsealed_version(data, epoch) {
-        None => return Some("its data log does not open".to_string()),
-        // a legacy v0 pack is only ever read by its migration to v2
-        Some((0, _)) => {
-            return legacy_migration_dry_run(data, epoch)
-                .err()
-                .map(|why| format!("its migration to v2 refuses: {why}"))
+    let Some((version, unsealed)) = pack_unsealed_version(data, epoch) else {
+        return Some("its data log does not open".to_string());
+    };
+    if version >= SENTINEL_MIN_VERSION {
+        if unsealed {
+            return Some("its data log is not sealed".to_string());
         }
-        // a past epoch's pack was sealed when the next epoch began
-        Some((_, true)) => return Some("its data log is not sealed".to_string()),
-        Some(_) => {}
+    } else {
+        match legacy_migration_dry_run(data, epoch) {
+            Err(why) => return Some(format!("its migration to v2 refuses: {why}")),
+            // the epoch's outputs run from the one after the previous epoch's final to its own
+            Ok(outputs) if version == 0 => {
+                let expected =
+                    record.final_consensus.number.saturating_sub(previous.final_consensus.number);
+                return (outputs != expected).then(|| {
+                    format!(
+                        "it holds {outputs} output(s), but the epoch's certified record has \
+                         {expected}"
+                    )
+                });
+            }
+            Ok(_) => {}
+        }
     }
     match classify_physical_corruption(data, epoch) {
         Err(e) => return Some(format!("its data log does not read: {e}")),
@@ -297,11 +325,27 @@ fn pack_damage(data: &Path, epoch: Epoch, previous: &EpochRecord) -> Option<Stri
         }
         Ok(None) => {}
     }
-    match validate_pack_file(data, epoch, Some(previous)) {
-        Ok(report) if report.verdict != Verdict::Invalid => None,
-        Ok(_) => Some(format!("`db validate --epoch {epoch}` finds it INVALID")),
-        Err(e) => Some(format!("its validation failed: {e}")),
-    }
+    let report = match validate_pack_file(data, epoch, Some(previous)) {
+        Ok(report) if report.verdict == Verdict::Invalid => {
+            return Some(format!("`db validate --epoch {epoch}` finds it INVALID"))
+        }
+        Ok(report) => report,
+        Err(e) => return Some(format!("its validation failed: {e}")),
+    };
+    // A pack whose last outputs are gone (a backup taken before the epoch closed, then sealed by
+    // `db repair`) still validates as far as it goes: its final output must be the certified one.
+    let last = (report.last_consensus_number, report.last_consensus_digest);
+    let certified = record.final_consensus;
+    (last != (Some(certified.number), Some(certified.hash))).then(|| match last {
+        (Some(number), _) => format!(
+            "it ends at output {number}, not at the epoch's certified final output {}",
+            certified.number
+        ),
+        _ => format!(
+            "it holds no output, not the epoch's certified final output {}",
+            certified.number
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -317,8 +361,8 @@ mod test {
     use tn_reth::RethChainSpec;
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
-        test_genesis, BlsSignature, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-        EpochCertificate, EpochRecord,
+        test_genesis, BlsSignature, Committee, ConsensusHeaderDigest, ConsensusNumHash,
+        ConsensusOutput, EpochCertificate, EpochRecord,
     };
 
     use super::{EpochImportError, EpochPackState};
@@ -330,10 +374,20 @@ mod test {
 
     const TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// Epoch 1 of [`closed_epochs`]: what its pack is built from.
+    struct Epoch1 {
+        /// Its three outputs.
+        outputs: Vec<ConsensusOutput>,
+        /// The record of epoch 0, which its pack's meta chains to.
+        previous: EpochRecord,
+        /// Its committee.
+        committee: Committee,
+    }
+
     /// A node's epochs directory, closed: epochs 0 and 1 sealed with three outputs each, the
     /// live epoch 2 the latest-consensus hint names, and the records of epochs 0 and 1, each
-    /// certified. Returns the outputs of epoch 1.
-    async fn closed_epochs(dir: &Path) -> Vec<ConsensusOutput> {
+    /// certified. Returns what epoch 1's pack is built from.
+    async fn closed_epochs(dir: &Path) -> Epoch1 {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let spec: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let committees = [
@@ -353,6 +407,7 @@ mod test {
         chain.new_epoch(previous.clone(), committees[0].clone()).await.unwrap();
         let mut parent = ConsensusHeaderDigest::default();
         let mut epoch1 = Vec::new();
+        let mut record0 = None;
         for epoch in 0..2_usize {
             for n in (epoch as u64 * 3 + 1)..=(epoch as u64 * 3 + 3) {
                 let output =
@@ -379,12 +434,44 @@ mod test {
             };
             chain.epochs().save(record.clone(), cert).await.unwrap();
             chain.new_epoch(record.clone(), committees[epoch + 1].clone()).await.unwrap();
+            if epoch == 0 {
+                record0 = Some(record.clone());
+            }
             previous = record;
         }
         chain.epochs().persist().await.unwrap();
         chain.close().await;
         ConsensusChain::write_latest_consensus_hint(dir, 2, 6).unwrap();
-        epoch1
+        Epoch1 {
+            outputs: epoch1,
+            previous: record0.expect("epoch 0 closed"),
+            committee: committees[1].clone(),
+        }
+    }
+
+    /// Replace epoch 1's pack under `base` with one of on-disk `version` holding the first `keep`
+    /// of its outputs, closed as a pack of that version was: v2 sealed with its clean-close
+    /// sentinel, v0 and v1 (which predate it) without one.
+    async fn rebuild_epoch1(base: &Path, epoch1: &Epoch1, version: u16, keep: usize) {
+        std::fs::remove_dir_all(base.join("epoch-1")).unwrap();
+        let pack = ConsensusPack::open_append_version(
+            base,
+            epoch1.previous.clone(),
+            epoch1.committee.clone(),
+            version,
+        )
+        .unwrap();
+        for output in &epoch1.outputs[..keep] {
+            pack.save_consensus_output(output.clone()).await.unwrap();
+        }
+        pack.persist().await.unwrap();
+        pack.close().await;
+        if version < crate::consensus_pack::SENTINEL_MIN_VERSION {
+            let data = base.join("epoch-1").join(DATA_NAME);
+            let len = std::fs::metadata(&data).unwrap().len();
+            let file = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
+            file.set_len(len - crate::archive::data_file::SENTINEL_LEN).unwrap();
+        }
     }
 
     /// Every file under `dir` with its bytes, for proving a run left the directory as it found it.
@@ -546,7 +633,7 @@ mod test {
     async fn import_epoch_at_rest_installs_a_verified_copy() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("epochs");
-        let outputs = closed_epochs(&base).await;
+        let outputs = closed_epochs(&base).await.outputs;
         let copy = tmp.path().join("copy");
         copy_dir(&base.join("epoch-1"), &copy);
         let import = |source: &Path, install| {
@@ -592,5 +679,35 @@ mod test {
             done.replaces
         );
         assert_holds(&base, &outputs).await;
+    }
+
+    /// Each pack version is judged by its own rule (`pack_damage`): a whole legacy pack (v0 or
+    /// v1, which predate the clean-close sentinel) and a whole sealed v2 pack are refused as
+    /// nothing to import, while a pack of each version that lost its last output, though it reads
+    /// cleanly as far as it goes, is replaced by the verified copy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_epoch_at_rest_judges_each_version_and_needs_the_certified_final() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("epochs");
+        let epoch1 = closed_epochs(&base).await;
+        let copy = tmp.path().join("copy");
+        copy_dir(&base.join("epoch-1"), &copy);
+        let import = || ConsensusChain::import_epoch_at_rest(&base, 1, &copy, true, TIMEOUT);
+        for version in [0_u16, 1, 2] {
+            rebuild_epoch1(&base, &epoch1, version, 3).await;
+            let err = import().await.unwrap_err();
+            assert!(
+                matches!(err, EpochImportError::NothingToImport { epoch: 1, .. }),
+                "a whole v{version} pack: {err}"
+            );
+            rebuild_epoch1(&base, &epoch1, version, 2).await;
+            let done = import().await.expect("a short pack is replaced");
+            assert!(
+                matches!(done.replaces, EpochPackState::Damaged(_)),
+                "a short v{version} pack: {:?}",
+                done.replaces
+            );
+            assert_holds(&base, &epoch1.outputs).await;
+        }
     }
 }
