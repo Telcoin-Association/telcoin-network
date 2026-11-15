@@ -3562,6 +3562,56 @@ mod tests {
         Ok(())
     }
 
+    /// Captures the fields of every event, so a test can read a log line without a log backend.
+    #[derive(Default)]
+    struct LineCapture(std::sync::Mutex<Vec<std::collections::BTreeMap<&'static str, String>>>);
+
+    impl LineCapture {
+        /// The fields of the first captured event whose message is `message`.
+        fn line(&self, message: &str) -> Option<std::collections::BTreeMap<&'static str, String>> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .find(|fields| fields.get("message").is_some_and(|logged| logged == message))
+                .cloned()
+        }
+    }
+
+    impl tracing::Subscriber for LineCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = FieldCapture::default();
+            event.record(&mut fields);
+            self.0.lock().expect("capture lock").push(fields.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// One event's fields, by name, as their `Debug` text.
+    #[derive(Default)]
+    struct FieldCapture(std::collections::BTreeMap<&'static str, String>);
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name(), format!("{value:?}"));
+        }
+    }
+
     // ---- bench7 epoch-loop-output-drop ----
 
     /// Run the leftover drain on `queued` with `last_forwarded` as the last output the engine
