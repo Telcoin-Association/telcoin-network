@@ -9805,7 +9805,6 @@ dependencies = [
  "assert_matches",
  "eyre",
  "futures",
- "futures-util",
  "jsonrpsee",
  "libc",
  "metrics",

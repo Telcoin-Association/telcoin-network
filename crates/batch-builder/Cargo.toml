@@ -18,13 +18,13 @@ futures-util = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-eyre = { workspace = true }
 metrics = { workspace = true }
 reth-metrics = { workspace = true }
 
 [dev-dependencies]
 # unit tests
 alloy = { workspace = true }
+eyre = { workspace = true }
 assert_matches = { workspace = true }
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
