@@ -107,14 +107,15 @@ enum DbSubcommand {
     /// Check one consensus epoch pack for damage.
     ///
     /// Walks the pack's `data` log and reports integrity issues: a torn tail that a restart or `db
-    /// repair` truncates, or damage that loses data, with what to do about it. Takes the pack's
-    /// path (`<datadir>/consensus-db/epochs/epoch-<N>`, or its `data` file), not `--datadir`, and
-    /// takes no datadir lock. Read-only (changes no file). Validate the newest epoch, or one whose
+    /// repair` truncates, or damage that loses data, with what to do about it. Takes a pack's path
+    /// (an `epoch-<N>` directory or its `data` file, anywhere), or `--epoch N` alone for
+    /// `<datadir>/consensus-db/epochs/epoch-<N>`, or `--all` for every epoch of the datadir. Takes
+    /// no datadir lock. Read-only (changes no file). Validate the newest epoch, or one whose
     /// pack is not sealed yet, only with the node STOPPED: a running node may truncate or grow
     /// that file under this command, which can then crash (SIGBUS; the node's data is not harmed),
     /// and the command warns when it sees such a pack. A sealed past epoch can be validated while
     /// the node runs. Exits non-zero for damage, and for a torn tail in a past epoch (which only
-    /// `db repair` truncates).
+    /// `db repair` truncates); with `--all`, when any epoch fails.
     Validate(DbValidateArgs),
 
     /// Repair consensus packs and epoch records at rest (dry run unless --force).
@@ -198,11 +199,13 @@ enum DbSubcommand {
 
 impl DbSubcommand {
     /// The line naming what the command acts on, which it prints first: the datadir, made
-    /// absolute, or for `validate`, which takes a pack path and ignores `--datadir`, that path.
+    /// absolute, or for `validate` given a pack path, which then ignores `--datadir`, that path.
     fn target(&self, datadir: &Path) -> String {
         let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.into());
         match self {
-            Self::Validate(args) => format!("pack: {}", absolute(&args.path).display()),
+            Self::Validate(DbValidateArgs { path: Some(path), .. }) => {
+                format!("pack: {}", absolute(path).display())
+            }
             _ => format!("datadir: {}", absolute(datadir).display()),
         }
     }
@@ -378,7 +381,7 @@ impl DbCommand {
         // default is the OS data directory) shows at once; on stderr, beside the other warnings,
         // so the reports on stdout stay as they are.
         eprintln!("{}", self.command.target(&datadir));
-        if !matches!(self.command, DbSubcommand::Validate(_)) {
+        if !matches!(self.command, DbSubcommand::Validate(DbValidateArgs { path: Some(_), .. })) {
             require_datadir(&datadir)?;
         }
         match &self.command {
@@ -402,7 +405,7 @@ impl DbCommand {
                 println!("{}", check_table(&report));
             }
             DbSubcommand::MigrateExecution(args) => args.execute(datadir)?,
-            DbSubcommand::Validate(args) => args.execute()?,
+            DbSubcommand::Validate(args) => args.execute(&datadir)?,
             DbSubcommand::Repair(args) => args.execute(datadir)?,
             DbSubcommand::Migrate(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
@@ -418,146 +421,198 @@ impl DbCommand {
 /// Read-only: this never mutates the pack. It opens the `data` stream read-only via mmap, so
 /// validating the CURRENT/latest epoch — the one a running node holds open for append — is unsafe:
 /// the node truncates that file on epoch-close and remaps it on growth, and a concurrent truncate
-/// can crash this command with a SIGBUS (node data is never harmed). `validate` takes a pack path
-/// rather than the datadir, so it does not consult the `telcoin.pid` lock — validate the
-/// current/latest epoch only with the node STOPPED. A sealed past epoch is safe to validate live,
-/// except briefly during an epoch handoff before the just-sealed pack has its clean-close sentinel.
+/// can crash this command with a SIGBUS (node data is never harmed). `validate` does not consult
+/// the `telcoin.pid` lock — validate the current/latest epoch only with the node STOPPED. A sealed
+/// past epoch is safe to validate live, except briefly during an epoch handoff before the
+/// just-sealed pack has its clean-close sentinel.
 #[derive(Debug, Args)]
 pub struct DbValidateArgs {
-    /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one.
+    /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one. Without it,
+    /// `--epoch N` names `<datadir>/consensus-db/epochs/epoch-<N>`, and `--all` every epoch there.
     ///
     /// The `data` stream is self-contained for validation — the sidecar `idx`/`hash`/`bhash`
     /// indexes are not required.
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
 
     /// Epoch number of the pack.
     ///
-    /// Required unless it can be derived from an `epoch-NN` directory in the path. The header
-    /// `uid` is derived from the epoch, so an incorrect value fails to open the file.
+    /// With a path, required unless it can be derived from an `epoch-NN` directory in the path.
+    /// The header `uid` is derived from the epoch, so an incorrect value fails to open the file.
     #[arg(long)]
     pub epoch: Option<Epoch>,
+
+    /// Validate every epoch's pack under `<datadir>/consensus-db/epochs`, in order, and fail if
+    /// any fails. It warns on the newest epoch, which a running node writes.
+    #[arg(long, conflicts_with_all = ["path", "epoch"])]
+    pub all: bool,
 }
 
 impl DbValidateArgs {
-    /// Validate the pack and print the report to stdout.
-    fn execute(&self) -> eyre::Result<()> {
-        let (data_file, epoch) = resolve_data_file_and_epoch(&self.path, self.epoch)?;
-
-        // Warn (do not refuse) if this looks like the current/latest epoch a running node may hold
-        // open — `db validate` maps it read-only, so a concurrent truncate/grow could SIGBUS us.
-        warn_if_current_epoch(&data_file, epoch);
-
-        // A legacy v0 (batches-first) pack is only ever read by its migration to v2, so it is
-        // judged by a dry run of that migration (what `db migrate`, `db repair` and the node all
-        // run on it), not by the header-first walks below.
-        if matches!(pack_unsealed_version(&data_file, epoch), Some((0, _))) {
-            return match legacy_migration_dry_run(&data_file, epoch) {
-                Ok(outputs) => {
-                    println!(
-                        "legacy v0 pack: a dry run of its migration to v2 copies {outputs} \
-                         output(s) cleanly; `db migrate --force`, or the node when it opens or \
-                         reads this epoch, converts it."
-                    );
-                    Ok(())
-                }
-                Err(why) => {
-                    println!("legacy v0 pack: its migration to v2 refuses: {why}");
-                    bail!("pack {} is INVALID (see report above)", data_file.display());
-                }
-            };
+    /// Validate the pack(s) named, under `datadir` when no path is given, and print the reports
+    /// to stdout.
+    fn execute(&self, datadir: &PathBuf) -> eyre::Result<()> {
+        match (&self.path, self.epoch, self.all) {
+            (Some(path), epoch, _) => validate_pack(path, epoch),
+            (None, _, true) => validate_all(&datadir.epochs_db_path()),
+            (None, Some(epoch), false) => {
+                validate_pack(&datadir.epochs_db_path().join(format!("epoch-{epoch}")), Some(epoch))
+            }
+            (None, None, false) => bail!("name the pack: a PATH, `--epoch N` or `--all`"),
         }
+    }
+}
 
-        // Physical framing first: a torn/corrupt record stream cannot be walked for logical checks,
-        // so classify the failure mode (truncatable tail vs data-losing corruption) and report the
-        // recommended operator action instead of bailing with a bare read error.
-        if let Some(corruption) = classify_physical_corruption(&data_file, epoch)
-            .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
-        {
-            print!("{corruption}");
-            // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
-            // committed prefix before it must still be logically checked — otherwise `db validate`
-            // reports nothing useful for the normal shape of any crashed current epoch. Bound the
-            // walk at the last COMPLETE output (the WAL `consistent_end`), NOT at the
-            // first bad record offset: a tear inside the in-flight output would
-            // otherwise report that output's unwritten batches as false "absent" and
-            // flip the verdict INVALID right after "SAFE".
-            let mut prefix_invalid = false;
-            // "Truncatable" is only what recovery would do: a tear past which an acked output
-            // still lies is refused by a node restart and `db repair --force` alike, and a legacy
-            // pack's tail is judged by the migration. Say so instead of promising a self-heal.
-            if corruption.kind.is_truncatable() {
-                if let Some(why) = recovery_refusal(&data_file, epoch) {
-                    println!("NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}");
-                    bail!("pack {} is corrupt (see report above)", data_file.display());
-                }
-                print_legacy_tail_note(&data_file, epoch);
-            }
-            if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
-                let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
-                eprintln!("\nValidating the intact prefix before the tear (up to byte {bound})...",);
-                match validate_pack_file_bounded(&data_file, epoch, None, Some(bound)) {
-                    Ok(report) => {
-                        prefix_invalid = report.verdict == Verdict::Invalid;
-                        print!("{report}");
-                    }
-                    Err(e) => {
-                        // The prefix could not be checked, so it cannot be reported healthy.
-                        eprintln!("bounded validation of the intact prefix failed: {e}");
-                        prefix_invalid = true;
-                    }
-                }
-            }
-            // Exit code: a truncatable tail whose intact prefix is Valid is a benign, self-healing
-            // shape → success. A data-losing corruption kind (or an INVALID prefix) is a real
-            // problem → non-zero exit so scripts/operators notice.
-            if !corruption.kind.is_truncatable() || prefix_invalid {
-                bail!("pack {} is corrupt (see report above)", data_file.display());
-            }
-            return require_current_epoch_for_tail(&data_file, epoch);
+/// `db validate --all`: validate every epoch's pack under `epochs_dir` in order, reporting each
+/// interrupted install, and fail naming the epochs that failed.
+fn validate_all(epochs_dir: &Path) -> eyre::Result<()> {
+    if !epochs_dir.is_dir() {
+        bail!("no consensus epochs directory at {}", epochs_dir.display());
+    }
+    for epoch in interrupted_installs(epochs_dir)? {
+        println!("epoch {epoch}: {}", interrupted_install_note(epoch));
+    }
+    let epochs = ConsensusPack::epoch_dirs(epochs_dir)
+        .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
+    let mut failed = Vec::new();
+    for &epoch in &epochs {
+        println!("epoch {epoch}:");
+        if let Err(e) = validate_pack(&epochs_dir.join(format!("epoch-{epoch}")), Some(epoch)) {
+            println!("epoch {epoch}: FAILED: {e:#}");
+            failed.push(epoch.to_string());
         }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "{} of {} epoch pack(s) under {} failed: epoch(s) {} (see the reports above)",
+            failed.len(),
+            epochs.len(),
+            epochs_dir.display(),
+            failed.join(", ")
+        );
+    }
+    println!("{} epoch pack(s) under {} validated", epochs.len(), epochs_dir.display());
+    Ok(())
+}
 
-        // Every record frames, but an unclean pack can still end in an incomplete output whose
-        // last record happens to end the file: an unacked in-flight write that recovery truncates,
-        // not corruption. Report it as such and validate the complete prefix before it.
-        if let Some(end) = incomplete_trailing_output(&data_file, epoch)
-            .map_err(|e| eyre!("failed to check pack {}: {e}", data_file.display()))?
-        {
-            if let Some(why) = recovery_refusal(&data_file, epoch) {
+/// Validate the pack at `path` (of `epoch`, else the epoch its `epoch-NN` directory names) and
+/// print the report to stdout.
+fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
+    let (data_file, epoch) = resolve_data_file_and_epoch(path, epoch)?;
+
+    // Warn (do not refuse) if this looks like the current/latest epoch a running node may hold
+    // open — `db validate` maps it read-only, so a concurrent truncate/grow could SIGBUS us.
+    warn_if_current_epoch(&data_file, epoch);
+
+    // A legacy v0 (batches-first) pack is only ever read by its migration to v2, so it is
+    // judged by a dry run of that migration (what `db migrate`, `db repair` and the node all
+    // run on it), not by the header-first walks below.
+    if matches!(pack_unsealed_version(&data_file, epoch), Some((0, _))) {
+        return match legacy_migration_dry_run(&data_file, epoch) {
+            Ok(outputs) => {
                 println!(
-                    "NOT TRUNCATABLE: the pack was not cleanly closed and its last output is \
-                     incomplete (bytes past offset {end}), but recovery would refuse to truncate \
-                     it: {why}"
+                    "legacy v0 pack: a dry run of its migration to v2 copies {outputs} \
+                     output(s) cleanly; `db migrate --force`, or the node when it opens or \
+                     reads this epoch, converts it."
                 );
-                bail!("pack {} is corrupt (see report above)", data_file.display());
+                Ok(())
             }
-            println!(
-                "TRUNCATABLE: the pack was not cleanly closed and its last output is incomplete \
-                 (bytes past offset {end}); this unacked in-flight write is truncated by a node \
-                 restart or `db repair --force`."
-            );
-            print_legacy_tail_note(&data_file, epoch);
-            eprintln!("\nValidating the complete prefix (up to byte {end})...");
-            let report = validate_pack_file_bounded(&data_file, epoch, None, Some(end))
-                .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
-            print!("{report}");
-            if report.verdict == Verdict::Invalid {
+            Err(why) => {
+                println!("legacy v0 pack: its migration to v2 refuses: {why}");
                 bail!("pack {} is INVALID (see report above)", data_file.display());
             }
-            return require_current_epoch_for_tail(&data_file, epoch);
+        };
+    }
+
+    // Physical framing first: a torn/corrupt record stream cannot be walked for logical checks,
+    // so classify the failure mode (truncatable tail vs data-losing corruption) and report the
+    // recommended operator action instead of bailing with a bare read error.
+    if let Some(corruption) = classify_physical_corruption(&data_file, epoch)
+        .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
+    {
+        print!("{corruption}");
+        // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
+        // committed prefix before it must still be logically checked — otherwise `db validate`
+        // reports nothing useful for the normal shape of any crashed current epoch. Bound the
+        // walk at the last COMPLETE output (the WAL `consistent_end`), NOT at the
+        // first bad record offset: a tear inside the in-flight output would
+        // otherwise report that output's unwritten batches as false "absent" and
+        // flip the verdict INVALID right after "SAFE".
+        let mut prefix_invalid = false;
+        // "Truncatable" is only what recovery would do: a tear past which an acked output
+        // still lies is refused by a node restart and `db repair --force` alike, and a legacy
+        // pack's tail is judged by the migration. Say so instead of promising a self-heal.
+        if corruption.kind.is_truncatable() {
+            if let Some(why) = recovery_refusal(&data_file, epoch) {
+                println!("NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}");
+                bail!("pack {} is corrupt (see report above)", data_file.display());
+            }
+            print_legacy_tail_note(&data_file, epoch);
         }
+        if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
+            let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
+            eprintln!("\nValidating the intact prefix before the tear (up to byte {bound})...",);
+            match validate_pack_file_bounded(&data_file, epoch, None, Some(bound)) {
+                Ok(report) => {
+                    prefix_invalid = report.verdict == Verdict::Invalid;
+                    print!("{report}");
+                }
+                Err(e) => {
+                    // The prefix could not be checked, so it cannot be reported healthy.
+                    eprintln!("bounded validation of the intact prefix failed: {e}");
+                    prefix_invalid = true;
+                }
+            }
+        }
+        // Exit code: a truncatable tail whose intact prefix is Valid is a benign, self-healing
+        // shape → success. A data-losing corruption kind (or an INVALID prefix) is a real
+        // problem → non-zero exit so scripts/operators notice.
+        if !corruption.kind.is_truncatable() || prefix_invalid {
+            bail!("pack {} is corrupt (see report above)", data_file.display());
+        }
+        return require_current_epoch_for_tail(&data_file, epoch);
+    }
 
-        let report = validate_pack_file(&data_file, epoch, None)
+    // Every record frames, but an unclean pack can still end in an incomplete output whose
+    // last record happens to end the file: an unacked in-flight write that recovery truncates,
+    // not corruption. Report it as such and validate the complete prefix before it.
+    if let Some(end) = incomplete_trailing_output(&data_file, epoch)
+        .map_err(|e| eyre!("failed to check pack {}: {e}", data_file.display()))?
+    {
+        if let Some(why) = recovery_refusal(&data_file, epoch) {
+            println!(
+                "NOT TRUNCATABLE: the pack was not cleanly closed and its last output is \
+                 incomplete (bytes past offset {end}), but recovery would refuse to truncate \
+                 it: {why}"
+            );
+            bail!("pack {} is corrupt (see report above)", data_file.display());
+        }
+        println!(
+            "TRUNCATABLE: the pack was not cleanly closed and its last output is incomplete \
+             (bytes past offset {end}); this unacked in-flight write is truncated by a node \
+             restart or `db repair --force`."
+        );
+        print_legacy_tail_note(&data_file, epoch);
+        eprintln!("\nValidating the complete prefix (up to byte {end})...");
+        let report = validate_pack_file_bounded(&data_file, epoch, None, Some(end))
             .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
-
-        // Report goes to stdout (tracing/logs go to stderr/file).
         print!("{report}");
-        // Non-zero exit on an INVALID verdict so automation can tell a healthy datadir from a
-        // corrupt one by exit status.
         if report.verdict == Verdict::Invalid {
             bail!("pack {} is INVALID (see report above)", data_file.display());
         }
-        Ok(())
+        return require_current_epoch_for_tail(&data_file, epoch);
     }
+
+    let report = validate_pack_file(&data_file, epoch, None)
+        .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
+
+    // Report goes to stdout (tracing/logs go to stderr/file).
+    print!("{report}");
+    // Non-zero exit on an INVALID verdict so automation can tell a healthy datadir from a
+    // corrupt one by exit status.
+    if report.verdict == Verdict::Invalid {
+        bail!("pack {} is INVALID (see report above)", data_file.display());
+    }
+    Ok(())
 }
 
 /// A truncatable tail heals only where the node opens the epoch for append: the epoch it resumes
@@ -2190,9 +2245,10 @@ mod tests {
             assert!(!epochs.join("epoch-2").exists(), "nothing put back");
         };
 
-        let err = super::DbValidateArgs { path: epochs.join("epoch-2"), epoch: None }
-            .execute()
-            .expect_err("the epoch's directory is missing");
+        let err =
+            super::DbValidateArgs { path: Some(epochs.join("epoch-2")), epoch: None, all: false }
+                .execute(&datadir)
+                .expect_err("the epoch's directory is missing");
         let err = format!("{err:#}");
         assert!(err.contains("INTERRUPTED INSTALL"), "{err}");
         assert!(err.contains("the node's next start puts it back"), "{err}");
@@ -2306,10 +2362,18 @@ mod tests {
             );
         }
         let validate = super::DbSubcommand::Validate(super::DbValidateArgs {
-            path: "/packs/epoch-3".into(),
+            path: Some("/packs/epoch-3".into()),
             epoch: None,
+            all: false,
         });
         assert_eq!(validate.target(datadir), "pack: /packs/epoch-3");
+        // without a path it validates under the datadir, and names that
+        let validate = super::DbSubcommand::Validate(super::DbValidateArgs {
+            path: None,
+            epoch: Some(3),
+            all: false,
+        });
+        assert_eq!(validate.target(datadir), format!("datadir: {}", cwd.join(datadir).display()));
     }
 
     /// A datadir that does not exist is refused by name before the datadir lock (whose lockfile
@@ -2765,8 +2829,11 @@ mod tests {
         bytes.extend_from_slice(&[0xAB; 10]);
         fs::write(&data_file, &bytes).unwrap();
 
-        let args = super::DbValidateArgs { path: epoch_dir, epoch: None };
-        assert!(args.execute().is_err(), "a torn epoch meta must fail validation");
+        let args = super::DbValidateArgs { path: Some(epoch_dir), epoch: None, all: false };
+        assert!(
+            args.execute(&dir.path().to_path_buf()).is_err(),
+            "a torn epoch meta must fail validation"
+        );
     }
 
     /// A legacy v0 (batches-first) pack is only ever read by its migration to v2, so `db validate`
@@ -2791,7 +2858,10 @@ mod tests {
             }
             pack.commit().unwrap();
         };
-        let validate = || super::DbValidateArgs { path: epoch_dir.clone(), epoch: None }.execute();
+        let validate = || {
+            super::DbValidateArgs { path: Some(epoch_dir.clone()), epoch: None, all: false }
+                .execute(&dir.path().to_path_buf())
+        };
 
         // The meta's committee must decode (a real committee of more than one authority).
         let mut committee = tn_types::CommitteeBuilder::new(0);
@@ -3814,5 +3884,90 @@ mod tests {
             .expect_err("a bundle of another committee must be refused");
         assert!(format!("{err:#}").contains("failed certificate verification"), "{err:#}");
         assert!(!fresh_path.genesis_path().exists(), "a verify-only run wrote genesis/");
+    }
+
+    /// A sealed v2 pack of `epoch` under `epochs` holding only its meta: one that validates.
+    fn write_meta_only_pack(epochs: &Path, epoch: tn_types::Epoch) {
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression},
+            consensus_pack::{EpochMeta, PackRecord, PACK_VERSION},
+        };
+        let epoch_dir = epochs.join(format!("epoch-{epoch}"));
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let mut committee = tn_types::CommitteeBuilder::new(epoch);
+        for (i, signer) in test_signers(40, 4).iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        let meta = PackRecord::EpochMeta(EpochMeta {
+            epoch,
+            committee: committee.build(),
+            ..Default::default()
+        });
+        let mut pack = Pack::<PackRecord>::open(
+            epoch_dir.join(super::DATA_NAME),
+            epoch as u64,
+            false,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )
+        .unwrap();
+        pack.append(&meta).unwrap();
+        pack.commit().unwrap();
+    }
+
+    /// `db validate` without a path validates under `--datadir`: `--epoch N` the pack of epoch N,
+    /// `--all` every epoch's in turn, failing naming each that fails; with neither it asks for
+    /// one. The path form still ignores `--datadir`, even one that does not exist.
+    #[test]
+    fn db_validate_resolves_packs_under_the_datadir() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        for epoch in 0..3 {
+            write_meta_only_pack(&epochs, epoch);
+        }
+        let validate = |epoch, all| {
+            let args = super::DbValidateArgs { path: None, epoch, all };
+            super::DbCommand { command: super::DbSubcommand::Validate(args) }
+                .execute(datadir.clone())
+        };
+        validate(Some(1), false).expect("epoch 1's pack validates");
+        validate(None, true).expect("every epoch validates");
+        let err = validate(Some(7), false).expect_err("no epoch 7");
+        assert!(format!("{err:#}").contains("epoch-7"), "{err:#}");
+        let err = validate(None, false).expect_err("nothing named");
+        assert!(format!("{err:#}").contains("`--epoch N` or `--all`"), "{err:#}");
+
+        // damage epoch 1's data log past its meta: `--epoch 1` and `--all` fail, naming it
+        let data = epochs.join("epoch-1").join(super::DATA_NAME);
+        let mut bytes = fs::read(&data).unwrap();
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 10]);
+        fs::write(&data, &bytes).unwrap();
+        let _ = validate(Some(1), false).expect_err("epoch 1 is damaged");
+        validate(Some(2), false).expect("epoch 2 still validates");
+        let err = validate(None, true).expect_err("one epoch fails");
+        assert!(format!("{err:#}").contains("1 of 3 epoch pack(s)"), "{err:#}");
+        assert!(format!("{err:#}").contains("epoch(s) 1 "), "{err:#}");
+
+        // the path form takes no datadir, so a missing one is not refused
+        let args =
+            super::DbValidateArgs { path: Some(epochs.join("epoch-2")), epoch: None, all: false };
+        super::DbCommand { command: super::DbSubcommand::Validate(args) }
+            .execute(dir.path().join("no-such-datadir"))
+            .expect("the path form ignores --datadir");
+        // and the datadir forms refuse one
+        let args = super::DbValidateArgs { path: None, epoch: Some(2), all: false };
+        let err = super::DbCommand { command: super::DbSubcommand::Validate(args) }
+            .execute(dir.path().join("no-such-datadir"))
+            .expect_err("no datadir");
+        assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
+
+        // `--all` names every epoch, so it takes neither a path nor `--epoch`
+        for args in [&["validate", "--all", "--epoch", "1"][..], &["validate", "--all", "x"]] {
+            let parsed = Cli::<NoArgs>::try_parse_args_from([&["tn", "db"][..], args].concat());
+            assert!(parsed.is_err(), "{args:?} must not parse");
+        }
     }
 }

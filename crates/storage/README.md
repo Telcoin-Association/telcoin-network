@@ -481,7 +481,8 @@ notified is only logged, which is why `finish_epoch` re-checks the packs and sto
 
 ### Tooling
 
-`telcoin-network db validate <path>` walks a pack's `data` stream read-only and reports integrity
+`telcoin-network db validate <path>` (or `--epoch N` for `<datadir>/consensus-db/epochs/epoch-N`,
+or `--all` for every epoch there, in turn) walks a pack's `data` stream read-only and reports integrity
 issues. A check it could not run is an error, never a verdict: a data log it cannot open or read
 (in the validation walk, the index cross-check's walk, the incomplete-output check) fails the
 command, and the recovery check reports an unopenable log as "recoverability unknown", so a
@@ -507,7 +508,7 @@ then checks the restored epoch with the others. `db repair`,
 `db migrate`, `db load-state`, `db tndb-stat`, `db reset-execution`, `db migrate-execution` and,
 on the default (tn-lmdb) build, `db stats` and `db check` refuse to run while a live node holds the
 `<datadir>/telcoin.pid` lock, and hold it while they run (intentional-design item 9); `db validate`
-takes a pack path and no lock.
+takes no lock.
 
 ### Benchmarks
 
