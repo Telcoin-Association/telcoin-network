@@ -567,15 +567,17 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ProviderFactory<N> {
         self.provider()?.transaction_id(tx_hash)
     }
 
+    // TN(TN-0202): the transaction reads go through a `DatabaseProvider`, the only reader that
+    // resolves the `Transactions` rows storing positions.
     fn transaction_by_id(&self, id: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
-        self.static_file_provider.transaction_by_id(id)
+        self.provider()?.transaction_by_id(id)
     }
 
     fn transaction_by_id_unhashed(
         &self,
         id: TxNumber,
     ) -> ProviderResult<Option<Self::Transaction>> {
-        self.static_file_provider.transaction_by_id_unhashed(id)
+        self.provider()?.transaction_by_id_unhashed(id)
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
@@ -607,7 +609,7 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ProviderFactory<N> {
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Transaction>> {
-        self.static_file_provider.transactions_by_tx_range(range)
+        self.provider()?.transactions_by_tx_range(range)
     }
 
     fn senders_by_tx_range(

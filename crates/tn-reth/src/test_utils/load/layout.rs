@@ -1,6 +1,7 @@
 //! The reth storage layout a bench datadir holds, [`StorageLayout`], and the one place the bench
 //! selects it for a new datadir ([`StorageLayout::select`]) and reads it back from an open one
-//! ([`StorageLayout::of`]).
+//! ([`StorageLayout::of`]); likewise where it keeps its transactions, [`TxBodies`]
+//! ([`TxBodies::select`], [`TxBodies::of`]).
 //!
 //! The layout is written once, when the genesis is (`init_genesis` stores reth's
 //! `StorageSettings`), and an existing datadir opens in the layout it holds. So the bench selects
@@ -13,6 +14,13 @@
 //! (`env::StorageLayout::for_new_datadirs`) never decides a bench's layout. v2 needs the tn-lmdb
 //! build (the env refuses it on MDBX), so [`StorageLayout::selectable`] refuses it on the MDBX
 //! build before the bench builds anything.
+//!
+//! **Transactions.** Where a new datadir keeps its transactions is fixed at its creation too (the
+//! layout marker, `env::layout`), so [`TxBodies::select`] sets it for inline too
+//! ([`RethConfig::with_new_datadir_tx_bodies`]): the env's default for new datadirs
+//! (`env::TxBodies::for_new_datadirs`, pointers on the tn-lmdb build) never decides it either.
+//! Pointers need layout v2 (a v1 datadir would store them inline), so [`TxBodies::selectable`]
+//! refuses them on v1.
 
 use crate::{RethConfig, RethEnv};
 use reth_provider::{
@@ -105,5 +113,76 @@ impl StorageLayout {
         Self::ALL.into_iter().find(|layout| layout.settings() == stored).ok_or_else(|| {
             eyre::eyre!("the datadir's storage settings {stored:?} are neither v1 nor v2")
         })
+    }
+}
+
+/// Where a bench datadir keeps its transactions: the env's [`crate::env::TxBodies`], with a knob
+/// label and a serialized form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TxBodies {
+    /// Each transaction in the `Transactions` static files (layout marker version 1).
+    #[default]
+    Inline,
+    /// Each transaction's position in its block's consensus batch (layout marker version 2),
+    /// read back through the env's transaction resolver. Layout v2 only.
+    Pointers,
+}
+
+impl TxBodies {
+    /// Every format.
+    pub const ALL: [Self; 2] = [Self::Inline, Self::Pointers];
+
+    /// Its knob value and report label: `inline` or `pointers`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Pointers => "pointers",
+        }
+    }
+
+    /// The format labelled `label`.
+    pub fn parse(label: &str) -> eyre::Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|format| format.label() == label)
+            .ok_or_else(|| eyre::eyre!("{label:?} is not a transaction format: inline or pointers"))
+    }
+
+    /// The env's format of the same name.
+    pub const fn env_tx_bodies(self) -> crate::env::TxBodies {
+        match self {
+            Self::Inline => crate::env::TxBodies::Inline,
+            Self::Pointers => crate::env::TxBodies::Pointers,
+        }
+    }
+
+    /// Whether this build can make a new datadir of `layout` in this format: an error naming why
+    /// not. Pointers need layout v2 ([`StorageLayout::selectable`] says whether this build has
+    /// it).
+    pub fn selectable(self, layout: StorageLayout) -> eyre::Result<()> {
+        layout.selectable()?;
+        eyre::ensure!(
+            self == Self::Inline || layout == StorageLayout::V2,
+            "transactions stored by position (pointers) need storage layout v2, not {}",
+            layout.label()
+        );
+        Ok(())
+    }
+
+    /// Select this format for a new datadir of `layout` opened with `config` (see the module
+    /// docs), refused unless [`Self::selectable`].
+    pub fn select(self, layout: StorageLayout, config: &mut RethConfig) -> eyre::Result<()> {
+        self.selectable(layout)?;
+        *config = config.clone().with_new_datadir_tx_bodies(self.env_tx_bodies());
+        Ok(())
+    }
+
+    /// The format `env`'s datadir holds.
+    pub fn of(env: &RethEnv) -> Self {
+        match env.datadir_format().tx_bodies {
+            crate::env::TxBodies::Inline => Self::Inline,
+            crate::env::TxBodies::Pointers => Self::Pointers,
+        }
     }
 }

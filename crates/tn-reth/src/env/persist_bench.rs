@@ -529,7 +529,7 @@ fn run_mode(
             io_before = Some(engine.io_stats());
         }
         let start = Instant::now();
-        reth_env.persist_executed_output(&blocks).expect("persist");
+        reth_env.persist_executed_output(&blocks, &[]).expect("persist");
         let elapsed = start.elapsed();
         let split = Split::take(snapshotter, &reth_env);
 

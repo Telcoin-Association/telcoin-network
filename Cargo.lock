@@ -10133,6 +10133,7 @@ dependencies = [
  "fixed-cache",
  "futures",
  "jsonrpsee",
+ "lru",
  "metrics",
  "metrics-util",
  "page_size",

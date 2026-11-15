@@ -141,13 +141,17 @@ const ERC1967_IMPLEMENTATION_SLOT: B256 =
 /// The lines `tn_reth`'s storage layout guard logs on open (target `tn::reth`).
 const LAYOUT_MARKER_RECORDED_LOG: &str =
     "recorded TN's storage layout marker in an existing reth datadir";
-const NEW_DATADIR_LOG: &str = "new reth datadir: storage layout";
-/// Logged on an open of an existing reth datadir in the layout new datadirs get (a substring of
+const NEW_DATADIR_LOG: &str = "new reth datadir: storage format";
+/// [`NEW_DATADIR_LOG`] as builds before the transaction-format marker word it; `TN_BIN_PATH_PREV`
+/// may be one of them.
+const NEW_DATADIR_LOG_BEFORE_TX_BODIES: &str = "new reth datadir: storage layout";
+/// Logged on an open of an existing reth datadir in the format new datadirs get (a substring of
 /// [`NEW_DATADIR_LOG`] too, so it is only looked for in a run that opened an existing one).
-const EXISTING_DATADIR_LOG: &str = "reth datadir: storage layout";
-/// Logged instead of [`EXISTING_DATADIR_LOG`] on an open of an existing reth datadir in the other
-/// layout: a migrated v1 datadir under a binary that gives new datadirs v2.
-const KEEPS_LAYOUT_LOG: &str = "this reth datadir keeps its storage layout";
+const EXISTING_DATADIR_LOG: &str = "reth datadir: storage format";
+/// Logged instead of [`EXISTING_DATADIR_LOG`] on an open of an existing reth datadir in another
+/// format: a migrated v1 datadir, which stores transactions inline, under a binary that gives new
+/// datadirs v2 with transactions stored by position.
+const KEEPS_LAYOUT_LOG: &str = "this reth datadir keeps its storage format";
 
 /// The name prefix of the static files of the account change set segment, which only storage
 /// layout v2 writes (v1 keeps change sets in database tables).
@@ -201,7 +205,7 @@ fn log_lines(instance: usize, run: u32, needle: &str) -> eyre::Result<Vec<String
 }
 
 /// The one line of run `run` of validator `instance` that contains `needle`, which must also
-/// report each of `fields` (`layout=v1`, `new_datadirs=v2`).
+/// report each of `fields` (`layout=v1`, `new_datadirs=layout v2`).
 fn layout_log_line(
     instance: usize,
     run: u32,
@@ -453,7 +457,8 @@ async fn run_resync(
     progress(format!("{phase}: {reth_migrated}"));
     // a TN_BIN_PATH_PREV from before the layout marker leaves a datadir without one, which the
     // first open records; one built after it created the datadir with the marker
-    let prev_wrote_marker = !log_lines(RESET, RUN_PREV, NEW_DATADIR_LOG)?.is_empty();
+    let prev_wrote_marker = !log_lines(RESET, RUN_PREV, NEW_DATADIR_LOG)?.is_empty()
+        || !log_lines(RESET, RUN_PREV, NEW_DATADIR_LOG_BEFORE_TX_BODIES)?.is_empty();
     let marker_lines = log_lines(RESET, RUN_UPGRADED, LAYOUT_MARKER_RECORDED_LOG)?;
     if prev_wrote_marker {
         eyre::ensure!(
@@ -468,9 +473,13 @@ async fn run_resync(
         progress(format!("{phase}: {line}"));
     }
     // the migrated datadir stays v1 although this binary gives new datadirs v2
-    let open_line =
-        layout_log_line(RESET, RUN_UPGRADED, KEEPS_LAYOUT_LOG, &["layout=v1", "new_datadirs=v2"])
-            .wrap_err(phase)?;
+    let open_line = layout_log_line(
+        RESET,
+        RUN_UPGRADED,
+        KEEPS_LAYOUT_LOG,
+        &["format=layout v1, transactions inline", "new_datadirs=layout v2"],
+    )
+    .wrap_err(phase)?;
     let same_layout = log_lines(RESET, RUN_UPGRADED, EXISTING_DATADIR_LOG)?;
     eyre::ensure!(
         same_layout.is_empty(),
@@ -589,7 +598,8 @@ async fn run_resync(
         .wrap_err(phase)?;
     let head_at_rpc = get_block_number(reset_url)?;
     let new_line =
-        layout_log_line(RESET, RUN_REBUILT, NEW_DATADIR_LOG, &["layout=v2"]).wrap_err(phase)?;
+        layout_log_line(RESET, RUN_REBUILT, NEW_DATADIR_LOG, &["layout=v2", "tx_bodies=pointers"])
+            .wrap_err(phase)?;
     for absent in [MIGRATED_LOG, LAYOUT_MARKER_RECORDED_LOG, KEEPS_LAYOUT_LOG] {
         let lines = log_lines(RESET, RUN_REBUILT, absent)?;
         eyre::ensure!(lines.is_empty(), "{phase}: the rebuilt run logged {lines:?}");

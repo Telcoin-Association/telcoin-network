@@ -158,6 +158,10 @@ pub enum TnRethError {
         /// The payload's parent block.
         got: B256,
     },
+    /// `RethEnv::set_persisted_batch_sink` was called on an environment that already has a sink:
+    /// the first one stays.
+    #[error("a persisted-batch sink is already installed")]
+    PersistedBatchSinkAlreadySet,
 }
 
 impl From<TnRethError> for EthApiError {

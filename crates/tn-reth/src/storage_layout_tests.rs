@@ -549,7 +549,9 @@ fn jar_versions(
 
 /// A new datadir writes every static-file jar in its layout's format: version 1 in storage v1, for
 /// the segments it keeps in static files (headers, transactions, receipts), and version 2
-/// (checksummed) in storage v2, for every segment: those, senders and both changesets. Checked
+/// (checksummed) in storage v2, for every segment: those, senders and both changesets, except
+/// `Transactions`, whose jars in a new v2 datadir (which stores transactions by position) are
+/// version 3 (checksummed, tagged values). Checked
 /// after genesis and after blocks persisted into every segment. Storage v2 also refuses a
 /// version-1 jar of a checksummed segment at load (TN-0135); this reads the files themselves.
 #[tokio::test]
@@ -582,6 +584,13 @@ async fn new_datadirs_write_every_jar_in_their_layout_format() -> eyre::Result<(
             let label = format!("{} after {when}", name(settings));
             assert_eq!(versions.keys().copied().collect::<Vec<_>>(), segments, "{label}");
             for (segment, found) in versions {
+                // a new v2 datadir stores its transactions by position (`TxBodies`), in
+                // `Transactions` jars with tagged values: version 3
+                let version = if settings.is_v2() && segment == StaticFileSegment::Transactions {
+                    3
+                } else {
+                    version
+                };
                 assert!(
                     found.iter().all(|found| *found == version),
                     "{label}: {segment} {found:?}"
