@@ -105,6 +105,18 @@ pub(crate) fn check_filter_size(filter: &Filter) -> Result<(), EthFilterError> {
     Ok(())
 }
 
+/// TN(TN-0193): a range scan reads at most this many receipts and logs for each log a response
+/// may return (`QueryLimits::max_logs_per_response`): 1,000,000 at the default of 20,000, and no
+/// bound when responses have none.
+///
+/// The response limit bounds the logs that match, but every receipt of a block whose logs bloom
+/// matches the filter is read and each of its logs compared, whether any matches or not, so a
+/// range's work was bounded only by its block count. A scan that passes this bound ends with
+/// [`EthFilterError::QueryExceedsMaxReads`] and a retry range that fits, as the response limit
+/// does. 50 reads per returnable log leaves room for the blocks whose blooms match a filter by
+/// chance, and an operator who raises the response limit raises this bound with it.
+const SCAN_READS_PER_RESPONSE_LOG: usize = 50;
+
 /// Minimum number of bloom matching blocks in a header window for fetching their receipts in
 /// parallel
 const PARALLEL_PROCESSING_THRESHOLD: usize = 1000;
@@ -728,6 +740,11 @@ where
     ) -> Result<Vec<Log>, EthFilterError> {
         let mut all_logs = Vec::new();
 
+        // TN(TN-0193): the receipts and logs this scan may read, and has read.
+        let max_reads =
+            limits.max_logs_per_response.map(|max| max.saturating_mul(SCAN_READS_PER_RESPONSE_LOG));
+        let mut reads = 0usize;
+
         // get current chain tip to determine processing mode
         let chain_tip = self.provider().best_block_number()?;
 
@@ -819,6 +836,35 @@ where
                     );
                     return Err(EthFilterError::QueryExceedsMaxResults {
                         max_logs: max_logs_per_response,
+                        from_block,
+                        to_block: retry_to_block,
+                    });
+                }
+
+                // TN(TN-0193): every receipt of this block was read and each of its logs compared.
+                // Like the response limit, this never splits a single-block range, and the retry
+                // range leaves out the block that passed the bound.
+                let block_reads = receipts.len() +
+                    receipts
+                        .iter()
+                        .map(|receipt| alloy_consensus::TxReceipt::logs(receipt).len())
+                        .sum::<usize>();
+                reads = reads.saturating_add(block_reads);
+                if let Some(max_reads) = max_reads &&
+                    is_multi_block_range &&
+                    reads > max_reads
+                {
+                    let retry_to_block = num_hash.number.saturating_sub(1).max(from_block);
+                    debug!(
+                        target: "rpc::eth::filter",
+                        reads,
+                        max_reads,
+                        from_block,
+                        to_block = retry_to_block,
+                        "Query exceeded max receipts and logs read"
+                    );
+                    return Err(EthFilterError::QueryExceedsMaxReads {
+                        max_reads,
                         from_block,
                         to_block: retry_to_block,
                     });
@@ -1029,6 +1075,18 @@ pub enum EthFilterError {
     /// position.
     #[error("too many addresses or topics in one filter position, the limit is {0}")]
     TooManyFilterValues(usize),
+    /// TN(TN-0193): a range scan read more receipts and logs than it may.
+    #[error(
+        "query reads more than {max_reads} receipts and logs, retry with the range {from_block}-{to_block}"
+    )]
+    QueryExceedsMaxReads {
+        /// Most receipts and logs one range scan may read
+        max_reads: usize,
+        /// Start block of the suggested retry range
+        from_block: u64,
+        /// End block of the suggested retry range (the last block read within the bound)
+        to_block: u64,
+    },
 }
 
 impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
@@ -1045,6 +1103,7 @@ impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
             err @ (EthFilterError::InvalidBlockRangeParams |
             EthFilterError::QueryExceedsMaxBlocks(_) |
             EthFilterError::QueryExceedsMaxResults { .. } |
+            EthFilterError::QueryExceedsMaxReads { .. } |
             EthFilterError::BlockRangeExceedsHead |
             EthFilterError::TooManyFilterValues(_)) => {
                 rpc_error_with_code(jsonrpsee::types::error::INVALID_PARAMS_CODE, err.to_string())
@@ -2302,6 +2361,101 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// TN(TN-0193): a range scan stops once it has read more receipts and logs than the response
+    /// limit allows, even when no log matches, and suggests a retry range that fits.
+    #[tokio::test]
+    async fn range_scan_reads_are_bounded() {
+        use alloy_consensus::TxLegacy;
+        use alloy_primitives::{Address, Bloom, Bytes, Log, LogData, Signature};
+        use reth_db_api::models::StoredBlockBodyIndices;
+        use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned};
+
+        let provider = MockEthProvider::default();
+        let tx = TransactionSigned::new_unhashed(
+            TxLegacy {
+                chain_id: Some(1),
+                gas_price: 21_000,
+                gas_limit: 21_000,
+                ..Default::default()
+            }
+            .into(),
+            Signature::test_signature(),
+        );
+        // one receipt with 30 logs per block: 31 reads
+        let log = Log {
+            address: Address::with_last_byte(1),
+            data: LogData::new_unchecked(vec![], Bytes::new()),
+        };
+        let receipt = Receipt {
+            tx_type: TxType::Legacy,
+            cumulative_gas_used: 21_000,
+            logs: vec![log; 30],
+            success: true,
+        };
+        // every bloom matches every filter, so every block's receipts are read
+        let mut parent_hash = FixedBytes::default();
+        for number in 100..=104u64 {
+            let header = alloy_consensus::Header {
+                number,
+                parent_hash,
+                logs_bloom: Bloom::repeat_byte(0xff),
+                ..Default::default()
+            };
+            parent_hash = header.hash_slow();
+            provider.add_block(
+                parent_hash,
+                Block {
+                    header,
+                    body: BlockBody { transactions: vec![tx.clone()], ..Default::default() },
+                },
+            );
+            provider.add_receipts(number, vec![receipt.clone()]);
+            provider.add_block_body_indices(
+                number,
+                StoredBlockBodyIndices { first_tx_num: number - 100, tx_count: 1 },
+            );
+        }
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Box::new(TokioTaskExecutor::default()),
+        );
+        let scan = |filter: Filter, from: u64, to: u64, max_logs: Option<usize>| {
+            eth_filter.inner.clone().get_logs_in_block_range(
+                filter,
+                from,
+                to,
+                QueryLimits { max_blocks_per_filter: None, max_logs_per_response: max_logs },
+            )
+        };
+        let no_match = Filter::new().address(Address::with_last_byte(2));
+
+        // a limit of one log allows 50 reads: the second block passes them, so the retry range
+        // is the first block
+        let err = scan(no_match.clone(), 100, 104, Some(1)).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EthFilterError::QueryExceedsMaxReads {
+                    max_reads: 50,
+                    from_block: 100,
+                    to_block: 100
+                }
+            ),
+            "{err:?}"
+        );
+        // 155 reads fit a limit of four logs (200 reads)
+        assert!(scan(no_match.clone(), 100, 104, Some(4)).await.unwrap().is_empty());
+        // a single block is never split, and no response limit means no read bound
+        assert!(scan(no_match.clone(), 101, 101, Some(1)).await.unwrap().is_empty());
+        assert!(scan(no_match, 100, 104, None).await.unwrap().is_empty());
+        // matching logs are still returned within both limits
+        let logs = scan(Filter::new().address(Address::with_last_byte(1)), 100, 101, Some(60))
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 60);
     }
 
     /// TN(TN-0056): the third filter is refused at a limit of two, and uninstalling frees a slot.
