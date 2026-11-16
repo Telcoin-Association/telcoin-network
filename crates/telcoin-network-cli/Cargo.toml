@@ -58,6 +58,9 @@ dirs-next = { workspace = true }
 bs58 = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+# `db load-state --verify-only` imports the bundle's consensus pack into a staging directory
+# under the system temp directory, removed on every exit path
+tempfile = { workspace = true }
 url = { workspace = true }
 zeroize = { workspace = true }
 
@@ -69,7 +72,6 @@ libc = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-config = { workspace = true, features = ["test-utils"]}
-tempfile = { workspace = true }
 rand = { workspace = true }
 roaring = { workspace = true }
 crc32fast = "1.5.0"

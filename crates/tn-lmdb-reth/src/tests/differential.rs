@@ -83,14 +83,17 @@
 //! must equal MDBX's (the skips depend only on the outcomes), so within a run every form takes
 //! the same scripts and skips the same ops. The random tests draw their scripts from a new seed
 //! each run (`PROPTEST_RNG_SEED` picks one), printed with the totals and in a failure's message,
-//! which `PROPTEST_RNG_SEED` then reruns. `random_scripts_skip_counts_are_pinned_at_seed_1` and its
-//! `_heavy` variant run the same strategies from the fixed [`RNG_SEED`] and pin the totals by
-//! class, so a class whose share moved fails there. A test's scripts have a shape ([`Scripts`]):
+//! which `PROPTEST_RNG_SEED` then reruns. `random_scripts_skip_counts_are_pinned_at_seed_1`, its
+//! `_heavy` variant and its `_multi_leaf` one run the same strategies from the fixed [`RNG_SEED`]
+//! and pin the totals by class and the dup table's cursor calls, so a class whose share moved
+//! fails there. A test's scripts have a shape ([`Scripts`]):
 //! the narrow one above, or the multi-leaf one of `random_scripts_match_mdbx_multi_leaf` (and
 //! `_heavy`), seeded with [`MULTI_LEAF_ROWS`] rows under one dup key and as many header keys, the
 //! drawn keys and slots spread over them and the dup values in the wide encoding ([`WIDE`]), so
 //! the cursor calls run inside multi-leaf nested and composite trees. Every run also counts the
-//! dup table's cursor calls run and skipped apart, and fails if the skipped reach a fifth.
+//! dup table's cursor calls run and skipped apart, and fails if the skipped reach a fifth in a
+//! heavy run or a quarter in a default one, whose 32 scripts spread the share wide
+//! ([`DUP_SKIP_LIMIT_DEFAULT`]).
 
 use super::{
     adapter::create_mdbx_db, dup::second_value_refused, mdbx_port::create_test_db_with, Form,
@@ -1843,17 +1846,44 @@ fn random_seed() -> u64 {
     }
 }
 
-/// Ops run and skipped by class ([`CLASSES`]) over a test's scripts.
-type Totals = (u64, [u64; 9]);
+/// Ops run and skipped by class ([`CLASSES`]) over a test's scripts, and the dup table's cursor
+/// calls run and skipped.
+#[derive(Debug, PartialEq, Eq)]
+struct Totals {
+    ran: u64,
+    skips: [u64; 9],
+    dup_cursor_ran: u64,
+    dup_cursor_skipped: u64,
+}
+
+/// The share of the dup table's cursor calls a run may skip, as `1 / n`, where the sample is
+/// large: a heavy run's 2000 scripts hold the share near its mean (0.11 at seed 1 on the narrow
+/// scripts, 0.13 on a run of the multi-leaf ones).
+const DUP_SKIP_LIMIT: u64 = 5;
+
+/// [`DUP_SKIP_LIMIT`] for a default run's 32 scripts, whose share spreads wide: a cursor sent
+/// past the dup table's end (its seeded rows sit under one key, and half the drawn keys lie past
+/// them) skips every relative call until it is placed again, so the skips come in runs, and a
+/// few long scripts decide a run's share. On the multi-leaf scripts it averaged 0.105 over 300
+/// runs, with a standard deviation of 0.03, and one run in 300 reached a fifth; a quarter still
+/// fails a run whose dup cursors mostly sit in a skip class, and the pinned runs
+/// ([`random_scripts_skip_counts_are_pinned_at_seed_1`] and its kin) fix the share exactly.
+const DUP_SKIP_LIMIT_DEFAULT: u64 = 4;
 
 /// Runs `cases` scripts of up to `len` ops from `seed`, of the shape `scripts`, each on MDBX and
 /// on every form of tn-lmdb ([`differential`]), prints the ops run and skipped (by class, and
-/// the dup table's cursor calls apart) with the seed, and returns the ops run and skipped by
-/// class. A failure's message names the seed, which `PROPTEST_RNG_SEED` reruns. The skips must
-/// stay under a tenth of the ops run, and the dup table's skipped cursor calls under a fifth of
-/// its cursor calls: the dup layouts' cursor code is what the skip classes mostly cover, so a
-/// rate low over every op could still leave it mostly skipped.
-fn differential_cases(cases: u32, len: usize, seed: u64, scripts: Scripts) -> Totals {
+/// the dup table's cursor calls apart) with the seed, and returns those totals. A failure's
+/// message names the seed, which `PROPTEST_RNG_SEED` reruns. The skips must stay under a tenth of
+/// the ops run, and the dup table's skipped cursor calls under `1 / dup_skip_limit` of its cursor
+/// calls ([`DUP_SKIP_LIMIT`], [`DUP_SKIP_LIMIT_DEFAULT`]): the dup layouts' cursor code is what the
+/// skip classes mostly cover, so a rate low over every op could still leave it mostly skipped.
+fn differential_cases(
+    cases: u32,
+    len: usize,
+    seed: u64,
+    scripts: Scripts,
+    dup_skip_limit: u64,
+) -> Totals {
     let config = ProptestConfig {
         cases,
         rng_seed: RngSeed::Fixed(seed),
@@ -1891,13 +1921,18 @@ fn differential_cases(cases: u32, len: usize, seed: u64, scripts: Scripts) -> To
         "skipped ops reached a tenth of the ops run at seed {seed}: the scripts test little"
     );
     assert!(
-        totals.dup_cursor_skipped * 5 < totals.dup_cursor_ran,
-        "skipped dup cursor calls reached a fifth of those run at seed {seed} ({} of {}): the \
-         scripts test the dup cursors little",
+        totals.dup_cursor_skipped * dup_skip_limit < totals.dup_cursor_ran,
+        "skipped dup cursor calls reached 1/{dup_skip_limit} of those run at seed {seed} ({} of \
+         {}): the scripts test the dup cursors little",
         totals.dup_cursor_skipped,
         totals.dup_cursor_ran
     );
-    (totals.ran, totals.skips)
+    Totals {
+        ran: totals.ran,
+        skips: totals.skips,
+        dup_cursor_ran: totals.dup_cursor_ran,
+        dup_cursor_skipped: totals.dup_cursor_skipped,
+    }
 }
 
 /// What a pinned test's message says when its totals moved.
@@ -1906,22 +1941,40 @@ const PINNED_MOVED: &str = "ops run and skipped by class at the fixed seed, agai
                             ones), anything else is a behaviour change to find first";
 
 /// [`random_scripts_skip_counts_are_pinned_at_seed_1`]'s totals.
-const DEFAULT_TOTALS: Totals = (1604, [20, 0, 11, 1, 0, 7, 0, 3, 0]);
+const DEFAULT_TOTALS: Totals = Totals {
+    ran: 1604,
+    skips: [20, 0, 11, 1, 0, 7, 0, 3, 0],
+    dup_cursor_ran: 349,
+    dup_cursor_skipped: 24,
+};
 
 /// [`random_scripts_skip_counts_are_pinned_at_seed_1_heavy`]'s totals.
-const HEAVY_TOTALS: Totals = (294_529, [8988, 4, 2304, 23, 62, 1022, 52, 1048, 0]);
+const HEAVY_TOTALS: Totals = Totals {
+    ran: 294_529,
+    skips: [8988, 4, 2304, 23, 62, 1022, 52, 1048, 0],
+    dup_cursor_ran: 68_517,
+    dup_cursor_skipped: 7826,
+};
+
+/// [`random_scripts_skip_counts_are_pinned_at_seed_1_multi_leaf`]'s totals.
+const MULTI_LEAF_TOTALS: Totals = Totals {
+    ran: 17_374,
+    skips: [20, 0, 17, 1, 0, 8, 0, 2, 0],
+    dup_cursor_ran: 336,
+    dup_cursor_skipped: 37,
+};
 
 /// Random scripts of transaction and cursor calls on three tables (one dup-sort, one with
 /// overflow values) give the same outcomes on tn-lmdb, in every form, as on MDBX.
 #[test]
 fn random_scripts_match_mdbx() {
-    differential_cases(32, 64, random_seed(), Scripts::Narrow);
+    differential_cases(32, 64, random_seed(), Scripts::Narrow, DUP_SKIP_LIMIT_DEFAULT);
 }
 
 #[test]
 #[ignore = "heavy: run with --release"]
 fn random_scripts_match_mdbx_heavy() {
-    differential_cases(2000, 256, random_seed(), Scripts::Narrow);
+    differential_cases(2000, 256, random_seed(), Scripts::Narrow, DUP_SKIP_LIMIT);
 }
 
 /// [`random_scripts_match_mdbx`] on tables seeded with one dup key of [`MULTI_LEAF_ROWS`] rows
@@ -1931,20 +1984,20 @@ fn random_scripts_match_mdbx_heavy() {
 /// rests of several lengths ([`WIDE`]).
 #[test]
 fn random_scripts_match_mdbx_multi_leaf() {
-    differential_cases(32, 64, random_seed(), Scripts::MultiLeaf);
+    differential_cases(32, 64, random_seed(), Scripts::MultiLeaf, DUP_SKIP_LIMIT_DEFAULT);
 }
 
 #[test]
 #[ignore = "heavy: run with --release"]
 fn random_scripts_match_mdbx_multi_leaf_heavy() {
-    differential_cases(2000, 256, random_seed(), Scripts::MultiLeaf);
+    differential_cases(2000, 256, random_seed(), Scripts::MultiLeaf, DUP_SKIP_LIMIT);
 }
 
 /// [`random_scripts_match_mdbx`]'s scripts from [`RNG_SEED`] run and skip the pinned ops by
 /// class, on every form.
 #[test]
 fn random_scripts_skip_counts_are_pinned_at_seed_1() {
-    let totals = differential_cases(32, 64, RNG_SEED, Scripts::Narrow);
+    let totals = differential_cases(32, 64, RNG_SEED, Scripts::Narrow, DUP_SKIP_LIMIT_DEFAULT);
     assert_eq!(totals, DEFAULT_TOTALS, "{PINNED_MOVED}");
 }
 
@@ -1953,6 +2006,14 @@ fn random_scripts_skip_counts_are_pinned_at_seed_1() {
 #[test]
 #[ignore = "heavy: run with --release"]
 fn random_scripts_skip_counts_are_pinned_at_seed_1_heavy() {
-    let totals = differential_cases(2000, 256, RNG_SEED, Scripts::Narrow);
+    let totals = differential_cases(2000, 256, RNG_SEED, Scripts::Narrow, DUP_SKIP_LIMIT);
     assert_eq!(totals, HEAVY_TOTALS, "{PINNED_MOVED}");
+}
+
+/// [`random_scripts_match_mdbx_multi_leaf`]'s scripts from [`RNG_SEED`] run and skip the pinned
+/// ops by class, and the pinned dup cursor calls, on every form.
+#[test]
+fn random_scripts_skip_counts_are_pinned_at_seed_1_multi_leaf() {
+    let totals = differential_cases(32, 64, RNG_SEED, Scripts::MultiLeaf, DUP_SKIP_LIMIT_DEFAULT);
+    assert_eq!(totals, MULTI_LEAF_TOTALS, "{PINNED_MOVED}");
 }

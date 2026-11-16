@@ -100,6 +100,38 @@ impl PidLock {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    /// Whether a process holds the datadir lock now, found without holding it or writing
+    /// anything: `Some` with the PID the holder recorded (empty when none was) while one holds
+    /// it, and `None` when the lockfile is absent or nobody holds it. For a command that runs
+    /// beside a live node and only reads (`db load-state --verify-only`), to say a node is there.
+    ///
+    /// The probe opens the lockfile read-only (never creating it) and takes a shared lock, which a
+    /// holder's exclusive lock refuses, then releases it at once. A node starting in that instant
+    /// is refused as if another process held the lock, and can be started again.
+    pub fn holder(dirs: &impl TelcoinDirs) -> eyre::Result<Option<String>> {
+        Self::holder_at(dirs.node_pid_path())
+    }
+
+    fn holder_at(path: PathBuf) -> eyre::Result<Option<String>> {
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => bail!("failed to open PID lockfile {}: {e}", path.display()),
+        };
+        match file.try_lock_shared() {
+            // Nobody holds it exclusively; the handle's close releases the shared lock.
+            Ok(()) => Ok(None),
+            Err(TryLockError::WouldBlock) => {
+                let mut buf = String::new();
+                let _ = file.read_to_string(&mut buf);
+                Ok(Some(buf.trim().to_owned()))
+            }
+            Err(TryLockError::Error(e)) => {
+                bail!("failed to probe PID lockfile {}: {e}", path.display())
+            }
+        }
+    }
 }
 
 impl Drop for PidLock {
@@ -211,6 +243,26 @@ mod tests {
             fs::read_to_string(&path).unwrap().trim().parse::<u32>().unwrap(),
             std::process::id()
         );
+    }
+
+    /// The probe names a live holder, reports none for an absent or released lockfile, and
+    /// changes nothing: it creates no file, keeps a stale PID as it was, and leaves the lock free
+    /// for the next acquire.
+    #[test]
+    fn holder_reports_a_live_holder_and_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("telcoin.pid");
+        assert_eq!(PidLock::holder_at(path.clone()).unwrap(), None);
+        assert!(!path.exists(), "the probe must not create the lockfile");
+
+        let held = PidLock::acquire_at(path.clone()).unwrap();
+        assert_eq!(PidLock::holder_at(path.clone()).unwrap(), Some(std::process::id().to_string()));
+        drop(held);
+
+        fs::write(&path, "424242").unwrap();
+        assert_eq!(PidLock::holder_at(path.clone()).unwrap(), None, "a stale PID is no holder");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "424242", "the probe writes nothing");
+        let _lock = PidLock::acquire_at(path.clone()).expect("the probe released its lock");
     }
 
     /// The race an unlink-on-drop would open: a starter opens the lockfile while the holder is

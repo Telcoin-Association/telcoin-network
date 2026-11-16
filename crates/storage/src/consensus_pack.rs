@@ -2140,7 +2140,8 @@ thread_local! {
     /// check, as if that open had failed, so a legacy pack reaches the writable open.
     static SKIP_NEXT_LEGACY_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test-only: the next [`install_rename`] on this thread fails.
-    static FAIL_NEXT_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_NEXT_INSTALL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// Test-only: the next `Inner::build_migrated_pack` on this thread breaks the seal of its
     /// staged data log (see [`SealFault`]).
     static FAIL_NEXT_MIGRATION_SEAL: std::cell::Cell<Option<SealFault>> =

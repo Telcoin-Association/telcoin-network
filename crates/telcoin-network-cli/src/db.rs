@@ -17,13 +17,13 @@ use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
 use human_bytes::human_bytes;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs as _};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs};
 use tn_reth::{
     db_check, db_table_stats, iter_static_files, migrate_reth_db, refuse_pending_migration,
     snapshot::SnapshotRestorer, DatabaseArgs, DbCheckReport, DbTableStat, RethCommand, RethConfig,
@@ -107,14 +107,15 @@ enum DbSubcommand {
     /// Check one consensus epoch pack for damage.
     ///
     /// Walks the pack's `data` log and reports integrity issues: a torn tail that a restart or `db
-    /// repair` truncates, or damage that loses data, with what to do about it. Takes the pack's
-    /// path (`<datadir>/consensus-db/epochs/epoch-<N>`, or its `data` file), not `--datadir`, and
-    /// takes no datadir lock. Read-only (changes no file). Validate the newest epoch, or one whose
+    /// repair` truncates, or damage that loses data, with what to do about it. Takes a pack's path
+    /// (an `epoch-<N>` directory or its `data` file, anywhere), or `--epoch N` alone for
+    /// `<datadir>/consensus-db/epochs/epoch-<N>`, or `--all` for every epoch of the datadir. Takes
+    /// no datadir lock. Read-only (changes no file). Validate the newest epoch, or one whose
     /// pack is not sealed yet, only with the node STOPPED: a running node may truncate or grow
     /// that file under this command, which can then crash (SIGBUS; the node's data is not harmed),
     /// and the command warns when it sees such a pack. A sealed past epoch can be validated while
     /// the node runs. Exits non-zero for damage, and for a torn tail in a past epoch (which only
-    /// `db repair` truncates).
+    /// `db repair` truncates); with `--all`, when any epoch fails.
     Validate(DbValidateArgs),
 
     /// Repair consensus packs and epoch records at rest (dry run unless --force).
@@ -141,6 +142,28 @@ enum DbSubcommand {
     /// non-zero when a pack could not be migrated.
     Migrate(DbMigrateArgs),
 
+    /// Re-import one past epoch's consensus pack from a copy (dry run unless --force).
+    ///
+    /// Puts back the pack of past epoch N (`<datadir>/consensus-db/epochs/epoch-N`) from a copy:
+    /// this node's backup of `epoch-N`, or another node's sealed `epoch-N` (only its `data` file
+    /// is read). The copy is not trusted: it goes through the import a peer's stream takes,
+    /// which checks its last output against this node's certified record of epoch N and every
+    /// earlier one by its parent links, and it is installed only once verified, sealed and
+    /// read back, renamed into place as the node installs an import. It replaces a missing
+    /// pack, a damaged one, or an interrupted install whose copy is damaged. It refuses epoch
+    /// 0, the epoch the node resumes and any later one, an epoch whose certified record (or
+    /// the record before it) this node lacks, a copy inside the epochs directory (put it
+    /// elsewhere: the import and the node remove directories there), and a pack in place that
+    /// validates and ends with the epoch's certified final output. The node MUST be stopped: it
+    /// refuses while a node holds the datadir, and holds the datadir while it runs. Without
+    /// `--force` it imports and verifies the copy in a directory of its own under the epochs
+    /// directory (`import-N`), removes that, and changes nothing else. It needs about the pack's
+    /// size free on the datadir's filesystem beyond the floor a peer's import keeps free (one
+    /// growth step of the execution database plus a margin; pass the node's `--db.growth-step` if
+    /// it runs with one), and stops before free space drops below that floor. Exits non-zero when
+    /// it refuses or the copy fails.
+    ImportEpoch(DbImportEpochArgs),
+
     /// Restore a state-export bundle into a fresh datadir.
     ///
     /// Loads an EVM state export (an `epoch-N` directory written by `--enable-state-export`) into
@@ -154,7 +177,9 @@ enum DbSubcommand {
     /// the genesis committee, and the state against the last epoch record. The import can run for
     /// hours on a large state. A failed run removes the chain data it created (never keys or
     /// config); a stopped one (killed, power lost) leaves a marker the node refuses, and a rerun
-    /// with the same bundle removes what it created and restores again.
+    /// with the same bundle removes what it created and restores again. `--verify-only` runs
+    /// those checks and the consensus pack's import (in the system temp directory) on the bundle
+    /// and stops, writing nothing to the datadir.
     ///
     /// The database gets the format new datadirs get: it holds no transaction up to the pack's
     /// block, and in the default build stores each later transaction as its position in the
@@ -191,19 +216,21 @@ enum DbSubcommand {
     /// format, and from then on the node needs every pack its rows point into. A start that finds
     /// one missing refuses, naming the epochs, and a rebuild does not get past that (it
     /// re-executes from the same packs): put back each missing past `epoch-N` from a backup taken
-    /// after that epoch closed, or start over as a
-    /// new node with `consensus-db` moved aside as well, or swap in an observer's execution
+    /// after that epoch closed or another node's sealed copy (`db import-epoch`), or start over as
+    /// a new node with `consensus-db` moved aside as well, or swap in an observer's execution
     /// database (`--for-swap`).
     ResetExecution(DbResetExecutionArgs),
 }
 
 impl DbSubcommand {
     /// The line naming what the command acts on, which it prints first: the datadir, made
-    /// absolute, or for `validate`, which takes a pack path and ignores `--datadir`, that path.
+    /// absolute, or for `validate` given a pack path, which then ignores `--datadir`, that path.
     fn target(&self, datadir: &Path) -> String {
         let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.into());
         match self {
-            Self::Validate(args) => format!("pack: {}", absolute(&args.path).display()),
+            Self::Validate(DbValidateArgs { path: Some(path), .. }) => {
+                format!("pack: {}", absolute(path).display())
+            }
             _ => format!("datadir: {}", absolute(datadir).display()),
         }
     }
@@ -379,7 +406,7 @@ impl DbCommand {
         // default is the OS data directory) shows at once; on stderr, beside the other warnings,
         // so the reports on stdout stay as they are.
         eprintln!("{}", self.command.target(&datadir));
-        if !matches!(self.command, DbSubcommand::Validate(_)) {
+        if !matches!(self.command, DbSubcommand::Validate(DbValidateArgs { path: Some(_), .. })) {
             require_datadir(&datadir)?;
         }
         match &self.command {
@@ -403,9 +430,10 @@ impl DbCommand {
                 println!("{}", check_table(&report));
             }
             DbSubcommand::MigrateExecution(args) => args.execute(datadir)?,
-            DbSubcommand::Validate(args) => args.execute()?,
+            DbSubcommand::Validate(args) => args.execute(&datadir)?,
             DbSubcommand::Repair(args) => args.execute(datadir)?,
             DbSubcommand::Migrate(args) => args.execute(datadir)?,
+            DbSubcommand::ImportEpoch(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
             DbSubcommand::TndbStat => tndb_stat(&datadir)?,
             DbSubcommand::ResetExecution(args) => args.execute(datadir)?,
@@ -419,146 +447,215 @@ impl DbCommand {
 /// Read-only: this never mutates the pack. It opens the `data` stream read-only via mmap, so
 /// validating the CURRENT/latest epoch — the one a running node holds open for append — is unsafe:
 /// the node truncates that file on epoch-close and remaps it on growth, and a concurrent truncate
-/// can crash this command with a SIGBUS (node data is never harmed). `validate` takes a pack path
-/// rather than the datadir, so it does not consult the `telcoin.pid` lock — validate the
-/// current/latest epoch only with the node STOPPED. A sealed past epoch is safe to validate live,
-/// except briefly during an epoch handoff before the just-sealed pack has its clean-close sentinel.
+/// can crash this command with a SIGBUS (node data is never harmed). `validate` does not consult
+/// the `telcoin.pid` lock — validate the current/latest epoch only with the node STOPPED. A sealed
+/// past epoch is safe to validate live, except briefly during an epoch handoff before the
+/// just-sealed pack has its clean-close sentinel.
 #[derive(Debug, Args)]
 pub struct DbValidateArgs {
-    /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one.
+    /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one. Without it,
+    /// `--epoch N` names `<datadir>/consensus-db/epochs/epoch-<N>`, and `--all` every epoch there.
     ///
     /// The `data` stream is self-contained for validation — the sidecar `idx`/`hash`/`bhash`
     /// indexes are not required.
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
 
     /// Epoch number of the pack.
     ///
-    /// Required unless it can be derived from an `epoch-NN` directory in the path. The header
-    /// `uid` is derived from the epoch, so an incorrect value fails to open the file.
+    /// With a path, required unless it can be derived from an `epoch-NN` directory in the path.
+    /// The header `uid` is derived from the epoch, so an incorrect value fails to open the file.
     #[arg(long)]
     pub epoch: Option<Epoch>,
+
+    /// Validate every epoch's pack under `<datadir>/consensus-db/epochs`, in order, and fail if
+    /// any fails. It warns on the newest epoch, which a running node writes. For an interrupted
+    /// install it validates the last good copy (`epoch-N.replaced`) the node's next start puts
+    /// back as the missing `epoch-N`.
+    #[arg(long, conflicts_with_all = ["path", "epoch"])]
+    pub all: bool,
 }
 
 impl DbValidateArgs {
-    /// Validate the pack and print the report to stdout.
-    fn execute(&self) -> eyre::Result<()> {
-        let (data_file, epoch) = resolve_data_file_and_epoch(&self.path, self.epoch)?;
-
-        // Warn (do not refuse) if this looks like the current/latest epoch a running node may hold
-        // open — `db validate` maps it read-only, so a concurrent truncate/grow could SIGBUS us.
-        warn_if_current_epoch(&data_file, epoch);
-
-        // A legacy v0 (batches-first) pack is only ever read by its migration to v2, so it is
-        // judged by a dry run of that migration (what `db migrate`, `db repair` and the node all
-        // run on it), not by the header-first walks below.
-        if matches!(pack_unsealed_version(&data_file, epoch), Some((0, _))) {
-            return match legacy_migration_dry_run(&data_file, epoch) {
-                Ok(outputs) => {
-                    println!(
-                        "legacy v0 pack: a dry run of its migration to v2 copies {outputs} \
-                         output(s) cleanly; `db migrate --force`, or the node when it opens or \
-                         reads this epoch, converts it."
-                    );
-                    Ok(())
-                }
-                Err(why) => {
-                    println!("legacy v0 pack: its migration to v2 refuses: {why}");
-                    bail!("pack {} is INVALID (see report above)", data_file.display());
-                }
-            };
+    /// Validate the pack(s) named, under `datadir` when no path is given, and print the reports
+    /// to stdout.
+    fn execute(&self, datadir: &PathBuf) -> eyre::Result<()> {
+        match (&self.path, self.epoch, self.all) {
+            (Some(path), epoch, _) => validate_pack(path, epoch),
+            (None, _, true) => validate_all(&datadir.epochs_db_path()),
+            (None, Some(epoch), false) => {
+                validate_pack(&datadir.epochs_db_path().join(format!("epoch-{epoch}")), Some(epoch))
+            }
+            (None, None, false) => bail!("name the pack: a PATH, `--epoch N` or `--all`"),
         }
+    }
+}
 
-        // Physical framing first: a torn/corrupt record stream cannot be walked for logical checks,
-        // so classify the failure mode (truncatable tail vs data-losing corruption) and report the
-        // recommended operator action instead of bailing with a bare read error.
-        if let Some(corruption) = classify_physical_corruption(&data_file, epoch)
-            .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
-        {
-            print!("{corruption}");
-            // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
-            // committed prefix before it must still be logically checked — otherwise `db validate`
-            // reports nothing useful for the normal shape of any crashed current epoch. Bound the
-            // walk at the last COMPLETE output (the WAL `consistent_end`), NOT at the
-            // first bad record offset: a tear inside the in-flight output would
-            // otherwise report that output's unwritten batches as false "absent" and
-            // flip the verdict INVALID right after "SAFE".
-            let mut prefix_invalid = false;
-            // "Truncatable" is only what recovery would do: a tear past which an acked output
-            // still lies is refused by a node restart and `db repair --force` alike, and a legacy
-            // pack's tail is judged by the migration. Say so instead of promising a self-heal.
-            if corruption.kind.is_truncatable() {
-                if let Some(why) = recovery_refusal(&data_file, epoch) {
-                    println!("NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}");
-                    bail!("pack {} is corrupt (see report above)", data_file.display());
-                }
-                print_legacy_tail_note(&data_file, epoch);
-            }
-            if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
-                let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
-                eprintln!("\nValidating the intact prefix before the tear (up to byte {bound})...",);
-                match validate_pack_file_bounded(&data_file, epoch, None, Some(bound)) {
-                    Ok(report) => {
-                        prefix_invalid = report.verdict == Verdict::Invalid;
-                        print!("{report}");
-                    }
-                    Err(e) => {
-                        // The prefix could not be checked, so it cannot be reported healthy.
-                        eprintln!("bounded validation of the intact prefix failed: {e}");
-                        prefix_invalid = true;
-                    }
-                }
-            }
-            // Exit code: a truncatable tail whose intact prefix is Valid is a benign, self-healing
-            // shape → success. A data-losing corruption kind (or an INVALID prefix) is a real
-            // problem → non-zero exit so scripts/operators notice.
-            if !corruption.kind.is_truncatable() || prefix_invalid {
-                bail!("pack {} is corrupt (see report above)", data_file.display());
-            }
-            return require_current_epoch_for_tail(&data_file, epoch);
+/// `db validate --all`: validate every epoch's pack under `epochs_dir` in order, and fail naming
+/// the epochs that failed. An interrupted install's epoch is reported as one, and its last good
+/// copy (`epoch-N.replaced`), which the node's next start puts back as `epoch-N`, is validated
+/// in its place.
+fn validate_all(epochs_dir: &Path) -> eyre::Result<()> {
+    if !epochs_dir.is_dir() {
+        bail!("no consensus epochs directory at {}", epochs_dir.display());
+    }
+    let interrupted = interrupted_installs(epochs_dir)?;
+    let epochs = ConsensusPack::epoch_dirs(epochs_dir)
+        .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
+    // an interrupted install has no `epoch-N`, so no epoch is in both lists
+    let packs: BTreeMap<Epoch, PathBuf> = epochs
+        .iter()
+        .map(|&epoch| (epoch, epochs_dir.join(format!("epoch-{epoch}"))))
+        .chain(
+            interrupted
+                .iter()
+                .map(|&epoch| (epoch, epochs_dir.join(format!("epoch-{epoch}.replaced")))),
+        )
+        .collect();
+    let mut failed = Vec::new();
+    for (&epoch, pack) in &packs {
+        if interrupted.contains(&epoch) {
+            println!("epoch {epoch}: {}", interrupted_install_note(epoch));
+            println!("epoch {epoch} (its last good copy, {}):", pack.display());
+        } else {
+            println!("epoch {epoch}:");
         }
+        if let Err(e) = validate_pack(pack, Some(epoch)) {
+            println!("epoch {epoch}: FAILED: {e:#}");
+            failed.push(epoch.to_string());
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "{} of {} epoch pack(s) under {} failed: epoch(s) {} (see the reports above)",
+            failed.len(),
+            packs.len(),
+            epochs_dir.display(),
+            failed.join(", ")
+        );
+    }
+    println!("{} epoch pack(s) under {} validated", packs.len(), epochs_dir.display());
+    Ok(())
+}
 
-        // Every record frames, but an unclean pack can still end in an incomplete output whose
-        // last record happens to end the file: an unacked in-flight write that recovery truncates,
-        // not corruption. Report it as such and validate the complete prefix before it.
-        if let Some(end) = incomplete_trailing_output(&data_file, epoch)
-            .map_err(|e| eyre!("failed to check pack {}: {e}", data_file.display()))?
-        {
-            if let Some(why) = recovery_refusal(&data_file, epoch) {
+/// Validate the pack at `path` (of `epoch`, else the epoch its `epoch-NN` directory names) and
+/// print the report to stdout.
+fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
+    let (data_file, epoch) = resolve_data_file_and_epoch(path, epoch)?;
+
+    // Warn (do not refuse) if this looks like the current/latest epoch a running node may hold
+    // open — `db validate` maps it read-only, so a concurrent truncate/grow could SIGBUS us.
+    warn_if_current_epoch(&data_file, epoch);
+
+    // A legacy v0 (batches-first) pack is only ever read by its migration to v2, so it is
+    // judged by a dry run of that migration (what `db migrate`, `db repair` and the node all
+    // run on it), not by the header-first walks below.
+    if matches!(pack_unsealed_version(&data_file, epoch), Some((0, _))) {
+        return match legacy_migration_dry_run(&data_file, epoch) {
+            Ok(outputs) => {
                 println!(
-                    "NOT TRUNCATABLE: the pack was not cleanly closed and its last output is \
-                     incomplete (bytes past offset {end}), but recovery would refuse to truncate \
-                     it: {why}"
+                    "legacy v0 pack: a dry run of its migration to v2 copies {outputs} \
+                     output(s) cleanly; `db migrate --force`, or the node when it opens or \
+                     reads this epoch, converts it."
                 );
-                bail!("pack {} is corrupt (see report above)", data_file.display());
+                Ok(())
             }
-            println!(
-                "TRUNCATABLE: the pack was not cleanly closed and its last output is incomplete \
-                 (bytes past offset {end}); this unacked in-flight write is truncated by a node \
-                 restart or `db repair --force`."
-            );
-            print_legacy_tail_note(&data_file, epoch);
-            eprintln!("\nValidating the complete prefix (up to byte {end})...");
-            let report = validate_pack_file_bounded(&data_file, epoch, None, Some(end))
-                .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
-            print!("{report}");
-            if report.verdict == Verdict::Invalid {
+            Err(why) => {
+                println!("legacy v0 pack: its migration to v2 refuses: {why}");
                 bail!("pack {} is INVALID (see report above)", data_file.display());
             }
-            return require_current_epoch_for_tail(&data_file, epoch);
+        };
+    }
+
+    // Physical framing first: a torn/corrupt record stream cannot be walked for logical checks,
+    // so classify the failure mode (truncatable tail vs data-losing corruption) and report the
+    // recommended operator action instead of bailing with a bare read error.
+    if let Some(corruption) = classify_physical_corruption(&data_file, epoch)
+        .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
+    {
+        print!("{corruption}");
+        // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
+        // committed prefix before it must still be logically checked — otherwise `db validate`
+        // reports nothing useful for the normal shape of any crashed current epoch. Bound the
+        // walk at the last COMPLETE output (the WAL `consistent_end`), NOT at the
+        // first bad record offset: a tear inside the in-flight output would
+        // otherwise report that output's unwritten batches as false "absent" and
+        // flip the verdict INVALID right after "SAFE".
+        let mut prefix_invalid = false;
+        // "Truncatable" is only what recovery would do: a tear past which an acked output
+        // still lies is refused by a node restart and `db repair --force` alike, and a legacy
+        // pack's tail is judged by the migration. Say so instead of promising a self-heal.
+        if corruption.kind.is_truncatable() {
+            if let Some(why) = recovery_refusal(&data_file, epoch) {
+                println!("NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}");
+                bail!("pack {} is corrupt (see report above)", data_file.display());
+            }
+            print_legacy_tail_note(&data_file, epoch);
         }
+        if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
+            let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
+            eprintln!("\nValidating the intact prefix before the tear (up to byte {bound})...",);
+            match validate_pack_file_bounded(&data_file, epoch, None, Some(bound)) {
+                Ok(report) => {
+                    prefix_invalid = report.verdict == Verdict::Invalid;
+                    print!("{report}");
+                }
+                Err(e) => {
+                    // The prefix could not be checked, so it cannot be reported healthy.
+                    eprintln!("bounded validation of the intact prefix failed: {e}");
+                    prefix_invalid = true;
+                }
+            }
+        }
+        // Exit code: a truncatable tail whose intact prefix is Valid is a benign, self-healing
+        // shape → success. A data-losing corruption kind (or an INVALID prefix) is a real
+        // problem → non-zero exit so scripts/operators notice.
+        if !corruption.kind.is_truncatable() || prefix_invalid {
+            bail!("pack {} is corrupt (see report above)", data_file.display());
+        }
+        return require_current_epoch_for_tail(&data_file, epoch);
+    }
 
-        let report = validate_pack_file(&data_file, epoch, None)
+    // Every record frames, but an unclean pack can still end in an incomplete output whose
+    // last record happens to end the file: an unacked in-flight write that recovery truncates,
+    // not corruption. Report it as such and validate the complete prefix before it.
+    if let Some(end) = incomplete_trailing_output(&data_file, epoch)
+        .map_err(|e| eyre!("failed to check pack {}: {e}", data_file.display()))?
+    {
+        if let Some(why) = recovery_refusal(&data_file, epoch) {
+            println!(
+                "NOT TRUNCATABLE: the pack was not cleanly closed and its last output is \
+                 incomplete (bytes past offset {end}), but recovery would refuse to truncate \
+                 it: {why}"
+            );
+            bail!("pack {} is corrupt (see report above)", data_file.display());
+        }
+        println!(
+            "TRUNCATABLE: the pack was not cleanly closed and its last output is incomplete \
+             (bytes past offset {end}); this unacked in-flight write is truncated by a node \
+             restart or `db repair --force`."
+        );
+        print_legacy_tail_note(&data_file, epoch);
+        eprintln!("\nValidating the complete prefix (up to byte {end})...");
+        let report = validate_pack_file_bounded(&data_file, epoch, None, Some(end))
             .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
-
-        // Report goes to stdout (tracing/logs go to stderr/file).
         print!("{report}");
-        // Non-zero exit on an INVALID verdict so automation can tell a healthy datadir from a
-        // corrupt one by exit status.
         if report.verdict == Verdict::Invalid {
             bail!("pack {} is INVALID (see report above)", data_file.display());
         }
-        Ok(())
+        return require_current_epoch_for_tail(&data_file, epoch);
     }
+
+    let report = validate_pack_file(&data_file, epoch, None)
+        .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
+
+    // Report goes to stdout (tracing/logs go to stderr/file).
+    print!("{report}");
+    // Non-zero exit on an INVALID verdict so automation can tell a healthy datadir from a
+    // corrupt one by exit status.
+    if report.verdict == Verdict::Invalid {
+        bail!("pack {} is INVALID (see report above)", data_file.display());
+    }
+    Ok(())
 }
 
 /// A truncatable tail heals only where the node opens the epoch for append: the epoch it resumes
@@ -1129,6 +1226,96 @@ impl DbMigrateArgs {
     }
 }
 
+/// Re-import one past epoch's consensus pack from a copy (`db import-epoch`), through
+/// [`ConsensusChain::import_epoch_at_rest`].
+#[derive(Debug, Args)]
+pub struct DbImportEpochArgs {
+    /// The past epoch whose pack to put back.
+    #[arg(long)]
+    pub epoch: Epoch,
+
+    /// The copy: an `epoch-N` directory (this node's backup, or another node's sealed one), or
+    /// its `data` file, outside `<datadir>/consensus-db/epochs`.
+    #[arg(long, value_name = "PATH")]
+    pub from: PathBuf,
+
+    /// Install the verified copy. Without it, verify the copy only and change nothing.
+    #[arg(long)]
+    pub force: bool,
+
+    /// The node's `--db.growth-step`, when it runs with one (`4GB`, `512MB`, a number of bytes).
+    /// The import keeps free what the node keeps free for a peer's import: one growth step of
+    /// the execution database plus a margin. Unset, the step is the backend's default, as the
+    /// node's is.
+    #[arg(long = "db.growth-step", value_name = "SIZE", value_parser = tn_reth::parse_db_growth_step)]
+    pub growth_step: Option<u64>,
+}
+
+impl DbImportEpochArgs {
+    /// The free-space floor the import keeps: the node's own for a peer's import, from its
+    /// execution database's growth step (`--db.growth-step`, else the backend's default).
+    fn min_free(&self) -> u64 {
+        tn_storage::consensus_pack::import_min_free(
+            self.growth_step.unwrap_or_else(tn_reth::default_execution_db_growth_step),
+        )
+    }
+
+    /// Verify (and with `--force` install) the copy into the datadir, and print what it did.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        self.run(datadir, &mut std::io::stdout())
+    }
+
+    /// [`Self::execute`], printing the report to `out`.
+    fn run(&self, datadir: PathBuf, out: &mut impl std::io::Write) -> eyre::Result<()> {
+        let epochs_dir = datadir.epochs_db_path();
+        if !epochs_dir.is_dir() {
+            bail!("no consensus epochs directory at {}", epochs_dir.display());
+        }
+        if !self.force {
+            eprintln!("(dry run: verifying the copy only; re-run with `--force` to install it)");
+        }
+        // The install replaces files a running node reads: refuse while a node holds the datadir,
+        // and hold it so a node cannot start mid-import; released when this returns.
+        let _pid_lock = PidLock::acquire(&datadir)?;
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+        let import = runtime
+            .block_on(ConsensusChain::import_epoch_at_rest(
+                &epochs_dir,
+                self.epoch,
+                &self.from,
+                self.force,
+                STREAM_IMPORT_TIMEOUT,
+                self.min_free(),
+            ))
+            .map_err(|e| eyre!("epoch {}: {e}", self.epoch))?;
+        if import.installed {
+            writeln!(
+                out,
+                "epoch {}: installed the copy from {} ({} bytes of data log, verified against the \
+                 certified record of epoch {}) in place of {}",
+                import.epoch,
+                self.from.display(),
+                import.bytes,
+                import.epoch,
+                import.replaces,
+            )?;
+        } else {
+            writeln!(
+                out,
+                "dry run: epoch {}: the copy at {} ({} bytes of data log) verifies against the \
+                 certified record of epoch {}; it would replace {}; pass --force to install it",
+                import.epoch,
+                self.from.display(),
+                import.bytes,
+                import.epoch,
+                import.replaces,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Restore an EVM state-export pack into a new reth database under the datadir.
 #[derive(Debug, Args)]
 pub struct DbLoadStateArgs {
@@ -1158,6 +1345,24 @@ pub struct DbLoadStateArgs {
         hide_short_help = true
     )]
     pub allow_faucet_on_chain: bool,
+
+    /// Check the bundle and stop, writing nothing to the datadir: the checks a restore runs before
+    /// its first write (the bundle's parts and closed epoch, its whole certificate chain against
+    /// the genesis committee, and its state against the last epoch record), and the restore's
+    /// import of the consensus pack (`consensus_data`) against the last epoch records, then exit 0
+    /// if all pass. The consensus pack is imported into a directory under the temp directory
+    /// (`$TMPDIR` when set, else the system's: `/tmp` on Linux), which needs about the pack's size
+    /// free and is removed afterwards. On many Linux hosts `/tmp` is a RAM-backed tmpfs or a small
+    /// root partition: set `TMPDIR` to a directory on a disk with room. The state data's own
+    /// records are read only by the restore itself.
+    ///
+    /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
+    /// is used, as a restore would), never written. It takes no datadir lock, so it can vet a
+    /// bundle beside a running node, and warns when one holds the datadir: the restore itself
+    /// still needs the node stopped and a datadir whose execution database holds no blocks past
+    /// genesis, which this does not check.
+    #[arg(long)]
+    pub verify_only: bool,
 }
 
 impl DbLoadStateArgs {
@@ -1174,7 +1379,14 @@ impl DbLoadStateArgs {
         // released when this returns. Every config load below needs the datadir to exist, and so
         // does the lockfile: say so directly rather than through the lockfile's open error.
         require_datadir(&datadir)?;
-        let _pid_lock = PidLock::acquire(&datadir)?;
+        // A verify-only run writes nothing, so it needs no lock and can vet a bundle beside a node;
+        // it says when a node is there, since the restore itself cannot run beside one.
+        let _pid_lock = (!self.verify_only).then(|| PidLock::acquire(&datadir)).transpose()?;
+        if self.verify_only {
+            if let Some(warning) = verify_only_lock_warning(&datadir) {
+                eprintln!("{warning}");
+            }
+        }
 
         // An unfinished `db reset-execution` holds part of the execution database in its staging
         // directory: a restore beside it would leave the datadir holding two, and the reset's rerun
@@ -1217,18 +1429,17 @@ impl DbLoadStateArgs {
         // checks above have passed. This is loaded here, not inside the import closure, because the
         // pre-import chain walk below needs it — and a datadir missing its committee should fail
         // before the import, not after it.
-        if let Some(chain) = self.chain {
-            chain.write_committee(&datadir)?;
-        }
-        let genesis_committee =
-            Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML)
-                .map_err(|e| {
-                    eyre!(
-                        "failed to load genesis committee from {} (needed to verify epoch \
-                         records): {e}",
-                        datadir.committee_path().display()
-                    )
-                })?;
+        let genesis_committee = match self.chain {
+            // the committee `write_committee` would write, held in memory instead
+            Some(chain) if self.verify_only && !datadir.committee_path().exists() => {
+                chain.bundled_committee()?
+            }
+            Some(chain) if !self.verify_only => {
+                chain.write_committee(&datadir)?;
+                load_genesis_committee(&datadir)?
+            }
+            _ => load_genesis_committee(&datadir)?,
+        };
 
         // Verify the WHOLE certificate chain before any chain data is created. This is the
         // expensive check in trust terms and the cheap one in wall-clock: one super-quorum BLS
@@ -1247,6 +1458,21 @@ impl DbLoadStateArgs {
         // `state_data` and `epoch_records` copied from different exports — is refused while the
         // target is still untouched, instead of after a multi-GB import has already committed.
         check_state_pack_matches_record(&self.pack, last_epoch_record)?;
+        if self.verify_only {
+            // The restore imports the consensus pack only after the state, which can take hours:
+            // check it now, as the restore will, outside the datadir.
+            verify_bundle_consensus(&std::env::temp_dir(), &bundle_consensus, &records)?;
+            println!(
+                "verified: the bundle at {} restores epoch {} (block {}): its certificate chain \
+                 verifies against the genesis committee, its state matches the epoch record, and \
+                 its consensus pack imports up to the epoch's certified final output; nothing was \
+                 written to the datadir",
+                self.pack.display(),
+                last_epoch_record.epoch,
+                last_epoch_record.final_state.number,
+            );
+            return Ok(());
+        }
 
         // `RethConfig::new` is the only public constructor; `RethCommand` has no `Default`, so
         // parse an empty arg list for its defaults (rpc/txpool are irrelevant to a one-shot
@@ -1346,6 +1572,17 @@ impl DbLoadStateArgs {
         );
         Ok(())
     }
+}
+
+/// Load the genesis committee from `datadir`, the trust root `db load-state` verifies a bundle's
+/// epoch records against, as the node loads it.
+fn load_genesis_committee(datadir: &PathBuf) -> eyre::Result<Committee> {
+    Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML).map_err(|e| {
+        eyre!(
+            "failed to load genesis committee from {} (needed to verify epoch records): {e}",
+            datadir.committee_path().display()
+        )
+    })
 }
 
 /// The chain-data directories a state import creates under `datadir`: the reth db, its static
@@ -1703,54 +1940,16 @@ fn restore_consensus_and_records(
                  bootstrap from a later epoch's complete bundle instead"
             );
         }
-        let previous = &records[(n - 1) as usize];
         let final_record = &records[n as usize];
-        let epoch_dir = epochs_dir.join(format!("epoch-{n}"));
-        let file = tokio::fs::File::open(bundle_consensus).await.map_err(|e| {
-            eyre!("failed to open consensus data {}: {e}", bundle_consensus.display())
-        })?;
         // Landing directly at `epochs_dir` (not a temp) is safe here: this is an offline, single
         // writer restore into a fresh datadir, so the online rename/install-lock dance is unneeded.
-        // No free-space floor: the floor guards the node's live stores against peer-supplied
-        // bytes, and this is the operator's own bundle into a datadir nothing else is using; a
-        // real shortage surfaces as the write error.
-        let pack = ConsensusPack::stream_import_with_floor(
+        import_bundle_consensus(
             epochs_dir,
-            file,
-            n,
-            previous,
-            final_record.final_consensus,
-            STREAM_IMPORT_TIMEOUT,
-            0,
+            bundle_consensus,
+            &records[(n - 1) as usize],
+            final_record,
         )
-        .await
-        .map_err(|e| {
-            let _ = fs::remove_dir_all(&epoch_dir);
-            eyre!("consensus stream import for epoch {n} failed: {e}")
-        })?;
-        pack.persist().await.map_err(|e| eyre!("failed to persist consensus pack: {e}"))?;
-        // The chain was verified as it streamed; confirm the rebuilt tip is exactly the epoch's
-        // final consensus header before declaring success.
-        let tip = pack.latest_consensus_header().await;
-        pack.close().await;
-        // Read-back failure and tip mismatch are different diagnoses and get different messages: a
-        // mismatch means the bundle rebuilt into the wrong chain, whereas an `Err` means the pack
-        // could not be read at all. Both roll the epoch dir back, matching the import error path
-        // above, since this restore wrote that directory itself and owns the cleanup.
-        let tip = tip.map_err(|e| {
-            let _ = fs::remove_dir_all(&epoch_dir);
-            eyre!("failed to read back the rebuilt consensus pack tip for epoch {n}: {e}")
-        })?;
-        let tip_ok = matches!(
-            &tip,
-            Some(header)
-                if header.number == final_record.final_consensus.number
-                    && header.digest() == final_record.final_consensus.hash
-        );
-        if !tip_ok {
-            let _ = fs::remove_dir_all(&epoch_dir);
-            bail!("rebuilt consensus pack tip does not match epoch {n} final consensus: {tip:?}");
-        }
+        .await?;
 
         // Point the consensus "latest" slot hint at this epoch's final consensus so a node started
         // on this datadir resumes syncing from here instead of from genesis.
@@ -1769,6 +1968,144 @@ fn restore_consensus_and_records(
         epochs_dir.display()
     );
     Ok(())
+}
+
+/// Import the bundle's `consensus_data` at `bundle_consensus` as the pack of the bundle's last
+/// epoch N (`final_record.epoch`) under `epochs_dir`, verified as it streams against `previous`
+/// (the record of epoch N - 1) up to `final_record`'s certified final output, and confirm that the
+/// pack's tip reads back as that output. A failed import or check removes the `epoch-N` directory
+/// it created. The restore and `--verify-only` both run this, so the check a verify-only run makes
+/// is the restore's own.
+async fn import_bundle_consensus(
+    epochs_dir: &Path,
+    bundle_consensus: &Path,
+    previous: &EpochRecord,
+    final_record: &EpochRecord,
+) -> eyre::Result<()> {
+    let n = final_record.epoch;
+    let epoch_dir = epochs_dir.join(format!("epoch-{n}"));
+    let file = tokio::fs::File::open(bundle_consensus)
+        .await
+        .map_err(|e| eyre!("failed to open consensus data {}: {e}", bundle_consensus.display()))?;
+    // No free-space floor: the floor guards the node's live stores against peer-supplied bytes,
+    // and this is the operator's own bundle into a directory nothing else is using; a real
+    // shortage surfaces as the write error.
+    let pack = ConsensusPack::stream_import_with_floor(
+        epochs_dir,
+        file,
+        n,
+        previous,
+        final_record.final_consensus,
+        STREAM_IMPORT_TIMEOUT,
+        0,
+    )
+    .await
+    .map_err(|e| {
+        let _ = fs::remove_dir_all(&epoch_dir);
+        eyre!("consensus stream import for epoch {n} failed: {e}")
+    })?;
+    pack.persist().await.map_err(|e| eyre!("failed to persist consensus pack: {e}"))?;
+    // The chain was verified as it streamed; confirm the rebuilt tip is exactly the epoch's
+    // final consensus header before declaring success.
+    let tip = pack.latest_consensus_header().await;
+    pack.close().await;
+    // Read-back failure and tip mismatch are different diagnoses and get different messages: a
+    // mismatch means the bundle rebuilt into the wrong chain, whereas an `Err` means the pack
+    // could not be read at all. Both roll the epoch dir back, matching the import error path
+    // above, since the caller's run wrote that directory itself and owns the cleanup.
+    let tip = tip.map_err(|e| {
+        let _ = fs::remove_dir_all(&epoch_dir);
+        eyre!("failed to read back the rebuilt consensus pack tip for epoch {n}: {e}")
+    })?;
+    let tip_ok = matches!(
+        &tip,
+        Some(header)
+            if header.number == final_record.final_consensus.number
+                && header.digest() == final_record.final_consensus.hash
+    );
+    if !tip_ok {
+        let _ = fs::remove_dir_all(&epoch_dir);
+        bail!("rebuilt consensus pack tip does not match epoch {n} final consensus: {tip:?}");
+    }
+    Ok(())
+}
+
+/// `db load-state --verify-only`'s note that a process holds the datadir lock (a running node):
+/// the check goes on beside it, but the restore itself refuses while it runs. `None` when nobody
+/// holds the lock; a lock that cannot be probed is said so, and the check goes on.
+fn verify_only_lock_warning(datadir: &impl TelcoinDirs) -> Option<String> {
+    match PidLock::holder(datadir) {
+        Ok(None) => None,
+        Ok(Some(pid)) => {
+            let who = if pid.is_empty() { String::new() } else { format!(" (pid {pid})") };
+            Some(format!(
+                "warning: a running telcoin process{who} holds this data directory ({}); the \
+                 bundle is checked beside it, but the restore itself needs that process stopped \
+                 and a datadir whose execution database holds no blocks past genesis",
+                datadir.node_pid_path().display()
+            ))
+        }
+        Err(e) => {
+            Some(format!("warning: could not tell whether a node holds this data directory: {e:#}"))
+        }
+    }
+}
+
+/// `db load-state --verify-only`'s check of the bundle's consensus pack: the restore's own import
+/// ([`import_bundle_consensus`]) of `bundle_consensus` against the last two of the verified
+/// `records`, run in a new staging directory under `staging_root` (the temp directory, `$TMPDIR`
+/// when set, outside the datadir), which is removed whatever the outcome. Needs about the pack's
+/// size free there, so a failure names where it staged and that `TMPDIR` moves it.
+fn verify_bundle_consensus(
+    staging_root: &Path,
+    bundle_consensus: &Path,
+    records: &[EpochRecord],
+) -> eyre::Result<()> {
+    let [.., previous, final_record] = records else {
+        bail!("the bundle's consensus pack needs the records of its epoch and the one before it");
+    };
+    let staging = tempfile::Builder::new()
+        .prefix("tn-load-state-verify-")
+        .tempdir_in(staging_root)
+        .map_err(|e| {
+            eyre!(
+                "cannot create a staging directory under {} to check the bundle's consensus \
+                 pack (set TMPDIR to stage it elsewhere): {e}",
+                staging_root.display()
+            )
+        })?;
+    // The runtime is dropped, and with it every blocking task the import ran, before the staging
+    // directory is removed.
+    let checked = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(eyre::Report::from)
+        .and_then(|runtime| {
+            runtime.block_on(import_bundle_consensus(
+                staging.path(),
+                bundle_consensus,
+                previous,
+                final_record,
+            ))
+        });
+    let staged = staging.path().to_path_buf();
+    if let Err(e) = staging.close() {
+        eprintln!(
+            "warning: could not remove the staging directory {} of the consensus pack check: {e}",
+            staged.display()
+        );
+    }
+    // A shortage of space in the staging directory fails the import as a bad pack would, so the
+    // error says where it staged.
+    checked.map_err(|e| {
+        e.wrap_err(format!(
+            "the bundle's consensus pack {} does not restore (imported in a staging directory \
+             under {}, which needs about the pack's size free; set TMPDIR to stage it elsewhere)",
+            bundle_consensus.display(),
+            staging_root.display()
+        ))
+    })
 }
 
 /// Verify each bundle record against its certificate and save it into `db`, rebuilding the indexed
@@ -2231,9 +2568,10 @@ mod tests {
             assert!(!epochs.join("epoch-2").exists(), "nothing put back");
         };
 
-        let err = super::DbValidateArgs { path: epochs.join("epoch-2"), epoch: None }
-            .execute()
-            .expect_err("the epoch's directory is missing");
+        let err =
+            super::DbValidateArgs { path: Some(epochs.join("epoch-2")), epoch: None, all: false }
+                .execute(&datadir)
+                .expect_err("the epoch's directory is missing");
         let err = format!("{err:#}");
         assert!(err.contains("INTERRUPTED INSTALL"), "{err}");
         assert!(err.contains("the node's next start puts it back"), "{err}");
@@ -2294,15 +2632,16 @@ mod tests {
     fn db_validate_gives_no_interrupted_install_hint_beside_a_live_epoch() {
         use tn_config::TelcoinDirs as _;
         let dir = tempfile::tempdir().unwrap();
-        let epochs = dir.path().to_path_buf().epochs_db_path();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
         fs::create_dir_all(epochs.join("epoch-2")).unwrap();
         let aside = epochs.join("epoch-2.replaced");
         fs::create_dir_all(&aside).unwrap();
         fs::write(aside.join(tn_storage::consensus_pack::DATA_NAME), b"stale copy").unwrap();
 
         let data = epochs.join("epoch-2").join(tn_storage::consensus_pack::DATA_NAME);
-        let err = super::DbValidateArgs { path: data.clone(), epoch: None }
-            .execute()
+        let err = super::DbValidateArgs { path: Some(data.clone()), epoch: None, all: false }
+            .execute(&datadir)
             .expect_err("the epoch's data log is missing");
         let err = format!("{err:#}");
         assert!(err.contains("path does not exist"), "{err}");
@@ -2311,8 +2650,8 @@ mod tests {
 
         // with `epoch-2` itself missing, the aside is an interrupted install and the hint is given
         fs::remove_dir(epochs.join("epoch-2")).unwrap();
-        let err = super::DbValidateArgs { path: data, epoch: None }
-            .execute()
+        let err = super::DbValidateArgs { path: Some(data), epoch: None, all: false }
+            .execute(&datadir)
             .expect_err("the epoch's directory is missing");
         assert!(format!("{err:#}").contains("INTERRUPTED INSTALL"), "{err:#}");
     }
@@ -2335,7 +2674,7 @@ mod tests {
             assert!(about.len() <= 80, "{name}'s summary fits one line: {about:?}");
             assert!(command.get_long_about().is_some(), "{name} has details");
         }
-        assert_eq!(names.len(), 9, "{names:?}");
+        assert_eq!(names.len(), 10, "{names:?}");
         let validate = db.find_subcommand("validate").unwrap();
         let details = validate.get_long_about().unwrap().to_string();
         assert!(details.contains("only with the node STOPPED"), "{details}");
@@ -2357,10 +2696,17 @@ mod tests {
             }),
             super::DbSubcommand::Repair(super::DbRepairArgs { epoch: None, force: false }),
             super::DbSubcommand::Migrate(super::DbMigrateArgs { epoch: None, force: false }),
+            super::DbSubcommand::ImportEpoch(super::DbImportEpochArgs {
+                epoch: 1,
+                from: "copy".into(),
+                force: false,
+                growth_step: None,
+            }),
             super::DbSubcommand::LoadState(super::DbLoadStateArgs {
                 pack: "bundle".into(),
                 chain: None,
                 allow_faucet_on_chain: false,
+                verify_only: false,
             }),
             super::DbSubcommand::TndbStat,
             super::DbSubcommand::ResetExecution(super::DbResetExecutionArgs {
@@ -2376,10 +2722,18 @@ mod tests {
             );
         }
         let validate = super::DbSubcommand::Validate(super::DbValidateArgs {
-            path: "/packs/epoch-3".into(),
+            path: Some("/packs/epoch-3".into()),
             epoch: None,
+            all: false,
         });
         assert_eq!(validate.target(datadir), "pack: /packs/epoch-3");
+        // without a path it validates under the datadir, and names that
+        let validate = super::DbSubcommand::Validate(super::DbValidateArgs {
+            path: None,
+            epoch: Some(3),
+            all: false,
+        });
+        assert_eq!(validate.target(datadir), format!("datadir: {}", cwd.join(datadir).display()));
     }
 
     /// A datadir that does not exist is refused by name before the datadir lock (whose lockfile
@@ -2397,10 +2751,17 @@ mod tests {
             super::DbSubcommand::TndbStat,
             super::DbSubcommand::Repair(super::DbRepairArgs { epoch: None, force: false }),
             super::DbSubcommand::Migrate(super::DbMigrateArgs { epoch: None, force: false }),
+            super::DbSubcommand::ImportEpoch(super::DbImportEpochArgs {
+                epoch: 1,
+                from: dir.path().join("copy"),
+                force: true,
+                growth_step: None,
+            }),
             super::DbSubcommand::LoadState(super::DbLoadStateArgs {
                 pack: dir.path().join("bundle"),
                 chain: None,
                 allow_faucet_on_chain: false,
+                verify_only: false,
             }),
             super::DbSubcommand::ResetExecution(super::DbResetExecutionArgs {
                 force: true,
@@ -2484,6 +2845,7 @@ mod tests {
             pack: dir.path().join("bundle"),
             chain: None,
             allow_faucet_on_chain: false,
+            verify_only: false,
         }
         .execute(datadir)
         .expect_err("load-state must refuse while a node holds the lock");
@@ -2527,6 +2889,7 @@ mod tests {
             pack: dir.path().join("bundle"),
             chain: None,
             allow_faucet_on_chain: false,
+            verify_only: false,
         }
         .execute(datadir.clone())
         .expect_err("an unfinished reset");
@@ -2556,6 +2919,7 @@ mod tests {
                 pack: dir.path().join("bundle"),
                 chain: None,
                 allow_faucet_on_chain: false,
+                verify_only: false,
             }
             .execute(datadir.clone())
         };
@@ -2831,8 +3195,11 @@ mod tests {
         bytes.extend_from_slice(&[0xAB; 10]);
         fs::write(&data_file, &bytes).unwrap();
 
-        let args = super::DbValidateArgs { path: epoch_dir, epoch: None };
-        assert!(args.execute().is_err(), "a torn epoch meta must fail validation");
+        let args = super::DbValidateArgs { path: Some(epoch_dir), epoch: None, all: false };
+        assert!(
+            args.execute(&dir.path().to_path_buf()).is_err(),
+            "a torn epoch meta must fail validation"
+        );
     }
 
     /// A legacy v0 (batches-first) pack is only ever read by its migration to v2, so `db validate`
@@ -2857,7 +3224,10 @@ mod tests {
             }
             pack.commit().unwrap();
         };
-        let validate = || super::DbValidateArgs { path: epoch_dir.clone(), epoch: None }.execute();
+        let validate = || {
+            super::DbValidateArgs { path: Some(epoch_dir.clone()), epoch: None, all: false }
+                .execute(&dir.path().to_path_buf())
+        };
 
         // The meta's committee must decode (a real committee of more than one authority).
         let mut committee = tn_types::CommitteeBuilder::new(0);
@@ -3651,6 +4021,7 @@ mod tests {
             pack: bundle.path().to_path_buf(),
             chain: Some(super::NamedChain::Mainnet),
             allow_faucet_on_chain: false,
+            verify_only: false,
         };
         // a faucet build stops at the mainnet refusal, any other build at the bundle check
         for (faucet_enabled, expected) in [(true, "refuses mainnet"), (false, "state-only pack")] {
@@ -3717,6 +4088,7 @@ mod tests {
             pack: bundle.path().to_path_buf(),
             chain: Some(super::NamedChain::Adiri),
             allow_faucet_on_chain: false,
+            verify_only: false,
         };
         let err = args
             .execute(datadir_path.clone())
@@ -3777,5 +4149,414 @@ mod tests {
         assert!(stat.execute(datadir.clone()).is_err(), "the node has it open");
         drop(db);
         let _ = fs::remove_dir_all(&datadir);
+    }
+
+    /// Every file under `dir` with its size and a CRC of its bytes, for the tests that prove a
+    /// command left a datadir as it found it.
+    fn tree_listing(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (u64, u32)> {
+        let mut listing = std::collections::BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(at) = pending.pop() {
+            for entry in fs::read_dir(&at).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                let relative = path.strip_prefix(dir).expect("under dir").to_path_buf();
+                if path.is_dir() {
+                    listing.insert(relative, (u64::MAX, 0));
+                    pending.push(path);
+                } else {
+                    let bytes = fs::read(&path).expect("read file");
+                    listing.insert(relative, (bytes.len() as u64, crc32fast::hash(&bytes)));
+                }
+            }
+        }
+        listing
+    }
+
+    /// The consensus pack of `epoch` under a committee of `signers`, as an export's
+    /// `consensus_data` holds it (the data log up to its last complete output): three outputs
+    /// chained to a record of `epoch - 1` whose final state and consensus are the defaults, as
+    /// [`signed_chain`] gives every record before its tip. Returns the bytes and the final output.
+    fn bundle_consensus_data(
+        signers: &[TestSigner],
+        epoch: u32,
+    ) -> (Vec<u8>, tn_types::ConsensusNumHash) {
+        use tn_types::{
+            Certificate, CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+            EpochSeedChainValue, ReputationScores,
+        };
+        let mut committee = tn_types::CommitteeBuilder::new(epoch);
+        for (i, signer) in signers.iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        let committee = committee.build();
+        let dir = tempfile::tempdir().expect("pack dir");
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let final_consensus = runtime.block_on(async {
+            let chain = super::ConsensusChain::new_for_test(dir.path().to_path_buf(), committee)
+                .await
+                .expect("open the epoch's pack");
+            let mut parent = ConsensusHeaderDigest::default();
+            for number in 1..=3_u64 {
+                let mut leader = Certificate::default();
+                leader.update_header_epoch_for_test(epoch);
+                leader.update_header_round_for_test(number as u32);
+                let sub_dag = CommittedSubDag::new(
+                    vec![leader.clone()],
+                    leader,
+                    number,
+                    ReputationScores::default(),
+                    None,
+                    EpochSeedChainValue::genesis_placeholder(),
+                );
+                let output = ConsensusOutput::new_with_subdag(sub_dag, parent, number);
+                parent = output.consensus_header_hash();
+                chain.save_consensus_output(output).await.expect("save output");
+            }
+            chain.persist_current().await.expect("persist");
+            chain.close().await;
+            ConsensusNumHash::new(3, parent)
+        });
+        let data = dir.path().join(format!("epoch-{epoch}")).join(super::DATA_NAME);
+        let end = tn_storage::consensus_pack::wal_consistent_end(&data, epoch).expect("pack end");
+        let mut bytes = fs::read(&data).expect("read pack");
+        bytes.truncate(usize::try_from(end).expect("pack end fits"));
+        (bytes, final_consensus)
+    }
+
+    /// A bundle of epoch `last_epoch` (1 or more) signed by `signers`, whose state pack and
+    /// consensus pack are bound to its tip record: one every check of `db load-state` accepts
+    /// against a genesis committee of `signers`.
+    fn write_verifiable_bundle(bundle: &Path, signers: &[TestSigner], last_epoch: u32) {
+        use tn_storage::{
+            epoch_records::{CERTS_NAME, RECORDS_NAME},
+            exec_state_pack::{ExecStatePackReader, ExecStatePackWriter},
+        };
+        use tn_types::{BlockNumHash, ExecHeader, B256};
+        let root = B256::from([7u8; 32]);
+        let snapshot = ExecHeader { number: 1, state_root: root, ..Default::default() };
+        ExecStatePackWriter::create(bundle, root, std::slice::from_ref(&snapshot))
+            .expect("create pack")
+            .finish()
+            .expect("finish pack");
+        let pack_final_state = {
+            let reader = ExecStatePackReader::open(bundle).expect("open pack");
+            BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash)
+        };
+        let (consensus_data, final_consensus) = bundle_consensus_data(signers, last_epoch);
+        let (mut records, mut certs) =
+            signed_chain(last_epoch - 1, signers, BlockNumHash::default());
+        let (mut tip, _) = signed_pair_with_final_state(
+            last_epoch,
+            signers,
+            records.last().expect("the record before the tip").digest(),
+            pack_final_state,
+        );
+        tip.final_consensus = final_consensus;
+        let cert = cert_over(&tip, signers);
+        certs.insert(cert.epoch_hash, cert);
+        records.push(tip);
+        let records_src = tempfile::tempdir().expect("records src");
+        write_signed_bundle(records_src.path(), &records, &certs);
+        fs::copy(records_src.path().join(RECORDS_NAME), bundle.join("epoch_records"))
+            .expect("copy records");
+        fs::copy(records_src.path().join(CERTS_NAME), bundle.join("epoch_certs"))
+            .expect("copy certs");
+        fs::write(bundle.join("consensus_data"), consensus_data).expect("write consensus data");
+    }
+
+    /// `db load-state --verify-only` runs the restore's checks on a bundle and writes nothing to
+    /// the datadir: a bundle that passes them is reported and leaves the datadir byte-identical,
+    /// beside a node holding the datadir (it takes no lock, and warns that the node is there); its
+    /// consensus pack is imported as the restore imports it, in a staging directory removed
+    /// whatever the outcome, so a bundle whose `consensus_data` would fail the restore fails here;
+    /// with `--chain` and no committee in the datadir it verifies against the chain's bundled
+    /// committee held in memory, writing no `genesis/`.
+    #[cfg(unix)]
+    #[test]
+    fn load_state_verify_only_checks_the_bundle_and_writes_nothing() {
+        use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo, PidLock, TelcoinDirs as _};
+
+        let signers = test_signers(31, 4);
+        let bundle = tempfile::tempdir().expect("bundle");
+        write_verifiable_bundle(bundle.path(), &signers, 2);
+        let args = |chain| super::DbLoadStateArgs {
+            pack: bundle.path().to_path_buf(),
+            chain,
+            allow_faucet_on_chain: false,
+            verify_only: true,
+        };
+
+        // a datadir whose genesis committee is the bundle's signers, held by a running node
+        let datadir = tempfile::tempdir().expect("datadir");
+        let datadir_path = datadir.path().to_path_buf();
+        Config::write_to_path(datadir_path.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)
+            .expect("seed node info");
+        let mut committee = tn_types::CommitteeBuilder::new(0);
+        for (i, signer) in signers.iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        Config::write_to_path(datadir_path.committee_path(), committee.build(), ConfigFmt::YAML)
+            .expect("seed genesis committee");
+        let _node = PidLock::acquire(&datadir_path).expect("a node holds the datadir");
+        let before = tree_listing(&datadir_path);
+        // the datadir's committee is used, as a restore with `--chain` keeps one already there
+        args(Some(super::NamedChain::Adiri))
+            .execute(datadir_path.clone())
+            .expect("a bundle that passes every check verifies");
+        assert_eq!(tree_listing(&datadir_path), before, "a verify-only run changed the datadir");
+        // and it says a node holds the datadir, which the restore itself needs stopped
+        let warning = super::verify_only_lock_warning(&datadir_path).expect("a held lock warns");
+        assert!(
+            warning.contains(&format!("(pid {})", std::process::id()))
+                && warning.contains("needs that process stopped"),
+            "{warning}"
+        );
+
+        // the consensus pack is imported as the restore imports it, in a staging directory that
+        // is removed whatever the outcome
+        let consensus_data = bundle.path().join("consensus_data");
+        let records = EpochRecordDb::read_records_from_pack(bundle.path().join("epoch_records"))
+            .expect("bundle records");
+        let staging = tempfile::tempdir().expect("staging root");
+        super::verify_bundle_consensus(staging.path(), &consensus_data, &records)
+            .expect("the bundle's pack imports");
+        assert_eq!(tree_listing(staging.path()), Default::default(), "staging left behind");
+        // a pack that is not one, and one cut short before the tip's final output
+        let real = fs::read(&consensus_data).expect("read consensus data");
+        let cut_short = &real[..real.len() - 1];
+        for (bytes, what) in [(&b"x"[..], "not a pack"), (cut_short, "cut short")] {
+            fs::write(&consensus_data, bytes).expect("write consensus data");
+            let err = super::verify_bundle_consensus(staging.path(), &consensus_data, &records)
+                .expect_err(what);
+            assert!(format!("{err:#}").contains("consensus stream import"), "{what}: {err:#}");
+            assert_eq!(tree_listing(staging.path()), Default::default(), "{what}: staging left");
+            let err =
+                args(Some(super::NamedChain::Adiri)).execute(datadir_path.clone()).expect_err(what);
+            assert!(format!("{err:#}").contains("consensus pack"), "{what}: {err:#}");
+            assert_eq!(tree_listing(&datadir_path), before, "{what}: the datadir changed");
+        }
+        fs::write(&consensus_data, &real).expect("restore consensus data");
+
+        // no committee in the datadir: the bundled one, held in memory, refuses another chain's
+        // bundle, and no committee is written
+        let fresh = tempfile::tempdir().expect("fresh datadir");
+        let fresh_path = fresh.path().to_path_buf();
+        Config::write_to_path(fresh_path.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)
+            .expect("seed node info");
+        let err = args(Some(super::NamedChain::Adiri))
+            .execute(fresh_path.clone())
+            .expect_err("a bundle of another committee must be refused");
+        assert!(format!("{err:#}").contains("failed certificate verification"), "{err:#}");
+        assert!(!fresh_path.genesis_path().exists(), "a verify-only run wrote genesis/");
+        assert_eq!(super::verify_only_lock_warning(&fresh_path), None, "no lock, no warning");
+    }
+
+    /// A sealed v2 pack of `epoch` under `epochs` holding only its meta: one that validates.
+    fn write_meta_only_pack(epochs: &Path, epoch: tn_types::Epoch) {
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression},
+            consensus_pack::{EpochMeta, PackRecord, PACK_VERSION},
+        };
+        let epoch_dir = epochs.join(format!("epoch-{epoch}"));
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let mut committee = tn_types::CommitteeBuilder::new(epoch);
+        for (i, signer) in test_signers(40, 4).iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        let meta = PackRecord::EpochMeta(EpochMeta {
+            epoch,
+            committee: committee.build(),
+            ..Default::default()
+        });
+        let mut pack = Pack::<PackRecord>::open(
+            epoch_dir.join(super::DATA_NAME),
+            epoch as u64,
+            false,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )
+        .unwrap();
+        pack.append(&meta).unwrap();
+        pack.commit().unwrap();
+    }
+
+    /// `db validate` without a path validates under `--datadir`: `--epoch N` the pack of epoch N,
+    /// `--all` every epoch's in turn, failing naming each that fails; with neither it asks for
+    /// one. The path form still ignores `--datadir`, even one that does not exist.
+    #[test]
+    fn db_validate_resolves_packs_under_the_datadir() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        for epoch in 0..3 {
+            write_meta_only_pack(&epochs, epoch);
+        }
+        let validate = |epoch, all| {
+            let args = super::DbValidateArgs { path: None, epoch, all };
+            super::DbCommand { command: super::DbSubcommand::Validate(args) }
+                .execute(datadir.clone())
+        };
+        validate(Some(1), false).expect("epoch 1's pack validates");
+        validate(None, true).expect("every epoch validates");
+        let err = validate(Some(7), false).expect_err("no epoch 7");
+        assert!(format!("{err:#}").contains("epoch-7"), "{err:#}");
+        let err = validate(None, false).expect_err("nothing named");
+        assert!(format!("{err:#}").contains("`--epoch N` or `--all`"), "{err:#}");
+
+        // damage epoch 1's data log past its meta: `--epoch 1` and `--all` fail, naming it
+        let data = epochs.join("epoch-1").join(super::DATA_NAME);
+        let mut bytes = fs::read(&data).unwrap();
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 10]);
+        fs::write(&data, &bytes).unwrap();
+        let _ = validate(Some(1), false).expect_err("epoch 1 is damaged");
+        validate(Some(2), false).expect("epoch 2 still validates");
+        let err = validate(None, true).expect_err("one epoch fails");
+        assert!(format!("{err:#}").contains("1 of 3 epoch pack(s)"), "{err:#}");
+        assert!(format!("{err:#}").contains("epoch(s) 1 "), "{err:#}");
+
+        // the path form takes no datadir, so a missing one is not refused
+        let args =
+            super::DbValidateArgs { path: Some(epochs.join("epoch-2")), epoch: None, all: false };
+        super::DbCommand { command: super::DbSubcommand::Validate(args) }
+            .execute(dir.path().join("no-such-datadir"))
+            .expect("the path form ignores --datadir");
+        // and the datadir forms refuse one
+        let args = super::DbValidateArgs { path: None, epoch: Some(2), all: false };
+        let err = super::DbCommand { command: super::DbSubcommand::Validate(args) }
+            .execute(dir.path().join("no-such-datadir"))
+            .expect_err("no datadir");
+        assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
+
+        // `--all` names every epoch, so it takes neither a path nor `--epoch`
+        for args in [&["validate", "--all", "--epoch", "1"][..], &["validate", "--all", "x"]] {
+            let parsed = Cli::<NoArgs>::try_parse_args_from([&["tn", "db"][..], args].concat());
+            assert!(parsed.is_err(), "{args:?} must not parse");
+        }
+    }
+
+    /// `db validate --all` validates an interrupted install's last good copy, which the node's
+    /// next start puts back, in place of its missing `epoch-N`, and fails naming the epoch when
+    /// that copy does not validate, as `--epoch N` fails for it.
+    #[test]
+    fn db_validate_all_validates_an_interrupted_installs_copy() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        for epoch in 0..3 {
+            write_meta_only_pack(&epochs, epoch);
+        }
+        fs::rename(epochs.join("epoch-1"), epochs.join("epoch-1.replaced")).unwrap();
+        let validate = |epoch, all| {
+            let args = super::DbValidateArgs { path: None, epoch, all };
+            super::DbCommand { command: super::DbSubcommand::Validate(args) }
+                .execute(datadir.clone())
+        };
+        validate(None, true).expect("every epoch validates, the interrupted install's copy too");
+
+        // damage the copy past its meta: `--all` fails naming epoch 1, as `--epoch 1` does
+        let data = epochs.join("epoch-1.replaced").join(super::DATA_NAME);
+        let mut bytes = fs::read(&data).unwrap();
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 10]);
+        fs::write(&data, &bytes).unwrap();
+        let err = validate(None, true).expect_err("the interrupted install's copy is damaged");
+        assert!(format!("{err:#}").contains("1 of 3 epoch pack(s)"), "{err:#}");
+        assert!(format!("{err:#}").contains("epoch(s) 1 "), "{err:#}");
+        let _ = validate(Some(1), false).expect_err("epoch 1 is an interrupted install");
+    }
+
+    /// `db import-epoch` parses its epoch, copy and `--force`, needs both of the first two, and
+    /// says in its help that it needs the node stopped and writes only with `--force`.
+    #[test]
+    fn parse_db_import_epoch_subcommand() {
+        let cli = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "import-epoch",
+            "--epoch",
+            "3",
+            "--from",
+            "/backup/epoch-3",
+            "--force",
+        ])
+        .expect("parsed");
+        let Commands::Db(db) = cli.command else { panic!("expected the db subcommand") };
+        let super::DbSubcommand::ImportEpoch(args) = db.command else { panic!("import-epoch") };
+        assert_eq!((args.epoch, args.from, args.force), (3, "/backup/epoch-3".into(), true));
+        for args in [&["--epoch", "3"][..], &["--from", "/backup/epoch-3"]] {
+            let parsed = Cli::<NoArgs>::try_parse_args_from(
+                [&["tn", "db", "import-epoch"][..], args].concat(),
+            );
+            assert!(parsed.is_err(), "{args:?} must not parse");
+        }
+        use clap::CommandFactory as _;
+        let cli = Cli::<NoArgs>::command();
+        let help = cli
+            .find_subcommand("db")
+            .and_then(|db| db.find_subcommand("import-epoch"))
+            .and_then(|command| command.get_long_about())
+            .expect("import-epoch's details")
+            .to_string();
+        assert!(help.contains("The node MUST be stopped"), "{help}");
+        assert!(help.contains("Without `--force` it"), "{help}");
+    }
+
+    /// `db import-epoch` keeps free the floor the node keeps for a peer's import: from the node's
+    /// default growth step when `--db.growth-step` is unset, else from the one given, read as
+    /// the node reads it; a size the node refuses is refused.
+    #[test]
+    fn db_import_epoch_keeps_the_nodes_import_floor() {
+        use clap::Parser as _;
+        use tn_storage::consensus_pack::import_min_free;
+        let floor = |extra: &[&str]| {
+            let args = ["db", "import-epoch", "--epoch", "1", "--from", "copy"];
+            let command = super::DbCommand::try_parse_from(args.iter().chain(extra))?;
+            let super::DbSubcommand::ImportEpoch(import) = command.command else {
+                panic!("not import-epoch");
+            };
+            Ok::<_, clap::Error>(import.min_free())
+        };
+        assert_eq!(
+            floor(&[]).unwrap(),
+            import_min_free(tn_reth::default_execution_db_growth_step())
+        );
+        assert_eq!(floor(&["--db.growth-step", "4GB"]).unwrap(), import_min_free(4 << 30));
+        let err = floor(&["--db.growth-step", "4XB"]).expect_err("an unknown unit");
+        assert!(err.to_string().contains("Invalid unit"), "{err}");
+    }
+
+    /// `db import-epoch` refuses while a node holds the datadir, before reading anything; with
+    /// the lock free it refuses epoch 0 (verified against the pre-genesis descriptor, which no
+    /// copy carries) and a datadir with no epochs directory, and writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn db_import_epoch_refuses_a_running_node_and_what_it_cannot_verify() {
+        use tn_config::{PidLock, TelcoinDirs as _};
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let import = |epoch| super::DbImportEpochArgs {
+            epoch,
+            from: dir.path().join("copy"),
+            force: true,
+            growth_step: None,
+        };
+        let err = import(1).execute(datadir.clone()).expect_err("no epochs directory");
+        assert!(format!("{err:#}").contains("no consensus epochs directory"), "{err:#}");
+
+        let epochs = datadir.epochs_db_path();
+        fs::create_dir_all(&epochs).unwrap();
+        let held = PidLock::acquire(&datadir).expect("a node holds the datadir");
+        let err = import(1).execute(datadir.clone()).expect_err("refused while a node runs");
+        assert!(err.to_string().contains("another telcoin process"), "{err}");
+        drop(held);
+        let before = tree_listing(&epochs);
+        let err = import(0).execute(datadir.clone()).expect_err("epoch 0");
+        assert!(format!("{err:#}").contains("epoch 0 cannot be imported"), "{err:#}");
+        let err = import(1).execute(datadir.clone()).expect_err("nothing to verify against");
+        assert!(format!("{err:#}").contains("not a past epoch"), "{err:#}");
+        assert_eq!(tree_listing(&epochs), before, "a refusal wrote nothing");
     }
 }

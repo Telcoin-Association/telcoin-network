@@ -5,8 +5,9 @@
 //! - `impl ConsensusChain`, in order:
 //!   - `new` and the recent-header cache;
 //!   - the epoch handoff (`new_epoch`, `seal_previous_pack`);
-//!   - import and staging (`stream_import`, `import_partial_to_staging`,
-//!     `recover_incomplete_installs`, `install_imported_epoch_dir`);
+//!   - import and staging (`stream_import`, `import_sealed`, `import_partial_to_staging`,
+//!     `recover_incomplete_installs`, `install_imported_epoch_dir`); the at-rest import of one past
+//!     epoch's pack from a copy (`import_epoch_at_rest`) is in `consensus/at_rest_import.rs`;
 //!   - save and persist (`save_consensus_output`, `persist_current_timed`, `clamp_latest_to_pack`);
 //!   - the reads (`with_consensus_header_by_digest` and the recent-header cache,
 //!     `consensus_output_by_number`, `get_batches`);
@@ -54,6 +55,9 @@ use crate::{
     },
     epoch_records::{EpochDbError, EpochRecordDb},
 };
+
+mod at_rest_import;
+pub use at_rest_import::{EpochImport, EpochImportError, EpochPackState};
 
 /// Simple enum for which of two saved consensus states we are using.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -956,10 +960,83 @@ impl ConsensusChain {
         if refused_as_live() {
             return Err(ConsensusChainError::LiveEpochImport(epoch));
         }
-        // Import path will use RAII to remove the import dir when we are done.
-        let Some(import_path) = ImportPath::new(&self.base_path, epoch)? else {
-            // If this returns None then we are already importing this epoch.
+        // The import, sealed and read back sealed in its own `import-{epoch}` directory, whose
+        // guard removes the directory when this returns.
+        let Some((_import_path, path)) = Self::import_sealed(
+            &self.base_path,
+            stream,
+            epoch_record,
+            previous_epoch,
+            timeout,
+            self.import_min_free,
+        )
+        .await?
+        else {
+            // Already importing this epoch.
             return Ok(());
+        };
+        // Acquire the install lock only now — after the (multi-second) network download has
+        // finished writing into the temp import dir. It must NOT wrap the download (that would
+        // block unrelated epoch transitions on network I/O). Held through the remove+rename and
+        // cache invalidation below so new_epoch's open_append cannot observe the transient window
+        // where epoch-{N} is unlinked.
+        let _install = self.pack_install.lock().await;
+        if refused_as_live() {
+            return Err(ConsensusChainError::LiveEpochImport(epoch));
+        }
+        let replace_current = self.current_pack.lock().epoch() == epoch;
+        // Atomically install the imported dir (rename-aside): the live epoch-{N} dir is moved aside
+        // and only removed after the new one is renamed in and the parent is fsync'd, so a rename
+        // failure never leaves `current_pack` writing to an unlinked inode (on failure the old dir
+        // is restored and the error propagates).
+        let install_result = Self::install_imported_epoch_dir(
+            &self.base_path,
+            epoch,
+            &path.join(format!("epoch-{epoch}")),
+        );
+        // Invalidate the cache and bump the install generation regardless of the install outcome:
+        // a post-rename `fsync_directory` failure still leaves the NEW inode in place, so any
+        // concurrent get_static that opened FDs on the old inode must not leave a stale entry (and
+        // a racing open must not cache the stale handle — see the generation guard in
+        // `get_static`). Harmless when the rename failed and the old inode was restored (same
+        // inode; the re-open below just re-reads it).
+        self.install_generation.fetch_add(1, Ordering::Release);
+        for p in self.take_cached(&[epoch]) {
+            p.close().await;
+        }
+        // Surface a genuine install failure only AFTER invalidating the cache above.
+        install_result?;
+        if replace_current {
+            // Do this directly, using get_static() will short circuit on the old pack. A failed
+            // swap is left pending, for the next import to finish (`complete_pending_swap`).
+            if let Err(e) = self.swap_in_installed(epoch).await {
+                *self.pending_swap.lock() = Some(epoch);
+                return Err(Self::swap_failed(epoch, e).into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream `epoch_record`'s pack from `stream` into a new `import-{epoch}` directory of
+    /// `base_path` (see [`Self::stream_import`]), leaving at least `min_free` free: authenticated
+    /// as it streams, sealed with a checked seal, and read back sealed, so the `epoch-{epoch}`
+    /// directory under the returned path is what an install may put in place
+    /// ([`Self::install_imported_epoch_dir`]). The guard comes back with the path: dropping it
+    /// removes the directory with whatever is left in it. `None` if this process is already
+    /// importing the epoch. Any failure leaves nothing behind.
+    async fn import_sealed<R: AsyncRead + Unpin>(
+        base_path: &Path,
+        stream: R,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        timeout: Duration,
+        min_free: u64,
+    ) -> Result<Option<(ImportPath, PathBuf)>, ConsensusChainError> {
+        let epoch = epoch_record.epoch;
+        // Import path will use RAII to remove the import dir when we are done.
+        let Some(import_path) = ImportPath::new(base_path, epoch)? else {
+            // If this returns None then we are already importing this epoch.
+            return Ok(None);
         };
         // Store our files out of the way while we import so we don't use them until ready.
         let path = import_path.path().to_path_buf();
@@ -968,14 +1045,14 @@ impl ConsensusChain {
         // is the epoch's whole certified chain. The import holds `import_path` while its files
         // are open: a failed or abandoned import's directory is removed only after the import
         // stopped writing into it.
-        let (pack, _import_path) = ConsensusPack::stream_import_leased(
+        let (pack, import_path) = ConsensusPack::stream_import_leased(
             &path,
             stream,
             epoch,
             previous_epoch,
             epoch_record.final_consensus,
             timeout,
-            self.import_min_free,
+            min_free,
             import_path,
         )
         .await?;
@@ -1022,46 +1099,7 @@ impl ConsensusChain {
                  installed"
             ))
         })?;
-        // Acquire the install lock only now — after the (multi-second) network download has
-        // finished writing into the temp import dir. It must NOT wrap the download (that would
-        // block unrelated epoch transitions on network I/O). Held through the remove+rename and
-        // cache invalidation below so new_epoch's open_append cannot observe the transient window
-        // where epoch-{N} is unlinked.
-        let _install = self.pack_install.lock().await;
-        if refused_as_live() {
-            return Err(ConsensusChainError::LiveEpochImport(epoch));
-        }
-        let replace_current = self.current_pack.lock().epoch() == epoch;
-        // Atomically install the imported dir (rename-aside): the live epoch-{N} dir is moved aside
-        // and only removed after the new one is renamed in and the parent is fsync'd, so a rename
-        // failure never leaves `current_pack` writing to an unlinked inode (on failure the old dir
-        // is restored and the error propagates).
-        let install_result = Self::install_imported_epoch_dir(
-            &self.base_path,
-            epoch,
-            &path.join(format!("epoch-{epoch}")),
-        );
-        // Invalidate the cache and bump the install generation regardless of the install outcome:
-        // a post-rename `fsync_directory` failure still leaves the NEW inode in place, so any
-        // concurrent get_static that opened FDs on the old inode must not leave a stale entry (and
-        // a racing open must not cache the stale handle — see the generation guard in
-        // `get_static`). Harmless when the rename failed and the old inode was restored (same
-        // inode; the re-open below just re-reads it).
-        self.install_generation.fetch_add(1, Ordering::Release);
-        for p in self.take_cached(&[epoch]) {
-            p.close().await;
-        }
-        // Surface a genuine install failure only AFTER invalidating the cache above.
-        install_result?;
-        if replace_current {
-            // Do this directly, using get_static() will short circuit on the old pack. A failed
-            // swap is left pending, for the next import to finish (`complete_pending_swap`).
-            if let Err(e) = self.swap_in_installed(epoch).await {
-                *self.pending_swap.lock() = Some(epoch);
-                return Err(Self::swap_failed(epoch, e).into());
-            }
-        }
-        Ok(())
+        Ok(Some((import_path, path)))
     }
 
     /// Replace `current_pack`, of `epoch`, whose files an install replaced, with a static handle

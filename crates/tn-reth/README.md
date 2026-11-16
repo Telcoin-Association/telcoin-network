@@ -1047,11 +1047,19 @@ CHANGES.md TN-0200..0203.
   point into, the missing ones and the recovery below.
 - **Recovery.**
   - A missing pack (the start refused): put back each missing `consensus-db/epochs/epoch-N/` from
-    a backup taken after that epoch closed (a sealed epoch's pack never changes; check the copy
-    with `db validate` first). A whole `consensus-db/` from an older backup lacks the packs of the
-    epochs since it was taken, so it fixes the gap only with the execution database restored from
-    the same stop or rebuilt, and a validator restored that way stays stopped until the network
-    has closed the epoch it was last in (its later votes are not in the backup). The node cannot
+    a backup taken after that epoch closed, or from another node's sealed copy of it (a sealed
+    epoch's pack never changes, and every node's is the same certified chain). `telcoin-network db
+    import-epoch --epoch N --from <copy>`, with the node stopped, does it verified: the copy's
+    `data` goes through the import a peer's stream takes (`ConsensusChain::import_epoch_at_rest`),
+    checked against this node's certified record of epoch N and every earlier output by its
+    parent links, and only a verified, sealed copy is renamed into place; without `--force` it only
+    verifies. The copy must lie outside `consensus-db/epochs/`. It needs the records of epochs N-1
+    and N (the second certified) and refuses the epoch the node resumes, and epoch 0, whose sealed
+    pack is put back from this node's backup as a plain copy (then `db validate --epoch 0`). A
+    whole `consensus-db/` from an older backup lacks the packs of the epochs since it was taken,
+    so it fixes the gap only with the execution database restored from the same stop or rebuilt,
+    and a validator restored that way stays stopped until the network has closed the epoch it was
+    last in (its later votes are not in the backup). The node cannot
     rebuild a lost pack itself: it fetches no pack below the epoch its consensus database is at,
     and a rebuild of the execution database (`db reset-execution`) re-executes from its own packs,
     so it stops at the same gap. Without a backup the node starts over as a new one: move the
@@ -1065,9 +1073,9 @@ CHANGES.md TN-0200..0203.
     node runs on. A past epoch's pack whose indexes are missing or damaged beside its sealed data
     log is rebuilt from the data log in the background, as a consensus read of the epoch rebuilds
     it, and its reads answer again once that is done. With the node stopped, `telcoin-network db
-    validate` reports the pack's damage and `db repair` fixes what it can
-    (crates/storage/README.md); otherwise put back that epoch's directory from a backup taken
-    after it closed, or start over as above.
+    validate --epoch N` reports the pack's damage and `db repair` fixes what it can
+    (crates/storage/README.md); otherwise `db import-epoch` replaces that epoch's pack with a
+    verified copy, from a backup taken after it closed or another node's, or start over as above.
   - `handoff_timeout`: a closed epoch's pack stayed unsealed or mid-install for a second. During
     an epoch handoff it passes; if it stays, a past epoch's pack was left unsealed: `db
     validate`.
