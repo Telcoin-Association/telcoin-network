@@ -210,11 +210,10 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     requeued_out_of_order: RequeuedOutOfOrderHandles,
     /// The `tn_primary_requeued_order_unknown_total{reason}` counters, resolved once per epoch.
     requeued_order_unknown: RequeuedOrderUnknownHandles,
-    /// The own-chain order hold of issue #1807: `Some` when the `digest_order_hold` switch is on,
-    /// and then consulted for every new header. `None` keeps the drain the base's, byte for byte.
-    /// A field of the epoch's proposer because its record names a header by round alone, and
-    /// rounds restart every epoch.
-    order_hold: Option<OwnChainOrder>,
+    /// The own-chain order hold of issue #1807, consulted for every new header. A field of the
+    /// epoch's proposer because its record names a header by round alone, and rounds restart
+    /// every epoch.
+    order_hold: OwnChainOrder,
     /// The `tn_primary_headers_held_total` and `tn_primary_digests_held` handles, resolved once
     /// per epoch.
     order_hold_metrics: OrderHoldHandles,
@@ -259,12 +258,11 @@ struct ProposalTrigger {
 
 /// The order-hold fields of a new header's `header proposed` line (issue #1807).
 ///
-/// Observability only. With the `digest_order_hold` switch off the proposer holds nothing, so the
-/// three counts are zero; `own_parent` is measured either way.
+/// Observability only. The three counts are zero when the hold keeps nothing back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HoldReport {
     /// The header's parents carry this node's certificate of the own header tracked at the
-    /// previous round (see [`Proposer::cites_own_parent`] and [`HoldPlan::own_parent`]).
+    /// previous round (see [`HoldPlan::own_parent`]).
     own_parent: bool,
     /// Digests the hold left in the queue: those still queued in a held lane once the header took
     /// its share.
@@ -380,7 +378,7 @@ impl<DB: Database> Proposer<DB> {
             committed_own_round: 0,
             requeued_out_of_order: RequeuedOutOfOrderHandles::new(),
             requeued_order_unknown: RequeuedOrderUnknownHandles::new(),
-            order_hold: config.parameters().digest_order_hold.then(OwnChainOrder::default),
+            order_hold: OwnChainOrder::default(),
             order_hold_metrics: OrderHoldHandles::new(),
         }
     }
@@ -1042,10 +1040,9 @@ impl<DB: Database> Proposer<DB> {
     /// The commit path re-queues every expired header in one call and keeps them oldest first
     /// across rounds. With `max_header_num_of_batches` capping a header, the older batches here
     /// can wait one header longer. This is rare, and #1807 covers what out-of-order carriage
-    /// does to transaction nonces; `tn_primary_requeued_out_of_order_total` counts it. With the
-    /// `digest_order_hold` switch on, two tracked headers that carry one worker are own-chain
-    /// linked, so the older is certified and never canceled, and the reverse order cannot
-    /// reorder a lane.
+    /// does to transaction nonces; `tn_primary_requeued_out_of_order_total` counts it. Under the
+    /// order hold, two tracked headers that carry one worker are own-chain linked, so the older
+    /// is certified and never canceled, and the reverse order cannot reorder a lane.
     fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
         let mut requeued = BTreeMap::new();
         // see `process_committed_headers`: a header tracked again after an own commit settled its
@@ -1090,21 +1087,17 @@ impl<DB: Database> Proposer<DB> {
         self.prepend_requeued(requeued, round, RequeueCause::Canceled, stale_resend);
     }
 
-    /// Tell the order hold, when the `digest_order_hold` switch is on, that the own header at
-    /// `round` left [`Self::proposed_headers`]. Called beside every removal from it.
+    /// Tell the order hold that the own header at `round` left [`Self::proposed_headers`].
+    /// Called beside every removal from it.
     fn forget_held(&mut self, round: Round) {
-        if let Some(order) = self.order_hold.as_mut() {
-            order.forget(round);
-        }
+        self.order_hold.forget(round);
     }
 
-    /// Tell the order hold, when the `digest_order_hold` switch is on, that the own header at
-    /// `round` is sent again without a new plan: the restart re-propose and the max-delay re-send.
-    /// A header that has a record keeps it; one without (the restart) proves no older header.
+    /// Tell the order hold that the own header at `round` is sent again without a new plan: the
+    /// restart re-propose and the max-delay re-send. A header that has a record keeps it; one
+    /// without (the restart) proves no older header.
     fn record_held_resent(&mut self, round: Round) {
-        if let Some(order) = self.order_hold.as_mut() {
-            order.record_resent(round);
-        }
+        self.order_hold.record_resent(round);
     }
 
     /// Prepend `requeued`, the batch digests of own headers that will not be committed (oldest
@@ -1144,10 +1137,10 @@ impl<DB: Database> Proposer<DB> {
             out_of_order = order.out_of_order,
             "digests resent"
         );
-        // invariant I2 of the order hold: with the switch on, a digest re-queued behind a newer
-        // digest of its lane means the hold did not cover that lane, through the garbage-collection
-        // cut its module doc describes or a fault; one line per re-queue, not per digest
-        if self.order_hold.is_some() && order.out_of_order > 0 {
+        // invariant I2 of the order hold: a digest re-queued behind a newer digest of its lane
+        // means the hold did not cover that lane, through the garbage-collection cut its module
+        // doc describes or a fault; one line per re-queue, not per digest
+        if order.out_of_order > 0 {
             warn!(
                 target: "primary::proposer",
                 count,
@@ -1199,14 +1192,9 @@ impl<DB: Database> Proposer<DB> {
     /// and the cursor advances past the last lane served, so slots rotate across headers
     /// and no lane is excluded permanently when more workers have digests than a header
     /// holds. With one worker this is exactly the old single-queue FIFO drain.
-    fn drain_digests_for_header(&mut self) -> VecDeque<ProposerDigest> {
-        self.drain_digests_except(&BTreeSet::new())
-    }
-
-    /// [`Self::drain_digests_for_header`] over every lane but those of `held` workers, whose
-    /// digests stay queued in order (the order hold of issue #1807). The held lanes take no slot
-    /// and the cursor advances past the last lane served, as without a hold; an empty `held` is
-    /// exactly that drain.
+    ///
+    /// Every lane of a `held` worker is left out: its digests stay queued in order (the order
+    /// hold of issue #1807) and take no slot, and the cursor advances past the last lane served.
     fn drain_digests_except(&mut self, held: &BTreeSet<WorkerId>) -> VecDeque<ProposerDigest> {
         let queues = &self.digests;
         // Ascending worker ids, rotated to start at the cursor, without the held lanes.
@@ -1271,23 +1259,6 @@ impl<DB: Database> Proposer<DB> {
             blockers: plan.blockers.len(),
         };
         (digests, hold)
-    }
-
-    /// Whether `parents` carry this node's certificate of the own header tracked at the round
-    /// below `round`: the `own_parent` field of the `header proposed` line (issue #1807).
-    ///
-    /// Only a tracked previous header counts, so round 1 (its genesis parents have no tracked own
-    /// header below them) and a header whose previous own header already left the tracked set
-    /// report `false`. Observability only: the header's contents never depend on it.
-    fn cites_own_parent(&self, round: Round, parents: &[Certificate]) -> bool {
-        let Some(previous) = round.checked_sub(1).and_then(|r| self.proposed_headers.get(&r))
-        else {
-            return false;
-        };
-        let previous = previous.digest();
-        parents.iter().any(|parent| {
-            parent.origin() == &self.authority_id && parent.header().digest() == previous
-        })
     }
 
     /// Conditions are met to propose the next header.
@@ -1369,28 +1340,13 @@ impl<DB: Database> Proposer<DB> {
                 // plans on exactly this set (issue #1807)
                 let parents = std::mem::take(&mut self.last_parents);
                 let pending_before = self.pending_digests_len();
-                // with the hold on, plan and record at the drain: a record is read only through a
-                // tracked own parent, so the record of a header whose proposal fails is inert
-                let plan = self.order_hold.as_mut().map(|order| {
-                    let plan = order.plan(
-                        current_round,
-                        &parents,
-                        &self.proposed_headers,
-                        &self.authority_id,
-                    );
-                    order.record(&plan);
-                    plan
-                });
-                let (digests, hold) = match plan {
-                    Some(plan) => self.drain_held(&plan),
-                    None => {
-                        let own_parent = self.cites_own_parent(current_round, &parents);
-                        (
-                            self.drain_digests_for_header(),
-                            HoldReport { own_parent, ..HoldReport::default() },
-                        )
-                    }
-                };
+                // plan and record at the drain: a record is read only through a tracked own
+                // parent, so the record of a header whose proposal fails is inert
+                let order = &mut self.order_hold;
+                let plan =
+                    order.plan(current_round, &parents, &self.proposed_headers, &self.authority_id);
+                order.record(&plan);
+                let (digests, hold) = self.drain_held(&plan);
                 // collect values from &mut self for this header
                 let trigger = ProposalTrigger {
                     reason,
@@ -1461,7 +1417,7 @@ impl<DB: Database> Proposer<DB> {
         // `committed_own_round` starts at 0 after a restart, so this guard does not catch the
         // max-delay re-send of a last own header that committed before the restart (see the order
         // hold's module doc).
-        if self.order_hold.is_some() && header.round() <= self.committed_own_round {
+        if header.round() <= self.committed_own_round {
             header.payload().keys().for_each(|digest| {
                 self.proposed_first_received.remove(digest);
                 self.lane_seqs.committed(digest);
@@ -1551,9 +1507,7 @@ impl<DB: Database> Proposer<DB> {
             "proposer stopped"
         );
         // the held digests leave with the proposer, for the orphan re-pool
-        if self.order_hold.is_some() {
-            self.order_hold_metrics.digests_held.set(0.0);
-        }
+        self.order_hold_metrics.digests_held.set(0.0);
     }
 
     /// Wrapper async function to either query the pending header or never resolve.
@@ -1658,13 +1612,13 @@ impl<DB: Database> Proposer<DB> {
             //      - this is happy path
             //      - vote for leader or leader already has enough votes to trigger commit
             let enough_parents = self.has_parents_for_round();
-            // with `digest_order_hold` on, digests held back in a lane still count here, as every
-            // queued digest did before: a held backlog of at least the threshold builds the next
-            // header without waiting for the min delay, and that header can carry none of it.
-            // Under load this fires as with the switch off (the queue is above the threshold
-            // either way); at light load a held backlog fires earlier. Leaving held digests out of
-            // the count while the only blocker is the previous round's own header, so that the
-            // min delay waits for its certificate, is not built (see the order hold's module doc)
+            // digests held back in a lane count here as every queued digest does: a held backlog
+            // of at least the threshold builds the next header without waiting for the min delay,
+            // and that header can carry none of it. Under load this changes nothing (the queue is
+            // above the threshold either way); at light load a held backlog fires earlier.
+            // Leaving held digests out of the count while the only blocker is the previous round's
+            // own header, so that the min delay waits for its certificate, is not built (see the
+            // order hold's module doc)
             let enough_digests = self.pending_digests_len() >= self.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value

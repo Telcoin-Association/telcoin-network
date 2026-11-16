@@ -98,11 +98,11 @@ pub(crate) const PASSPHRASE: &str = "restart_test";
 /// node's `runtime_switches!` list (`crates/config/src/node.rs`).
 ///
 /// A switch that arrives later adds its entry at the end, here and in [`STACK_SWITCHES_OFF`].
-pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 1] = [("digest_order_hold", "true")];
+pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 0] = [];
 
 /// Every runtime switch of the node at its default, as the `node switches` line renders it, in the
 /// order of [`STACK_SWITCHES_ON`].
-pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 1] = [("digest_order_hold", "false")];
+pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 0] = [];
 
 /// What the `node switches` line of a node given the switch entries `given` must show: every
 /// switch of [`STACK_SWITCHES_OFF`], with the value of `given` where it names the switch.

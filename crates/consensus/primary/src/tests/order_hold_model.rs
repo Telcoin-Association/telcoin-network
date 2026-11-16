@@ -675,8 +675,8 @@ struct ProposerModel {
 }
 
 impl ProposerModel {
-    /// Main's drain (`drain_digests_for_header`) over the lanes not in `held`: one digest per lane
-    /// per pass in ascending lane order from the cursor, first in first out, up to `cap`.
+    /// The proposer's drain (`drain_digests_except`) over the lanes not in `held`: one digest
+    /// per lane per pass in ascending lane order from the cursor, first in first out, up to `cap`.
     fn drain(&mut self, cap: usize, held: &BTreeSet<WorkerId>) -> Vec<DigestId> {
         let queues = &self.queue;
         let lanes: Vec<WorkerId> = queues

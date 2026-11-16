@@ -68,7 +68,7 @@ async fn test_multi_worker_proposed_header_payload() -> eyre::Result<()> {
         .iter()
         .map(|(digest, worker_id)| (*worker_id, VecDeque::from([queued(*digest, *worker_id)])))
         .collect();
-    let selected = proposer.drain_digests_for_header();
+    let selected = proposer.drain_digests_except(&BTreeSet::new());
     let identity = HeaderIdentity {
         round: 1,
         epoch: config.epoch(),
@@ -926,7 +926,7 @@ async fn test_drain_digests_shares_header_slots_across_workers() {
     proposer.digests.insert(0, w0.iter().map(|digest| queued(*digest, 0)).collect());
     proposer.digests.insert(1, w1.iter().map(|digest| queued(*digest, 1)).collect());
 
-    let selected = proposer.drain_digests_for_header();
+    let selected = proposer.drain_digests_except(&BTreeSet::new());
     assert_eq!(selected.len(), 10, "header fills to the cap");
 
     // rounds of one-per-worker while both lanes have digests, then worker 0 takes the rest
@@ -961,7 +961,7 @@ async fn test_drain_digests_single_worker_is_fifo() {
     let w0: Vec<B256> = (0..cap + 2).map(|_| B256::random()).collect();
     proposer.digests.insert(0, w0.iter().map(|digest| queued(*digest, 0)).collect());
 
-    let selected = proposer.drain_digests_for_header();
+    let selected = proposer.drain_digests_except(&BTreeSet::new());
     let got: Vec<B256> = selected.iter().map(|digest| digest.digest).collect();
     assert_eq!(got, w0[..cap].to_vec(), "single worker drains FIFO up to the cap");
     let remaining: Vec<B256> =
@@ -996,13 +996,19 @@ async fn test_drain_digests_rotates_across_headers_when_lanes_exceed_cap() {
             .insert(worker_id, (0..depth).map(|_| queued(B256::random(), worker_id)).collect());
     });
 
-    let first: Vec<WorkerId> =
-        proposer.drain_digests_for_header().iter().map(|digest| digest.worker_id).collect();
+    let first: Vec<WorkerId> = proposer
+        .drain_digests_except(&BTreeSet::new())
+        .iter()
+        .map(|digest| digest.worker_id)
+        .collect();
     assert_eq!(first, (0..10).collect::<Vec<_>>(), "first header serves lanes 0-9");
 
     // the next header resumes at lane 10 instead of restarting at lane 0
-    let second: Vec<WorkerId> =
-        proposer.drain_digests_for_header().iter().map(|digest| digest.worker_id).collect();
+    let second: Vec<WorkerId> = proposer
+        .drain_digests_except(&BTreeSet::new())
+        .iter()
+        .map(|digest| digest.worker_id)
+        .collect();
     assert_eq!(second, vec![10, 11, 0], "the cursor rotates the walk to the unserved lanes");
 }
 
@@ -2582,86 +2588,6 @@ fn payload_entries(header: &Header) -> Vec<(BlockHash, WorkerId)> {
     header.payload().iter().map(|(digest, worker_id)| (*digest, *worker_id)).collect()
 }
 
-/// The payload order of a scripted run through both re-queue paths, a lane rotation and the
-/// header cap, pinned as a golden list (issue #1807).
-///
-/// The list is the payload order of the base commit, before the proposer numbered its digests:
-/// this test was committed and run green there first, queuing straight into the lanes. It now
-/// queues through the numbered push, so the bookkeeping runs on every path. The bookkeeping is
-/// observability only, so every header must still carry exactly these digests in exactly this
-/// order.
-///
-/// Catches: bookkeeping that changes which digests a header drains, their order, or what a cancel
-/// or a commit puts back in the queue.
-#[tokio::test]
-async fn test_digest_order_bookkeeping_keeps_payloads_golden() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let committee = fixture.committee();
-    let primary = fixture.authorities().next().unwrap();
-    let task_manager = TaskManager::default();
-    let cb = ConsensusBus::new();
-    let _rx_headers = cb.subscribe_headers();
-    let mut proposer = proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager);
-    assert_eq!(proposer.max_header_num_of_batches, 10, "the script assumes the default header cap");
-    // worker 0 reports digests 1.., worker 1 digests 101..
-    let mut headers = Vec::new();
-
-    report_fixed(&mut proposer, 0, &[1, 2, 3]);
-    report_fixed(&mut proposer, 1, &[101, 102]);
-    let h1 = propose_and_track(&mut proposer).await;
-    headers.push(h1.clone());
-    report_fixed(&mut proposer, 0, &[4, 5]);
-    headers.push(propose_and_track(&mut proposer).await);
-    // the certifier cancels round 1 after round 2 drained newer worker-0 digests
-    proposer.process_uncertified_header(h1.round(), h1.digest());
-    report_fixed(&mut proposer, 1, &[103]);
-    headers.push(propose_and_track(&mut proposer).await);
-    report_fixed(&mut proposer, 0, &[6]);
-    headers.push(propose_and_track(&mut proposer).await);
-    // round 3 commits: round 2 died behind it, round 4 is still in flight
-    proposer.process_committed_headers(5, vec![3]);
-    headers.push(propose_and_track(&mut proposer).await);
-    // round 5 commits: round 4 died behind it
-    proposer.process_committed_headers(6, vec![5]);
-    report_fixed(&mut proposer, 1, &(104..=115).collect::<Vec<_>>());
-    report_fixed(&mut proposer, 0, &[7]);
-    headers.push(propose_and_track(&mut proposer).await);
-    headers.push(propose_and_track(&mut proposer).await);
-
-    // (digest number, worker) per header, in payload order
-    let golden: [&[(u8, WorkerId)]; 7] = [
-        &[(1, 0), (101, 1), (2, 0), (102, 1), (3, 0)],
-        &[(4, 0), (5, 0)],
-        &[(101, 1), (1, 0), (102, 1), (2, 0), (103, 1), (3, 0)],
-        &[(6, 0)],
-        &[(4, 0), (5, 0)],
-        &[
-            (104, 1),
-            (6, 0),
-            (105, 1),
-            (7, 0),
-            (106, 1),
-            (107, 1),
-            (108, 1),
-            (109, 1),
-            (110, 1),
-            (111, 1),
-        ],
-        &[(112, 1), (113, 1), (114, 1), (115, 1)],
-    ];
-    let golden: Vec<Vec<(BlockHash, WorkerId)>> = golden
-        .iter()
-        .map(|entries| {
-            entries.iter().map(|(n, worker_id)| (fixed_digest(*n), *worker_id)).collect()
-        })
-        .collect();
-    assert_eq!(headers.iter().map(payload_entries).collect::<Vec<_>>(), golden);
-    assert_eq!(
-        headers.iter().map(Header::round).collect::<Vec<_>>(),
-        (1..=7).collect::<Vec<Round>>()
-    );
-}
-
 /// Queue `numbers` as digests that `worker_id` just reported, through the proposer's own push.
 fn report_fixed(proposer: &mut Proposer<MemDatabase>, worker_id: WorkerId, numbers: &[u8]) {
     for n in numbers {
@@ -2780,83 +2706,6 @@ async fn test_lane_sequence_survives_requeues() {
     assert_eq!(order_totals(&snapshotter), [Some(3), Some(0), Some(1), Some(0)]);
 }
 
-/// A canceled header's digests that return behind a newer digest of their worker count once each
-/// in `requeued_out_of_order_total{cause="canceled"}` and in the `digests resent` line's
-/// `out_of_order`, and only on the overtaken worker. The newer digest counts while its header is
-/// still in flight, before the proposer tracks it.
-///
-/// Catches: a counter that ignores the header in flight (the cancel report can be handled before
-/// the newer header's result), counts a worker whose lane nothing overtook, or files the count
-/// under the wrong cause.
-#[tokio::test]
-async fn test_canceled_requeue_behind_a_newer_digest_counts_out_of_order() {
-    use crate::log_capture::LogCapture;
-
-    let capture = LogCapture::new("consensus::metrics");
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
-    let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    let (_fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
-
-    report_fixed(&mut proposer, 0, &[1, 2]);
-    report_fixed(&mut proposer, 1, &[101]);
-    let h1 = propose_and_track(&mut proposer).await;
-    // round 2 drains a newer worker-0 digest; its result has not come back yet
-    report_fixed(&mut proposer, 0, &[3]);
-    let h2 = proposer
-        .propose_next_header(ProposeReason::MinDelay)
-        .expect("proposal spawned")
-        .await
-        .expect("proposal task reported")
-        .expect("header proposed");
-    assert_eq!(payload_digests(&h2), [fixed_digest(3)]);
-    assert!(!proposer.proposed_headers.contains_key(&h2.round()), "round 2 is still in flight");
-
-    proposer.process_uncertified_header(h1.round(), h1.digest());
-
-    let lines = capture.events("digests resent");
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].u64_field("count"), Some(3));
-    assert_eq!(lines[0].u64_field("out_of_order"), Some(2), "worker 0's two digests, not 101");
-    assert_eq!(order_totals(&snapshotter), [Some(2), Some(0), Some(0), Some(0)]);
-}
-
-/// A dead header's digests that return behind a digest of their worker that already committed
-/// count in `requeued_out_of_order_total{cause="committed"}`: issue #1807's own case, the older
-/// batch executing after the newer one.
-///
-/// Catches: a committed digest that stops counting as out of the queue once its header leaves the
-/// tracked set, or the count filed under `canceled`.
-#[tokio::test]
-async fn test_committed_requeue_behind_a_committed_digest_counts_out_of_order() {
-    use crate::log_capture::LogCapture;
-
-    let capture = LogCapture::new("consensus::metrics");
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
-    let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    let (_fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
-
-    report_fixed(&mut proposer, 0, &[1, 2]);
-    let h1 = propose_and_track(&mut proposer).await;
-    report_fixed(&mut proposer, 0, &[3]);
-    let h2 = propose_and_track(&mut proposer).await;
-
-    // round 2 commits without round 1 among its ancestors: round 1 died behind it
-    proposer.process_committed_headers(h2.round() + 2, vec![h2.round()]);
-    assert_eq!(payload_digests(&h1), [fixed_digest(1), fixed_digest(2)]);
-    assert_eq!(
-        lane_entries(&proposer, 0),
-        [(fixed_digest(1), Some(0)), (fixed_digest(2), Some(1))]
-    );
-
-    let lines = capture.events("digests resent");
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].field("cause"), Some("committed"));
-    assert_eq!(lines[0].u64_field("out_of_order"), Some(2));
-    assert_eq!(order_totals(&snapshotter), [Some(0), Some(2), Some(0), Some(0)]);
-}
-
 /// Re-queues that keep each lane in order count nothing: a canceled header with nothing newer of
 /// its worker out of the queue, two headers returned together, and an older header returned after
 /// a newer one already came back (it lands ahead of it).
@@ -2909,34 +2758,6 @@ async fn test_requeues_that_keep_lane_order_count_nothing() {
     assert_eq!(lines.len(), 4);
     assert!(lines.iter().all(|line| line.u64_field("out_of_order") == Some(0)), "{lines:?}");
     assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(0)]);
-}
-
-/// A committed header that the max-delay tick re-sent before the round moved on is tracked again,
-/// and the next commit notice re-queues its already committed digests. Those count as
-/// `stale_resend`, never as out of order, although a newer digest of their worker committed.
-///
-/// Catches: the duplicate re-queue of committed digests counted as #1807's out-of-order carriage,
-/// or lumped with a restart's `unknown_seq`.
-#[tokio::test]
-async fn test_stale_resend_requeue_is_not_out_of_order() {
-    let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    let (_fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
-
-    report_fixed(&mut proposer, 0, &[1, 2]);
-    let h1 = propose_and_track(&mut proposer).await;
-    proposer.process_committed_headers(h1.round() + 2, vec![h1.round()]);
-    assert!(proposer.proposed_headers.is_empty());
-    // the max-delay re-send of the committed round-1 header comes back and is tracked again
-    proposer.handle_proposal_result(Ok(h1.clone())).expect("re-send tracked");
-
-    report_fixed(&mut proposer, 0, &[3]);
-    let h2 = propose_and_track(&mut proposer).await;
-    proposer.process_committed_headers(h2.round() + 2, vec![h2.round()]);
-    let lane = lane_entries(&proposer, 0);
-    assert_eq!(lane, [(fixed_digest(1), None), (fixed_digest(2), None)], "re-queued, unnumbered");
-
-    assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(2)]);
 }
 
 /// The `header proposed` line ends with the order-hold fields, after every earlier field:
@@ -3059,42 +2880,9 @@ async fn test_proposer_stopped_reports_what_it_leaves() {
     assert_eq!(fields(&lines[1]), [epoch, Some(5), Some(0), Some(0), Some(0), Some(0)]);
 }
 
-/// A header whose own commit notice is handled before its proposal result comes back is tracked
-/// after the notice, so its later re-queue counts as `stale_resend`; its digests still leave the
-/// order bookkeeping, as their first receipts do.
-///
-/// Catches: a stale re-send that leaves its digests' entries behind, which would count them as in
-/// flight in `proposer stopped` and as newer digests out of the queue in every later judgment.
-#[tokio::test]
-async fn test_stale_resend_releases_its_digest_numbers() {
-    let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    let (_fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
-
-    report_fixed(&mut proposer, 0, &[1, 2]);
-    let h1 = proposer
-        .propose_next_header(ProposeReason::MinDelay)
-        .expect("proposal spawned")
-        .await
-        .expect("proposal task reported")
-        .expect("header proposed");
-    // the notice naming round 1 arrives before round 1's result
-    proposer.process_committed_headers(h1.round() + 2, vec![h1.round()]);
-    proposer.handle_proposal_result(Ok(h1.clone())).expect("header tracked");
-
-    report_fixed(&mut proposer, 0, &[3]);
-    let h2 = propose_and_track(&mut proposer).await;
-    proposer.process_committed_headers(h2.round() + 2, vec![h2.round()]);
-    assert_eq!(lane_entries(&proposer, 0), [(fixed_digest(1), None), (fixed_digest(2), None)]);
-    assert_eq!(proposer.lane_seqs.out_of_queue().count(), 0, "no entry outlives its header");
-    assert!(proposer.proposed_first_received.is_empty(), "nor does a first receipt");
-
-    assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(2)]);
-}
-
-/// A default fixture whose consensus parameters set the `digest_order_hold` switch to `on`.
-fn hold_fixture(on: bool) -> CommitteeFixture<MemDatabase> {
-    exec_fixture(tn_config::Parameters { digest_order_hold: on, ..Default::default() })
+/// A fixture with default consensus parameters, for the order hold's tests.
+fn hold_fixture() -> CommitteeFixture<MemDatabase> {
+    exec_fixture(tn_config::Parameters::default())
 }
 
 /// The proposer of `fixture`'s first authority, its metric handles resolved under `recorder`, and
@@ -3167,58 +2955,45 @@ fn hold_metrics(snapshotter: &metrics_util::debugging::Snapshotter) -> (Option<u
     (headers, digests)
 }
 
-/// Issue #1807's canceled case on both switch settings. Round 1 carries worker 0's digests 1 and 2
-/// and is never certified; round 2 is built without it while worker 0 reports 3 and worker 1
-/// reports 101; then the certifier cancels round 1 and round 3 is built on round 2.
+/// Issue #1807's canceled case. Round 1 carries worker 0's digests 1 and 2 and is never certified;
+/// round 2 is built without it while worker 0 reports 3 and worker 1 reports 101; then the
+/// certifier cancels round 1 and round 3 is built on round 2.
 ///
-/// Switch off: round 2 carries 3, the cancel returns 1 and 2 behind it (`out_of_order` 2), and
-/// worker 0's lane would execute 3 before 1 and 2. Switch on: round 2 holds worker 0 only (worker
-/// 1 drains), the cancel puts 1 and 2 at the front, round 3 carries 1, 2, 3 in order, nothing
-/// counts out of order, and the hold's fields and metrics say what was held.
+/// Round 2 holds worker 0 only (worker 1 drains), the cancel puts 1 and 2 at the front, round 3
+/// carries 1, 2, 3 in order, nothing counts out of order, and the hold's fields and metrics say
+/// what was held. Without the hold, round 2 would carry 3 and the cancel would return 1 and 2
+/// behind it, so worker 0's lane would execute 3 before 1 and 2.
 ///
-/// Catches: a hold that misses the canceled kind, holds every lane instead of the blocker's, lets
-/// the next header after the cancel stay held, or a switch-off drain that differs from the base.
+/// Catches: a hold that misses the canceled kind, holds every lane instead of the blocker's, or
+/// lets the next header after the cancel stay held.
 #[tokio::test]
 async fn test_order_hold_keeps_a_canceled_headers_lane_in_order() {
     use crate::log_capture::LogCapture;
 
     let d = fixed_digest;
-    for on in [false, true] {
-        let capture = LogCapture::new("consensus::metrics");
-        let _capture_guard = tracing::subscriber::set_default(capture.clone());
-        let recorder = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let fixture = hold_fixture(on);
-        let task_manager = TaskManager::default();
-        let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = hold_fixture();
+    let task_manager = TaskManager::default();
+    let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
 
-        report_fixed(&mut proposer, 0, &[1, 2]);
-        let h1 = propose_and_track(&mut proposer).await;
-        report_fixed(&mut proposer, 0, &[3]);
-        report_fixed(&mut proposer, 1, &[101]);
-        let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, None)).await;
-        proposer.process_uncertified_header(h1.round(), h1.digest());
-        let h3 = build_on(&mut proposer, hold_parents(&fixture, 2, Some(&h2))).await;
+    report_fixed(&mut proposer, 0, &[1, 2]);
+    let h1 = propose_and_track(&mut proposer).await;
+    report_fixed(&mut proposer, 0, &[3]);
+    report_fixed(&mut proposer, 1, &[101]);
+    let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, None)).await;
+    proposer.process_uncertified_header(h1.round(), h1.digest());
+    let h3 = build_on(&mut proposer, hold_parents(&fixture, 2, Some(&h2))).await;
 
-        assert_eq!(payload_entries(&h1), [(d(1), 0), (d(2), 0)]);
-        if on {
-            assert_eq!(payload_entries(&h2), [(d(101), 1)], "only worker 0 is held");
-            assert_eq!(payload_entries(&h3), [(d(1), 0), (d(2), 0), (d(3), 0)]);
-            assert_eq!(hold_fields(&capture, 2), (false, [1, 1, 1]));
-            assert_eq!(hold_fields(&capture, 3), (true, [0, 0, 0]));
-            assert_eq!(hold_metrics(&snapshotter), (Some(1), Some(0.0)));
-            assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(0)]);
-        } else {
-            assert_eq!(payload_entries(&h2), [(d(101), 1), (d(3), 0)]);
-            assert_eq!(payload_entries(&h3), [(d(1), 0), (d(2), 0)]);
-            assert_eq!(hold_fields(&capture, 2), (false, [0, 0, 0]));
-            assert_eq!(hold_fields(&capture, 3), (true, [0, 0, 0]));
-            assert_eq!(order_totals(&snapshotter), [Some(2), Some(0), Some(0), Some(0)]);
-            let (headers, digests) = hold_metrics(&snapshotter);
-            assert_eq!(headers, Some(0), "the switch off holds nothing");
-            assert_eq!(digests.unwrap_or_default(), 0.0);
-        }
-    }
+    assert_eq!(payload_entries(&h1), [(d(1), 0), (d(2), 0)]);
+    assert_eq!(payload_entries(&h2), [(d(101), 1)], "only worker 0 is held");
+    assert_eq!(payload_entries(&h3), [(d(1), 0), (d(2), 0), (d(3), 0)]);
+    assert_eq!(hold_fields(&capture, 2), (false, [1, 1, 1]));
+    assert_eq!(hold_fields(&capture, 3), (true, [0, 0, 0]));
+    assert_eq!(hold_metrics(&snapshotter), (Some(1), Some(0.0)));
+    assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(0)]);
 }
 
 /// The race: round 1 is certified, but its certificate misses round 2's parents, so round 2 holds
@@ -3239,7 +3014,7 @@ async fn test_order_hold_releases_the_lane_when_the_notice_settles_the_blocker()
         let _capture_guard = tracing::subscriber::set_default(capture.clone());
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let fixture = hold_fixture(true);
+        let fixture = hold_fixture();
         let task_manager = TaskManager::default();
         let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
 
@@ -3264,8 +3039,9 @@ async fn test_order_hold_releases_the_lane_when_the_notice_settles_the_blocker()
 }
 
 /// While the own chain is intact, the hold changes nothing: a script of rounds that each cite the
-/// previous own header carries the same payloads with the switch on as off, every line reports
-/// zero held, and `headers_held_total` stays 0. That is the hold's cost on a healthy node.
+/// previous own header drains every lane in rotation, every line reports zero held, and
+/// `headers_held_total` stays 0. That is the hold's cost on a healthy node. The payloads are
+/// pinned as a golden list, the order this script drained without the hold.
 ///
 /// Catches: a hold that reads a proven own parent as a blocker, or a held-lane filter that moves
 /// the drain's cursor when nothing is held.
@@ -3273,36 +3049,49 @@ async fn test_order_hold_releases_the_lane_when_the_notice_settles_the_blocker()
 async fn test_order_hold_holds_nothing_on_an_intact_own_chain() {
     use crate::log_capture::LogCapture;
 
-    let mut runs = Vec::new();
-    for on in [false, true] {
-        let capture = LogCapture::new("consensus::metrics");
-        let _capture_guard = tracing::subscriber::set_default(capture.clone());
-        let recorder = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let fixture = hold_fixture(on);
-        let task_manager = TaskManager::default();
-        let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = hold_fixture();
+    let task_manager = TaskManager::default();
+    let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
 
-        let mut previous = None;
-        let mut payloads = Vec::new();
-        for round in 1..=8u8 {
-            report_fixed(&mut proposer, 0, &[round * 2, round * 2 + 1]);
-            report_fixed(&mut proposer, u16::from(round % 3), &[100 + round]);
-            let header = match &previous {
-                None => propose_and_track(&mut proposer).await,
-                Some(own) => {
-                    let parents = hold_parents(&fixture, Round::from(round) - 1, Some(own));
-                    build_on(&mut proposer, parents).await
-                }
-            };
-            assert_eq!(hold_fields(&capture, header.round()), (round > 1, [0, 0, 0]));
-            payloads.push(payload_entries(&header));
-            previous = Some(header);
-        }
-        assert_eq!(hold_metrics(&snapshotter).0, Some(0), "on={on}");
-        runs.push(payloads);
+    let mut previous = None;
+    let mut payloads = Vec::new();
+    for round in 1..=8u8 {
+        report_fixed(&mut proposer, 0, &[round * 2, round * 2 + 1]);
+        report_fixed(&mut proposer, u16::from(round % 3), &[100 + round]);
+        let header = match &previous {
+            None => propose_and_track(&mut proposer).await,
+            Some(own) => {
+                let parents = hold_parents(&fixture, Round::from(round) - 1, Some(own));
+                build_on(&mut proposer, parents).await
+            }
+        };
+        assert_eq!(hold_fields(&capture, header.round()), (round > 1, [0, 0, 0]));
+        payloads.push(payload_entries(&header));
+        previous = Some(header);
     }
-    assert_eq!(runs[0], runs[1], "an intact own chain drains exactly as without the hold");
+    assert_eq!(hold_metrics(&snapshotter).0, Some(0));
+    // (digest number, worker) per header, in payload order
+    let golden: [&[(u8, WorkerId)]; 8] = [
+        &[(2, 0), (101, 1), (3, 0)],
+        &[(102, 2), (4, 0), (5, 0)],
+        &[(6, 0), (7, 0), (103, 0)],
+        &[(104, 1), (8, 0), (9, 0)],
+        &[(105, 2), (10, 0), (11, 0)],
+        &[(12, 0), (13, 0), (106, 0)],
+        &[(107, 1), (14, 0), (15, 0)],
+        &[(108, 2), (16, 0), (17, 0)],
+    ];
+    let golden: Vec<Vec<(BlockHash, WorkerId)>> = golden
+        .iter()
+        .map(|entries| {
+            entries.iter().map(|(n, worker_id)| (fixed_digest(*n), *worker_id)).collect()
+        })
+        .collect();
+    assert_eq!(payloads, golden, "an intact own chain drains exactly as without the hold");
 }
 
 /// `unproven` carries through the own chain: once round 2 is built without its own parent, round 1
@@ -3325,7 +3114,7 @@ async fn test_order_hold_carries_unproven_through_the_chain_and_round_jumps() {
     let d = fixed_digest;
 
     // transitive: round 1 is never certified, rounds 3 and 4 cite their own parents
-    let fixture = hold_fixture(true);
+    let fixture = hold_fixture();
     let task_manager = TaskManager::default();
     let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
     report_fixed(&mut proposer, 0, &[1]);
@@ -3349,7 +3138,7 @@ async fn test_order_hold_carries_unproven_through_the_chain_and_round_jumps() {
     assert_eq!(hold_fields(&capture, 5), (true, [0, 0, 0]));
 
     // reverse report order: rounds 1 and 2 die, their reports are handled newest first
-    let fixture = hold_fixture(true);
+    let fixture = hold_fixture();
     let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
     report_fixed(&mut proposer, 0, &[11]);
     let r1 = propose_and_track(&mut proposer).await;
@@ -3370,7 +3159,7 @@ async fn test_order_hold_carries_unproven_through_the_chain_and_round_jumps() {
     assert_eq!((lane(0), lane(1)), (vec![d(11), d(12)], vec![d(111), d(112)]));
 
     // a round jump: the parents of round 5 cannot cite an own header of round 5
-    let fixture = hold_fixture(true);
+    let fixture = hold_fixture();
     let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
     report_fixed(&mut proposer, 0, &[21]);
     propose_and_track(&mut proposer).await;
@@ -3403,7 +3192,7 @@ async fn test_order_hold_survives_a_dropped_cancel_report() {
     for full_channel in [true, false] {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let fixture = hold_fixture(true);
+        let fixture = hold_fixture();
         let task_manager = TaskManager::default();
         let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
 
@@ -3435,7 +3224,7 @@ async fn test_order_hold_survives_a_dropped_cancel_report() {
             assert_eq!(hold_metrics(&snapshotter), (Some(0), Some(0.0)), "the gauge is reset");
 
             // the next epoch's proposer has its own order: nothing tracked, nothing held
-            let next = hold_fixture(true);
+            let next = hold_fixture();
             let (_rx_next, mut proposer) = hold_proposer(&next, &recorder, &task_manager);
             report_fixed(&mut proposer, 0, &[1, 2]);
             let first = propose_and_track(&mut proposer).await;
@@ -3460,7 +3249,7 @@ async fn test_order_hold_restart_reproposal_records_its_header() {
     let d = fixed_digest;
     for cited in [true, false] {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
-        let fixture = hold_fixture(true);
+        let fixture = hold_fixture();
         let author = fixture.authorities().next().unwrap().id();
         let stored = build_header_at(&author, 3, fixture.committee().epoch(), &[d(9)]);
         let config = fixture.authorities().next().unwrap().consensus_config();
@@ -3500,7 +3289,7 @@ async fn test_order_hold_max_delay_resend_keeps_the_record() {
     let capture = LogCapture::new("consensus::metrics");
     let _capture_guard = tracing::subscriber::set_default(capture.clone());
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let fixture = hold_fixture(true);
+    let fixture = hold_fixture();
     let task_manager = TaskManager::default();
     let committee = fixture.committee();
     let config = fixture.authorities().next().unwrap().consensus_config();
@@ -3532,11 +3321,10 @@ async fn test_order_hold_max_delay_resend_keeps_the_record() {
     assert_eq!(hold_fields(&capture, 3), (true, [0, 0, 0]));
 }
 
-/// With the hold on, a committed header that comes back after its commit notice (a max-delay
-/// re-send that raced the notice, or a new header whose result came after it) is not tracked
-/// again: it never blocks a later header, its committed digests are never re-queued, and its
-/// digests leave the order bookkeeping. With the switch off the same script re-queues them as
-/// `stale_resend` (`test_stale_resend_requeue_is_not_out_of_order`).
+/// A committed header that comes back after its commit notice (a max-delay re-send that raced the
+/// notice, or a new header whose result came after it) is not tracked again: it never blocks a
+/// later header, its committed digests are never re-queued, and its digests leave the order
+/// bookkeeping.
 ///
 /// Catches: a stale re-send that holds its lanes behind every header without an own parent until
 /// the next own commit, and the duplicate re-queue of its committed digests.
@@ -3548,7 +3336,7 @@ async fn test_order_hold_stale_resend_is_never_a_blocker() {
     let _capture_guard = tracing::subscriber::set_default(capture.clone());
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let fixture = hold_fixture(true);
+    let fixture = hold_fixture();
     let task_manager = TaskManager::default();
     let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
     let d = fixed_digest;
@@ -3594,48 +3382,41 @@ async fn test_order_hold_stale_resend_is_never_a_blocker() {
 /// and its notice re-queues round 1 with cause `committed`; round 3 is built on round 2 and
 /// commits. Committed order is round 2's payload, then round 3's.
 ///
-/// Switch off: d1 executes before d0, and the re-queue counts one out of order. Switch on: round 2
-/// holds worker 0, d0 and d1 execute in order, and nothing counts.
+/// Round 2 holds worker 0, so d0 and d1 execute in order and nothing counts; without the hold, d1
+/// would execute before d0 and the re-queue would count one out of order.
 ///
-/// Catches: a proposer whose drain differs from the model's with the hold on, the case the model
-/// found first with it off.
+/// Catches: a proposer whose drain differs from the model's under the hold, in the case the model
+/// found first without it.
 #[tokio::test]
 async fn test_order_hold_replays_the_model_counterexample() {
     let d = fixed_digest;
-    for on in [false, true] {
-        let recorder = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let fixture = hold_fixture(on);
-        let task_manager = TaskManager::default();
-        let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = hold_fixture();
+    let task_manager = TaskManager::default();
+    let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
 
-        report_fixed(&mut proposer, 0, &[0]);
-        let h1 = propose_and_track(&mut proposer).await;
-        report_fixed(&mut proposer, 0, &[1]);
-        let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, None)).await;
-        proposer.process_committed_headers(4, vec![h2.round()]);
-        // the cancel report for round 1 arrives late and finds it settled
-        proposer.process_uncertified_header(h1.round(), h1.digest());
-        let h3 = build_on(&mut proposer, hold_parents(&fixture, 2, Some(&h2))).await;
-        proposer.process_committed_headers(5, vec![h3.round()]);
+    report_fixed(&mut proposer, 0, &[0]);
+    let h1 = propose_and_track(&mut proposer).await;
+    report_fixed(&mut proposer, 0, &[1]);
+    let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, None)).await;
+    proposer.process_committed_headers(4, vec![h2.round()]);
+    // the cancel report for round 1 arrives late and finds it settled
+    proposer.process_uncertified_header(h1.round(), h1.digest());
+    let h3 = build_on(&mut proposer, hold_parents(&fixture, 2, Some(&h2))).await;
+    proposer.process_committed_headers(5, vec![h3.round()]);
 
-        let executed: Vec<BlockHash> = [&h2, &h3].into_iter().flat_map(payload_digests).collect();
-        if on {
-            assert_eq!(executed, [d(0), d(1)], "the hold keeps worker 0's order");
-            assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(0)]);
-        } else {
-            assert_eq!(executed, [d(1), d(0)], "without the hold d1 overtakes d0");
-            assert_eq!(order_totals(&snapshotter), [Some(0), Some(1), Some(0), Some(0)]);
-        }
-    }
+    let executed: Vec<BlockHash> = [&h2, &h3].into_iter().flat_map(payload_digests).collect();
+    assert_eq!(executed, [d(0), d(1)], "the hold keeps worker 0's order");
+    assert_eq!(order_totals(&snapshotter), [Some(0), Some(0), Some(0), Some(0)]);
 }
 
 /// The garbage-collection residual: round 2 cites round 1 as its own parent and carries worker 0's
 /// next digest, then commits while round 1, cut below the collection depth, is never ordered. Its
-/// re-queue lands behind a committed newer digest: counted out of order, and with the hold on one
+/// re-queue lands behind a committed newer digest: counted out of order, and one
 /// warning per re-queue says the hold did not cover the lane.
 ///
-/// Catches: a residual that passes silently with the switch on, or a warning per digest.
+/// Catches: a residual that passes silently, or a warning per digest.
 #[tokio::test]
 async fn test_order_hold_warns_once_per_requeue_out_of_order() {
     use crate::log_capture::LogCapture;
@@ -3644,7 +3425,7 @@ async fn test_order_hold_warns_once_per_requeue_out_of_order() {
     let _capture_guard = tracing::subscriber::set_default(capture.clone());
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let fixture = hold_fixture(true);
+    let fixture = hold_fixture();
     let task_manager = TaskManager::default();
     let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
 

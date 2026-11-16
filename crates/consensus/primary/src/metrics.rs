@@ -647,8 +647,8 @@ impl RequeuedOrderUnknownHandles {
     }
 }
 
-/// The order hold's metrics (issue #1807, the `digest_order_hold` switch), resolved once when a
-/// proposer is built. The handles are `Arc`-backed. With the switch off neither moves from 0.
+/// The order hold's metrics (issue #1807), resolved once when a proposer is built. The handles
+/// are `Arc`-backed.
 #[derive(Clone, Debug)]
 pub(crate) struct OrderHoldHandles {
     /// `tn_primary.headers_held_total`: new own headers that left at least one batch digest
