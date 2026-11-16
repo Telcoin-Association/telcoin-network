@@ -11,6 +11,7 @@ use std::{ffi::OsString, fmt, path::PathBuf, str::FromStr};
 use tn_config::KeyConfig;
 use tn_node::engine::TnBuilder;
 use tn_reth::{dirs::DEFAULT_ROOT_DIR, init_reth_defaults, LogArgs};
+use tn_types::error::NodeForked;
 use tokio::{runtime::Builder, task::JoinHandle};
 use tracing::info_span;
 use zeroize::Zeroizing;
@@ -250,17 +251,79 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     Node(Box<node::NodeCommand<Ext>>),
 }
 
+/// The exit status of a node that stopped because it has forked ([`NodeForked`]): an epoch record
+/// it holds differs from the one the network certified. A restart meets the same fork, so a
+/// supervisor should not restart the node on this status (systemd: `RestartPreventExitStatus=10`).
+///
+/// 10 means nothing else: systemd names 1 to 7 and 64 to 78, clap exits 2 on a usage error, a Rust
+/// panic exits 101, and 126 and above belong to the shell and to signals.
+pub const FORKED_EXIT_STATUS: i32 = 10;
+
+/// The process exit status for an error [`Cli::run`] returned: [`FORKED_EXIT_STATUS`] for a fork
+/// stop ([`NodeForked::is_in`]), 1 for any other error.
+pub fn exit_status(error: &eyre::Report) -> i32 {
+    if NodeForked::is_in(error) {
+        FORKED_EXIT_STATUS
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
     use tn_config::Config;
     use tn_reth::ColorMode;
+    use tn_types::{TaskError, TaskJoinError};
 
     #[test]
     fn parse_color_mode() {
         let tn = Cli::<NoArgs>::try_parse_args_from(["tn", "node", "--color", "always"]).unwrap();
         assert_eq!(tn.logs.color, ColorMode::Always);
+    }
+
+    /// A node that stopped because it has forked exits with [`FORKED_EXIT_STATUS`], however the
+    /// fork reached the exit error; any other error exits 1, a message that reads like a fork
+    /// included.
+    #[test]
+    fn exit_status_tells_a_fork_stop_by_its_type() {
+        // the epoch vote round's fork, through the critical collector and the node's task manager
+        let round = eyre::Report::new(NodeForked::new(
+            "epoch 3: the network certified epoch record a where this node computed b; this node \
+             has forked",
+        ));
+        let collector = TaskJoinError::CriticalExitError(
+            "Epoch Vote Collector".to_string(),
+            TaskError::from_report(round),
+        );
+        let exit = collector.to_report("Node task shutdown");
+        assert_eq!(exit_status(&exit), FORKED_EXIT_STATUS, "{exit:?}");
+        assert_eq!(
+            exit.to_string(),
+            "Node task shutdown: Critical task Epoch Vote Collector has exited unexpectedly: epoch \
+             3: the network certified epoch record a where this node computed b; this node has \
+             forked",
+        );
+
+        // the epoch record sync's conflict: the fork is the context over the store's refusal, and
+        // the report reaches the exit as it is or under more context
+        let sync = eyre::Report::new(std::io::Error::other("conflicting record"))
+            .wrap_err(NodeForked::new("epoch 3: this node's execution diverged"));
+        assert_eq!(exit_status(&sync), FORKED_EXIT_STATUS, "{sync:?}");
+        let collector = TaskJoinError::CriticalExitError(
+            "Epoch Record Collector".to_string(),
+            TaskError::from_report(sync.wrap_err("startup")),
+        );
+        let exit = collector.to_report("a node task failed as the node stopped");
+        assert_eq!(exit_status(&exit), FORKED_EXIT_STATUS, "{exit:?}");
+
+        let other = TaskJoinError::CriticalExitError(
+            "consensus engine".to_string(),
+            TaskError::from_report(eyre::eyre!("this node has forked")),
+        );
+        assert_eq!(exit_status(&other.to_report("Node task shutdown")), 1);
+        assert_eq!(exit_status(&eyre::eyre!("failed to persist")), 1);
     }
 
     #[test]

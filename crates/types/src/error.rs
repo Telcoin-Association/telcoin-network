@@ -373,3 +373,29 @@ impl<T: std::fmt::Debug> From<SendError<T>> for HeaderError {
         Self::TNSend(e.to_string())
     }
 }
+
+/// The stop of a node that has forked: an epoch record it holds differs from the one the network
+/// certified.
+///
+/// A restart meets the same fork and stops again, so the process exits with a status of its own
+/// for this stop, which a supervisor can be told not to restart on. The error is the stop's whole
+/// message. Where an error is flattened into a message to cross a task boundary
+/// ([`crate::TaskError::from_report`], [`crate::TaskJoinError::to_report`]), a fork's message is
+/// wrapped in this type again, so from where the fork is found to the process exit it is told by
+/// this type ([`Self::is_in`]), never by its text.
+#[derive(Clone, Debug, Error)]
+#[error("{0}")]
+pub struct NodeForked(String);
+
+impl NodeForked {
+    /// A fork stop with `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// Whether `report` is a fork stop: a [`NodeForked`] is its error, a context added to it with
+    /// `wrap_err`, or a source in its chain.
+    pub fn is_in(report: &eyre::Report) -> bool {
+        report.downcast_ref::<Self>().is_some() || report.chain().any(|error| error.is::<Self>())
+    }
+}

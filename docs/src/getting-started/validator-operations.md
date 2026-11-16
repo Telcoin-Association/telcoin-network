@@ -236,6 +236,22 @@ Copy or restore whole datadirs, never single static files: a file from another c
 
 ## Storage tools and recovery
 
+### Exit status
+
+The node's process exits with one of these statuses:
+
+| Status | Meaning |
+| --- | --- |
+| 0 | A requested stop (SIGINT or SIGTERM) |
+| 1 | An error. The process prints it to stderr (`Error: ...`), and the node log names it (`Error running node: ...`) |
+| 2 | A usage error: an argument or flag the node does not accept |
+| 10 | This node has forked: an epoch record it holds differs from the one the network certified, found at the epoch's vote or by the epoch record sync |
+
+A restart meets the same fork and stops again, so do not restart a node automatically on status 10: keep it stopped, keep its datadir as it is, and tell the Telcoin Association network team.
+Under systemd, add `RestartPreventExitStatus=10` to the unit's `[Service]` section, next to `Restart=on-failure`.
+A supervisor that cannot filter by exit status restarts a forked node into the same stop every time: cap its restarts (Docker's `restart: on-failure:<max-retries>`) and alert on status 10.
+Other stops that repeat at every restart exit 1, such as a final-state mismatch at an epoch close (`tn_epoch_final_state_mismatches_total` under [Execution alerts](#execution-alerts)).
+
 ### Database commands
 
 The `telcoin-network db` commands work on the datadir that `--datadir <datadir>` names, and on the OS data directory without it.
