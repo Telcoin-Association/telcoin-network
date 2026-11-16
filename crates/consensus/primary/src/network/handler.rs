@@ -641,21 +641,26 @@ where
                             // work, so gossipsub forwards only verified
                             // certificates (#1772).
                             pending.accept().await;
-                            if self.consensus_bus.is_cvv() {
+                            // Only active CVVs run the certificate-manager path.
+                            // Inactive CVVs have no certificate manager subscribed, so
+                            // process_peer_certificate would only fail with
+                            // CertificateManagerOneshot (issue #1516).
+                            if self.consensus_bus.is_active_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round(), None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
                                 }
                                 self.state_sync.process_peer_certificate(&mut cert).await?;
                             }
-                            if self.consensus_bus.is_cvv_inactive()
-                                && self.consensus_config.committee().epoch() == cert.epoch()
-                            {
-                                // If we are catching up and this is for our current epoch save in
-                                // cache so we will be able
-                                // to rejoin consensus later when caught up.
-                                let _ = self.consensus_config.node_storage().write((*cert).clone());
-                            }
+                            // Do NOT write gossiped certificates while inactive.
+                            // The certificate store must stay causally complete (every
+                            // stored certificate has its parents stored), because DAG
+                            // recovery trusts it without a parent check
+                            // (consensus/state.rs construct_dag_from_cert_store).
+                            // An inactive node cannot check parents — its certificate
+                            // manager is not running. Writing here would create store
+                            // gaps and risk a divergent DAG on promotion/rejoin.
+                            //
                             // ExEx delivery runs on consensus-following nodes
                             // (Observer + inactive CVV), never on the active
                             // validator hot path. The certificate verified against
