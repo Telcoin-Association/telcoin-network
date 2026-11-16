@@ -253,15 +253,28 @@ fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
         None => Vec::new(),
     };
     let mut ways = String::new();
-    if !past.is_empty() {
-        ways.push_str(&format!(
+    // another node's sealed copy, checked against this node's records, puts back any past epoch
+    let import = "another node's sealed copy (`db import-epoch --epoch N --from <copy>` verifies \
+                  and installs one)";
+    match past.as_slice() {
+        [] => {}
+        // every epoch below a point lost, the shape `db load-state` leaves: it never held them
+        &[(0, last)] => ways.push_str(&format!(
             " A datadir bootstrapped with `db load-state` holds packs only from the restored epoch \
-             on. To rebuild it, put back each missing `epoch-N` directory from a backup taken \
-             after that epoch closed (epoch(s) {}; a sealed epoch's pack never changes) or another \
-             node's sealed copy (`db import-epoch --epoch N --from <copy>` verifies and installs \
-             one).",
+             on, and this one holds none below epoch {}. To get a new execution database, run \
+             `db load-state` again instead, with `db`, `static_files`, `restored-state-floor` and \
+             `consensus-db` moved aside (its import creates the restored epoch's pack and refuses \
+             a datadir that holds one; a validator then stays stopped until the network has closed \
+             the last epoch it took part in). To rebuild it, put back each missing pack (epoch(s) \
+             {}) from {import}.",
+            last + 1,
             runs(&past),
-        ));
+        )),
+        _ => ways.push_str(&format!(
+            " To rebuild it, put back each missing `epoch-N` directory from a backup taken after \
+             that epoch closed (epoch(s) {}; a sealed epoch's pack never changes) or {import}.",
+            runs(&past),
+        )),
     }
     if resume_lost {
         ways.push_str(&format!(
@@ -677,7 +690,10 @@ mod tests {
     /// every start. A pack counts only as the node's start finds it, its data log: an `epoch-N`
     /// directory without one is a gap, and an interrupted install's aside holding one fills it.
     /// The newest epoch's directory without a data log (its creation stopped first) is no gap: the
-    /// node creates it again when it enters the epoch.
+    /// node creates it again when it enters the epoch. Each lost epoch gets only the recoveries
+    /// that put it back: a backup or another node's copy for a gap between packs, and for the
+    /// shape `db load-state` leaves (no pack below the restored epoch, which it never held) a
+    /// rerun of `db load-state` or other nodes' copies, not a backup.
     #[test]
     fn a_reset_refuses_a_gap_in_the_packs() {
         let dir = datadir();
@@ -699,10 +715,14 @@ mod tests {
                 "{err}"
             );
             assert!(
-                err.contains("put back each missing `epoch-N` directory from a backup"),
+                err.contains(
+                    "each missing `epoch-N` directory from a backup taken after that epoch closed \
+                     (epoch(s) 1, 4;"
+                ),
                 "{err}"
             );
             assert!(err.contains("`db import-epoch --epoch N --from <copy>`"), "{err}");
+            assert!(!err.contains("`db load-state` again"), "{err}");
             assert!(err.contains("pass `--for-swap`"), "{err}");
             assert_eq!(
                 names(root),
@@ -725,6 +745,41 @@ mod tests {
         // the swap replays nothing below the copy's tip, so a gap does not refuse it
         fs::remove_dir_all(epochs.join("epoch-4.replaced")).unwrap();
         reset_execution(root, false, ResetMode::Swap).unwrap();
+
+        // the shape `db load-state` leaves: only the restored epoch's pack, the hint at it
+        let dir = datadir();
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        fs::remove_dir_all(epochs.join("epoch-0")).unwrap();
+        fs::remove_dir_all(epochs.join("epoch-1")).unwrap();
+        pack(&epochs.join("epoch-3"));
+        ConsensusChain::write_latest_consensus_hint(&epochs, 3, 30).unwrap();
+        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("(packs up to epoch 3) lacks the pack of epoch(s) 0..=2,"), "{err}");
+        assert!(err.contains("run `db load-state` again"), "{err}");
+        assert!(
+            err.contains(
+                "with `db`, `static_files`, `restored-state-floor` and `consensus-db` moved aside \
+                 (its import creates the restored epoch's pack and refuses a datadir that holds \
+                 one; a validator then stays stopped until the network has closed the last epoch \
+                 it took part in)"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("`db import-epoch --epoch N --from <copy>`"), "{err}");
+        assert!(!err.contains("from a backup"), "it never held them: {err}");
+        assert!(err.contains("pass `--for-swap`"), "{err}");
+
+        // the lowest pack lost too, with a gap above it: no longer that shape
+        pack(&epochs.join("epoch-1"));
+        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("lacks the pack of epoch(s) 0, 2,"), "{err}");
+        assert!(
+            err.contains("from a backup taken after that epoch closed (epoch(s) 0, 2;"),
+            "{err}"
+        );
+        assert!(err.contains("`db import-epoch --epoch N --from <copy>`"), "{err}");
+        assert!(!err.contains("`db load-state` again"), "{err}");
     }
 
     #[test]
