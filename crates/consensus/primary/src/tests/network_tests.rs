@@ -7673,7 +7673,7 @@ fn execute_outputs(
     })
 }
 
-/// The `vote path timing` line ends with the voter's execution side of the request: the block the
+/// The `vote path timing` line carries the voter's execution side of the request: the block the
 /// header names, the voter's tip on arrival and at the answer, and the block-bearing outputs it
 /// still had to execute to hold the named block. A wait that ends without the block logs the
 /// outputs executed during it with `exec_deficit_open=true`; a block reached inside the wait counts
@@ -7735,7 +7735,7 @@ async fn vote_path_timing_line_carries_exec_deficit() -> eyre::Result<()> {
     assert!(
         open.contains(
             " exec_named=3 exec_tip_arrival=0 exec_tip_answer=1 exec_deficit_outputs=1 \
-             exec_deficit_open=true"
+             exec_deficit_open=true superseded_by_round=0 superseded_after_ms=0"
         ),
         "{open}"
     );
@@ -7749,7 +7749,7 @@ async fn vote_path_timing_line_carries_exec_deficit() -> eyre::Result<()> {
     assert!(
         reached.contains(
             " exec_named=4 exec_tip_arrival=1 exec_tip_answer=4 exec_deficit_outputs=3 \
-             exec_deficit_open=false"
+             exec_deficit_open=false superseded_by_round=0 superseded_after_ms=0"
         ),
         "{reached}"
     );
@@ -7760,7 +7760,7 @@ async fn vote_path_timing_line_carries_exec_deficit() -> eyre::Result<()> {
     assert!(
         held.contains(
             " exec_named=2 exec_tip_arrival=4 exec_tip_answer=4 exec_deficit_outputs=0 \
-             exec_deficit_open=false"
+             exec_deficit_open=false superseded_by_round=0 superseded_after_ms=0"
         ),
         "{held}"
     );
@@ -7784,6 +7784,85 @@ async fn vote_path_timing_line_carries_exec_deficit() -> eyre::Result<()> {
     };
     let open: Vec<f64> = open.iter().map(|sample| sample.0).collect();
     assert_eq!(open, vec![1.0], "the outputs executed during the wait that missed the block");
+
+    Ok(())
+}
+
+// ---- bench8 vote-superseded-by ----
+
+/// A request that the same author's next header supersedes during its execution wait ends its
+/// `vote path timing` line with that header's round and the milliseconds from its own arrival to
+/// that header's arrival; a request that is not superseded logs 0 and 0. A request already below
+/// the author's newest round on arrival names that round with 0 ms: the newer request came first.
+///
+/// The stage stamps read the wall clock, so this test runs on it: about one second.
+#[tokio::test]
+async fn vote_path_timing_line_carries_superseding_request() -> eyre::Result<()> {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(LinesAt {
+        target: "primary::network",
+        level: tracing::Level::DEBUG,
+        lines: lines.clone(),
+    });
+    let timing_line = |round: Round| {
+        let key = format!(" round={round} ");
+        let lines = lines.lock();
+        lines
+            .iter()
+            .rev()
+            .find(|line| line.starts_with("vote path timing") && line.contains(&key))
+            .cloned()
+            .unwrap_or_else(|| panic!("no vote path timing line for round {round}"))
+    };
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let executed = BlockNumHash::new(parent.number(), parent.hash());
+    let unexecuted = BlockNumHash::new(parent.number() + 1, BlockHash::random());
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let gap = Duration::from_millis(300);
+    assert!(VOTE_EXECUTION_WAIT > gap * 2, "the newer request arrives well inside the wait");
+
+    // round 2 names a block that never executes and waits; round 3 arrives `gap` later naming an
+    // executed block, so round 2 is refused as superseded once its wait ends
+    let (older, newer) = tokio::join!(
+        handler.vote(peer, header_at(&committee, author, 2, unexecuted), Vec::new()),
+        async {
+            tokio::time::sleep(gap).await;
+            handler.vote(peer, header_at(&committee, author, 3, executed), Vec::new()).await
+        },
+    );
+    assert_matches!(
+        older,
+        Err(PrimaryNetworkError::SupersededRequest { round: 2, newest_round: 3, .. }),
+        "round 2 is superseded by round 3 during its wait"
+    );
+    assert!(!matches!(newer, Err(PrimaryNetworkError::SupersededRequest { .. })), "{newer:?}");
+    let superseded = timing_line(2);
+    assert!(superseded.contains(" outcome=\"superseded\" "), "{superseded}");
+    assert_eq!(line_field(&superseded, "superseded_by_round"), 3, "{superseded}");
+    let after = line_field(&superseded, "superseded_after_ms");
+    let gap_ms = u64::try_from(gap.as_millis()).expect("a short gap");
+    assert!(
+        after >= gap_ms && after <= line_field(&superseded, "total_ms"),
+        "round 3 arrived `gap` after round 2 and before its answer: {superseded}"
+    );
+    assert!(
+        superseded.find(" exec_deficit_open=") < superseded.find(" superseded_by_round="),
+        "the new fields come last: {superseded}"
+    );
+    let answered = timing_line(3);
+    assert!(!answered.contains(" outcome=\"superseded\" "), "{answered}");
+    assert!(answered.contains(" superseded_by_round=0 superseded_after_ms=0"), "{answered}");
+
+    // round 1 arrives below the author's newest round: refused at once, the newer request came
+    // first
+    let stale = handler.vote(peer, header_at(&committee, author, 1, executed), Vec::new()).await;
+    assert_matches!(stale, Err(PrimaryNetworkError::SupersededRequest { newest_round: 3, .. }));
+    let stale = timing_line(1);
+    assert!(stale.contains(" outcome=\"superseded\" "), "{stale}");
+    assert!(stale.contains(" superseded_by_round=3 superseded_after_ms=0"), "{stale}");
 
     Ok(())
 }

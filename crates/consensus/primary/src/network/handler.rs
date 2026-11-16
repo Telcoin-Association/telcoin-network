@@ -208,16 +208,18 @@ pub(crate) struct RequestHandler<DB> {
     /// in the same branch, so this keeps the warning to once per author per round. Only headers
     /// whose author passed committee validation get that far, so every key is a committee member.
     deferred_vote_warned: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
-    /// The newest `(epoch, round)` of a vote request received from each author. Read and written
-    /// only with `vote_queue_fix` on.
+    /// The newest `(epoch, round)` of a vote request received from each author, with the arrival
+    /// of the first request of that round. Read and written only with `vote_queue_fix` on.
     ///
     /// A request of the same epoch and a lower round is refused as superseded before the
     /// per-author lock, or once it takes it. An entry moves only for a request whose peer is its
     /// author, so no peer can raise another author's mark, and only for a header of this epoch
     /// at most `gc_depth` rounds past the committed round, so a far-future header cannot hold
     /// back the author's real ones. Only committee members get that far, so the map holds one
-    /// entry per member at most. The lock is never held across an await.
-    newest_vote_requests: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
+    /// entry per member at most. The lock is never held across an await. The arrival is only
+    /// logged: a request refused as superseded reports the newest round and how long after its own
+    /// arrival that round's request arrived.
+    newest_vote_requests: Arc<Mutex<HashMap<AuthorityIdentifier, NewestVoteRequest>>>,
     /// Digests of certificates this node verified recently, bounded by
     /// [`RECENTLY_VERIFIED_CERTIFICATES`].
     ///
@@ -984,6 +986,11 @@ where
             )
         };
         let exec_deficit_open = !reached;
+        // only a superseded answer names the newer request; every other outcome logs 0 and 0
+        let (superseded_by_round, superseded_after_ms) = match timing.superseded {
+            Some((newer, after)) if outcome == VoteOutcome::Superseded => (newer, millis(after)),
+            _ => (0, 0),
+        };
         self.vote_metrics.record_exec_deficit(exec_deficit_outputs, exec_deficit_open);
         match outcome {
             VoteOutcome::Created => self.vote_metrics.record_created(),
@@ -1019,6 +1026,8 @@ where
             exec_tip_answer,
             exec_deficit_outputs,
             exec_deficit_open,
+            superseded_by_round,
+            superseded_after_ms,
             "vote path timing"
         );
     }
@@ -1082,7 +1091,7 @@ where
             // `vote_inner` (the attached parents, the drift tier, the seed signature) stays under
             // the lock, so a header that fails only one of those still waits
             let in_window = self.in_vote_window(&header);
-            self.refuse_superseded_request(&header, in_window)?;
+            self.refuse_superseded_request(&header, in_window, timing)?;
             if in_window && header.validate(self.consensus_config.committee()).is_ok() {
                 timing.enter(VoteStage::PreLockWait);
                 let waited = timeout(
@@ -1097,7 +1106,7 @@ where
                     return Err(HeaderError::ClosedWatchChannel.into());
                 }
                 // a newer request from the author may have arrived during the wait
-                self.refuse_superseded_request(&header, false)?;
+                self.refuse_superseded_request(&header, false, timing)?;
             }
         }
         // We have already verified committee membership with the peer check but this will double
@@ -1162,7 +1171,7 @@ where
                 // lock: refuse it before any decision below, leaving the entry untouched. it comes
                 // after the two answers above, which hand back a vote already cast for this header
                 // and sign nothing new for an older one
-                self.refuse_superseded_request(&header, false)?;
+                self.refuse_superseded_request(&header, false, timing)?;
             }
             // put back below when this request ends without a decision on the header
             let previous_vote = auth_last_vote.clone();
@@ -1395,17 +1404,27 @@ where
     /// before the author lock and once the lock is taken. The refusal is `SupersededRequest`:
     /// recoverable, without a penalty, and never written to the author's vote state.
     ///
+    /// `timing` is this request's: a recorded mark keeps its arrival, and a refusal records the
+    /// mark's round and arrival there for the `vote path timing` line. Neither changes a decision.
+    ///
     /// On arrival it comes before the author lock, so ahead of the cached-vote answer and the
     /// stored-vote recast that run under it: a repeat of an older header this node voted for,
     /// arriving after a newer request of the same author, is refused instead of getting its vote
     /// back. Nothing is signed and the cached vote stays; the author abandoned that header when it
     /// proposed the newer one.
-    fn refuse_superseded_request(&self, header: &Header, record: bool) -> PrimaryNetworkResult<()> {
+    fn refuse_superseded_request(
+        &self,
+        header: &Header,
+        record: bool,
+        timing: &mut VoteTiming,
+    ) -> PrimaryNetworkResult<()> {
         let mut newest = self.newest_vote_requests.lock();
-        match newest.get(header.author()).copied() {
-            Some((newest_epoch, newest_round))
+        let mark = newest.get(header.author()).copied();
+        match mark {
+            Some((newest_epoch, newest_round, newest_arrival))
                 if header.epoch() == newest_epoch && header.round() < newest_round =>
             {
+                timing.superseded_by(newest_round, newest_arrival);
                 Err(PrimaryNetworkError::SupersededRequest {
                     epoch: header.epoch(),
                     round: header.round(),
@@ -1416,7 +1435,18 @@ where
             _ => {
                 // every recorded header is of this committee's epoch, so this only raises the mark
                 if record {
-                    newest.insert(header.author().clone(), (header.epoch(), header.round()));
+                    // a repeat of the newest round keeps that round's first arrival: the request
+                    // that superseded the older rounds
+                    let arrival = match mark {
+                        Some((epoch, round, arrival))
+                            if (epoch, round) == (header.epoch(), header.round()) =>
+                        {
+                            arrival
+                        }
+                        _ => timing.started,
+                    };
+                    newest
+                        .insert(header.author().clone(), (header.epoch(), header.round(), arrival));
                 }
                 Ok(())
             }
@@ -2385,6 +2415,10 @@ struct VoteTiming {
     created: bool,
     /// The stage in progress when the vote timeout fired.
     timed_out: Option<VoteStage>,
+    /// The round of the newer request of the same author that refused this one as superseded,
+    /// and the time from this request's arrival to that request's, zero when that one arrived
+    /// first.
+    superseded: Option<(Round, Duration)>,
 }
 
 impl VoteTiming {
@@ -2402,6 +2436,7 @@ impl VoteTiming {
             stages: [None; VoteStage::COUNT],
             created: false,
             timed_out: None,
+            superseded: None,
         }
     }
 
@@ -2424,6 +2459,11 @@ impl VoteTiming {
     /// Mark that this request returns a new vote.
     fn vote_created(&mut self) {
         self.created = true;
+    }
+
+    /// Record that the newer request of `round`, which arrived at `arrival`, supersedes this one.
+    fn superseded_by(&mut self, round: Round, arrival: Instant) {
+        self.superseded = Some((round, arrival.saturating_duration_since(self.started)));
     }
 
     /// Record that the vote timeout fired at `now`, ending the stage in progress and returning it.
@@ -2463,6 +2503,10 @@ impl VoteTiming {
         self.stage(stage).map_or(0, millis)
     }
 }
+
+/// An author's newest vote request: its epoch and round, and when the first request of that round
+/// arrived (the arrival is only logged).
+type NewestVoteRequest = (Epoch, Round, Instant);
 
 /// The execution side of a vote request on its arrival, logged on the `vote path timing` line.
 #[derive(Clone, Copy, Debug)]
