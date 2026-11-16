@@ -216,8 +216,7 @@ const ROUND_ENDED_CERTIFIED_LOG: &str =
     "epoch vote round ended without a local quorum; the record is already certified";
 
 /// The info line, with fields `epoch` and `gaps`, of the record collector walking past an epoch it
-/// holds uncertified once a certified record after it is stored
-/// (`epoch_record_collect_past_uncertified`).
+/// holds uncertified once a certified record after it is stored.
 const WALK_LOG: &str = "epoch record collector walking past an uncertified epoch";
 
 /// The prometheus counter of [`WALK_LOG`]'s epochs.

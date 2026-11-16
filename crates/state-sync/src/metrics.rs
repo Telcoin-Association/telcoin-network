@@ -45,8 +45,7 @@ pub(crate) struct StateSyncMetrics {
     /// Epochs a record collection walked past: each epoch this node holds as its own uncertified
     /// record that a pass skipped once a certified record after it was stored, counted when the
     /// collection opens it as a gap. The startup sync and the record collector keep separate gap
-    /// sets, and both start empty after a restart, so one epoch can count more than once. Only
-    /// with `epoch_record_collect_past_uncertified` on.
+    /// sets, and both start empty after a restart, so one epoch can count more than once.
     pub(crate) epoch_record_gap_walks_total: Counter,
     /// Walks that ended on the next epoch's record naming another parent: this node's own
     /// uncertified record differs from the one the network built on, and the walk stops there.

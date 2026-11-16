@@ -99,22 +99,20 @@ pub(crate) const PASSPHRASE: &str = "restart_test";
 /// node's `runtime_switches!` list (`crates/config/src/node.rs`).
 ///
 /// A switch that arrives later adds its entry at the end, here and in [`STACK_SWITCHES_OFF`].
-pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 6] = [
+pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 5] = [
     ("quorum_exec_block", "true"),
     ("quorum_exec_block_starved_rounds", "4"),
     ("epoch_record_recertify", "true"),
-    ("epoch_record_collect_past_uncertified", "true"),
     ("vote_queue_fix", "true"),
     ("digest_order_hold", "true"),
 ];
 
 /// Every runtime switch of the node at its default, as the `node switches` line renders it, in the
 /// order of [`STACK_SWITCHES_ON`].
-pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 6] = [
+pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 5] = [
     ("quorum_exec_block", "false"),
     ("quorum_exec_block_starved_rounds", "0"),
     ("epoch_record_recertify", "false"),
-    ("epoch_record_collect_past_uncertified", "false"),
     ("vote_queue_fix", "false"),
     ("digest_order_hold", "false"),
 ];
