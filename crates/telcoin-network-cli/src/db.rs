@@ -1363,7 +1363,10 @@ pub struct DbLoadStateArgs {
     /// against the last epoch record), and the restore's import of the consensus pack
     /// (`consensus_data`) against the last epoch records, then exit 0 if all pass. The
     /// consensus pack is imported into a directory under the temp directory (`$TMPDIR` when
-    /// set, else the system's: `/tmp` on Linux), which needs about the pack's size free and is
+    /// set, else the system's: `/tmp` on Linux), which needs the pack's size plus the node's
+    /// import floor (one default growth step of the execution database plus a margin) free
+    /// there, since a running node may share that filesystem: it refuses to start without that
+    /// room, the import stops before free space drops below the floor, and the directory is
     /// removed afterwards. On many Linux hosts `/tmp` is a RAM-backed tmpfs or a small root
     /// partition: set `TMPDIR` to a directory on a disk with room. The state data's own
     /// records are read only by the restore itself.
@@ -2011,6 +2014,7 @@ fn restore_consensus_and_records(
             bundle_consensus,
             &records[(n - 1) as usize],
             final_record,
+            0,
         )
         .await?;
 
@@ -2038,13 +2042,15 @@ fn restore_consensus_and_records(
 /// (the record of epoch N - 1) up to `final_record`'s certified final output, and confirm that the
 /// pack's tip reads back as that output. A failed import or check removes the `epoch-N` directory
 /// when this call created it, and leaves one that was there before (the restore refuses such a
-/// datadir up front: `refuse_bundle_epoch_in_place`). The restore and `--verify-only` both run
-/// this, so the check a verify-only run makes is the restore's own.
+/// datadir up front: `refuse_bundle_epoch_in_place`). The import stops before free space under
+/// `epochs_dir` drops below `min_free`. The restore and `--verify-only` both run this, so the check
+/// a verify-only run makes is the restore's own.
 async fn import_bundle_consensus(
     epochs_dir: &Path,
     bundle_consensus: &Path,
     previous: &EpochRecord,
     final_record: &EpochRecord,
+    min_free: u64,
 ) -> eyre::Result<()> {
     let n = final_record.epoch;
     let epoch_dir = epochs_dir.join(format!("epoch-{n}"));
@@ -2061,9 +2067,9 @@ async fn import_bundle_consensus(
     let file = tokio::fs::File::open(bundle_consensus)
         .await
         .map_err(|e| eyre!("failed to open consensus data {}: {e}", bundle_consensus.display()))?;
-    // No free-space floor: the floor guards the node's live stores against peer-supplied bytes,
-    // and this is the operator's own bundle into a directory nothing else is using; a real
-    // shortage surfaces as the write error.
+    // The caller picks the floor: `0` for the offline restore, whose datadir no node is using (a
+    // real shortage surfaces as the write error), and the node's import floor for `--verify-only`,
+    // which may run beside a node whose stores share the staging root's filesystem.
     let pack = ConsensusPack::stream_import_with_floor(
         epochs_dir,
         file,
@@ -2071,7 +2077,7 @@ async fn import_bundle_consensus(
         previous,
         final_record.final_consensus,
         STREAM_IMPORT_TIMEOUT,
-        0,
+        min_free,
     )
     .await
     .map_err(|e| {
@@ -2128,8 +2134,11 @@ fn verify_only_lock_warning(datadir: &impl TelcoinDirs) -> Option<String> {
 /// `db load-state --verify-only`'s check of the bundle's consensus pack: the restore's own import
 /// ([`import_bundle_consensus`]) of `bundle_consensus` against the last two of the verified
 /// `records`, run in a new staging directory under `staging_root` (the temp directory, `$TMPDIR`
-/// when set, outside the datadir), which is removed whatever the outcome. Needs about the pack's
-/// size free there, so a failure names where it staged and that `TMPDIR` moves it.
+/// when set, outside the datadir), which is removed whatever the outcome. A running node may share
+/// that filesystem, so the check keeps the node's own import floor there
+/// ([`verify_only_import_floor`]): it refuses to start without room for the pack plus the floor,
+/// and the import stops before free space drops below the floor. A failure names where it staged
+/// and that `TMPDIR` moves it.
 fn verify_bundle_consensus(
     staging_root: &Path,
     bundle_consensus: &Path,
@@ -2138,6 +2147,18 @@ fn verify_bundle_consensus(
     let [.., previous, final_record] = records else {
         bail!("the bundle's consensus pack needs the records of its epoch and the one before it");
     };
+    let floor = verify_only_import_floor();
+    let pack_len = fs::metadata(bundle_consensus)
+        .map_err(|e| eyre!("failed to read {}: {e}", bundle_consensus.display()))?
+        .len();
+    let free = tn_storage::disk::available_bytes(staging_root).map_err(|e| {
+        eyre!(
+            "cannot read the free space under the staging root {} (set TMPDIR to stage the \
+             bundle's consensus pack elsewhere): {e}",
+            staging_root.display()
+        )
+    })?;
+    staging_has_room(staging_root, free, pack_len, floor)?;
     let staging = tempfile::Builder::new()
         .prefix("tn-load-state-verify-")
         .tempdir_in(staging_root)
@@ -2161,6 +2182,7 @@ fn verify_bundle_consensus(
                 bundle_consensus,
                 previous,
                 final_record,
+                floor,
             ))
         });
     let staged = staging.path().to_path_buf();
@@ -2175,11 +2197,34 @@ fn verify_bundle_consensus(
     checked.map_err(|e| {
         e.wrap_err(format!(
             "the bundle's consensus pack {} does not restore (imported in a staging directory \
-             under {}, which needs about the pack's size free; set TMPDIR to stage it elsewhere)",
+             under {}, which needs the pack's size plus the node's import floor of {floor} bytes \
+             free; set TMPDIR to stage it elsewhere)",
             bundle_consensus.display(),
             staging_root.display()
         ))
     })
+}
+
+/// The free-space floor `--verify-only` keeps under its staging root: the node's own for a peer's
+/// import, from its execution database's default growth step (`db import-epoch` computes it the
+/// same way when `--db.growth-step` is unset).
+fn verify_only_import_floor() -> u64 {
+    tn_storage::consensus_pack::import_min_free(tn_reth::default_execution_db_growth_step())
+}
+
+/// Refuse to stage the bundle's consensus pack (`pack_len` bytes) under `staging_root` unless its
+/// `free` bytes hold the pack plus the node's import `floor`: a running node may share that
+/// filesystem, and a write or growth step of its own stores that fails stops it.
+fn staging_has_room(staging_root: &Path, free: u64, pack_len: u64, floor: u64) -> eyre::Result<()> {
+    if free < pack_len.saturating_add(floor) {
+        bail!(
+            "the staging root {} has {free} bytes free; checking this bundle needs its consensus \
+             pack's {pack_len} bytes plus the node's import floor of {floor} bytes, since a running \
+             node may share this filesystem: set TMPDIR to a directory with room",
+            staging_root.display()
+        );
+    }
+    Ok(())
 }
 
 /// Verify each bundle record against its certificate and save it into `db`, rebuilding the indexed
@@ -4457,6 +4502,23 @@ mod tests {
         assert_eq!(super::verify_only_lock_warning(&fresh_path), None, "no lock, no warning");
     }
 
+    /// `--verify-only` stages the bundle's consensus pack only where the free space holds the pack
+    /// plus the node's import floor: one byte short refuses, naming `TMPDIR`; exactly enough
+    /// passes.
+    #[test]
+    fn verify_only_staging_needs_room_for_the_pack_and_the_import_floor() {
+        let root = Path::new("/staging");
+        let (pack, floor) = (1_000, 1 << 30);
+        let err = super::staging_has_room(root, pack + floor - 1, pack, floor)
+            .expect_err("one byte short");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("TMPDIR") && msg.contains("/staging"), "{msg}");
+        assert!(msg.contains(&format!("import floor of {floor} bytes")), "{msg}");
+        super::staging_has_room(root, pack + floor, pack, floor).expect("exactly enough");
+        let saturated = super::staging_has_room(root, u64::MAX, u64::MAX, floor);
+        assert!(saturated.is_ok(), "no overflow: {saturated:?}");
+    }
+
     /// A datadir for `db load-state` whose genesis committee is `signers`, with node info, no chain
     /// data and the (empty) lockfile a run leaves, so a run that changes nothing else leaves it
     /// byte-identical.
@@ -4533,6 +4595,7 @@ mod tests {
                 &bundle.path().join("consensus_data"),
                 &records[1],
                 &records[2],
+                0,
             ))
             .expect_err("the import does not replace a pack in place");
         assert!(format!("{err:#}").contains("consensus stream import"), "{err:#}");

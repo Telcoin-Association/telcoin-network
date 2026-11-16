@@ -5737,9 +5737,10 @@ impl Drop for ImportSlot {
 ///
 /// The floor holds the import's slot in an imports-in-flight counter (the process-wide
 /// [`IMPORTS_IN_FLIGHT`] in production) from its creation until it drops, when the import's
-/// blocking half returns, whatever its outcome. A floor of `0` takes no slot: it never checks, and
-/// its only user is `db load-state`'s restore, which runs offline in its own process, where no
-/// floored import runs beside it.
+/// blocking half returns, whatever its outcome. A floor of `0` takes no slot: it never checks. It
+/// is `db load-state`'s restore's alone, which runs offline in its own process, where no floored
+/// import runs beside it; `db load-state --verify-only`, which may run beside a node, keeps the
+/// node's floor.
 ///
 /// The import's blocking half checks the floor as its data log grows; the reader's task checks it
 /// again on a clock ([`ImportClock`], from [`Self::clock`]), with the data length the blocking half

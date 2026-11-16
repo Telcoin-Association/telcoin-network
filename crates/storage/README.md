@@ -294,7 +294,8 @@ at least `IMPORT_MIN_PROGRESS_BYTES` per `IMPORT_PROGRESS_WINDOW` (progress in w
 records are re-encoded with zstd and the bytes a peer streams say nothing about the disk it holds), or it
 stops as `ImportStalled`, which the fetcher charges to the peer; a stream declared uncompressed is
 refused (every pack writer compresses with zstd). A stopped import's files are removed only after its
-blocking half stopped writing them. `db load-state`'s restore of a local bundle has no floor and no clock;
+blocking half stopped writing them. `db load-state`'s restore of a local bundle has no floor and no clock
+(its `--verify-only`, which may run beside a node, keeps the node's floor);
 the imported pack is sealed before `pack_install` is taken, and the live (writable) epoch is replaced
 only with its stored record's chain, anything else, such as a prefix's partial final, being refused as
 `LiveEpochImport`), and drives epoch handoff.
