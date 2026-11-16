@@ -208,10 +208,10 @@ enum DbSubcommand {
     /// `execution-reset-<UTC time>` under the datadir (renames, never deletes: moving them back
     /// undoes it); the consensus database, keys and config stay. The node MUST be stopped: it
     /// refuses while a node holds the datadir, and holds the datadir while it runs. Refuses a
-    /// datadir whose consensus database lacks the pack of an epoch below its latest one that the
-    /// node cannot fetch again, one at or below the epoch it resumes from (one bootstrapped with
-    /// `db load-state` lacks every epoch below the restored one): the rebuild re-executes every
-    /// epoch from 0 from the node's own packs. A missing pack after the resume epoch passes, as
+    /// datadir whose consensus database lacks the pack of an epoch the node cannot fetch again,
+    /// one at or below the epoch it resumes from (one bootstrapped with `db load-state` lacks
+    /// every epoch below the restored one): the rebuild re-executes every epoch from 0 from the
+    /// node's own packs. A missing pack after the resume epoch passes, as
     /// the next start fetches it from peers. `--for-swap` skips that refusal
     /// for the side-observer swap. Refuses, in both modes, a datadir an unfinished `db load-state`
     /// left, as the node does. Without `--force` it prints what would move and changes nothing.

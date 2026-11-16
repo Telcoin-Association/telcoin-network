@@ -16,10 +16,10 @@
 //! an interrupted reset into the same directory.
 //!
 //! The rebuild re-executes every epoch from 0 from the node's own consensus packs, so the command
-//! refuses a datadir whose consensus database lacks the pack of an epoch below its latest one that
-//! the node cannot fetch again, at or below the epoch it resumes from ([`refuse_missing_packs`]): a
-//! datadir bootstrapped with `db load-state` (no pack below the restored epoch), or one that lost a
-//! past pack. The side-observer swap moves the execution database
+//! refuses a datadir whose consensus database lacks the pack of an epoch the node cannot fetch
+//! again, one at or below the epoch it resumes from ([`refuse_missing_packs`]): a datadir
+//! bootstrapped with `db load-state` (no pack below the restored epoch), or one that lost a past
+//! pack or the resume epoch's. The side-observer swap moves the execution database
 //! aside to copy in a synced observer's, which replays nothing below the copy's tip, so it skips
 //! that check ([`ResetMode::Swap`]). Both refuse a datadir an unfinished `db load-state` left, as
 //! the node does ([`refuse_interrupted_load_state`]): what they would move aside is half a restore,
@@ -127,16 +127,20 @@ fn pack_epoch(name: &str) -> Option<Epoch> {
     name.strip_prefix("epoch-")?.parse().ok()
 }
 
-/// The epochs from 0 to the latest of `present` (ascending, deduplicated) that it lacks, as
-/// inclusive ranges `(first, last)`.
-fn missing_ranges(present: &[Epoch]) -> Vec<(Epoch, Epoch)> {
+/// The epochs from 0 to `end` that `present` (ascending, deduplicated) lacks, as inclusive ranges
+/// `(first, last)`.
+fn missing_ranges(present: &[Epoch], end: Epoch) -> Vec<(Epoch, Epoch)> {
     let mut ranges = Vec::new();
-    let mut next = 0;
-    for &epoch in present {
-        if epoch > next {
-            ranges.push((next, epoch - 1));
+    // the first epoch not yet accounted for; `None` past the last epoch there is
+    let mut next = Some(0);
+    for &epoch in present.iter().take_while(|&&epoch| epoch <= end) {
+        if let Some(first) = next.filter(|&first| epoch > first) {
+            ranges.push((first, epoch - 1));
         }
-        next = epoch.saturating_add(1);
+        next = epoch.checked_add(1);
+    }
+    if let Some(first) = next.filter(|&first| first <= end) {
+        ranges.push((first, end));
     }
     ranges
 }
@@ -183,19 +187,19 @@ fn runs(ranges: &[(Epoch, Epoch)]) -> String {
         .join(", ")
 }
 
-/// Refuse a datadir whose consensus database lacks the pack of an epoch below the latest one it
-/// holds that the node cannot fetch again: one at or below the epoch it resumes from
-/// ([`ConsensusChain::resume_epoch`], the latest-consensus hint; genesis without one, as the node's
-/// start does). After a reset the node re-executes every epoch from 0 from its own packs. Its start
-/// opens the resume epoch's pack, refusing to start without it, and state-sync fetches from peers
-/// only the packs of the recorded epochs after it (`request_missing_packs`), so a missing pack at
-/// or below it would stop every start. A datadir bootstrapped with `db load-state` is one (it holds
-/// consensus only from the restored epoch on, where its hint points), and so is one that lost a
-/// past pack. A missing pack above the resume epoch (a catch-up stopped while several imports ran)
-/// is fetched again by the next start, so it passes, and a refusal for the others names it apart.
-/// A pack is present as the node's start finds it ([`ConsensusChain::pack_data_at_start`]: the
-/// epoch's data log, the one an interrupted install moved aside included). A datadir with no pack
-/// at all starts as a new node does and syncs from genesis, so it passes.
+/// Refuse a datadir whose consensus database lacks the pack of an epoch the node cannot fetch
+/// again: one at or below the epoch it resumes from ([`ConsensusChain::resume_epoch`], the
+/// latest-consensus hint; genesis without one, as the node's start does). After a reset the node
+/// re-executes every epoch from 0 from its own packs. Its start opens the resume epoch's pack,
+/// refusing to start without it past epoch 0, and state-sync fetches from peers only the packs of
+/// the recorded epochs after it (`request_missing_packs`), so a missing pack at or below it would
+/// stop every start. A datadir bootstrapped with `db load-state` is one (it holds consensus only
+/// from the restored epoch on, where its hint points), and so is one that lost a past pack or the
+/// resume epoch's. A missing pack above the resume epoch (a catch-up stopped while several imports
+/// ran) is fetched again by the next start, so it passes, and a refusal for the others names it
+/// apart. A pack is present as the node's start finds it ([`ConsensusChain::pack_data_at_start`]:
+/// the epoch's data log, the one an interrupted install moved aside included). A datadir with no
+/// pack and no hint past epoch 0 starts as a new node does and syncs from genesis, so it passes.
 fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
     let epochs = datadir.to_path_buf().epochs_db_path();
     if !exists(&epochs)? {
@@ -216,13 +220,23 @@ fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
     }
     present.sort_unstable();
     present.dedup();
-    let Some(latest) = present.last() else { return Ok(()) };
     let resume = ConsensusChain::resume_epoch(&epochs).unwrap_or(0);
-    let missing = split_ranges(&missing_ranges(&present), resume);
+    // the start opens the resume epoch's pack past epoch 0, so a missing one counts even above
+    // every pack the datadir holds
+    let end = match present.last() {
+        Some(&latest) => latest.max(resume),
+        None if resume > 0 => resume,
+        None => return Ok(()),
+    };
+    let missing = split_ranges(&missing_ranges(&present, end), resume);
     if missing.at_or_below.is_empty() {
         return Ok(());
     }
     let lost = runs(&missing.at_or_below);
+    let held = match present.last() {
+        Some(latest) => format!("packs up to epoch {latest}"),
+        None => "no pack".to_string(),
+    };
     let fetched = if missing.above.is_empty() {
         String::new()
     } else {
@@ -232,20 +246,47 @@ fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
             runs(&missing.above)
         )
     };
+    // the resume epoch is the one the node writes: no copy of a closed epoch puts it back
+    let resume_lost = missing.at_or_below.last().is_some_and(|&(_, last)| last == resume);
+    let past = match resume.checked_sub(1) {
+        Some(below) => split_ranges(&missing.at_or_below, below).at_or_below,
+        None => Vec::new(),
+    };
+    let mut ways = String::new();
+    if !past.is_empty() {
+        ways.push_str(&format!(
+            " A datadir bootstrapped with `db load-state` holds packs only from the restored epoch \
+             on. To rebuild it, put back each missing `epoch-N` directory from a backup taken \
+             after that epoch closed (epoch(s) {}; a sealed epoch's pack never changes) or another \
+             node's sealed copy (`db import-epoch --epoch N --from <copy>` verifies and installs \
+             one).",
+            runs(&past),
+        ));
+    }
+    if resume_lost {
+        ways.push_str(&format!(
+            " Epoch {resume} is the epoch the node resumes, whose pack it writes: neither a backup \
+             taken after an epoch closed nor `db import-epoch` (which refuses that epoch) puts its \
+             pack back. Restore the whole `consensus-db` from a backup taken with the node stopped \
+             (a validator whose whole `consensus-db/` is restored stays stopped until the network \
+             has closed the epoch it was last in)."
+        ));
+    }
+    let swap_too = if resume_lost && resume > 0 {
+        format!(" (its start opens the pack of epoch {resume} too)")
+    } else {
+        String::new()
+    };
     bail!(
         "{} cannot rebuild its execution database from genesis: the rebuild re-executes every \
-         epoch from 0 from this datadir's own consensus packs, and its consensus database (packs \
-         up to epoch {latest}) lacks the pack of epoch(s) {lost}, so every start would stop at the \
-         first missing one: the node resumes from epoch {resume}, its start opens that epoch's \
-         pack, and it fetches only the packs of the epochs after it.{fetched} A datadir \
-         bootstrapped with `db load-state` holds packs only from the restored epoch on. To \
-         rebuild it, put back each missing `epoch-N` directory from a backup taken after that \
-         epoch closed (epoch(s) {lost}; a sealed epoch's pack never changes) or another node's \
-         sealed copy (`db import-epoch --epoch N --from <copy>` verifies and installs one), \
-         or move `consensus-db` aside as well, so the node syncs from genesis as a new one does (a \
-         validator then stays stopped until the network has closed the last epoch it took part \
-         in). For the side-observer swap, which copies a synced observer's execution database in \
-         instead of rebuilding, pass `--for-swap`",
+         epoch from 0 from this datadir's own consensus packs, and its consensus database ({held}) \
+         lacks the pack of epoch(s) {lost}, so every start would stop at the first missing one: \
+         the node resumes from epoch {resume}, its start opens that epoch's pack, and it fetches \
+         only the packs of the epochs after it.{fetched}{ways} Or start over: move `consensus-db` \
+         aside as well, so the node syncs from genesis as a new one does (a validator then stays \
+         stopped until the network has closed the last epoch it took part in). For the \
+         side-observer swap, which copies a synced observer's execution database in instead of \
+         rebuilding, pass `--for-swap`{swap_too}",
         datadir.display(),
     )
 }
@@ -688,16 +729,20 @@ mod tests {
 
     #[test]
     fn missing_epochs_print_as_runs() {
-        assert!(missing_ranges(&[]).is_empty());
-        assert!(missing_ranges(&[0, 1, 2]).is_empty());
-        assert_eq!(runs(&missing_ranges(&[3])), "0..=2");
-        assert_eq!(runs(&missing_ranges(&[0, 2, 3, 7])), "1, 4..=6");
-        assert_eq!(runs(&missing_ranges(&[1])), "0");
+        assert!(missing_ranges(&[0, 1, 2], 2).is_empty());
+        assert_eq!(runs(&missing_ranges(&[3], 3)), "0..=2");
+        assert_eq!(runs(&missing_ranges(&[0, 2, 3, 7], 7)), "1, 4..=6");
+        assert_eq!(runs(&missing_ranges(&[1], 1)), "0");
+        // through an end past every pack held, and not past the end
+        assert_eq!(runs(&missing_ranges(&[], 5)), "0..=5");
+        assert_eq!(runs(&missing_ranges(&[0, 1], 3)), "2..=3");
+        assert_eq!(runs(&missing_ranges(&[0, 2, 9], 5)), "1, 3..=5");
+        assert_eq!(missing_ranges(&[Epoch::MAX], Epoch::MAX), [(0, Epoch::MAX - 1)]);
     }
 
     #[test]
     fn missing_epochs_split_at_the_resume_epoch() {
-        let ranges = missing_ranges(&[0, 2, 3, 7]);
+        let ranges = missing_ranges(&[0, 2, 3, 7], 7);
         let split = |epoch| split_ranges(&ranges, epoch);
         assert_eq!(split(0), SplitRanges { at_or_below: vec![], above: vec![(1, 1), (4, 6)] });
         assert_eq!(split(1), SplitRanges { at_or_below: vec![(1, 1)], above: vec![(4, 6)] });
@@ -747,6 +792,44 @@ mod tests {
         );
         pack(&epochs.join("epoch-2"));
         reset_execution(root, false, ResetMode::Rebuild).expect("only epoch 4 is missing");
+    }
+
+    /// The pack of the epoch the node resumes from is one its start opens, so a missing one
+    /// refuses a rebuild even with no pack after it, by the dry run too, and nothing moves. The
+    /// refusal names it apart: the node writes that epoch, so neither a backup taken after an
+    /// epoch closed nor `db import-epoch` puts it back. With no pack at all, a hint past epoch 0
+    /// refuses every epoch up to it; with no slot files either the datadir starts as a new node
+    /// does and passes.
+    #[test]
+    fn a_reset_refuses_a_missing_resume_epoch_pack() {
+        let dir = datadir();
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        for epoch in 2..=4 {
+            pack(&epochs.join(format!("epoch-{epoch}")));
+        }
+        ConsensusChain::write_latest_consensus_hint(&epochs, 5, 50).unwrap();
+        for force in [false, true] {
+            let err =
+                format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
+            assert!(err.contains("(packs up to epoch 4) lacks the pack of epoch(s) 5,"), "{err}");
+            assert!(err.contains("Epoch 5 is the epoch the node resumes"), "{err}");
+            assert!(err.contains("Restore the whole `consensus-db`"), "{err}");
+            assert!(!err.contains("`db import-epoch --epoch N"), "no past epoch is lost: {err}");
+            assert_eq!(names(root).len(), 6, "nothing moved: {:?}", names(root));
+        }
+
+        for epoch in 0..=4 {
+            fs::remove_dir_all(epochs.join(format!("epoch-{epoch}"))).unwrap();
+        }
+        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("(no pack) lacks the pack of epoch(s) 0..=5,"), "{err}");
+        assert!(err.contains("Epoch 5 is the epoch the node resumes"), "{err}");
+
+        for slot in ["consensus_slot1", "consensus_slot2"] {
+            let _ = fs::remove_file(epochs.join(slot));
+        }
+        reset_execution(root, false, ResetMode::Rebuild).expect("a new node's datadir");
     }
 
     /// The side-observer swap (`--for-swap`) moves the execution database of a datadir whose
