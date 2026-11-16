@@ -5,7 +5,7 @@
 
 use super::{gc::GarbageCollector, pending_cert_manager::PendingCertificateManager};
 use crate::{
-    aggregators::certificates::CertificatesAggregatorManager,
+    aggregators::certificates::{CertificateSource, CertificatesAggregatorManager},
     certificate_fetcher::CertificateFetcherCommand,
     consensus::gc_round,
     error::{CertManagerError, CertManagerResult, GarbageCollectorError},
@@ -236,6 +236,8 @@ where
         // write certificates to storage
         self.config.node_storage().write_all(certificates.iter())?;
 
+        // this node's own certificates are told apart on the `certificate accepted` line
+        let own_id = self.config.authority_id();
         for cert in certificates.into_iter() {
             // NOTE: these next two steps are considered critical
             //
@@ -243,8 +245,13 @@ where
             // certificate store
             //
             // append parent for round
+            let source = if own_id.as_ref() == Some(cert.origin()) {
+                CertificateSource::Own
+            } else {
+                CertificateSource::Peer
+            };
             self.parents
-                .append_certificate(cert.clone(), self.config.committee())
+                .append_certificate(cert.clone(), self.config.committee(), source)
                 .await
                 .inspect_err(|e| {
                     error!(target: "primary::cert_manager", ?e, "failed to append cert");
@@ -292,7 +299,13 @@ where
 
         // update parents
         for certificate in last_round_certificates {
-            self.parents.append_certificate(certificate, self.config.committee()).await?;
+            self.parents
+                .append_certificate(
+                    certificate,
+                    self.config.committee(),
+                    CertificateSource::Recovered,
+                )
+                .await?;
         }
 
         Ok(())
