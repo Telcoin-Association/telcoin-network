@@ -6,6 +6,7 @@
 mod basefee;
 mod clock_skew;
 mod common;
+mod digest_order_hold;
 mod eject;
 mod epoch_close_forms;
 mod epoch_record_walk;

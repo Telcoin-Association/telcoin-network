@@ -12,7 +12,7 @@ use super::{
     fleet::{
         all_validators, assert_epoch_records, assert_switches, expected_switches, log_str_field,
         node_epoch, wait_for_epoch_on_all, Fleet, Load, CANARY_LOG, EXECUTION_DELAY_ENV,
-        LOAD_START_TIMEOUT, STACK_SWITCHES_ON,
+        LOAD_START_TIMEOUT, PRODUCTION_CADENCE, SLOW_EXECUTION_DELAY_MS, STACK_SWITCHES_ON,
     },
 };
 use e2e_tests::FleetOverrides;
@@ -29,17 +29,6 @@ const FAST_NODE: usize = 0;
 /// The validators whose engines sleep before every output with batches; 2f+1 = 3 of the four, so
 /// they certify each other's headers without [`FAST_NODE`], the shape of bench 5 at f = 1.
 const SLOW_NODES: [usize; 3] = [1, 2, 3];
-
-/// Milliseconds each of [`SLOW_NODES`] sleeps before it executes an output with batches.
-///
-/// At [`PRODUCTION_CADENCE`] a round lasts about 0.9 s and an output commits every two rounds,
-/// about 1.8 s. The delay is longer than a round, so a slow voter reaches the block a fresh fast
-/// header names only after the fast node has moved on, and shorter than the commit interval, so
-/// the slow nodes keep pace and trail the fast node by one or two outputs, inside the quorum rule's
-/// floor of eight ring entries. A delay longer than the commit interval makes the slow nodes' lag
-/// grow without bound; past the floor the fix cannot help by design (measured at the quick cadence:
-/// the adaptive arm then certified 0.59 of the fast node's headers, nearly all named at the floor).
-const SLOW_EXECUTION_DELAY_MS: u64 = 1750;
 
 /// How long each arm of [`test_fast_executor_is_certified`] measures under load: about 100 rounds.
 const MEASURE_WINDOW: Duration = Duration::from_secs(90);
@@ -96,16 +85,6 @@ impl ExecArm {
         expected_switches(self.switches())
     }
 }
-
-/// The node's own defaults for its header and batch cadence, in place of the e2e harness's quick
-/// one (headers every 250 to 500 ms, batches every 250 ms).
-///
-/// At the quick cadence a round lasts about 200 ms and a slow voter must trail the fast node by
-/// more than that to miss its header, yet by less than the commit interval of about 400 ms to keep
-/// up: a margin a loaded host does not keep. At about a second a round, both margins are about half
-/// a second.
-const PRODUCTION_CADENCE: [(&str, &str); 3] =
-    [("min_header_delay", "1s"), ("max_header_delay", "2500ms"), ("max_batch_delay", "1s")];
 
 /// The most own headers, as a share of those it proposed in the window, the fast validator may
 /// certify in the control for the run to show the starvation the fix removes (measured 0.61 to
