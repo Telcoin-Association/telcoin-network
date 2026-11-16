@@ -455,6 +455,10 @@ impl<DB: Database> Certifier<DB> {
                                 Err(e) => {
                                     error!(target: "primary::certifier", "received an invalid vote from {authority_id:?}: {e:?}");
                                     self.metrics.invalid_votes_total.increment(1);
+                                    // the request task already listed this answer as an arrival
+                                    // of the voter it asked; the error goes under that voter too,
+                                    // so the round's line shows the voter in both lists
+                                    vote_round.answer(&name, "invalid_vote");
                                     None
                                 }
                             }
