@@ -51,8 +51,9 @@ impl LedgerRows {
     }
 
     /// Remove and return the digests of `reporter` that were counted more than
-    /// [`MAX_GC_DEPTH`] committed rounds ago. Such a batch can no longer be committed: its
-    /// certificate left the DAG.
+    /// [`MAX_GC_DEPTH`] committed rounds ago. A batch whose certificate is that old left the DAG
+    /// and can no longer be committed, but an aged digest may have no header yet and still commit
+    /// later (see [`ReportedBatchLedger`]).
     fn age_out(&mut self, reporter: &BlsPublicKey) -> Vec<B256> {
         let horizon = self.committed_round.saturating_sub(MAX_GC_DEPTH);
         let aged: Vec<B256> = self
@@ -108,9 +109,15 @@ impl LedgerRows {
 /// A commit removes the committed digests through [`Self::forget`], which also records the
 /// committed round. When a key is at the bound, the digests counted more than
 /// [`MAX_GC_DEPTH`] committed rounds earlier age out, and the caller deletes their rows from
-/// `NodeBatchesCache`. Such a batch can no longer be committed, so the age-out covers failed
-/// seals, reporter restarts, failed evictions and late re-stores of committed batches. The vote
-/// path fetches a deleted body again if a header needs it.
+/// `NodeBatchesCache`. The age-out covers failed seals, reporter restarts, failed evictions and
+/// late re-stores of committed batches, which can no longer be committed. It also drops a batch
+/// that its author still holds queued with no header yet, such as a digest of a lane held by the
+/// own-chain order hold (issue #1807): the digest was counted when its author sealed and
+/// reported it, and it keeps its slot until it commits. When the key is at the bound and the
+/// count is older than the age-out depth, the stored body is deleted although the batch can
+/// still commit. A voter does not refuse the header that later carries it: the age-out leaves
+/// the `Payload` row that the vote checks. Execution fetches the deleted body again from a peer;
+/// the author keeps its copy.
 ///
 /// The node builds one ledger per epoch and shares it with every worker, so the bound is one
 /// per committee key for the whole node, like [`tn_types::MAX_HEADER_NUM_OF_BATCHES`]. The
