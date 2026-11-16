@@ -1,7 +1,7 @@
 //! Aggregate votes after proposing a header.
 
 use parking_lot::Mutex;
-use std::{collections::HashSet, fmt::Write as _, sync::Arc, time::Instant};
+use std::{collections::HashSet, fmt, sync::Arc, time::Instant};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
@@ -151,12 +151,20 @@ impl VoteRound {
         }
     }
 
-    /// End the round and render its answers. Later answers are not listed, and a second call
-    /// renders the same answers.
+    /// End the round and copy out its answers and tally. Later answers are not listed, and a second
+    /// call copies the same answers.
+    ///
+    /// The lock is held only for the copy (each list has at most one entry per voter); the lists are
+    /// rendered when the line that ends the round is written, and not at all when it is disabled.
     pub(crate) fn finish(&self) -> VoteRoundEnd {
         let mut answers = self.answers.lock();
         answers.ended = true;
-        answers.render()
+        VoteRoundEnd {
+            arrivals: VoteArrivals(answers.arrivals.clone()),
+            errors: VoteErrors(answers.errors.clone()),
+            votes: answers.votes,
+            stake: answers.stake,
+        }
     }
 }
 
@@ -186,23 +194,63 @@ impl RoundVoter {
     }
 }
 
-/// A vote round's answers, rendered for the line that ends the round.
+/// A vote round's answers, copied for the line that ends the round; each list renders through
+/// `Display`, so a disabled line renders nothing.
 ///
 /// A voter is rendered as its full authority id (base58, which has no `:` or `,`).
 #[derive(Debug)]
 pub(crate) struct VoteRoundEnd {
     /// `[voter:ms,…]`: every voter whose vote reached this node before the round ended, in arrival
     /// order, with the milliseconds since the round's requests were sent; `[]` if none.
-    pub(crate) arrivals: String,
+    pub(crate) arrivals: VoteArrivals,
     /// `[voter:first_ms:last_ms:kind:count,…]`: every voter that answered other than with a vote
     /// before the round ended, in the order of its first such answer, with the milliseconds of its
     /// first and latest such answer, the outcome code of the latest and how many there were; `[]`
     /// if none.
-    pub(crate) errors: String,
+    pub(crate) errors: VoteErrors,
     /// The votes the round counted, this node's own included; 0 for a round that never started.
     pub(crate) votes: usize,
     /// The voting power of those votes.
     pub(crate) stake: VotingPower,
+}
+
+/// The votes of an ended round, in arrival order, rendered as `[voter:ms,…]`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VoteArrivals(Vec<(AuthorityIdentifier, u64)>);
+
+impl fmt::Display for VoteArrivals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (index, (voter, ms)) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{voter}:{ms}")?;
+        }
+        f.write_str("]")
+    }
+}
+
+/// The answers other than votes of an ended round, in the order of each voter's first such answer,
+/// rendered as `[voter:first_ms:last_ms:kind:count,…]`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VoteErrors(Vec<VoteRoundError>);
+
+impl fmt::Display for VoteErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (index, listed) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            write!(
+                f,
+                "{}:{}:{}:{}:{}",
+                listed.voter, listed.first_ms, listed.last_ms, listed.kind, listed.count
+            )?;
+        }
+        f.write_str("]")
+    }
 }
 
 /// What a [`VoteRound`] holds behind its lock.
@@ -271,36 +319,10 @@ impl VoteRoundAnswers {
             }),
         }
     }
-
-    /// Render both lists and the tally.
-    fn render(&self) -> VoteRoundEnd {
-        // writing to a string cannot fail, so the results of `write!` are discarded
-        let mut arrivals = String::from("[");
-        for (index, (voter, ms)) in self.arrivals.iter().enumerate() {
-            if index > 0 {
-                arrivals.push(',');
-            }
-            let _ = write!(arrivals, "{voter}:{ms}");
-        }
-        arrivals.push(']');
-        let mut errors = String::from("[");
-        for (index, listed) in self.errors.iter().enumerate() {
-            if index > 0 {
-                errors.push(',');
-            }
-            let _ = write!(
-                errors,
-                "{}:{}:{}:{}:{}",
-                listed.voter, listed.first_ms, listed.last_ms, listed.kind, listed.count
-            );
-        }
-        errors.push(']');
-        VoteRoundEnd { arrivals, errors, votes: self.votes, stake: self.stake }
-    }
 }
 
 /// One voter's answers, other than votes, in a vote round.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct VoteRoundError {
     /// The voter.
     voter: AuthorityIdentifier,
@@ -332,8 +354,8 @@ mod tests {
         }
         round.set_tally(3, 3);
         let end = round.finish();
-        assert_eq!(end.arrivals, format!("[{c}:41,{b}:44]"));
-        assert_eq!(end.errors, format!("[{a}:5:260:refused:2,{b}:60:60:missing_parents:1]"));
+        assert_eq!(end.arrivals.to_string(), format!("[{c}:41,{b}:44]"));
+        assert_eq!(end.errors.to_string(), format!("[{a}:5:260:refused:2,{b}:60:60:missing_parents:1]"));
         assert_eq!((end.votes, end.stake), (3, 3));
 
         // the round has ended: later answers and tallies are not listed
@@ -346,7 +368,7 @@ mod tests {
 
         // a round that never started renders empty lists and no votes
         let never = VoteRound::default().finish();
-        assert_eq!((never.arrivals.as_str(), never.errors.as_str()), ("[]", "[]"));
+        assert_eq!(format!("{} {}", never.arrivals, never.errors), "[] []");
         assert_eq!((never.votes, never.stake), (0, 0));
     }
 
@@ -365,10 +387,11 @@ mod tests {
             }
         }
         let end = round.finish();
-        assert_eq!(end.arrivals.split(',').count(), voters.len());
-        assert_eq!(end.errors.split(',').count(), voters.len());
-        assert!(end.arrivals.starts_with(&format!("[{}:1000,{}:1001,", voters[0], voters[1])));
-        assert!(end.errors.starts_with(&format!("[{}:0:200:deferred:3,", voters[0])));
-        assert!(end.arrivals.ends_with(&format!("{}:1009]", voters[9])));
+        let (arrivals, errors) = (end.arrivals.to_string(), end.errors.to_string());
+        assert_eq!(arrivals.split(',').count(), voters.len());
+        assert_eq!(errors.split(',').count(), voters.len());
+        assert!(arrivals.starts_with(&format!("[{}:1000,{}:1001,", voters[0], voters[1])));
+        assert!(errors.starts_with(&format!("[{}:0:200:deferred:3,", voters[0])));
+        assert!(arrivals.ends_with(&format!("{}:1009]", voters[9])));
     }
 }
