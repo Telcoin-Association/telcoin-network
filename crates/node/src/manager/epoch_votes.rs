@@ -3709,6 +3709,68 @@ mod epoch_vote_collector_tests {
         }
     }
 
+    /// Row `(false, true)` of `test_startup_rearm_recertifies_behind_a_certified_latest_record` run
+    /// through the collector, this node in every committee: the certified latest record the startup
+    /// re-arm arms gets no vote of this node's own (the collector's `cert_by_digest` guard), while
+    /// the close it runs re-votes the previous record (the failsafe) and the pick's older record,
+    /// candidate 2 % 1 = 0 of {0}.
+    #[tokio::test]
+    async fn test_startup_rearm_casts_no_own_vote_for_a_certified_latest_record() {
+        let (committee, keys) = four_keys();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("startup_rearm_no_own_vote").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        let records: Vec<EpochRecord> = (0..=2)
+            .map(|epoch| EpochRecord {
+                epoch,
+                committee: committee.clone(),
+                next_committee: committee.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let db = consensus_chain.epochs();
+        for record in &records[..2] {
+            db.save_record(record.clone()).await.unwrap();
+        }
+        db.save(records[2].clone(), stored_cert(&records[2], &keys[0])).await.unwrap();
+        db.persist().await.unwrap();
+        let (primary_network, published) = spawn_quiet_network();
+        let consensus_bus = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::new();
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            keys[0].clone(),
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.clone(),
+        );
+
+        let record_watch = consensus_bus.app().epoch_record_watch();
+        revote_uncertified_epoch_record_on_startup(db, record_watch).await;
+        assert_eq!(
+            record_watch.borrow().as_ref().map(|record| record.digest()),
+            Some(records[2].digest()),
+            "the certified latest record is armed",
+        );
+        wait_until(Duration::from_secs(5), "the re-votes for epochs 0 and 1 gossiped", || async {
+            Ok([0, 1].iter().all(|epoch| published.lock().iter().any(|vote| vote.epoch == *epoch)))
+        })
+        .await
+        .unwrap();
+        // an own vote for epoch 2 would go out INITIAL_VOTE_PUBLISH_DELAY after the re-votes
+        tokio::time::sleep(INITIAL_VOTE_PUBLISH_DELAY * 4).await;
+        node_shutdown.notify();
+        let votes = published.lock().clone();
+        assert!(votes.iter().all(|vote| vote.public_key == committee[0]), "only our votes");
+        let epochs: BTreeSet<Epoch> = votes.iter().map(|vote| vote.epoch).collect();
+        assert_eq!(epochs, BTreeSet::from([0, 1]), "no own vote for the certified epoch 2");
+    }
+
     /// The epochs of the queued round senders after `handle_new_vote` starts a round for epoch 1
     /// with rounds already queued for epochs 10, 4, 6, 7 and 8; with `ended`, the round of epoch 6
     /// has ended (its receiver is gone).
