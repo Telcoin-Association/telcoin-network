@@ -518,9 +518,10 @@ never read as "not found" or healthy; the node's next start puts it back
 (`ConsensusChain::recover_incomplete_installs`), and `db repair --force` runs that same step first,
 then checks the restored epoch with the others. `telcoin-network db import-epoch --epoch N --from
 <copy> [--force]` puts back one past epoch's pack from a copy at rest
-(`ConsensusChain::import_epoch_at_rest`, `consensus/at_rest_import.rs`): the copy's data log up to
-its last complete output (`wal_consistent_end`; a sealed log ends with its sentinel, which no peer
-serves) goes through the peer import's own staged path (`ConsensusChain::import_sealed`, the
+(`ConsensusChain::import_epoch_at_rest`, `consensus/at_rest_import.rs`; a legacy v0 copy is refused
+by its format, naming its conversion by `db migrate --force` in a scratch datadir): the copy's data
+log up to its last complete output (`wal_consistent_end`; a sealed log ends with its sentinel, which
+no peer serves) goes through the peer import's own staged path (`ConsensusChain::import_sealed`, the
 `import-N` directory, the checked seal and its read-back) against the local records of epochs N-1
 and N, read from their logs without opening the records DB (N certified, N chaining to N-1; a log
 an unclean stop left unsealed is read up to its torn tail, as the node's open recovers it), and

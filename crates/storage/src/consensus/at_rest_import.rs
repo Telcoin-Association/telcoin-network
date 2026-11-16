@@ -218,16 +218,11 @@ impl ConsensusChain {
         let data = if source.is_dir() { source.join(DATA_NAME) } else { source.to_path_buf() };
         let len = {
             let data = data.clone();
-            tokio::task::spawn_blocking(move || wal_consistent_end(&data, epoch))
+            tokio::task::spawn_blocking(move || copy_end(&data, epoch))
                 .await
                 .map_err(|e| EpochImportError::Source(format!("the copy's check stopped: {e}")))?
         }
-        .map_err(|e| {
-            EpochImportError::Source(format!(
-                "{} does not read as a data log of epoch {epoch}'s pack: {e}",
-                data.display()
-            ))
-        })?;
+        .map_err(EpochImportError::Source)?;
         let file = tokio::fs::File::open(&data).await.map_err(|e| {
             EpochImportError::Source(format!("cannot open {}: {e}", data.display()))
         })?;
@@ -251,6 +246,27 @@ impl ConsensusChain {
         drop(import_path);
         Ok(EpochImport { epoch, replaces, bytes: len, installed: install })
     }
+}
+
+/// The end of the last complete output in the copy's data log at `data` (see
+/// [`wal_consistent_end`]), or why the copy cannot be streamed, as an operator reads it. A legacy
+/// v0 (batches-first) copy is refused by its format: the stream import reads header-first logs
+/// only (v1 and v2), and the conversion is `db migrate`'s, which runs on a datadir's epochs
+/// directory, so the text names a scratch datadir to run it in.
+fn copy_end(data: &Path, epoch: Epoch) -> Result<u64, String> {
+    if let Some((0, _)) = pack_unsealed_version(data, epoch) {
+        return Err(format!(
+            "{} is a legacy v0 (batches-first) pack, which the import does not read; convert it \
+             first in a scratch datadir: copy it to `<scratch>/consensus-db/epochs/epoch-{epoch}/\
+             data` (a new directory outside this datadir), run `telcoin-network db migrate \
+             --datadir <scratch> --epoch {epoch} --force`, then import \
+             `<scratch>/consensus-db/epochs/epoch-{epoch}`",
+            data.display()
+        ));
+    }
+    wal_consistent_end(data, epoch).map_err(|e| {
+        format!("{} does not read as a data log of epoch {epoch}'s pack: {e}", data.display())
+    })
 }
 
 /// Why the copy at `source` cannot be read where it is: inside the epochs directory `base_path`,
@@ -931,6 +947,55 @@ mod test {
             );
             assert_holds(&base, &epoch1.outputs).await;
         }
+
+        // The copy's own version: a v1 copy imports as it is, while a v0 (batches-first) copy is
+        // refused by its format, not as corrupt, and imports once `db migrate --force` converted
+        // it in a scratch datadir holding only its data log (what that command runs).
+        let copies = tmp.path().join("copies");
+        for version in [0_u16, 1] {
+            rebuild_epoch1(&copies.join(format!("v{version}")), &epoch1, version, 3).await;
+        }
+        std::fs::remove_dir_all(base.join("epoch-1")).unwrap();
+        let import_from = |source: PathBuf| {
+            let base = base.clone();
+            async move {
+                ConsensusChain::import_epoch_at_rest(
+                    &base,
+                    1,
+                    &source,
+                    true,
+                    TIMEOUT,
+                    IMPORT_MIN_FREE_BYTES,
+                )
+                .await
+            }
+        };
+        let before = tree(&base);
+        let err = import_from(copies.join("v0").join("epoch-1")).await.unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, EpochImportError::Source(_)), "{text}");
+        for named in ["legacy v0", "db migrate --datadir <scratch> --epoch 1 --force"] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
+        assert!(!text.contains("corrupt"), "{text}");
+        assert_eq!(tree(&base), before, "a refused v0 copy left nothing behind");
+        let scratch = tmp.path().join("scratch").join("consensus-db").join("epochs");
+        std::fs::create_dir_all(scratch.join("epoch-1")).unwrap();
+        std::fs::copy(
+            copies.join("v0").join("epoch-1").join(DATA_NAME),
+            scratch.join("epoch-1").join(DATA_NAME),
+        )
+        .unwrap();
+        let migrated = ConsensusPack::migrate_epoch(&scratch, 1, true).await.unwrap();
+        assert!(
+            matches!(migrated, crate::consensus_pack::EpochMigrate::Migrated(_)),
+            "{migrated:?}"
+        );
+        import_from(scratch.join("epoch-1")).await.expect("the converted copy imports");
+        assert_holds(&base, &epoch1.outputs).await;
+        std::fs::remove_dir_all(base.join("epoch-1")).unwrap();
+        import_from(copies.join("v1").join("epoch-1")).await.expect("a v1 copy imports");
+        assert_holds(&base, &epoch1.outputs).await;
     }
 
     /// `past_pack_check` judges the pack the node's start reads against the local records: a
