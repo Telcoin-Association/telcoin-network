@@ -186,8 +186,8 @@ pub enum CorruptionKind {
     /// The epoch meta (record 0) is incomplete and nothing readable is behind it: the pack holds
     /// no outputs. No committed data is at risk, but it is not healed by truncation: both open
     /// doors REFUSE torn meta bytes (they cannot read the committee), and only a header followed
-    /// by nothing but zeros is re-initialized, by the open that creates the epoch. Remove this
-    /// `epoch-N` directory to rebuild.
+    /// by nothing but zeros is re-initialized, by the open that creates the epoch. The newest
+    /// epoch's `epoch-N` directory can be removed to rebuild it; a past epoch's outputs are lost.
     TornMetaEmpty,
     /// The epoch meta (record 0) is unreadable but complete records follow it: those outputs are
     /// unreachable without the meta. Data loss for this epoch.
@@ -260,9 +260,34 @@ pub struct PhysicalCorruption {
     pub detail: String,
 }
 
+impl PhysicalCorruption {
+    /// The report of this damage for an epoch the caller has placed: `past` is whether it is a past
+    /// epoch (before the epoch the node resumes from, or before a later epoch beside it), `None`
+    /// when that is not known. A torn epoch meta's recommended action then gives only the branch
+    /// that applies; the plain [`Display`] gives both, each with its condition.
+    pub fn report(&self, past: Option<bool>) -> impl Display + '_ {
+        CorruptionReport { corruption: self, past }
+    }
+}
+
 impl Display for PhysicalCorruption {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let summary = match self.kind {
+        self.report(None).fmt(f)
+    }
+}
+
+/// [`PhysicalCorruption::report`]: the damage and the recommended action for an epoch that is past
+/// (`Some(true)`), the newest (`Some(false)`) or not placed (`None`).
+struct CorruptionReport<'a> {
+    corruption: &'a PhysicalCorruption,
+    past: Option<bool>,
+}
+
+impl Display for CorruptionReport<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let past = self.past;
+        let corruption = self.corruption;
+        let summary = match corruption.kind {
             CorruptionKind::TornMetaEmpty => "torn epoch-meta record, nothing behind it",
             CorruptionKind::CorruptMetaWithData => {
                 "unreadable epoch-meta record with outputs behind it"
@@ -276,27 +301,39 @@ impl Display for PhysicalCorruption {
             }
         };
         writeln!(f, "PHYSICAL CORRUPTION: {summary}")?;
-        writeln!(f, "  first bad record offset:        {} bytes", self.offset)?;
-        writeln!(f, "  complete records before damage: {}", self.records_ok_before)?;
+        writeln!(f, "  first bad record offset:        {} bytes", corruption.offset)?;
+        writeln!(f, "  complete records before damage: {}", corruption.records_ok_before)?;
         writeln!(
             f,
             "  readable records after damage:  {}",
-            if self.decodable_after { "yes" } else { "no" }
+            if corruption.decodable_after { "yes" } else { "no" }
         )?;
-        writeln!(f, "  read error:                     {}", self.detail)?;
+        writeln!(f, "  read error:                     {}", corruption.detail)?;
         write!(f, "  recommended action:             ")?;
-        match self.kind {
-            CorruptionKind::TornMetaEmpty => writeln!(
-                f,
-                "ACTION NEEDED — both open doors refuse torn epoch-meta bytes (only a header \
-                 followed by nothing but zeros is re-initialized, and only when the node creates \
-                 the epoch). If this is the node's newest epoch (no later `epoch-M` directory \
-                 beside it), it holds no output and no committed data is at risk: with the node \
-                 stopped, remove this `epoch-N` directory, and the node creates it again when it \
-                 enters the epoch. If a later epoch exists, this is a past epoch and its outputs \
-                 are lost: do not remove it. {}",
-                lost_pack_remedy("epoch-N")
-            ),
+        match corruption.kind {
+            CorruptionKind::TornMetaEmpty => {
+                const REFUSED: &str = "ACTION NEEDED — both open doors refuse torn epoch-meta \
+                     bytes (only a header followed by nothing but zeros is re-initialized, and \
+                     only when the node creates the epoch).";
+                const NEWEST: &str = "it holds no output and no committed data is at risk: with \
+                     the node stopped, remove this `epoch-N` directory, and the node creates it \
+                     again when it enters the epoch.";
+                const PAST: &str = "its outputs are lost: do not remove it.";
+                let remedy = lost_pack_remedy("epoch-N");
+                match past {
+                    Some(false) => {
+                        writeln!(f, "{REFUSED} This is the node's newest epoch: {NEWEST}")
+                    }
+                    Some(true) => writeln!(f, "{REFUSED} This is a past epoch: {PAST} {remedy}"),
+                    None => writeln!(
+                        f,
+                        "{REFUSED} If this is the node's newest epoch (no later `epoch-M` \
+                         directory beside it, nor an interrupted install of one, \
+                         `epoch-M.replaced`), {NEWEST} If a later epoch exists, this is a past \
+                         epoch and {PAST} {remedy}"
+                    ),
+                }
+            }
             CorruptionKind::TornTrailingTail => writeln!(
                 f,
                 "truncatable unacked tail. If this is the CURRENT/latest epoch, the node heals it \
@@ -1953,6 +1990,27 @@ mod test {
             torn_meta.contains("past epoch and its outputs are lost: do not remove it"),
             "must keep a past epoch's directory: {torn_meta}"
         );
+        assert!(
+            torn_meta.contains("`epoch-M.replaced`"),
+            "an install is a later epoch: {torn_meta}"
+        );
+
+        // placed, the report gives only the branch that applies
+        let torn = super::PhysicalCorruption {
+            kind: super::CorruptionKind::TornMetaEmpty,
+            offset: 28,
+            records_ok_before: 0,
+            decodable_after: false,
+            detail: "short read".to_string(),
+        };
+        let past = torn.report(Some(true)).to_string();
+        assert!(past.contains("This is a past epoch: its outputs are lost"), "{past}");
+        assert!(past.contains("db import-epoch"), "a past epoch gets the lost-pack remedy: {past}");
+        assert!(!past.contains("remove this `epoch-N` directory"), "{past}");
+        let newest = torn.report(Some(false)).to_string();
+        assert!(newest.contains("remove this `epoch-N` directory"), "{newest}");
+        assert!(!newest.contains("past epoch"), "{newest}");
+        assert_eq!(torn.report(None).to_string(), torn_meta, "unplaced, it names both");
     }
 
     /// The index-degraded remediation no longer tells operators to delete `hash`/`bhash` by

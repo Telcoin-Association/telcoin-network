@@ -510,8 +510,8 @@ too), any other OS failure (a sync, a rename, an unlink), a failure the environm
 sync or seal (recovery seals its rebuilt indexes before it cuts the log), is no verdict on the epoch:
 it is reported as an error to rerun once the cause is fixed, never as unrepairable. A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
 drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. Only the newest
-epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory) was
-complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
+epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory, or
+an interrupted install of one, `epoch-N.replaced` with no `epoch-N`) was complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
 read-side heal, `db migrate`, `db repair` and `db validate`, even when its indexes cannot attest its
 length. A legacy v0
 (batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. An
