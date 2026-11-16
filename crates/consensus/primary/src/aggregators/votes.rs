@@ -154,8 +154,9 @@ impl VoteRound {
     /// End the round and copy out its answers and tally. Later answers are not listed, and a second
     /// call copies the same answers.
     ///
-    /// The lock is held only for the copy (each list has at most one entry per voter); the lists are
-    /// rendered when the line that ends the round is written, and not at all when it is disabled.
+    /// The lock is held only for the copy (each list has at most one entry per voter); the lists
+    /// are rendered when the line that ends the round is written, and not at all when it is
+    /// disabled.
     pub(crate) fn finish(&self) -> VoteRoundEnd {
         let mut answers = self.answers.lock();
         answers.ended = true;
@@ -355,7 +356,10 @@ mod tests {
         round.set_tally(3, 3);
         let end = round.finish();
         assert_eq!(end.arrivals.to_string(), format!("[{c}:41,{b}:44]"));
-        assert_eq!(end.errors.to_string(), format!("[{a}:5:260:refused:2,{b}:60:60:missing_parents:1]"));
+        assert_eq!(
+            end.errors.to_string(),
+            format!("[{a}:5:260:refused:2,{b}:60:60:missing_parents:1]")
+        );
         assert_eq!((end.votes, end.stake), (3, 3));
 
         // the round has ended: later answers and tallies are not listed
