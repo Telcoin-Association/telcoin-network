@@ -1205,6 +1205,7 @@ impl ConsensusPack {
             previous_epoch,
             final_consensus,
             timeout,
+            None,
             min_free,
             (),
         )
@@ -1217,6 +1218,11 @@ impl ConsensusPack {
     /// its files are discarded. `ConsensusChain::stream_import` passes its import directory's
     /// guard, so the directory is never removed (and an import of the same epoch never started in
     /// it) while this one still writes there.
+    ///
+    /// A `deadline` bounds the whole transfer: once that long has passed since it started, the
+    /// import stops as [`PackError::ImportDeadline`], however well the stream keeps its rates. It
+    /// is checked on the import's clock ([`ImportClock`]), which only a floored import has, so it
+    /// needs a `min_free` above `0`, as every peer import has.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream_import_leased<
         P: Into<PathBuf>,
@@ -1229,9 +1235,14 @@ impl ConsensusPack {
         previous_epoch: &EpochRecord,
         final_consensus: ConsensusNumHash,
         timeout: Duration,
+        deadline: Option<Duration>,
         min_free: u64,
         lease: L,
     ) -> Result<(ConsensusPack, L), PackError> {
+        debug_assert!(
+            deadline.is_none() || min_free != 0,
+            "a deadline is checked on a floored import's clock"
+        );
         let (inner, lease) = Inner::stream_import(
             path.into(),
             stream,
@@ -1239,6 +1250,7 @@ impl ConsensusPack {
             previous_epoch,
             final_consensus,
             timeout,
+            deadline,
             min_free,
             &IMPORTS_IN_FLIGHT,
             lease,
@@ -4541,7 +4553,9 @@ impl Inner {
     /// makes room for ([`DiskFloor`]), checked as the data log grows and every
     /// [`IMPORT_FREE_CHECK_INTERVAL`]; and a floored import that writes less than
     /// [`IMPORT_MIN_PROGRESS_BYTES`] per [`IMPORT_PROGRESS_WINDOW`] stops as
-    /// [`PackError::ImportStalled`] ([`ImportClock`]). A stream declared uncompressed is refused.
+    /// [`PackError::ImportStalled`] ([`ImportClock`]), and one given a `deadline` stops as
+    /// [`PackError::ImportDeadline`] once that long has passed since this call started reading the
+    /// stream. A stream declared uncompressed is refused.
     ///
     /// Only the stream reads run here ([`pump_import_frames`]). Each record's CPU work
     /// (decompress, decode, digest, re-encode) and every file write run on the blocking pool
@@ -4558,10 +4572,16 @@ impl Inner {
         previous_epoch: &EpochRecord,
         final_consensus: ConsensusNumHash,
         timeout: Duration,
+        deadline: Option<Duration>,
         min_free: u64,
         in_flight: &'static AtomicU64,
         lease: L,
     ) -> Result<(Self, L), PackError> {
+        // The deadline runs from the transfer's start, the header read below. One too far away to
+        // be an instant is no deadline.
+        let deadline = deadline.and_then(|deadline| {
+            tokio::time::Instant::now().checked_add(deadline).map(|at| (at, deadline))
+        });
         // `AsyncPackIter::open` rejects a source newer than `PACK_VERSION` (its `max_version`).
         // A header that does not read (transport) or is from a newer build is no fault of the
         // sender's bytes; one that reads but is wrong (a failed CRC, another epoch's uid, a
@@ -4606,7 +4626,7 @@ impl Inner {
         };
         let previous_epoch = previous_epoch.clone();
         let floor = DiskFloor::new(path.join(format!("epoch-{epoch}")), min_free, in_flight);
-        let mut clock = floor.clock();
+        let mut clock = floor.clock(deadline);
         #[cfg(test)]
         let fail_index_open = FAIL_NEXT_IMPORT_INDEX_OPEN.with(|fail| fail.replace(false));
         let mut worker = tokio::task::spawn_blocking(move || {
@@ -5763,11 +5783,18 @@ impl DiskFloor {
         Self { dir, min_free, checked_at: None, slot, written: Arc::default() }
     }
 
-    /// The checks on a clock that go with this floor, for the import's reader task; `None` for a
-    /// floor of `0`, which never stops an import.
-    fn clock(&self) -> Option<ImportClock> {
+    /// The checks on a clock that go with this floor, for the import's reader task, with the
+    /// transfer's `deadline` (when it must end, and how long it was given) if it has one; `None`
+    /// for a floor of `0`, which never stops an import.
+    fn clock(&self, deadline: Option<(tokio::time::Instant, Duration)>) -> Option<ImportClock> {
         let in_flight = self.slot.as_ref()?.0;
-        Some(ImportClock::new(self.dir.clone(), self.min_free, in_flight, self.written.clone()))
+        Some(ImportClock::new(
+            self.dir.clone(),
+            self.min_free,
+            in_flight,
+            self.written.clone(),
+            deadline,
+        ))
     }
 
     /// Check the free space once the import's data log has grown by [`IMPORT_FREE_CHECK_EVERY`]
@@ -5811,8 +5838,15 @@ fn check_free_space(dir: &Path, min_free: u64, imports: u64) -> Result<(), PackE
 /// - the free-space floor, as [`DiskFloor::check`] runs it (a held import gives its space back once
 ///   the node's own writes eat into the headroom above the floor);
 /// - progress measured in what the import writes: at least [`IMPORT_MIN_PROGRESS_BYTES`] per
-///   [`IMPORT_PROGRESS_WINDOW`], else [`PackError::ImportStalled`]. Together with the floor this
-///   ends every import: one that keeps writing reaches the floor.
+///   [`IMPORT_PROGRESS_WINDOW`], else [`PackError::ImportStalled`];
+/// - the transfer's deadline, if the caller gave one: past it, [`PackError::ImportDeadline`].
+///
+/// The progress bound, like the sync reader's per-frame timeout and throughput floor, bounds how
+/// fast an import must go, not how long it runs: a stream that keeps them ends only at its final
+/// output or at the floor. The deadline bounds the length. The primary's epoch fetcher gives one to
+/// every exchange in which the node is a public-tier requester or the serving peer is not staked,
+/// and none to a committee-tier requester served by a staked peer, whose import nothing else bounds
+/// in length.
 struct ImportClock {
     dir: PathBuf,
     min_free: u64,
@@ -5823,6 +5857,8 @@ struct ImportClock {
     /// When the current progress window started, and the data length then.
     window_start: tokio::time::Instant,
     window_written: u64,
+    /// When the transfer must have ended, and how long it was given; `None` for no deadline.
+    deadline: Option<(tokio::time::Instant, Duration)>,
 }
 
 impl ImportClock {
@@ -5831,13 +5867,23 @@ impl ImportClock {
         min_free: u64,
         in_flight: &'static AtomicU64,
         written: Arc<AtomicU64>,
+        deadline: Option<(tokio::time::Instant, Duration)>,
     ) -> Self {
         let now = tokio::time::Instant::now();
         let mut ticks =
             tokio::time::interval_at(now + IMPORT_FREE_CHECK_INTERVAL, IMPORT_FREE_CHECK_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let window_written = written.load(Ordering::Relaxed);
-        Self { dir, min_free, in_flight, written, ticks, window_start: now, window_written }
+        Self {
+            dir,
+            min_free,
+            in_flight,
+            written,
+            ticks,
+            window_start: now,
+            window_written,
+            deadline,
+        }
     }
 
     /// Run the checks at every tick that is due; `Ready` with the error of the first that fails.
@@ -5852,6 +5898,11 @@ impl ImportClock {
 
     fn check(&mut self, now: tokio::time::Instant) -> Result<(), PackError> {
         check_free_space(&self.dir, self.min_free, self.in_flight.load(Ordering::SeqCst).max(1))?;
+        if let Some((at, deadline)) = self.deadline {
+            if now >= at {
+                return Err(PackError::ImportDeadline { deadline });
+            }
+        }
         let elapsed = now.saturating_duration_since(self.window_start);
         if elapsed >= IMPORT_PROGRESS_WINDOW {
             let written = self.written.load(Ordering::Relaxed);
@@ -6763,6 +6814,13 @@ pub enum PackError {
         /// How long the window ran.
         window: Duration,
     },
+    /// A peer stream import ran past the deadline its caller gave the whole transfer. The rate
+    /// and progress bounds do not end a stream that keeps them, so without it a peer could hold
+    /// the epoch's only import for as long as it kept sending.
+    ImportDeadline {
+        /// How long the transfer was given.
+        deadline: Duration,
+    },
 }
 
 impl PackError {
@@ -6997,6 +7055,9 @@ impl Display for PackError {
                     f,
                     "stream import wrote {written} bytes in {window:?}, under its progress bound"
                 )
+            }
+            PackError::ImportDeadline { deadline } => {
+                write!(f, "stream import did not finish within its {deadline:?} deadline")
             }
         }
     }
@@ -15860,6 +15921,7 @@ pub(crate) mod test {
                 &previous_epoch,
                 ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
                 Duration::from_secs(30),
+                None,
                 1,
                 &IN_FLIGHT,
                 (),
@@ -16165,7 +16227,7 @@ pub(crate) mod test {
     /// clock by `step` after each, until `import` finishes (the rest is never sent); then wait for
     /// it in real time (its blocking half runs on a thread of its own) and return its result.
     /// Writes into a small duplex buffer wait for the import to read, so what it has written
-    /// keeps up with what was sent.
+    /// keeps up with what was sent. A write fails only once a stopped import dropped the stream.
     pub(crate) async fn drip_into<T: Send + 'static>(
         mut peer: tokio::io::DuplexStream,
         bytes: &[u8],
@@ -16175,10 +16237,9 @@ pub(crate) mod test {
     ) -> T {
         use tokio::io::AsyncWriteExt as _;
         for piece in bytes.chunks(chunk) {
-            if import.is_finished() {
+            if import.is_finished() || peer.write_all(piece).await.is_err() {
                 break;
             }
-            peer.write_all(piece).await.expect("the import reads the stream");
             settle().await;
             tokio::time::advance(step).await;
             settle().await;
@@ -16291,6 +16352,7 @@ pub(crate) mod test {
                 &previous_epoch,
                 last,
                 Duration::from_secs(3600),
+                None,
                 1,
                 &IN_FLIGHT,
                 (),
@@ -16342,6 +16404,7 @@ pub(crate) mod test {
                 &previous_epoch,
                 last,
                 Duration::from_secs(3600),
+                None,
                 1,
                 &IN_FLIGHT,
                 (),
@@ -16403,6 +16466,7 @@ pub(crate) mod test {
                 &previous_epoch,
                 ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
                 Duration::from_secs(3600),
+                None,
                 min_free,
                 &IN_FLIGHT,
                 (),

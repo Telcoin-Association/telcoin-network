@@ -214,10 +214,17 @@ impl ConsensusChain {
         let file = tokio::fs::File::open(&data).await.map_err(|e| {
             EpochImportError::Source(format!("cannot open {}: {e}", data.display()))
         })?;
-        let Some((import_path, path)) =
-            Self::import_sealed(base_path, file.take(len), &record, &previous, timeout, min_free)
-                .await
-                .map_err(EpochImportError::Import)?
+        let Some((import_path, path)) = Self::import_sealed(
+            base_path,
+            file.take(len),
+            &record,
+            &previous,
+            timeout,
+            None,
+            min_free,
+        )
+        .await
+        .map_err(EpochImportError::Import)?
         else {
             return Err(EpochImportError::Import(ConsensusChainError::IO(std::io::Error::other(
                 format!("this process is already importing epoch {epoch}"),

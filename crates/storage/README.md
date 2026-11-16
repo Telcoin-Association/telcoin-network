@@ -294,7 +294,11 @@ import gives its space back once the node's own writes eat into the headroom; an
 at least `IMPORT_MIN_PROGRESS_BYTES` per `IMPORT_PROGRESS_WINDOW` (progress in what it writes, since its
 records are re-encoded with zstd and the bytes a peer streams say nothing about the disk it holds), or it
 stops as `ImportStalled`, which the fetcher charges to the peer; a stream declared uncompressed is
-refused (every pack writer compresses with zstd). A stopped import's files are removed only after its
+refused (every pack writer compresses with zstd).
+The progress bound and the sync reader's rate bounds set how fast an import must go, not how long it runs: a stream that keeps them ends only at its final output or at the floor.
+The length is bounded by a deadline the caller gives the transfer (`stream_import`, `import_partial_to_staging`), checked by the same clock: past it the import stops as `ImportDeadline`, which the fetcher charges to the peer like a stall, and it never covers the seal or the install that follow.
+The fetcher gives 230 s (the 200 s public-tier serve cut plus one 30 s rate window) to every exchange in which the node is a public-tier requester or the serving peer is not staked, and no deadline to a committee-tier requester served by a staked peer, whose import nothing else bounds in length.
+A stopped import's files are removed only after its
 blocking half stopped writing them. `db load-state`'s restore of a local bundle has no floor and no clock;
 the imported pack is sealed before `pack_install` is taken, and the live (writable) epoch is replaced
 only with its stored record's chain, anything else, such as a prefix's partial final, being refused as
