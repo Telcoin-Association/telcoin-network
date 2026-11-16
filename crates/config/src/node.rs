@@ -487,6 +487,23 @@ pub struct Parameters {
     /// and a re-queued older digest can execute after a newer one of its lane. Issue #1807.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub digest_order_hold: bool,
+    /// How many recent-blocks ring entries below its own tip a header under the
+    /// [`Self::quorum_exec_block`] rule may name at most: the rule's floor.
+    ///
+    /// A benchmark parameter rather than an on/off switch: the default `8` is the floor the rule
+    /// was designed with, so the parameter at its default changes nothing, and a deeper floor lets
+    /// a header name an older block that more voters already hold. A ring entry is an executed
+    /// output that produced a block, so the floor is not a bound in rounds or in time; a ring
+    /// shorter than the floor floors at its oldest entry. It only matters while
+    /// `quorum_exec_block` is `true`, and only the proposer reads it: a voter accepts any
+    /// canonical block above its restore floor whatever this value is. The node refuses to start
+    /// with `0` or with a value above `gc_depth`, the number of entries the ring holds.
+    /// Issue #1804.
+    #[serde(
+        default = "Parameters::default_quorum_exec_block_floor_outputs",
+        skip_serializing_if = "Parameters::floor_outputs_at_default"
+    )]
+    pub quorum_exec_block_floor_outputs: u64,
     // ---- runtime switches: end ----
 }
 
@@ -597,12 +614,25 @@ impl Default for Parameters {
             epoch_record_conflict_halt: false,
             vote_queue_fix: false,
             digest_order_hold: false,
+            quorum_exec_block_floor_outputs: Parameters::default_quorum_exec_block_floor_outputs(),
             // ---- runtime switches: end ----
         }
     }
 }
 
 impl Parameters {
+    /// The default of [`Self::quorum_exec_block_floor_outputs`]: the floor the
+    /// `quorum_exec_block` rule was designed with.
+    pub const fn default_quorum_exec_block_floor_outputs() -> u64 {
+        8
+    }
+
+    /// Whether `value` is the default of [`Self::quorum_exec_block_floor_outputs`], which the
+    /// parameters file then leaves out, as it leaves out a switch at its default.
+    pub fn floor_outputs_at_default(value: &u64) -> bool {
+        *value == Self::default_quorum_exec_block_floor_outputs()
+    }
+
     /// Validate the protocol **ceilings** every node (production or test fixture) must honor.
     ///
     /// `gc_depth` and `max_header_num_of_batches` together bound how many unique batches a single
@@ -715,6 +745,13 @@ impl Parameters {
             self.min_header_delay,
             self.max_header_delay,
         );
+        eyre::ensure!(
+            (1..=u64::from(self.gc_depth)).contains(&self.quorum_exec_block_floor_outputs),
+            "quorum_exec_block_floor_outputs {} must be at least 1 and at most the {} entries of \
+             the recent-blocks ring (gc_depth)",
+            self.quorum_exec_block_floor_outputs,
+            self.gc_depth,
+        );
         Ok(())
     }
 
@@ -803,6 +840,7 @@ runtime_switches! {
     epoch_record_conflict_halt,
     vote_queue_fix,
     digest_order_hold,
+    quorum_exec_block_floor_outputs,
     // ---- runtime switches: end ----
 }
 
@@ -1077,6 +1115,34 @@ mod test {
         Parameters::default()
             .validate_operational_floors()
             .expect("default parameters must satisfy the operational floors");
+    }
+
+    /// The quorum-exec-block floor defaults to the rule's designed eight entries, is listed as a
+    /// count, and a floor of 0 or one above the ring's `gc_depth` entries refuses to start with a
+    /// message naming both numbers.
+    #[test]
+    fn parameters_bound_quorum_exec_block_floor_to_the_ring() {
+        let defaults = Parameters::default();
+        assert_eq!(defaults.quorum_exec_block_floor_outputs, 8);
+        let listed = defaults.switches();
+        let floor = listed.iter().find(|(name, _)| *name == "quorum_exec_block_floor_outputs");
+        assert_eq!(floor.map(|(_, value)| value.to_string()), Some("8".to_string()));
+        let ring = u64::from(defaults.gc_depth);
+        let with_floor =
+            |floor| Parameters { quorum_exec_block_floor_outputs: floor, ..Default::default() };
+        assert!(with_floor(1).validate_operational_floors().is_ok());
+        assert!(with_floor(ring).validate_operational_floors().is_ok());
+        for refused in [0, ring + 1] {
+            let message = with_floor(refused)
+                .validate_operational_floors()
+                .expect_err("a floor outside the ring is refused")
+                .to_string();
+            assert!(
+                message.contains(&format!("quorum_exec_block_floor_outputs {refused} "))
+                    && message.contains(&format!("the {ring} entries")),
+                "{message}"
+            );
+        }
     }
 
     #[test]

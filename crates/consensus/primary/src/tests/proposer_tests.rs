@@ -1948,7 +1948,7 @@ async fn test_header_without_requeued_digest_reports_zero_requeue_wait() {
 /// [`ExecBlockInputs`] with the `quorum_exec_block` switch off, for tests that drive
 /// [`Proposer::propose_header`] directly: the header names the own tip exactly as before.
 fn exec_off(committee: &Committee, author: &AuthorityIdentifier) -> ExecBlockInputs {
-    ExecBlockInputs::new(ExecPolicy::Off, committee, author, &[])
+    ExecBlockInputs::new(ExecPolicy::Off, committee, author, &[], QUORUM_EXEC_BLOCK_FLOOR_ENTRIES)
 }
 
 /// The epoch of the quorum-exec-block models: their parents and their ring's blocks carry it.
@@ -2006,6 +2006,7 @@ fn table_inputs(policy: ExecPolicy, parents: Vec<ParentExecBlock>) -> ExecBlockI
         epoch: EXEC_MODEL_EPOCH,
         quorum_threshold: 7,
         parents,
+        floor_entries: QUORUM_EXEC_BLOCK_FLOOR_ENTRIES,
     }
 }
 
@@ -2246,6 +2247,7 @@ fn self_feeding_fleet(
                 epoch: EXEC_MODEL_EPOCH,
                 quorum_threshold: 7,
                 parents: parents.clone(),
+                floor_entries: QUORUM_EXEC_BLOCK_FLOOR_ENTRIES,
             };
             let choice = choose_exec_block(&ring, &inputs);
             let at = history.iter().position(|b| *b == choice.block).expect("an executed output");
@@ -3134,6 +3136,7 @@ fn test_quorum_exec_block_faulty_high_parents_cost_the_gain_only() {
             epoch: EXEC_MODEL_EPOCH,
             quorum_threshold: 3,
             parents,
+            floor_entries: QUORUM_EXEC_BLOCK_FLOOR_ENTRIES,
         }
     };
     // the faulty member withholds; the proposer and each honest member that executed the named
@@ -3388,7 +3391,13 @@ fn test_quorum_exec_block_inputs_carry_the_committee_epoch() {
                     .expect("unsigned parent certificate")
             })
             .collect();
-        let inputs = ExecBlockInputs::new(ExecPolicy::Always, &committee, &author, &parents);
+        let inputs = ExecBlockInputs::new(
+            ExecPolicy::Always,
+            &committee,
+            &author,
+            &parents,
+            QUORUM_EXEC_BLOCK_FLOOR_ENTRIES,
+        );
         assert_eq!(inputs.epoch, 4);
         choose_exec_block(&ring, &inputs)
     };
@@ -4575,4 +4584,37 @@ fn test_quorum_exec_block_floor_golden_table() {
     for (name, ring, policy, parents, expected) in golden_exec_rows() {
         assert_golden_choice(&rings[ring], &table_inputs(policy, parents), name, expected);
     }
+}
+
+/// The golden table at a floor of sixteen entries. The rows whose quorum value lies nine to
+/// sixteen entries back (and, on the 12-output ring, ten and eleven back, inside that shorter ring)
+/// now name that value; the rows deeper than sixteen entries floor at the entry sixteen back
+/// (169) instead of eight back (193); every other row is unchanged.
+#[test]
+fn test_quorum_exec_block_floor_parameter_sixteen() {
+    use ExecBasis::{Floor, Quorum};
+    assert_eq!(
+        usize::try_from(tn_config::Parameters::default().quorum_exec_block_floor_outputs).ok(),
+        Some(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES),
+        "the parameter's default is the constant"
+    );
+    let changed: BTreeMap<&str, (BlockNumber, BlockNumber, ExecBasis)> = BTreeMap::from([
+        ("floor: nine entries back", (190, 217, Quorum)),
+        ("floor: twelve entries back", (181, 217, Quorum)),
+        ("floor: sixteen entries back", (169, 217, Quorum)),
+        ("floor: seventeen entries back", (169, 217, Floor)),
+        ("floor: the oldest entry", (169, 217, Floor)),
+        ("floor: starved window, nine entries back", (190, 217, Quorum)),
+        ("short ring: ten entries back", (103, 133, Quorum)),
+        ("short ring: the oldest entry", (100, 133, Quorum)),
+    ]);
+    let rings = golden_exec_rings();
+    let mut differing = 0;
+    for (name, ring, policy, parents, at_eight) in golden_exec_rows() {
+        let inputs = ExecBlockInputs { floor_entries: 16, ..table_inputs(policy, parents) };
+        let expected = changed.get(name).copied().unwrap_or(at_eight);
+        differing += usize::from(expected != at_eight);
+        assert_golden_choice(&rings[ring], &inputs, name, expected);
+    }
+    assert_eq!(differing, changed.len(), "every changed row is a row of the table and differs");
 }

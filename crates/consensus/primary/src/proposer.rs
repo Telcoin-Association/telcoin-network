@@ -218,6 +218,9 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// A field of the epoch's proposer because its record names a header by round alone, and
     /// rounds restart every epoch.
     order_hold: Option<OwnChainOrder>,
+    /// The `quorum_exec_block_floor_outputs` parameter: how many own ring entries below the tip a
+    /// header under the quorum rule may name at most.
+    exec_block_floor: usize,
     /// The `tn_primary_headers_held_total` and `tn_primary_digests_held` handles, resolved once
     /// per epoch.
     order_hold_metrics: OrderHoldHandles,
@@ -358,6 +361,10 @@ impl<DB: Database> Proposer<DB> {
 
         let quorum_exec_block = config.parameters().quorum_exec_block;
         let quorum_exec_block_starved_rounds = config.parameters().quorum_exec_block_starved_rounds;
+        // refused at start-up outside 1..=gc_depth; a value past usize floors at the oldest entry,
+        // as any value past the ring's length does
+        let exec_block_floor = usize::try_from(config.parameters().quorum_exec_block_floor_outputs)
+            .unwrap_or(usize::MAX);
         if let Some(warning) = ExecBlockPolicy::starved_rounds_warning(
             quorum_exec_block,
             quorum_exec_block_starved_rounds,
@@ -408,6 +415,7 @@ impl<DB: Database> Proposer<DB> {
             requeued_order_unknown: RequeuedOrderUnknownHandles::new(),
             order_hold: config.parameters().digest_order_hold.then(OwnChainOrder::default),
             order_hold_metrics: OrderHoldHandles::new(),
+            exec_block_floor,
         }
     }
 
@@ -1448,6 +1456,7 @@ impl<DB: Database> Proposer<DB> {
                     &self.committee,
                     &authority_id,
                     &parents,
+                    self.exec_block_floor,
                 );
 
                 let consensus_bus = self.consensus_bus.clone();
@@ -1962,7 +1971,16 @@ fn duration_ms(duration: Duration) -> u64 {
 /// produced blocks. With the switch off its next header names the forked tip, and voters refuse
 /// it at once. A faulty author gains nothing from this: a voter already accepts any canonical
 /// block above its restore floor.
+///
+/// The default of the `quorum_exec_block_floor_outputs` parameter, which sets the floor each
+/// proposer uses.
 pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
+
+// the parameter's default must stay the floor these docs cite
+const _: () = assert!(
+    tn_config::Parameters::default_quorum_exec_block_floor_outputs()
+        == QUORUM_EXEC_BLOCK_FLOOR_ENTRIES as u64
+);
 
 /// The bound on the adaptive policy's window, in headers built under the quorum rule (the switch
 /// keeps its name, `quorum_exec_block_starved_rounds`): repeated cancels double the configured
@@ -2293,15 +2311,21 @@ pub(crate) struct ExecBlockInputs {
     pub(crate) quorum_threshold: VotingPower,
     /// The header's parents' named blocks; empty unless the policy applies the quorum rule.
     pub(crate) parents: Vec<ParentExecBlock>,
+    /// The floor: how many own ring entries below the tip the quorum rule may name at most (the
+    /// `quorum_exec_block_floor_outputs` parameter, [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] by
+    /// default).
+    pub(crate) floor_entries: usize,
 }
 
 impl ExecBlockInputs {
-    /// The inputs for a header by `author` on `parents` under `policy`.
+    /// The inputs for a header by `author` on `parents` under `policy`, floored at `floor_entries`
+    /// own ring entries below the tip.
     fn new(
         policy: ExecPolicy,
         committee: &Committee,
         author: &AuthorityIdentifier,
         parents: &[Certificate],
+        floor_entries: usize,
     ) -> Self {
         let parents = if policy.applies_quorum_rule() {
             parents.iter().map(|parent| ParentExecBlock::new(parent, committee)).collect()
@@ -2315,6 +2339,7 @@ impl ExecBlockInputs {
             epoch: committee.epoch(),
             quorum_threshold: committee.quorum_threshold(),
             parents,
+            floor_entries,
         }
     }
 
@@ -2361,9 +2386,10 @@ pub(crate) struct ExecBlockChoice {
 ///   honest members that have not executed the lifted block and be cancelled. That costs the rule's
 ///   gain, not more: every voter that holds the own tip holds the choice, so a header under the
 ///   rule certifies whenever the same header naming the tip would have;
-/// - it is floored at the ring entry [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip (the
-///   oldest entry of a shorter ring). Entries count outputs that produced a block, so the floor has
-///   no bound in time (the constant's doc says what that delays);
+/// - it is floored at the ring entry [`ExecBlockInputs::floor_entries`] back from the tip
+///   ([`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] by default; the oldest entry of a shorter ring). Entries
+///   count outputs that produced a block, so the floor has no bound in time (the constant's doc
+///   says what that delays);
 /// - the block is the newest own ring entry at or below the value, so the number and the hash are
 ///   always this node's own execution, never a parent's hash;
 /// - nothing is named below the block the header's epoch opened on, the previous epoch's closing
@@ -2435,7 +2461,7 @@ fn quorum_rule_choice(
         return own_tip;
     };
 
-    let Some(floor) = ring.nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES) else {
+    let Some(floor) = ring.nth_newest(inputs.floor_entries) else {
         return own_tip;
     };
     if quorum_value < floor.number {
