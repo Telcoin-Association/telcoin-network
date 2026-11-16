@@ -3483,4 +3483,6 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   leave the runtime's thread free to release it; before the change it blocked that thread until
   the holder gave up; also the answers by hash and by number, for a missing block and for the
   `finalized` tag, which the mock answers with a provider error, each equal to what the inline
-  read answered). *Upstream*: no; upstream has the same shape, where those reads are short.
+  read answered). Mutation-checked: with either handler's read put back inline, its test fails
+  after the holder's 10 s and the other handler's test passes.
+  *Upstream*: no; upstream has the same shape, where those reads are short.
