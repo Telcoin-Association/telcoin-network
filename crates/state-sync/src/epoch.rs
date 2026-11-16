@@ -129,19 +129,18 @@ impl<'m> Collection<'m> {
     /// next epoch, `walked` being the epochs this pass already walked past without a record after
     /// them landing yet.
     ///
-    /// Only while fewer than [`MAX_UNCERTIFIED_GAPS`] gaps would
-    /// be open, not for a new walk from the epoch a walk that did not land started at less than a
-    /// retry interval ago ([`Collection::unlanded_walk`]: its extra requests are made at most once
-    /// per interval, not on every wake-up), and only when this node holds `epoch` as its own
-    /// stored, uncertified record that is not the epoch-0 dummy anchor. The next epoch's record is
-    /// then anchored on that record: its digest and its `next_committee` come from this node's
-    /// own execution of the epoch, so a record past it is checked exactly as it would be had
-    /// the epoch been certified. An uncertified record is stored by this node's own epoch
-    /// close, or is a peer's record that validated with a super-quorum certificate whose own
-    /// write then failed. A node without its own record of the epoch (a fresh node, an observer
-    /// far behind) never walks: the epoch's `next_committee` is not constrained by anything
-    /// such a node can check, so a fabricated record of the epoch could name the committee that
-    /// certifies a fabricated next one.
+    /// Only while fewer than [`MAX_UNCERTIFIED_GAPS`] gaps would be open, not for a new walk from
+    /// the epoch a walk that did not land started at less than a retry interval ago
+    /// ([`Collection::unlanded_walk`]: its extra requests are made at most once per interval, not
+    /// on every wake-up), and only when this node holds `epoch` as its own stored, uncertified
+    /// record that is not the epoch-0 dummy anchor. The next epoch's record is then anchored on
+    /// that record: its digest and its `next_committee` come from this node's own execution of the
+    /// epoch, so a record past it is checked exactly as it would be had the epoch been certified.
+    /// An uncertified record is stored by this node's own epoch close, or is a peer's record that
+    /// validated with a super-quorum certificate whose own write then failed. A node without its
+    /// own record of the epoch (a fresh node, an observer far behind) never walks: the epoch's
+    /// `next_committee` is not constrained by anything such a node can check, so a fabricated
+    /// record of the epoch could name the committee that certifies a fabricated next one.
     async fn may_walk_past(
         &self,
         epoch: Epoch,
@@ -532,21 +531,20 @@ fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
 ///
 /// Fails when our own epoch store fails to save or persist, or when a certified record conflicts
 /// with this node's own (see [`stop_on_local_failure`]); a peer's invalid or otherwise refused
-/// record is logged and asked for again on a later pass. Each
-/// certified record stored is published on [`ConsensusBusApp::certified_record_epoch`], so an
-/// active validator still running an epoch the network already closed leaves it to catch up.
+/// record is logged and asked for again on a later pass. Each certified record stored is published
+/// on [`ConsensusBusApp::certified_record_epoch`], so an active validator still running an epoch
+/// the network already closed leaves it to catch up.
 ///
-/// A pass told by a peer that it
-/// holds no certified record of an epoch this node holds as its own uncertified record goes on to
-/// the next epoch (see [`Collection::may_walk_past`]). Once a certified record after it is stored,
-/// the epoch is a gap of `collection`, which the record collector asks for again
-/// ([`retry_gaps`]). If the walk ends before that, on a record naming another parent (this node's
-/// own record differs from the one the network built on), a peer without the next record or no
-/// answer, the pass stops at the walked epoch, as if it had not walked. A pass that walked ends
-/// with the persist and the final-consensus publish below, a refused record included, unless it
-/// fails: a conflicting certified record or our own store failing to save a record ends it at
-/// once, before the persist, as it ends a pass that did not walk; a failed persist ends it before
-/// the publish.
+/// A pass told by a peer that it holds no certified record of an epoch this node holds as its own
+/// uncertified record goes on to the next epoch (see [`Collection::may_walk_past`]). Once a
+/// certified record after it is stored, the epoch is a gap of `collection`, which the record
+/// collector asks for again ([`retry_gaps`]). If the walk ends before that, on a record naming
+/// another parent (this node's own record differs from the one the network built on), a peer
+/// without the next record or no answer, the pass stops at the walked epoch, as if it had not
+/// walked. A pass that walked ends with the persist and the final-consensus publish below, a
+/// refused record included, unless it fails: a conflicting certified record or our own store
+/// failing to save a record ends it at once, before the persist, as it ends a pass that did not
+/// walk; a failed persist ends it before the publish.
 async fn collect_epoch_records(
     last_epoch: Epoch,
     consensus_chain: &ConsensusChain,
@@ -1449,8 +1447,6 @@ mod tests {
         Ok(())
     }
 
-    // ---- bench7 epoch-record-collector-hardening ----
-
     /// Records every `epoch-manager` info and error line as `message key=value ...` on the thread
     /// it is installed on with [`tracing::subscriber::set_default`].
     struct EpochManagerLines(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
@@ -1813,10 +1809,10 @@ mod tests {
             .collect()
     }
 
-    /// A peer's "not held" for the epoch this node holds as its own uncertified
-    /// record no longer ends the pass: the certified records after it validate against that record
-    /// and are stored, the epoch is an open gap, counted and logged once, and the certified-prefix
-    /// gauge stays below it.
+    /// A peer's "not held" for the epoch this node holds as its own uncertified record no longer
+    /// ends the pass: the certified records after it validate against that record and are stored,
+    /// the epoch is an open gap, counted and logged once, and the certified-prefix gauge stays
+    /// below it.
     #[tokio::test]
     async fn test_collect_epoch_records_walks_past_an_own_uncertified_epoch() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -1866,9 +1862,9 @@ mod tests {
         Ok(())
     }
 
-    /// A node without its own record of the epoch never walks past it: an observer
-    /// behind (record 0 certified, no record 1) stops as before, and the epoch-0 dummy anchor of a
-    /// fresh node is no record to walk past, while a real record 0 of its own is.
+    /// A node without its own record of the epoch never walks past it: an observer behind (record 0
+    /// certified, no record 1) stops as before, and the epoch-0 dummy anchor of a fresh node is no
+    /// record to walk past, while a real record 0 of its own is.
     #[tokio::test]
     async fn test_collect_epoch_records_does_not_walk_past_a_missing_record() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -1902,8 +1898,8 @@ mod tests {
     }
 
     /// When this node's own record of the walked epoch differs from the one the network built on,
-    /// the next epoch's certified record names another parent: the walk stops there, opens
-    /// no gap, and the case is counted.
+    /// the next epoch's certified record names another parent: the walk stops there, opens no gap,
+    /// and the case is counted.
     #[tokio::test]
     async fn test_collect_epoch_records_stops_at_a_parent_mismatch_after_a_walk() -> eyre::Result<()>
     {
@@ -2098,9 +2094,9 @@ mod tests {
     }
 
     /// A peer's certified record that validates against this node's record 0 but differs from its
-    /// own record 1 is counted and stops the collection: the pass, a gap
-    /// retry and the critical record collector all end with the error that says this node's
-    /// execution diverged, and the node's own record stays.
+    /// own record 1 is counted and stops the collection: the pass, a gap retry and the critical
+    /// record collector all end with the error that says this node's execution diverged, and the
+    /// node's own record stays.
     #[tokio::test]
     async fn test_collect_epoch_records_counts_and_stops_on_a_conflicting_certified_record(
     ) -> eyre::Result<()> {
@@ -2504,10 +2500,10 @@ mod tests {
         Ok(())
     }
 
-    /// A walk that does not land is not repeated on every wake-up: right after one, a pass from
-    /// the same epoch stops at the walked epoch, and the walk is tried again
-    /// once a retry interval has passed. Here no peer holds a certified record of epoch 1 (this
-    /// node's own, uncertified) or of epoch 2.
+    /// A walk that does not land is not repeated on every wake-up: right after one, a pass from the
+    /// same epoch stops at the walked epoch, and the walk is tried again once a retry interval has
+    /// passed. Here no peer holds a certified record of epoch 1 (this node's own, uncertified) or
+    /// of epoch 2.
     #[tokio::test(start_paused = true)]
     async fn test_a_walk_that_does_not_land_waits_a_retry_interval() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();

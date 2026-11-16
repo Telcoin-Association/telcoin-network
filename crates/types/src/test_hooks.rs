@@ -682,8 +682,6 @@ mod tests {
         }
     }
 
-    // ---- bench7 digest-order-hold ----
-
     /// A hold of `ms` milliseconds at `stage` on every `every`-th round.
     fn hold(ms: u64, stage: OwnCertDelayStage, every: u32) -> OwnCertDelay {
         let every = NonZeroU32::new(every).expect("non-zero every");
@@ -783,8 +781,6 @@ mod tests {
             );
         }
     }
-
-    // ---- bench7 epoch-record-collector-hardening: withhold hook ----
 
     /// The withhold hook withholds the first rounds of the named epoch and no other. This is the
     /// only test in the crate that sets the two variables, and the values latch on first read, so

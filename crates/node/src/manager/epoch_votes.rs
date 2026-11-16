@@ -852,6 +852,16 @@ async fn pick_recertify_record(db: &EpochRecordDb, epoch: Epoch) -> Option<Epoch
 /// not sign counts as `skipped`. The outcome is credited to the next round for the picked epoch to
 /// end, which can be a round already open for it or one evicted from the queue (`short`), and a
 /// pick whose round never starts is not counted.
+///
+/// A re-vote can find this node's own record in conflict with the network's certified one. When the
+/// round for the picked record falls short, its peer recovery fetches the certified record from a
+/// peer; when that record validates and its digest differs from this node's, the round logs at
+/// error a line ending in `we have forked!` and calls the node's shutdown, as it does for the
+/// newest record and the previous one. The stored record stays as it is, uncertified. After a
+/// restart, [`revote_uncertified_epoch_record_on_startup`] arms the latest record again while a
+/// record of the [`MAX_RECERTIFY_LOOKBACK`] epochs before it is uncertified, and with the same
+/// records stored the pick chooses the same record again, so the node stops again until an operator
+/// acts.
 async fn recertify_older_record(
     db: &EpochRecordDb,
     consensus_bus: &ConsensusBusApp,
@@ -1161,9 +1171,9 @@ fn record_epoch_record_quorum(
 /// [`record_epoch_record_quorum`]).
 ///
 /// The label `round` is the round's [`RoundKind`]: `current` for the newest record and the one
-/// before it, `recertify` for an older
-/// record. A reader that does not select on `round` sums both, which is what this counter counted
-/// before the label existed; `round="current"` keeps the misses of the latest closes only.
+/// before it, `recertify` for an older record. A reader that does not select on `round` sums both,
+/// which is what this counter counted before the label existed; `round="current"` keeps the misses
+/// of the latest closes only.
 fn record_missing_signers(
     committee: &[BlsPublicKey],
     remaining: &HashSet<BlsPublicKey>,
@@ -2882,8 +2892,6 @@ mod epoch_vote_collector_tests {
         assert_eq!(misses, 1, "only the quorum round counts a missed vote");
     }
 
-    // ---- bench7 epoch-record-collector-hardening ----
-
     /// Records every `epoch-manager` event as `LEVEL message key=value ...` on the thread it is
     /// installed on with [`tracing::subscriber::set_default`].
     struct EpochManagerLines(Arc<parking_lot::Mutex<Vec<String>>>);
@@ -3236,10 +3244,10 @@ mod epoch_vote_collector_tests {
         rounds
     }
 
-    /// P2's same-digest branch: after a failed local quorum the peer-recovery download returns
-    /// our own record with a quorum certificate, which is saved; the node does not stop. The
-    /// saved certificate drops the signatures kept for the epoch, and a
-    /// re-certify round counts as `certified`.
+    /// The same-digest branch of the peer recovery: after a failed local quorum the peer-recovery
+    /// download returns our own record with a quorum certificate, which is saved; the node does not
+    /// stop. The saved certificate drops the signatures kept for the epoch, and a re-certify round
+    /// counts as `certified`.
     #[tokio::test(start_paused = true)]
     async fn test_recovery_saves_a_same_digest_cert() {
         use metrics_util::debugging::DebuggingRecorder;
@@ -3837,8 +3845,6 @@ mod epoch_vote_collector_tests {
         assert_eq!(rounds, BTreeMap::from([("certified".into(), 1), ("short".into(), 1)]));
     }
 
-    // ---- bench7 epoch-record-collector-hardening: withhold hook ----
-
     thread_local! {
         /// The withhold hook a test installed on this thread with [`WithholdOnThisThread`]. The
         /// tests run on current-thread runtimes, so the collector they spawn consults it too.
@@ -4076,8 +4082,6 @@ mod epoch_vote_collector_tests {
         drop(hook);
         assert!(!withhold_own_epoch_vote(3), "the hook is gone with its guard");
     }
-
-    // ---- bench7 epoch-record-collector-hardening: review follow-ups ----
 
     /// Records `0..=6` stored uncertified, with committee `keys[0..4]` (this node is `keys[0]`)
     /// except record 1, whose committee `keys[1..5]` leaves this node out, and the kept-signature
@@ -4569,10 +4573,10 @@ mod epoch_vote_collector_tests {
         );
     }
 
-    /// V3: while the rounds of the latest close collect, members' re-votes for five distinct
-    /// older records start five more rounds; the
-    /// newest record's round and the previous one's are not evicted, and both certify when the
-    /// members' votes for them arrive. Main evicted the oldest-started rounds, which were these.
+    /// While the rounds of the latest close collect, members' re-votes for five distinct older
+    /// records start five more rounds; the newest record's round and the previous one's are not
+    /// evicted, and both certify when the members' votes for them arrive. Main evicted the
+    /// oldest-started rounds, which were these.
     #[tokio::test]
     async fn test_older_rounds_do_not_evict_the_latest_close() {
         let (committee, keys) = four_keys();

@@ -3018,8 +3018,6 @@ mod tests {
         Ok(())
     }
 
-    // ---- bench7 epoch-record-closing-block-check ----
-
     /// An epoch above adiri's early-epoch exemption, so the checks on it compare `extra_data` in
     /// every build.
     const CHECKED_EPOCH: Epoch = 200;
@@ -4001,8 +3999,6 @@ mod tests {
         Ok(())
     }
 
-    // ---- bench7 digest-order-hold ----
-
     /// One temporary chain with two worker pools and three senders: `funded` has a balance,
     /// `unfunded` has none, and `executed` starts at nonce 1, as if its nonce 0 had executed.
     struct OrphanPools {
@@ -4326,8 +4322,6 @@ mod tests {
         Ok(())
     }
 
-    // ---- bench7 epoch-loop-output-drop ----
-
     /// Run the leftover drain on `queued` with `last_forwarded` as the last output the engine
     /// got, an engine channel with room for all of them and no boundary in reach. Returns the
     /// drain's result, the numbers the engine received and the last forwarded number after it.
@@ -4400,8 +4394,6 @@ mod tests {
         assert_eq!(last_forwarded, 3);
         Ok(())
     }
-
-    // ---- bench7 epoch-loop-output-drop: review follow-ups ----
 
     /// The queue phase's skip names the output it skips (number and digest) and the phase that
     /// skipped it, and counts once in `tn_node.leftover_outputs_skipped_total`.

@@ -3118,8 +3118,6 @@ pub(super) mod tests {
         }
     }
 
-    // ---- bench7 epoch-record-closing-block-check ----
-
     /// The close-time identity check is counted: `mismatch` when the canonical tip is not a
     /// closing block (genesis), `ok` once epoch 0's closing block executed. A chain-global failure
     /// of the epoch-info read behind it compares nothing and counts nothing. What the check does
@@ -3253,8 +3251,6 @@ pub(super) mod tests {
         manager.recover_previous_epoch_record(1, &pin, &engine).await?;
         Ok(())
     }
-
-    // ---- bench7 epoch-loop-output-drop ----
 
     /// Output `number` led by a member of `committee` and carrying one batch of its own, so a
     /// pack over `committee` saves it and reads it back.
@@ -3458,8 +3454,6 @@ pub(super) mod tests {
         assert_eq!(last_forwarded, 3);
         Ok(())
     }
-
-    // ---- bench7 epoch-loop-output-drop: review follow-ups ----
 
     /// The live forward's intake fixture: a manager that already forwarded output 1 into an
     /// engine channel of a chosen capacity, and a boundary every output reaches, so the forward

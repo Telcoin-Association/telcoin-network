@@ -565,8 +565,6 @@ mod tests {
         .for_each(|line| assert!(rendered.contains(line), "missing {line:?} in {rendered}"));
     }
 
-    // ---- bench6 bench6-obs ----
-
     /// The execution stage histograms take the sub-ms layout through their `Full` matchers,
     /// recorded under the names the engine's and the execution environment's metric structs
     /// register. A 100 us lap sits on the first bound, which `le` includes; a 2 ms lap lands
