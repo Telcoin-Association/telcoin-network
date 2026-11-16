@@ -181,8 +181,8 @@ fn test_uncertified_epoch_walked_past() -> eyre::Result<()> {
     run_arm(Arm::Walk)
 }
 
-/// The close of `K + 2` re-votes the
-/// record of [`K`], which the hook no longer withholds, and certifies it.
+/// The close of `K + 2` re-votes the record of [`K`], which the hook no longer withholds, and
+/// certifies it.
 ///
 /// Shortly after the close of `K + 2` every validator serves the same certified records of epochs
 /// 0 to `K + 2`. At least one validator that withholds logs the re-certify round for [`K`], no
@@ -471,10 +471,10 @@ impl Observers {
             }
         }
 
-        // the walks: with the walk on, each validator walks past K once (it holds its own record
-        // of K uncertified until the close of K + 2 at the earliest, and its own round certifies
-        // K + 1); the own-record observer walks only when it comes back to the gap (its startup
-        // sync and its collector each walk once); the fresh observer never, holding no record of K
+        // the walks: each validator walks past K once (it holds its own record of K uncertified
+        // until the close of K + 2 at the earliest, and its own round certifies K + 1); the
+        // own-record observer walks only when it comes back to the gap (its startup sync and its
+        // collector each walk once); the fresh observer never, holding no record of K
         let walks = |node: usize, run: u32| log_lines(test, node, run, WALK_LOG, &[]);
         let mut walked = Vec::new();
         for &(node, run) in &runs {

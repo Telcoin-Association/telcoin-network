@@ -116,8 +116,7 @@ const HOOK_EVERY_ENV: &str = "TN_TEST_OWN_CERT_DELAY_EVERY";
 /// The line the certifier logs for every own certificate the hook holds.
 const HOOK_LOG: &str = "test hook: holding own certificate";
 
-/// The warning of invariant I2: a digest re-queued behind a newer digest of its lane with the
-/// hold on.
+/// The warning of invariant I2: a digest re-queued behind a newer digest of its lane.
 const HOLD_WARN_LOG: &str = "digests re-queued out of order under the order hold";
 
 /// The proposer's line for every re-queue.
@@ -148,9 +147,9 @@ const ORPHAN_RESULTS: [&str; 5] =
 /// The re-queue causes; the hold covers both.
 const CAUSES: [&str; 2] = ["canceled", "committed"];
 
-/// With the hold on, every transaction a validator accepted lands exactly once while the own chain
-/// of one validator keeps breaking, with the hook at `before_store` (see
-/// [`Form::hook`]). See [`check_form`] for the assertions.
+/// Every transaction a validator accepted lands exactly once while the own chain of one validator
+/// keeps breaking, with the hook at `before_store` (see [`Form::hook`]). See [`check_form`] for the
+/// assertions.
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
 fn test_hold_keeps_every_transaction_before_store() -> eyre::Result<()> {
@@ -210,11 +209,10 @@ impl Form {
     /// header commits without it (cause `committed`). Measured in the first runs: `before_store`
     /// re-queued digests only as `canceled`, `after_store` 32 only as `committed`.
     /// [`Self::BeforeStore`] takes `before_store`, [`Self::AfterStore`] and the kill take
-    /// `after_store`, so the hold runs on
-    /// both paths and the kill lands while a lane waits on a commit notice. Holds last 5 s, past
-    /// the next own header at this cadence, on every third round: the round after a held one
-    /// carries no own parent, and the one after that does, so the lane is free again and
-    /// drains.
+    /// `after_store`, so the hold runs on both paths and the kill lands while a lane waits on a
+    /// commit notice. Holds last 5 s, past the next own header at this cadence, on every third
+    /// round: the round after a held one carries no own parent, and the one after that does, so the
+    /// lane is free again and drains.
     fn hook(self) -> (&'static str, u64, u64) {
         match self {
             Self::BeforeStore => ("before_store", 5_000, 3),
@@ -1251,7 +1249,7 @@ fn check_form(
             let warned = lines_with(test, *node, *run, HOLD_WARN_LOG, None)?;
             let resent = lines_with(test, *node, *run, RESENT_LOG, Some("out_of_order"))?;
             failed.push(format!(
-                "node {node} run {run} re-queued digests out of order with the hold on: {:?}; \
+                "node {node} run {run} re-queued digests out of order: {:?}; \
                  warnings {warned:#?}; re-queues {resent:#?}",
                 counters.out_of_order
             ));

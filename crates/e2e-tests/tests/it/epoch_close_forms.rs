@@ -55,7 +55,7 @@ use tn_types::{
     GenesisAccount, U256,
 };
 
-/// The proposer fix's floor: a header names a block at most this many non-empty outputs behind its
+/// The proposer's floor: a header names a block at most this many non-empty outputs behind its
 /// proposer's tip (`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`), so a voter further behind refuses it.
 const FLOOR_OUTPUTS: usize = 8;
 
@@ -202,8 +202,8 @@ const QUORUM_LOG: &str = "epoch record quorum";
 /// earlier rounds for the record kept.
 const KEPT_LOG: &str = "epoch record certified from kept votes";
 
-/// The info line, with field `epoch`, of a re-certify pick: at the close
-/// of epoch N a node re-votes one of its uncertified records of epochs N - 16 to N - 2.
+/// The info line, with field `epoch`, of a re-certify pick: at the close of epoch N a node re-votes
+/// one of its uncertified records of epochs N - 16 to N - 2.
 const RECERTIFY_LOG: &str = "epoch record re-certify round";
 
 /// The info line, with field `epoch`, a vote round logs in place of [`ROUND_FAILED_LOG`] when it
@@ -421,9 +421,9 @@ fn check_held_member(
 /// [`EXIT_BEFORE_EPOCH_RECORD_ENV`] set to [`MISSED_EPOCH`], so each stops at its close of that
 /// epoch after the closing block executed and before it writes or votes for the record. The delay
 /// alone cannot keep them out of the window: with four members the DAG needs one of them to vote
-/// for every round, so the fix's floor bounds their backlog to about 8 outputs and their close to a
-/// few seconds after the fast members'. The fast members [`ROUND_FAST`] vote alone; each round must
-/// log [`ROUND_FAILED_LOG`] for the record, and neither may then serve it certified. The held
+/// for every round, so the proposer's floor bounds their backlog to about 8 outputs and their close
+/// to a few seconds after the fast members'. The fast members [`ROUND_FAST`] vote alone; each round
+/// must log [`ROUND_FAILED_LOG`] for the record, and neither may then serve it certified. The held
 /// members are then restarted without the delay or the hook (the release); they rebuild the record
 /// from their closing block and enter the next epoch.
 ///

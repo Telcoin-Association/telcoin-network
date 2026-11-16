@@ -6,10 +6,10 @@
 //!
 //! `TN_E2E_PARAMETERS` holds top-level `parameters.yaml` entries that every start helper merges
 //! into the `parameters.yaml` of every node it starts, restarts included, so a lane can run an
-//! existing test set with a node switch on without editing a test:
+//! existing test set with a node parameter changed without editing a test:
 //!
 //! ```text
-//! TN_E2E_PARAMETERS='example_switch: true; other_switch: 4' cargo nextest run ...
+//! TN_E2E_PARAMETERS='example_parameter: true; other_parameter: 4' cargo nextest run ...
 //! ```
 //!
 //! The value is a list of `key: value` entries separated by `;`. A key is a plain top-level name
@@ -439,9 +439,10 @@ pub fn config_observer(
 ///   it, so a test that edits a node's `parameters.yaml` directly between starts loses the edit;
 ///   change a node's parameters between starts through its overrides instead. The harness knows
 ///   none of the keys: the node's `Parameters` ignores a top-level key it does not know, so a test
-///   can name a switch whether or not the node under test reads it. The same holds for a misspelled
-///   key, or one the node reads from another file, so a test should check the setting took effect
-///   in the node itself (a log line or metric that reports it) rather than trust the merge.
+///   can name a parameter whether or not the node under test reads it. The same holds for a
+///   misspelled key, or one the node reads from another file, so a test should check the setting
+///   took effect in the node itself (a log line or metric that reports it) rather than trust the
+///   merge.
 /// - `env` holds environment variables for the node's process only, set after the variables
 ///   [`TestBinary::command`] forwards, so an entry overrides a forwarded variable of the same name.
 ///   This is how a test arms the hooks in `tn_types::test_hooks` (for example
@@ -607,10 +608,10 @@ impl NodeOverrides {
 /// ```
 /// use e2e_tests::FleetOverrides;
 ///
-/// // validators 1 and 2 (instances 0 and 1) run with the switch, 3 and 4 without it
+/// // validators 1 and 2 (instances 0 and 1) run with the parameter, 3 and 4 without it
 /// let overrides = FleetOverrides::default().parameter(
 ///     ["validator-1", "validator-2"],
-///     "example_switch",
+///     "example_parameter",
 ///     "true",
 /// );
 /// assert!(overrides.node("validator-3").is_empty());
@@ -1224,8 +1225,8 @@ mod tests {
 
     #[test]
     fn merge_appends_a_new_key_and_keeps_every_other_line() {
-        let merged = merge_parameters_yaml(BASE, &pairs(&[("example_switch", "true")])).unwrap();
-        assert_eq!(merged, format!("{BASE}example_switch: true\n"));
+        let merged = merge_parameters_yaml(BASE, &pairs(&[("example_parameter", "true")])).unwrap();
+        assert_eq!(merged, format!("{BASE}example_parameter: true\n"));
     }
 
     #[test]
@@ -1281,7 +1282,7 @@ mod tests {
     }
 
     /// The harness's own `parameters.yaml` (as `config_local_testnet` writes it) takes an unknown
-    /// switch and a typed override, and the node's loader reads the typed value back.
+    /// parameter and a typed override, and the node's loader reads the typed value back.
     #[test]
     fn apply_parameters_reaches_the_node_loader() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1346,7 +1347,7 @@ mod tests {
     #[test]
     fn fleet_overrides_assign_each_setting_to_the_named_nodes() {
         let fleet = FleetOverrides::default()
-            .parameter(["validator-1", "validator-2"], "example_switch", "true")
+            .parameter(["validator-1", "validator-2"], "example_parameter", "true")
             .env(
                 ["validator-2", "validator-3", "validator-4"],
                 "TN_TEST_EXECUTION_DELAY_MS",
@@ -1354,12 +1355,12 @@ mod tests {
             );
         assert_eq!(
             fleet.node("validator-1"),
-            &NodeOverrides::default().parameter("example_switch", "true")
+            &NodeOverrides::default().parameter("example_parameter", "true")
         );
         assert_eq!(
             fleet.node("validator-2"),
             &NodeOverrides::default()
-                .parameter("example_switch", "true")
+                .parameter("example_parameter", "true")
                 .env("TN_TEST_EXECUTION_DELAY_MS", "400")
         );
         assert_eq!(
@@ -1376,8 +1377,8 @@ mod tests {
     #[test]
     fn parse_e2e_parameters_reads_entries_in_order() {
         assert_eq!(
-            parse_e2e_parameters("example_switch: true; other_switch: 4").unwrap(),
-            pairs(&[("example_switch", "true"), ("other_switch", "4")])
+            parse_e2e_parameters("example_parameter: true; other_parameter: 4").unwrap(),
+            pairs(&[("example_parameter", "true"), ("other_parameter", "4")])
         );
         // whitespace is trimmed, empty entries are skipped, a value keeps its own colons and
         // spaces, and a repeated key stays repeated (the merge lets the later one win)
@@ -1393,14 +1394,14 @@ mod tests {
     #[test]
     fn parse_e2e_parameters_rejects_malformed_entries_naming_the_variable() {
         for raw in [
-            "example_switch",
-            "example_switch true",
-            "example_switch=true",
+            "example_parameter",
+            "example_parameter true",
+            "example_parameter=true",
             ": true",
             "two words: true",
             "nested.inner: 3",
-            "example_switch:",
-            "example_switch:   ; other_switch: 4",
+            "example_parameter:",
+            "example_parameter:   ; other_parameter: 4",
             "a: 1\nb: 2",
             "ok: 1; broken",
         ] {
@@ -1413,23 +1414,23 @@ mod tests {
     /// other fleet-wide entry is still merged; the node's environment is kept.
     #[test]
     fn layered_over_puts_the_test_entries_last() {
-        let fleet_wide = pairs(&[("example_switch", "true"), ("other_switch", "4")]);
+        let fleet_wide = pairs(&[("example_parameter", "true"), ("other_parameter", "4")]);
         let node = NodeOverrides::default()
-            .parameter("example_switch", "false")
+            .parameter("example_parameter", "false")
             .env("TN_TEST_EXECUTION_DELAY_MS", "400");
         let layered = node.layered_over(&fleet_wide);
         assert_eq!(
             layered.parameters,
             pairs(&[
-                ("example_switch", "true"),
-                ("other_switch", "4"),
-                ("example_switch", "false")
+                ("example_parameter", "true"),
+                ("other_parameter", "4"),
+                ("example_parameter", "false")
             ])
         );
         assert_eq!(layered.env, node.env);
         let merged = merge_parameters_yaml(BASE, &layered.parameters).unwrap();
-        assert!(merged.ends_with("other_switch: 4\nexample_switch: false\n"), "{merged}");
-        assert_eq!(merged.matches("example_switch:").count(), 1, "{merged}");
+        assert!(merged.ends_with("other_parameter: 4\nexample_parameter: false\n"), "{merged}");
+        assert_eq!(merged.matches("example_parameter:").count(), 1, "{merged}");
 
         // nothing fleet-wide leaves the node's overrides as they are
         assert_eq!(node.layered_over(&[]), node);
@@ -1468,8 +1469,6 @@ mod tests {
         NodeOverrides::default().apply_layered(dir.path(), &[]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
     }
-
-    // ---- bench7 bench6-e2e-scaffold ----
 
     /// The pass a multi-node start helper runs before it spawns anything fails at the first node
     /// that cannot take its overrides, naming it and leaving its file alone, so the helper returns
@@ -1510,7 +1509,7 @@ mod tests {
     fn dropped_entries_notice_names_the_datadir_and_the_dropped_keys() {
         let node_dir = std::path::Path::new("/tmp/e2e-test/validator-2");
         let previous =
-            merge_parameters_yaml(BASE, &pairs(&[("example_switch", "true"), ("first", "9")]))
+            merge_parameters_yaml(BASE, &pairs(&[("example_parameter", "true"), ("first", "9")]))
                 .unwrap();
 
         // a restart without overrides: the harness's file comes back
@@ -1518,7 +1517,7 @@ mod tests {
             dropped_entries_notice(node_dir, &previous, BASE).as_deref(),
             Some(
                 "e2e: /tmp/e2e-test/validator-2 starts without the parameters.yaml entries \
-                 [\"example_switch\", \"first\"] of its previous start: each start writes the \
+                 [\"example_parameter\", \"first\"] of its previous start: each start writes the \
                  harness's file plus its own entries, so restart it with the same overrides to \
                  keep them"
             )
@@ -1526,10 +1525,10 @@ mod tests {
 
         // a restart with other overrides: a changed value counts, a kept entry does not
         let other =
-            merge_parameters_yaml(BASE, &pairs(&[("first", "9"), ("example_switch", "false")]))
+            merge_parameters_yaml(BASE, &pairs(&[("first", "9"), ("example_parameter", "false")]))
                 .unwrap();
         let notice = dropped_entries_notice(node_dir, &previous, &other).unwrap();
-        assert!(notice.contains(" [\"example_switch\"] "), "{notice}");
+        assert!(notice.contains(" [\"example_parameter\"] "), "{notice}");
 
         // a block value replaced by the harness's is a change too
         let flat = merge_parameters_yaml(BASE, &pairs(&[("nested", "{}")])).unwrap();
@@ -1538,7 +1537,7 @@ mod tests {
 
         // the same file, or one that only adds entries, says nothing
         assert_eq!(dropped_entries_notice(node_dir, &previous, &previous), None);
-        let more = merge_parameters_yaml(&previous, &pairs(&[("other_switch", "4")])).unwrap();
+        let more = merge_parameters_yaml(&previous, &pairs(&[("other_parameter", "4")])).unwrap();
         assert_eq!(dropped_entries_notice(node_dir, &previous, &more), None);
         assert_eq!(dropped_entries_notice(node_dir, BASE, BASE), None);
     }
