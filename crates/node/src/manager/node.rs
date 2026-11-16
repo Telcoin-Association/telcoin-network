@@ -28,6 +28,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     future::ready,
     sync::Arc,
+    time::Duration,
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{
@@ -38,7 +39,10 @@ use tn_primary::{
     ConsensusBusApp, NodeMode, QueChannel,
 };
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
-use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb, open_db, DatabaseType};
+use tn_storage::{
+    certificate_pack::CertificatePack, consensus::ConsensusChain, epoch_records::EpochRecordDb,
+    open_db, DatabaseType,
+};
 use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
@@ -70,6 +74,11 @@ pub(crate) use run_epoch::RunEpochMode;
 /// Name of the process-lifetime [`TaskManager`] that owns tasks outliving any single epoch
 /// (p2p networks, engine updates, consensus fetchers).
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
+
+/// How long the node's tasks get to exit on the node shutdown, running their graceful exits (the
+/// engine drains what it holds), before the node task manager signals its own shutdown to end the
+/// rest. Reth's tasks follow only that signal, so a clean stop takes this long.
+const NODE_TASK_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
 pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
@@ -302,6 +311,12 @@ pub(crate) struct EpochManager<P, DB> {
     /// Handle to the epoch pack files that durably store consensus data. Persisted on startup and
     /// at shutdown; read by the fetch tasks that backfill missing epochs.
     consensus_chain: ConsensusChain,
+
+    /// The running epoch's certificate pack while it is open (a proposing node only). Shared with
+    /// the epoch's consensus task, which saves into it. Held here rather than by `run_epoch` so it
+    /// is sealed however the epoch ends: `finish_epoch` seals it at the epoch's end, and
+    /// `finish_stopped_epoch` at a node stop, which drops `run_epoch` wherever it waits.
+    certificate_pack: Option<Arc<CertificatePack>>,
 
     /// The uncommitted batches that each committee key stored on this node through the worker
     /// report path and the gossip prefetch (issue #1794). One ledger for all workers of the node.
@@ -853,6 +868,7 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            certificate_pack: None,
             reported_batches: ReportedBatchLedger::new(),
             primary_sync_ledgers: PrimarySyncLedgers::new(),
             bootstrap_servers,
@@ -1115,26 +1131,6 @@ where
                 on_chain_workers,
             )
             .await?;
-        // A loopback listener cannot dial remote bootstrap peers, so such a node finds no peers.
-        endpoints::loopback_listeners_with_remote_peers(
-            std::iter::once(("PRIMARY_LISTENER_MULTIADDR".to_owned(), &primary_address)).chain(
-                worker_addresses
-                    .iter()
-                    .map(|(id, address)| (endpoints::worker_listener_env_var(*id), address)),
-            ),
-            self.bootstrap_servers
-                .values()
-                .flat_map(|server| std::iter::once(&server.primary).chain(&server.workers))
-                .map(|peer| &peer.network_address),
-        )
-        .into_iter()
-        .for_each(|(env_var, listener, suggested)| {
-            warn!(
-                target: "epoch-manager",
-                %listener,
-                "this listener binds a loopback IP, so its dials cannot reach the remote bootstrap peers and the node will find no peers; set {env_var}={suggested} to bind every interface (the advertised address does not change; docs/src/network/transport.md)"
-            );
-        });
         let primary_network_handle = self
             .primary_network_handle
             .as_ref()
@@ -1553,22 +1549,33 @@ where
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result,
         };
-        // Persist the current pack, then drain the long-lived tasks REGARDLESS of a persist error.
-        // The task-held `consensus_chain` clones are released by `node_task_manager`'s own `Drop`,
-        // which notifies `local_shutdown` (every task `select!`s on it) — this happens when `run`
-        // returns, before `shutdown()`, so those clones are gone within milliseconds; the drain
-        // below just awaits the tasks' exit. (The worker RPC servers hold one more clone
+        // A node shutdown ends the select by dropping the epoch loop wherever it waits, so the
+        // running epoch never reaches its end (`finish_epoch`). `finish_stopped_epoch` makes the
+        // epoch's writes durable instead: it seals the certificate pack, persists the current
+        // consensus pack and checks the stores, and returns a failure. Then drain the long-lived
+        // tasks REGARDLESS of that error.
+        // The node's own tasks exit on the node shutdown and get `NODE_TASK_EXIT_GRACE` for their
+        // graceful exits (the engine drains what it holds); then `shutdown_tasks` notifies the
+        // manager's `local_shutdown` (every task `select!`s on it), which ends the rest, reth's
+        // tasks among them, and joins them. That releases the task-held `consensus_chain` clones
+        // before `run` returns and `shutdown()` runs. (The worker RPC servers hold one more clone
         // that is NOT a `node_task_manager` task; it is released as the jsonrpsee task
         // winds down after `engine` drops, which `shutdown()` waits out via
         // `wait_until_sole_owner` before `close()` — and if it outlives that wait,
         // `close()` now force-seals rather than leaving the pack unsealed.) Surfacing the
-        // persist error before draining (a bare `?`) would skip that drain; the `Drop`
-        // fallback is runtime-safe regardless. Persist error still takes precedence over `result`.
-        let persist_result = self.consensus_chain.persist_current().await;
-        node_task_manager.wait_for_task_shutdown().await;
-        persist_result?;
-
-        result
+        // storage error before draining (a bare `?`) would skip that drain; the `Drop`
+        // fallback is runtime-safe regardless. On a clean stop a storage error is the exit
+        // error, and after it a critical task that failed as it stopped (the engine's drain
+        // failing to execute or persist what it held); when the loop failed, its own error is
+        // (`finish_stopped_epoch` and the drain log what the stop meets then).
+        let stop_result = self.finish_stopped_epoch(result.is_err()).await;
+        let stopped = node_task_manager.shutdown_tasks(NODE_TASK_EXIT_GRACE).await;
+        stop_result?;
+        result?;
+        match stopped.failed {
+            Some(e) => Err(eyre!("a node task failed as the node stopped: {e}")),
+            None => Ok(()),
+        }
     }
 
     /// Gracefully close storage handles that would otherwise block a tokio worker on `Drop`.
@@ -1959,8 +1966,10 @@ where
                         "failed to READ the consensus store while resolving the producing \
                          consensus header for the executed tip (block {}, epoch {tip_epoch}): \
                          this is a storage error, not a missing record - do NOT delete the \
-                         chain-data directories; inspect the consensus-db epoch pack files (or \
-                         restore them from a backup or peers) and retry",
+                         chain-data directories; check the consensus-db epoch packs with \
+                         `telcoin-network db validate` and `db repair` (a dry run), put back a \
+                         damaged past `epoch-N/` from a backup taken after its epoch closed (no \
+                         peer sends a past pack again), and retry",
                         tip.number
                     )
                 })?;
@@ -1973,27 +1982,47 @@ where
     /// consensus output (with or without blocks).
     ///
     /// This is the live counterpart to [`try_restore_state`](Self::try_restore_state): the latter
-    /// seeds `recent_blocks` once at startup, this keeps it current thereafter. If the engine
-    /// update channel closes the engine is gone, so the task returns an error to bring the node
-    /// down.
+    /// seeds `recent_blocks` once at startup, this keeps it current thereafter. See
+    /// [`forward_engine_updates`] for how the task ends.
     fn spawn_engine_update_task(
         &self,
-        mut engine_update: mpsc::Receiver<EngineUpdate>,
+        engine_update: mpsc::Receiver<EngineUpdate>,
         task_manager: &TaskManager,
     ) {
-        let consensus_bus = self.consensus_bus.clone();
-        task_manager.spawn_critical_task("engine updates for consensus", async move {
-            while let Some((latest_round, consensus_num_hash, latest_executed_block)) =
-                engine_update.recv().await
-            {
-                consensus_bus.recent_blocks().send_modify(|blocks| {
-                    blocks.push_latest(latest_round, consensus_num_hash, latest_executed_block)
-                });
-            }
-            error!(target: "engine", "engine updates ended, node will exit");
-            Err(TaskError::from_message("engine updates ended, node will exit"))
+        task_manager.spawn_critical_task(
+            "engine updates for consensus",
+            forward_engine_updates(
+                engine_update,
+                self.consensus_bus.clone(),
+                self.node_shutdown.clone(),
+            ),
+        );
+    }
+}
+
+/// Push each engine update into `ConsensusBus::recent_blocks` until the engine drops its sender.
+///
+/// The engine exits on the node's shutdown, so the channel closing while `node_shutdown` is
+/// notified is a normal exit. Closing at any other time means the engine is gone: the task returns
+/// an error to bring the node down.
+async fn forward_engine_updates(
+    mut engine_update: mpsc::Receiver<EngineUpdate>,
+    consensus_bus: ConsensusBusApp,
+    node_shutdown: ShutdownNotifier,
+) -> Result<(), TaskError> {
+    while let Some((latest_round, consensus_num_hash, latest_executed_block)) =
+        engine_update.recv().await
+    {
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(latest_round, consensus_num_hash, latest_executed_block)
         });
     }
+    if node_shutdown.is_notified() {
+        debug!(target: "engine", "engine updates ended with the node shutdown");
+        return Ok(());
+    }
+    error!(target: "engine", "engine updates ended, node will exit");
+    Err(TaskError::from_message("engine updates ended, node will exit"))
 }
 
 /// Refuse to start on an incomplete state restore: reth is populated to a tip past genesis but the
@@ -2141,6 +2170,35 @@ mod tests {
         BlsKeypair, BlsSignature, EpochCertificate, EpochRecord, ExecHeader, RpcInfo,
         TnReceiver as _, TnSender as _, B256,
     };
+
+    /// The engine closes its update channel when it exits. During a requested node shutdown that
+    /// is a normal exit of the engine-updates task; at any other time the task fails and its
+    /// critical exit stops the node.
+    #[tokio::test]
+    async fn engine_updates_end_fails_only_outside_a_shutdown() {
+        let node_shutdown = ShutdownNotifier::new();
+        let (engine_update_tx, engine_update_rx) = mpsc::channel(1);
+        node_shutdown.notify();
+        drop(engine_update_tx);
+        let ended =
+            forward_engine_updates(engine_update_rx, ConsensusBusApp::new(), node_shutdown).await;
+        assert!(ended.is_ok(), "a clean stop is not a failure: {ended:?}");
+
+        let node_shutdown = ShutdownNotifier::new();
+        let (engine_update_tx, engine_update_rx) = mpsc::channel(1);
+        let mut task_manager = TaskManager::default();
+        task_manager.spawn_critical_task(
+            "engine updates for consensus",
+            forward_engine_updates(engine_update_rx, ConsensusBusApp::new(), node_shutdown.clone()),
+        );
+        drop(engine_update_tx);
+        match task_manager.until_task_ends(node_shutdown).await {
+            Err(tn_types::TaskJoinError::CriticalExitError(name, _)) => {
+                assert_eq!(name, "engine updates for consensus")
+            }
+            other => panic!("the engine ending on its own stops the node: {other:?}"),
+        }
+    }
 
     /// Startup follows the latest record's next committee for both retiring and joining keys.
     #[tokio::test]

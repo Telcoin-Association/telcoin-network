@@ -604,8 +604,12 @@ impl RethEnv {
                 Err(eyre::eyre!(
                     "storage consistency check found the database ahead of {lagging}. Startup \
                      cannot heal this direction: the backend lost data, which indicates \
-                     corruption or manual datadir changes. Restore the datadir from a snapshot \
-                     or backup before restarting"
+                     corruption or manual datadir changes. Before restarting, restore the \
+                     execution database (`db`, `static_files` and any `restored-state-floor`, \
+                     all from one stop) from a backup, or rebuild it (`telcoin-network db \
+                     reset-execution`). A restore of the whole datadir, or into a new one from \
+                     a snapshot, replaces `consensus-db` too: a validator restored that way \
+                     stays stopped until the network has closed the epoch it was last in"
                 ))
             })?;
 

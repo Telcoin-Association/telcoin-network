@@ -30,7 +30,9 @@ use crate::RethEnv;
     "the execution datadir stores transactions of blocks {}..={} by their position in consensus \
      packs of epochs {}..={}, and {} lacks epoch(s) {}. This node does not fetch past epochs from \
      peers, and a rebuild of the execution database re-executes from its own packs, so it stops at \
-     the same gap. Restore `consensus-db` from a backup; without one, start over as a new node, \
+     the same gap. Put back each missing `epoch-N` directory from a backup taken after that \
+     epoch closed (a sealed epoch's pack never changes; a whole `consensus-db` from an older \
+     backup lacks the packs since it was taken); without one, start over as a new node, \
      moving both the execution database (`telcoin-network db reset-execution`) and `consensus-db` \
      aside, or swap in the execution database of an observer bootstrapped with \
      `telcoin-network db load-state` from epoch {} or a later one (`db reset-execution --for-swap`)",

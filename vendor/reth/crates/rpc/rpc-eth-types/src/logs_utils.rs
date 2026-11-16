@@ -13,6 +13,8 @@ use reth_storage_api::{BlockReader, ProviderBlock};
 use std::sync::Arc;
 use thiserror::Error;
 
+use crate::tx_read_scope::TxReadScope;
+
 /// Returns all matching of a block's receipts when the transaction hashes are known.
 pub fn matching_block_logs_with_tx_hashes<'a, I, R>(
     filter: &Filter,
@@ -82,6 +84,10 @@ where
     if !filter.matches_block(&block_num_hash) {
         return Ok(());
     }
+
+    // TN(TN-0204): the provider path reads each matching transaction by id; in this scope a
+    // datadir that stores transactions by batch position reads the block's batch once
+    let _scope = matches!(provider_or_block, ProviderOrBlock::Provider(_)).then(TxReadScope::enter);
 
     // Tracks the index of a log in the entire block.
     let mut log_index: u64 = 0;

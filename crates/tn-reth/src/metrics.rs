@@ -16,7 +16,11 @@
 //! `tn_reth.account_walk_fallbacks_total` (labeled by `reason`, see [`AccountWalkFallback`]),
 //! counts blocks whose split account walk ran on one thread instead, and a sixth,
 //! `tn_reth.storage_walk_fallbacks_total` (labeled by `reason`, see [`StorageWalkFallback`]), hot
-//! storage tries whose split storage root was not used. A seventh,
+//! storage tries whose split storage root was not used. Beside them,
+//! `tn_reth.account_walk_splits_total` counts the blocks whose root the split account walk composed
+//! and `tn_reth.storage_walk_splits_total` the hot storage tries whose storage root was composed
+//! from the split's pieces, so the share of the splits that ran can be read (see
+//! [`record_account_walk_split`] and [`record_storage_walk_splits`]). A seventh,
 //! `tn_reth.parallel_state_root_task_failures_total` (labeled by `reason`, see
 //! [`ParallelRootTaskFailure`]), counts the parallel state-root tasks that failed and left their
 //! part to the serial computation.
@@ -26,9 +30,9 @@
 //! [`record_tx_body_inline_rows`]).
 //!
 //! Transaction reads of such a datadir (`env::tx_bodies`): `tn_reth.tx_body_resolves_total`
-//! (labeled by `source`: `recent`, `cold`, `live_pack`, `closed_pack`, `memory`) counts the blocks
-//! whose position rows were resolved, `tn_reth.tx_body_resolve_failures_total` (labeled by
-//! `reason`, alertable) those that failed, `tn_reth.tx_body_pack_opens_total` the closed-epoch
+//! (labeled by `source`: `recent`, `cold`, `live_pack`, `closed_pack`, `memory`, `scoped`) counts
+//! the blocks whose position rows were resolved, `tn_reth.tx_body_resolve_failures_total` (labeled
+//! by `reason`, alertable) those that failed, `tn_reth.tx_body_pack_opens_total` the closed-epoch
 //! packs the resolver opened, the gauge `tn_reth.tx_body_cache_bytes` (labeled by `part`: `recent`,
 //! `cold`) the decoded-batch cache's size, and the histogram `tn_reth.tx_body_resolve_seconds` the
 //! resolves that read a pack. See [`register_tx_body_series`].
@@ -155,6 +159,7 @@ pub(crate) fn init() {
     register_invalid_tx_skip_series();
     register_account_walk_fallback_series();
     register_storage_walk_fallback_series();
+    register_walk_split_series();
     register_parallel_root_task_failure_series();
     register_retired_pool_handoff_series();
     register_tx_body_series();
@@ -619,6 +624,44 @@ fn register_storage_walk_fallback_series() {
 /// test.
 pub(crate) fn record_storage_walk_fallback(reason: StorageWalkFallback) {
     metrics::counter!(STORAGE_WALK_FALLBACKS, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for blocks whose root the split account walk composed
+/// (`env/output_overlay/account_split.rs`), kept next to its only emission helper,
+/// [`record_account_walk_split`]. Read against [`ACCOUNT_WALK_FALLBACKS`]: the two together, less
+/// its `mismatch` reason (a composed block also counted there), are the blocks the split would
+/// take.
+const ACCOUNT_WALK_SPLITS: &str = "tn_reth.account_walk_splits_total";
+
+/// Counter name for hot storage tries whose storage root the walk took composed from the split's
+/// pieces (`env/output_overlay/storage_split.rs`), once per trie and block, kept next to its only
+/// emission helper, [`record_storage_walk_splits`]. Read against [`STORAGE_WALK_FALLBACKS`]: the
+/// two together are the hot tries the split would take, less the `mismatch` reason (counted per
+/// block) and the tries with a piece that failed or was never computed (in neither; a failed piece
+/// is counted in [`PARALLEL_ROOT_TASK_FAILURES`]).
+const STORAGE_WALK_SPLITS: &str = "tn_reth.storage_walk_splits_total";
+
+/// Register [`ACCOUNT_WALK_SPLITS`] and [`STORAGE_WALK_SPLITS`] at zero. Called from [`init`], for
+/// the reasons given there.
+fn register_walk_split_series() {
+    metrics::counter!(ACCOUNT_WALK_SPLITS).increment(0);
+    metrics::counter!(STORAGE_WALK_SPLITS).increment(0);
+}
+
+/// Count one block whose root the split account walk composed. Called once per such block, on the
+/// thread that computed its root, after the walk; the macro path re-resolves the recorder on every
+/// call, keeping the series observable from a unit test, at one registry lookup per block.
+pub(crate) fn record_account_walk_split() {
+    metrics::counter!(ACCOUNT_WALK_SPLITS).increment(1);
+}
+
+/// Count `tries` hot storage tries whose storage root was composed from the split's pieces. Called
+/// once per block, on the thread that computed its root, after the walk; a block with none records
+/// nothing.
+pub(crate) fn record_storage_walk_splits(tries: usize) {
+    if tries > 0 {
+        metrics::counter!(STORAGE_WALK_SPLITS).increment(tries as u64);
+    }
 }
 
 /// Counter name for parallel state-root work (a storage-root task, a walk helper, an account
@@ -1635,6 +1678,38 @@ mod tests {
                 reason.label()
             );
         });
+    }
+
+    /// [`register_walk_split_series`] registers both split counters at zero; each record moves only
+    /// its own, and a block with no composed storage root records nothing.
+    #[test]
+    fn test_walk_splits_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let counts = || {
+            let snapshot = snapshotter.snapshot().into_vec();
+            [ACCOUNT_WALK_SPLITS, STORAGE_WALK_SPLITS].map(|name| {
+                snapshot
+                    .iter()
+                    .find(|(key, ..)| key.key().name() == name)
+                    .map(|(.., value)| match value {
+                        DebugValue::Counter(n) => *n,
+                        other => panic!("{name} is not a counter: {other:?}"),
+                    })
+                    .unwrap_or_else(|| panic!("{name} not registered"))
+            })
+        };
+        metrics::with_local_recorder(&recorder, register_walk_split_series);
+        assert_eq!(counts(), [0, 0]);
+
+        metrics::with_local_recorder(&recorder, || {
+            record_account_walk_split();
+            record_storage_walk_splits(0);
+        });
+        assert_eq!(counts(), [1, 0]);
+        // a snapshot reads each counter's increments since the last one
+        metrics::with_local_recorder(&recorder, || record_storage_walk_splits(3));
+        assert_eq!(counts(), [0, 3]);
     }
 
     /// [`register_account_walk_fallback_series`] registers one series per

@@ -252,9 +252,16 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
   bounded to the logical length.
 
 `pack_validate` (the `db validate` diagnostic) classifies a damaged data file as `TornTrailingTail`
-(an unacked torn tail — truncated and repaired) or as needing a re-sync: `TornMetaEmpty` (a torn
-epoch-meta is never repaired — INV2), `CorruptMetaWithData`, `MidLogCorruption`, `CorruptSealedRecord`
-(data loss). Only a `TornTrailingTail` exits `db validate` with success. Its read-only recovery checks
+(an unacked torn tail — truncated and repaired) or as damage no local repair fixes: `TornMetaEmpty` (a
+torn epoch-meta is never repaired — INV2), `CorruptMetaWithData`, `MidLogCorruption`,
+`CorruptSealedRecord` (data loss). Only a `TornTrailingTail` exits `db validate` with success. Nothing
+fetches a past epoch's pack again, so each report of data loss ends with the recovery
+(`pack_validate::lost_pack_remedy`): put back the epoch's directory from a backup taken after that epoch
+closed (a sealed past pack never changes; a whole `consensus-db` from an older backup lacks the later packs), or
+start the node over (crates/tn-reth/README.md, "Transactions stored by position"), and never delete the
+`epoch-N` directory, which a datadir storing transactions by position needs at every start. Only the
+newest epoch's torn-empty meta or all-zero data file holds no output: the node creates (or
+re-initializes) that epoch again when it enters it. Its read-only recovery checks
 (shared with `db repair`'s dry run) read the position index's entries straight from the file, so an
 index a crash left unsealed attests the same output boundaries it does to the writable open.
 
@@ -333,8 +340,9 @@ failure is never reported to someone else), and closing persists before the file
 epoch's record is never replaced: re-saving the same record is a no-op, and a different one is refused
 (`ConflictingRecord`), since epoch records are identical on every node. A stored certificate counts
 only if it reads back: one that does not is not certified (`first_missing_historical_cert` stops at
-it), and a re-save reports it (`Unreadable`) rather than skipping or replacing it; the cure is a
-re-sync. The by-number routing follows only what is stored: it is built at open and extended after
+it), and a re-save reports it (`Unreadable`) rather than skipping or replacing it; nothing fetches
+it again, so the cure is a backup of the epoch-records files (`db repair` names the recovery). The
+by-number routing follows only what is stored: it is built at open and extended after
 each save by the same checked read (`extend_routing`), and a stored record that does not read back
 fails the open, naming its epoch. `certificate_pack` and `exec_state_pack` are per-epoch / per-snapshot packs for
 certificate bundles and EVM state exports.
@@ -463,7 +471,7 @@ notified is only logged, which is why `finish_epoch` re-checks the packs and sto
 
 ```
 <datadir>/
-  db/                          reth execution DB (MDBX)
+  db/                          reth execution DB (tn-lmdb.dat; mdbx.dat on the mdbx build)
   static_files/                reth static file segments
   consensus-db/                tndb/{epoch,kad,cache} (one tndb log per environment) + the epochs/ tree below
     epochs/
@@ -490,8 +498,8 @@ issues. A check it could not run is an error, never a verdict: a data log it can
 command, and the recovery check reports an unopenable log as "recoverability unknown", so a
 transient failure never reads as a truncatable tail or a skipped index check. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
-default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported for
-re-sync, never "fixed". A read the disk failed (opening the data log included, for the validation
+default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported with
+its recovery (above), never "fixed". A read the disk failed (opening the data log included, for the validation
 too), any other OS failure (a sync, a rename, an unlink), a failure the environment caused
 (descriptor or memory exhaustion, a permission problem, a full disk), or a rebuilt index that did not
 sync or seal (recovery seals its rebuilt indexes before it cuts the log), is no verdict on the epoch:
@@ -501,9 +509,16 @@ epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `ep
 complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
 read-side heal, `db migrate`, `db repair` and `db validate`, even when its indexes cannot attest its
 length. A legacy v0
-(batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. `db repair`,
-`db migrate`, `db load-state` and `db tndb-stat` refuse to run while a live node holds the
-`<datadir>/telcoin.pid` lock (intentional-design item 9).
+(batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. An
+interrupted install (`epoch-N.replaced` with no `epoch-N`: an install or migration stopped between
+its two renames) is reported by `db repair`, `db migrate` and `db validate` of the missing `epoch-N`,
+never read as "not found" or healthy; the node's next start puts it back
+(`ConsensusChain::recover_incomplete_installs`), and `db repair --force` runs that same step first,
+then checks the restored epoch with the others. `db repair`,
+`db migrate`, `db load-state`, `db tndb-stat`, `db reset-execution`, `db migrate-execution` and,
+on the default (tn-lmdb) build, `db stats` and `db check` refuse to run while a live node holds the
+`<datadir>/telcoin.pid` lock, and hold it while they run (intentional-design item 9); `db validate`
+takes a pack path and no lock.
 
 ### Benchmarks
 

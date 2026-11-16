@@ -11,6 +11,7 @@
 //! never a missing or another transaction.
 
 use std::{
+    collections::HashMap,
     fs,
     io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
@@ -457,7 +458,7 @@ async fn a_lost_or_damaged_pack_refuses_the_start_or_fails_the_read() -> eyre::R
     let message = err.to_string();
     for says in [
         "lacks epoch(s) 1.",
-        "Restore `consensus-db` from a backup",
+        "Put back each missing `epoch-N` directory from a backup taken after that epoch closed",
         "db load-state` from epoch 1 or a later one",
     ] {
         assert!(message.contains(says), "{message}");
@@ -649,5 +650,87 @@ async fn rows_past_their_batch_or_naming_another_transaction_fail() -> eyre::Res
             "{failure}"
         );
     }
+    Ok(())
+}
+
+/// The resolves `snapshotter`'s recorder counted since its last snapshot, by the `source` their
+/// batch came from (a snapshot takes the counts).
+fn resolves(snapshotter: &metrics_util::debugging::Snapshotter) -> HashMap<String, u64> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| match value {
+            metrics_util::debugging::DebugValue::Counter(count)
+                if key.key().name() == "tn_reth.tx_body_resolves_total" =>
+            {
+                let source = key.key().labels().find(|label| label.key() == "source")?;
+                Some((source.value().to_owned(), count))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `eth_getLogs` matches a block's logs without the RPC cache through
+/// `append_matching_block_logs`, which reads the transaction of each matching receipt by id, one
+/// call each. With no decoded-batch cache, the block's batch is still read from its pack once
+/// (the read scope the log path enters keeps it for the block's later reads), and every log names
+/// its transaction. The same reads outside a scope read the pack once each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocks_logs_read_its_batch_once() -> eyre::Result<()> {
+    use alloy::rpc::types::Filter;
+    use reth_rpc_eth_types::logs_utils::{append_matching_block_logs, ProviderOrBlock};
+    use tn_types::{Log, Receipt};
+
+    let run = Run::new(&[TxBodies::Pointers], 0, 2, |_, _| Box::new(|| ())).await?;
+    let env = run.env(TxBodies::Pointers);
+    let stored = read_all(env)?;
+    // the closed epoch's block with the most transactions
+    let block = stored
+        .iter()
+        .filter(|tx| tx.epoch == 0)
+        .map(|tx| tx.block)
+        .max_by_key(|&block| stored.iter().filter(|tx| tx.block == block).count())
+        .expect("epoch 0 stored transactions");
+    let txs: Vec<&StoredTx> = stored.iter().filter(|tx| tx.block == block).collect();
+    eyre::ensure!(txs.len() >= 2, "block {block} has {} transactions", txs.len());
+    let provider = env.blockchain_provider();
+    let header = provider.sealed_header(block)?.expect("a header");
+    // one log a receipt: the default filter matches each one, so each transaction is read
+    let receipts = vec![Receipt { logs: vec![Log::default()], ..Default::default() }; txs.len()];
+
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut logs = Vec::new();
+    metrics::with_local_recorder(&recorder, || {
+        append_matching_block_logs(
+            &mut logs,
+            ProviderOrBlock::Provider(&provider),
+            &Filter::default(),
+            header.num_hash(),
+            &receipts,
+            false,
+            header.timestamp,
+        )
+    })?;
+    let hashes: Vec<_> = logs.iter().map(|log| log.transaction_hash).collect();
+    assert_eq!(hashes, txs.iter().map(|tx| Some(tx.hash)).collect::<Vec<_>>());
+    let counted = resolves(&snapshotter);
+    assert_eq!(counted.get("closed_pack"), Some(&1), "the batch read from its pack once");
+    assert_eq!(counted.get("scoped"), Some(&(txs.len() as u64 - 1)), "the rest from the scope");
+
+    // the same reads outside a scope: the pack once each, nothing kept
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || -> eyre::Result<()> {
+        for tx in &txs {
+            provider.transaction_by_id(tx.id)?.expect("the transaction");
+        }
+        Ok(())
+    })?;
+    let counted = resolves(&snapshotter);
+    assert_eq!(counted.get("closed_pack"), Some(&(txs.len() as u64)), "the pack once each");
+    assert_eq!(counted.get("scoped"), None, "nothing from a scope");
     Ok(())
 }

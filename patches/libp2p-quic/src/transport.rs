@@ -172,7 +172,9 @@ impl<P: Provider> GenTransport<P> {
                         .iter()
                         .any(|ip_addr| ip_addr.is_loopback())
                 } else {
-                    true
+                    // A socket bound to a loopback IP cannot send to another host. With no
+                    // listener left, `dial` uses a socket bound to the unspecified address.
+                    !l.socket_addr().ip().is_loopback()
                 }
             })
             .collect();

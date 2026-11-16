@@ -158,8 +158,8 @@ The alert levels are starting points; tune them after a week of baseline data.
 | Memory pressure | `/proc/pressure/memory`, `full avg60` | Above 1 | The kernel is reclaiming pages the node needs, so all its threads stall | Add RAM. On RPC nodes, lower `--rpc-cache.max-blocks`. Do not add swap. |
 | IO pressure | `/proc/pressure/io`, `full avg60` | Above 10 | Execution is waiting on disk | Move to faster storage or raise the volume's provisioned IOPS, then check for throttling. |
 | Disk throttling | The provider's volume metrics (GCP reports throttled read and write operations and bytes per disk); `iostat -x` queue size and await | Any sustained throttling | The volume has reached its provisioned IOPS or throughput | Raise the volume limits or move to local NVMe. |
-| Free disk space | Free space on the filesystem that holds the datadir (`df`, or node_exporter's `node_filesystem_avail_bytes`) | Below 20% of the volume, or less than a week of growth at the current rate | Every node is an archive node, so disk use only grows. The batch cache also has no fixed maximum: batches consensus has not committed take disk until they are committed or the epoch closes | Grow the volume or move to a larger one before it fills: a full disk stops the node. If free space falls faster than the chain grows, check the batch cache size row. |
-| Consensus database stopped | `tn_storage_tndb_failed`, one series per database (`env` is `epoch`, `kad` or `cache`); the node exiting with an error that names the database | 1 on any `env`, or the node exiting non-zero | A sync or write of that database failed (a full disk, an I/O error), or a read found damage on disk. The database refuses every write, and the node stops itself rather than run on storage it cannot write. Any other storage failure of the node's own (a consensus pack, the epoch records, the certificate archive) stops it the same way | Page. Read the exit error and the node log (target `tndb`), check free space and the disk, fix the cause, and restart the node. If the error names damage, or the restart refuses to open the database, run `telcoin-network db tndb-stat` and tell the Telcoin Association network team before you delete anything. |
+| Free disk space | Free space on the filesystem that holds the datadir (`df`, or node_exporter's `node_filesystem_avail_bytes`) | Below 20% of the volume, or less than a week of growth at the current rate | Every node is an archive node, so disk use only grows. The batch cache also has no fixed maximum: batches consensus has not committed take disk until they are committed or the epoch closes | Grow the volume or move to a larger one before it fills: a full disk stops the node (see [Full disk](#full-disk)). If free space falls faster than the chain grows, check the batch cache size row. |
+| Consensus database stopped | `tn_storage_tndb_failed`, one series per database (`env` is `epoch`, `kad` or `cache`); the node exiting with an error that names the database | 1 on any `env`, or the node exiting non-zero | A sync or write of that database failed (a full disk, an I/O error), or a read found damage on disk. The database refuses every write, and the node stops itself rather than run on storage it cannot write. Any other storage failure of the node's own (a consensus pack, the epoch records, the certificate archive) stops it the same way | Page. Read the exit error and the node log (target `tndb`), check free space (see [Full disk](#full-disk)) and the disk, fix the cause, and restart the node. If the error names damage, or the restart refuses to open the database, run `telcoin-network db tndb-stat` and tell the Telcoin Association network team before you delete anything. |
 | Batch cache size | `tn_storage_tndb_log_bytes{env="cache"}`, the length of the cache's log under `<datadir>/consensus-db/tndb/cache`. It grows with each batch written and removed, and drops at each compaction (`tn_storage_tndb_compactions_total{env="cache",outcome="switched"}`) | Above 768 MiB for 10 minutes | Batches are not leaving the cache (consensus is not committing them), or its compactions are failing (see the next row) | Check the next row. If compactions succeed and the log still grows, tell the Telcoin Association network team. |
 | Consensus database compactions failing | `tn_storage_tndb_compaction_abandons_total`, by `env` and `cause`, beside `tn_storage_tndb_compactions_total{outcome="switched"}` | 2 or more abandons in 3 hours for one `env`, with no switched compaction in those 3 hours. Retries slow to one an hour, so a plain count such as 3 in an hour goes quiet about 75 minutes into a failure that persists; this one keeps firing until a compaction succeeds | The log is not being compacted, so its disk use keeps growing. `cause` says why: `disk_full` (not enough free space for the copy: the database's current size plus 384 MiB to start one, 256 MiB while it runs), `writer_outran` (writes faster than a compaction can catch up, an extreme burst), `corruption`, `panic` or `error` | `disk_full`: free disk space. `corruption`: stop the node, run `telcoin-network db tndb-stat`, and tell the Telcoin Association network team. Otherwise tell the network team. |
 | Consensus database syncs | p99 of `tn_storage_tndb_sync_seconds` per `env`, over 5 minutes | Above 100 ms | Votes and proposals wait for these syncs before they leave the node | Check IO pressure and disk throttling. |
@@ -198,7 +198,7 @@ The release ships no alert rules or dashboard panels for them.
 | `tn_reth_parallel_state_root_task_failures_total{reason="tip_moved"}` | A parallel state-root task saw another finalized block than its walk: something wrote the state or trie tables while an output's blocks were built, and the node has no such writer | Leaves that part to the serial computation and runs on | Tell the Telcoin Association network team. The other reasons (`provider`, `database`, `panicked`) cost block time only; read this series first when one node parts from its peers. |
 | `tn_reth_unrecoverable_txs_dropped_total` | A certified batch carried transaction bytes that do not decode: batch validation was bypassed somewhere | Drops the transaction and runs on | Tell the Telcoin Association network team. |
 | `tn_reth_tx_body_inline_rows_total` | An execution database that stores transactions by their position in consensus batches (a new one does: tn-reth README, "Transactions stored by position") stored some whole instead: their block's batch did not hash to the digest the block names. Expected only while the node re-executes adiri's duplicate-batch epochs (up to epoch 160) | Stores those transactions whole, which reads correctly and costs the space the format saves; the first such block in a process logs a warning naming it and why. Runs on | Outside those epochs, tell the Telcoin Association network team, with the warning's block. Nothing needs repair. |
-| `tn_reth_tx_body_resolve_failures_total` (by `reason`) | A read of transactions stored by position could not take them from the consensus packs: a pack missing or damaged (`pack_missing`, `batch_missing`, `read`), a pack left unsealed or mid-install (`handoff_timeout`), or a stored row or batch that does not match (`no_batch_digest`, `position_out_of_range`, `decode`, `batch_too_large`), or no packs attached to the process (`packs_not_attached`) | Fails that read: the RPC call answers an error, never another transaction. Other reads answer, and the node runs on | Follow the tn-reth README ("Transactions stored by position", "Recovery"): with the node stopped, check the epoch's pack with `telcoin-network db validate` and `db repair` what it can; otherwise restore `consensus-db/` from a backup. Rebuilding the execution database does not help: it re-executes from the same packs. Without a backup the node starts over as a new one (the execution database and `consensus-db/` moved aside), or a validator swaps in the execution database of an observer bootstrapped with `db load-state` from the pack's epoch or a later one. A `handoff_timeout` during an epoch change that does not repeat needs nothing. Otherwise tell the Telcoin Association network team. A node whose consensus database lacks a pack its execution database points into does not start, and names the missing epochs and these ways to recover. |
+| `tn_reth_tx_body_resolve_failures_total` (by `reason`) | A read of transactions stored by position could not take them from the consensus packs: a pack missing or damaged (`pack_missing`, `batch_missing`, `read`), a pack left unsealed or mid-install (`handoff_timeout`), or a stored row or batch that does not match (`no_batch_digest`, `position_out_of_range`, `decode`, `batch_too_large`), or no packs attached to the process (`packs_not_attached`) | Fails that read: the RPC call answers an error, never another transaction. Other reads answer, and the node runs on | Follow the tn-reth README ("Transactions stored by position", "Recovery"): with the node stopped, check the epoch's pack with `telcoin-network db validate <datadir>/consensus-db/epochs/epoch-<N>`, run `telcoin-network db repair --datadir <datadir> --epoch <N>` to see what it would do, and then with `--force` to do it; otherwise restore it from a backup (see [Consensus database backups](#consensus-database-backups)). Rebuilding the execution database does not help: it re-executes from the same packs. Without a backup the node starts over as a new one (the execution database and `consensus-db/` moved aside), or a validator swaps in the execution database of an observer bootstrapped with `db load-state` from the pack's epoch or a later one. A `handoff_timeout` during an epoch change that does not repeat needs nothing. Otherwise tell the Telcoin Association network team. A node whose consensus database lacks a pack its execution database points into does not start, and names the missing epochs and these ways to recover. |
 | `tn_reth_canon_state_lagged_total` | The transaction pool's maintenance fell behind and lost canonical-state notifications | Reloads the pool's sender state and runs on | A rate that does not fall back to 0 means the worker cannot keep up: check CPU pressure and the engine backlog. |
 | `tn_epoch_final_state_mismatches_total` | An epoch the node re-executed closed on another block than the epoch record it holds | Stops, and stops again at every restart | Keep the moved-aside execution database, follow the rebuild text of the tn-reth README ("Upgrading a testnet node": a record of the node's own from a diverged execution needs a fresh `consensus-db/`), and tell the Telcoin Association network team. |
 
@@ -215,8 +215,106 @@ What to do:
 
 1. Stop the node.
 2. After an I/O error, check the disk, then reboot the host: `db check` reads through the page cache, which can still hold pages the device never took.
-3. Run `telcoin-network db check --datadir <datadir>`. It checks every page's checksum and the structure of the whole database, and names what failed. If it passes, the failure was no damage on disk (a full disk, say): fix the cause and start the node.
-4. A damaged database is not repaired in place. Move it aside with `telcoin-network db reset-execution --datadir <datadir> --force` and rebuild it: in place, or for a validator by the side-observer swap (the tn-reth README's "Upgrading a testnet node"). One damaged page usually means more: check the disk and the memory before you trust the host again.
+3. Run `telcoin-network db check --datadir <datadir>`. It checks every page's checksum and the structure of `db/tn-lmdb.dat`, and names what failed. It checks nothing else: not the static files and not the consensus database (see [What each check covers](#what-each-check-covers)). If it passes, the execution database holds no damage, and the failure was something else: a full disk, say ([Full disk](#full-disk)), or a damaged static file, which the error names ([Static file damage](#static-file-damage)). Fix the cause and start the node.
+4. A damaged database is not repaired in place. Move it aside with `telcoin-network db reset-execution --datadir <datadir> --force` and rebuild it: in place, or for a validator by the side-observer swap (the tn-reth README's "Upgrading a testnet node"). The rebuild re-executes every epoch from 0 from the node's own consensus packs, so `db reset-execution` refuses, moving nothing, a datadir that lacks one of them: one bootstrapped with `db load-state` (it holds packs only from the restored epoch on), or one that lost a pack. Such a node rebuilds by the swap, with an observer whose database fits its packs (the tn-reth README's "Transactions stored by position" says which), or starts over as a new one with `consensus-db/` moved aside as well (a validator then stays stopped until the network has closed the last epoch it took part in). One damaged page usually means more: check the disk and the memory before you trust the host again.
+
+### Static file damage
+
+The execution layer keeps part of the chain's history (headers and transactions among it) in static files under `<datadir>/static_files/`, beside `db/`.
+In the storage layout new datadirs get (v2), every value in them carries a checksum that each read verifies, so damage shows as an error naming the file, such as `static file <path> is damaged: the value at row <r>, column <c> fails its checksum`.
+A datadir in the older layout (v1) has no static-file checksums.
+No command checks the static files at rest: `db check` does not read them.
+Reads of the damaged rows fail (an RPC call answers an error) and other reads answer, but damage under the committee and epoch reads stops the node, and damage in a segment's latest file stops its next start.
+
+What to do:
+
+1. Stop the node.
+2. The file is damaged on this node only (a disk or memory fault, or a bad copy), and nothing repairs it in place. Rebuild the execution database as in step 4 of [Execution database damage](#execution-database-damage): `db reset-execution` moves `static_files/` aside with `db/`.
+3. Check the disk: one damaged file usually means more.
+
+Copy or restore whole datadirs, never single static files: a file from another copy can read as this one's without an error.
+
+## Storage tools and recovery
+
+### Database commands
+
+The `telcoin-network db` commands work on the datadir that `--datadir <datadir>` names, and on the OS data directory without it.
+Each prints the datadir it acts on (`datadir: <path>`) to stderr before anything else; check it. `db validate` takes a pack's path instead, and prints that (`pack: <path>`).
+"Node stopped" means the command refuses to run while a node holds the datadir, and holds the datadir while it runs, so a node started meanwhile is refused.
+A command exits with status 1 when it fails or finds damage that needs action. The dry runs of `db repair` and `db migrate` exit 0 when they find only what `--force` would fix, and `db validate` exits 0 for a torn tail of the newest epoch, which the node's next start truncates.
+
+| Command | What it does | Node stopped | Writes |
+| --- | --- | --- | --- |
+| `db stats` | Reports the execution database: its static files, then each table's rows, pages and size | Yes | No |
+| `db check` | Checks every page's checksum and the structure of the execution database, `db/tn-lmdb.dat` | Yes | No |
+| `db tndb-stat` | Reports the consensus database (tndb): for each of `epoch`, `kad` and `cache`, its generation, live and dead bytes, and each table's rows and index state | Yes | No |
+| `db validate <datadir>/consensus-db/epochs/epoch-<N>` | Checks one epoch's consensus pack: a torn tail, or damage that loses data, with what to do | Only for the newest epoch, or a pack not sealed yet; a sealed past epoch can be checked while the node runs | No |
+| `db repair [--epoch <N>] [--force]` | Repairs consensus packs: truncates a torn tail, rebuilds indexes, puts back an install that stopped half-way, and heals the epoch records. Without `--epoch` it skips the newest epoch | Yes | Only with `--force`; without it, reports what it would do |
+| `db migrate [--epoch <N>] [--force]` | Rewrites consensus packs from before v2 in the v2 format | Yes | Only with `--force`; without it, reports what it would do |
+| `db migrate-execution` | Moves the execution database from MDBX to tn-lmdb now, instead of at the node's next start; pass the node's `--db.*` flags | Yes | Yes |
+| `db load-state <bundle>` | Restores a state-export bundle into a fresh datadir (the tn-reth README's "Snapshot export / restore") | Yes | Yes |
+| `db reset-execution [--force] [--for-swap]` | Moves `db/`, `static_files/` and `restored-state-floor` into `<datadir>/execution-reset-<UTC time>/`, so the next start rebuilds the execution database | Yes | Only with `--force` (renames, never deletes); without it, reports what it would move |
+
+`telcoin-network db <command> --help` says what each refuses and why.
+
+### What each check covers
+
+| Data | Where | Checked at rest by |
+| --- | --- | --- |
+| Execution database | `db/tn-lmdb.dat` | `db check` |
+| Static files | `static_files/` | Nothing: a v2 datadir's reads verify each value's checksum, and each start checks the end of every segment's latest file |
+| Consensus packs | `consensus-db/epochs/epoch-<N>/` | `db validate` (one pack) and the dry run of `db repair` (every epoch but the newest, unless named) |
+| Epoch records | `consensus-db/epochs/epochs.pack`, `epoch_certs.pack` | The dry run of `db repair` |
+| Consensus database (tndb) | `consensus-db/tndb/` | `db tndb-stat`, which reads each log as the node's open does and reports one it cannot read |
+
+### Full disk
+
+A full disk stops the node: a write of its own storage failed, and it stops rather than run on storage it cannot write.
+A full disk does not damage the node's files: once there is room, a start resumes.
+
+1. Keep the node stopped (a service manager that restarts it at once only fails again).
+2. Find what grew: `du -sh <datadir>/* <datadir>/consensus-db/*`, and `telcoin-network db tndb-stat --datadir <datadir>` for the consensus database's live and dead bytes. If the batch cache grew, see the batch cache size row under [Capacity monitoring](#capacity-monitoring).
+3. Grow the volume, or move the datadir to a larger one. That is the fix; deleting files only buys time.
+4. If you must free space on the volume first, these are safe to delete:
+   - an `execution-reset-<UTC time>/` directory, once the node rebuilt (or swapped) after that reset runs well and you will not undo the reset; keep it while the Telcoin Association network team looks into a divergence. Never an `execution-reset-*.partial` directory: that reset has not finished;
+   - `consensus-db.forked/`, left by the recovery from a forked epoch record, once its cause is known;
+   - state-export bundles you no longer need under `consensus-db/state_exports/` (written with `--enable-state-export`, which `--state-export-keep <N>` bounds; the node never reads them back);
+   - files outside the datadir that share its volume.
+
+   Delete nothing else in the datadir. In particular never delete a `consensus-db/epochs/epoch-<N>/` or `epoch-<N>.replaced/` directory, the epoch records (`epochs.pack`, `epoch_certs.pack`), anything under `consensus-db/tndb/` (its `gen-<N>` and `idx-<N>` directories included), or the markers `load-state-in-progress`, `restored-state-floor`, `mdbx-migrated` and `db/database.version`. The node itself deletes tndb's old generations and unfinished compactions at its next start (`db tndb-stat` lists them).
+5. Start the node with free space for its next writes:
+   - the execution database grows its file by up to one growth step at a time, each step allocated when it is taken: `--db.growth-step`, 1 GiB by default;
+   - each consensus file the node writes (the open epoch's pack, the epoch records, the tndb logs) allocates up to 128 MiB ahead of its data as it grows;
+   - a consensus database compaction starts only with the size of the database it compacts plus 384 MiB free, and gives way below 256 MiB;
+   - a node catching up whole epochs from peers stops a pack import when free space is under one growth step plus 512 MiB, plus 320 MiB for each import running (about 1.8 GiB for one with the default step);
+   - a node still to move its execution database from MDBX to tn-lmdb refuses to start without the database's live pages plus a quarter plus 1 GiB (or the growth step, if larger) free.
+
+   Free at least the growth step plus 2 GiB (3 GiB with the default step), and grow the volume as soon as you can.
+
+### Consensus database backups
+
+A datadir that stores transactions by their position in the consensus packs (the format new datadirs get: the tn-reth README's "Transactions stored by position") needs every pack its execution database points into, and nothing fetches a past epoch's pack again: a node that loses one refuses to start, naming the missing epochs.
+Its recovery is a backup, or starting over as a new node (the tn-reth README's "Recovery").
+`db validate` and `db repair` name the same recovery for a pack whose data is damaged.
+Keep a backup.
+
+To take one:
+
+1. Stop the node. A copy of a running node is not a backup: it writes the open epoch's pack, the epoch records and the tndb logs as it runs.
+2. Copy `<datadir>/consensus-db/` whole into a new directory on another disk, keeping it as it is: `cp -a <datadir>/consensus-db <backup>/consensus-db`, or `rsync -a` into an empty directory. Keep the previous backup until the copy has finished.
+3. To keep a full restore point as well, copy `<datadir>/db/`, `<datadir>/static_files/` and, if there is one, `<datadir>/restored-state-floor` at the same stop.
+4. Start the node.
+
+A backup holds the packs of the epochs that had closed when it was taken, so take one regularly, at planned stops such as upgrades.
+Back up the keys separately, as [BLS key custody](#bls-key-custody) says.
+
+To restore, with the node stopped:
+
+- **A whole restore point** (`consensus-db/`, `db/`, `static_files/` and `restored-state-floor` from one stop): move the datadir's entries of those names aside (never delete them), copy the backup's in, and start the node. It resumes from the backup and catches up from peers, as a node stopped since then does.
+- **One lost or damaged past epoch**, as the reports of `db validate` and `db repair` name it: put back only its `epoch-<N>/` from a backup taken after that epoch closed. Check the backup's copy first with `telcoin-network db validate <backup>/consensus-db/epochs/epoch-<N>`, move a damaged `<datadir>/consensus-db/epochs/epoch-<N>/` out of `epochs/` (never delete it), and copy the backup's `epoch-<N>/` into `epochs/`. The next start checks again that every pack the execution database points into is there, and names any still missing.
+- **`consensus-db/` alone**, from a backup older than the execution database: the packs of the epochs since the backup are missing from it, so a datadir that stores transactions by position refuses to start, naming them. Restore the execution database from the same stop as well, or rebuild it as in step 4 of [Execution database damage](#execution-database-damage).
+
+Whenever a validator's whole `consensus-db/` is restored from a backup, keep the validator stopped until the network has closed the epoch it was last in: the backup holds none of the votes and proposals the validator made since it was taken.
 
 ## Required evidence before mainnet
 

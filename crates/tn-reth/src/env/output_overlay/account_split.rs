@@ -47,7 +47,8 @@
 //! storage root the subtries took from the storage-root tasks (a task hands its result out once).
 //! These fallbacks are counted by reason in `tn_reth.account_walk_fallbacks_total`
 //! ([`crate::metrics::AccountWalkFallback`]), as is a sampled serial check that found a wrong
-//! result on a block the split composed.
+//! result on a block the split composed. The blocks whose root the split composed are counted in
+//! `tn_reth.account_walk_splits_total`.
 //!
 //! # Off switch
 //!

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use eyre::WrapErr as _;
+use eyre::{bail, WrapErr as _};
 use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
@@ -71,7 +71,8 @@ async fn save_and_persist_with_logs(
 /// Collect and manage votes for a specific epoch record.
 ///
 /// Returns `Err` only when our own epoch store fails to save or persist the certificate (see
-/// `EpochDbError::stop_on_local_failure`); every other way a round ends is `Ok`.
+/// `EpochDbError::stop_on_local_failure`), or when the network certified a different record for
+/// the epoch than ours (a fork); every other way a round ends is `Ok`.
 async fn manage_epoch_votes(
     epoch_rec: EpochRecord,
     key_config: KeyConfig,
@@ -285,8 +286,13 @@ async fn manage_epoch_votes(
                                     // We generated a different record than the network certified, so we
                                     // have forked. A fork is not something a node can safely recover from
                                     // (records are deterministic, so ours is simply wrong) — fail-stop
-                                    // rather than adopt the network's record and pretend to recover.
-                                    node_shutdown.notify();
+                                    // rather than adopt the network's record and pretend to recover. The
+                                    // error stops the node through the collector, so it exits non-zero.
+                                    bail!(
+                                        "epoch {}: the network certified epoch record {new_epoch_hash} \
+                                         where this node computed {epoch_hash}; this node has forked",
+                                        epoch_rec.epoch
+                                    );
                                 } else {
                                     info!(
                                         target: "epoch-manager",
@@ -335,7 +341,7 @@ async fn handle_new_vote(
     primary_network: PrimaryNetworkHandle,
     task_spawner: &TaskSpawner,
     node_shutdown: ShutdownNotifier,
-    store_failed: &Sender<TaskError>,
+    round_failed: &Sender<TaskError>,
 ) {
     let mut remove = None;
     let mut found = false;
@@ -378,9 +384,10 @@ async fn handle_new_vote(
         };
         // Spawn the vote collector in response to a vote if it was missing.
         // This allows the possibility of recovering a cert with a republished vote even if stale.
-        // A round is not critical (it ends once its epoch is certified or given up), so its one
-        // error, our own store failing, goes to the critical collector, which stops the node.
-        let store_failed = store_failed.clone();
+        // A round is not critical (it ends once its epoch is certified or given up), so its
+        // errors, our own store failing or a fork, go to the critical collector, which stops the
+        // node.
+        let round_failed = round_failed.clone();
         task_spawner.spawn_task(format!("epoch votes for epoch {}", epoch_rec.epoch), async move {
             if let Err(e) = manage_epoch_votes(
                 epoch_rec,
@@ -392,7 +399,7 @@ async fn handle_new_vote(
             )
             .await
             {
-                let _ = store_failed.send(TaskError::from_message(format!("{e:#}"))).await;
+                let _ = round_failed.send(TaskError::from_message(format!("{e:#}"))).await;
             }
             Ok(())
         });
@@ -426,9 +433,9 @@ fn new_epoch_vote(consensus_bus: &ConsensusBusApp, epoch_vote: EpochVote) {
 /// eliminating the gap at epoch boundaries where votes could be lost. It watches for new
 /// `EpochRecord`s via a `watch` channel and collects votes for each epoch.
 ///
-/// A round that finds our own epoch store failing (see `EpochDbError::stop_on_local_failure`)
-/// reports it here, and this critical task returns the error, so the node exits for operator
-/// intervention.
+/// A round that finds our own epoch store failing (see `EpochDbError::stop_on_local_failure`) or
+/// our record forked from the one the network certified reports it here, and this critical task
+/// returns the error, so the node exits, non-zero, for operator intervention.
 pub(crate) fn spawn_epoch_vote_collector(
     consensus_chain: ConsensusChain,
     consensus_bus: ConsensusBusApp,
@@ -443,7 +450,7 @@ pub(crate) fn spawn_epoch_vote_collector(
     let mut vote_queues: VoteQueue = VecDeque::with_capacity(5);
     let shutdown = node_shutdown.subscribe();
     // The first failure is enough to stop the node.
-    let (store_failed_tx, mut store_failed_rx) = mpsc::channel(1);
+    let (round_failed_tx, mut round_failed_rx) = mpsc::channel(1);
 
     node_task_spawner.spawn_critical_task("Epoch Vote Collector", async move {
         loop {
@@ -451,7 +458,7 @@ pub(crate) fn spawn_epoch_vote_collector(
             let epoch_rec = loop {
                 tokio::select! {
                     _ = &shutdown => return Ok(()),
-                    Some(err) = store_failed_rx.recv() => return Err(err),
+                    Some(err) = round_failed_rx.recv() => return Err(err),
                     _ = epoch_rx.changed() => {
                         if let Some(rec) = epoch_rx.borrow_and_update().clone() {
                             break rec;
@@ -462,7 +469,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                             None => return Ok(()),  // Channel closed- we are done.
                             Some(vote) => {
                                 handle_new_vote(vote, &mut vote_queues, consensus_chain.clone(), key_config.clone(),
-                                    primary_network.clone(), &task_spawner, node_shutdown.clone(), &store_failed_tx).await;
+                                    primary_network.clone(), &task_spawner, node_shutdown.clone(), &round_failed_tx).await;
                             }
                         }
                     }
@@ -1491,15 +1498,18 @@ mod epoch_vote_collector_tests {
 
     /// Fail-stop on fork: after a failed local vote quorum, the peer-recovery download returns a
     /// record that validates against our locally-trusted anchor but whose digest differs from the
-    /// one we computed. That is an unrecoverable fork (records are deterministic), so the collector
-    /// must call `node_shutdown.notify()` rather than silently adopt the peer's record.
+    /// one we computed. That is an unrecoverable fork (records are deterministic), so the round
+    /// must end with the fork as its error rather than silently adopt the peer's record. The
+    /// error reaches the critical collector, which stops the node with it (the path
+    /// `test_failed_epoch_store_stops_the_collector` follows), so the node exits non-zero; the
+    /// round itself leaves the node's shutdown to that error.
     ///
     /// Paused clock: `manage_epoch_votes` reaches the recovery path only after
     /// `MAX_EPOCH_VOTE_TIMEOUTS` vote windows of `EPOCH_VOTE_RECV_TIMEOUT` each (~60s of real
     /// time), and the recovery loop bails if the vote channel is closed, so the sender is held
     /// open and the windows are fast-forwarded.
     #[tokio::test(start_paused = true)]
-    async fn test_fork_digest_mismatch_triggers_shutdown() {
+    async fn test_fork_digest_mismatch_fails_the_round() {
         let mut rng = StdRng::from_os_rng();
         let kp1 = BlsKeypair::generate(&mut rng);
         let kp2 = BlsKeypair::generate(&mut rng);
@@ -1581,11 +1591,9 @@ mod epoch_vote_collector_tests {
         let node_shutdown = ShutdownNotifier::new();
         let noticer = node_shutdown.subscribe();
 
-        // Drive the collector directly: the vote windows auto-advance under the paused clock and
-        // the recovery download returns the mismatched record, so the fork is detected and fires
-        // `node_shutdown.notify()`. The call then returns because the recovery loop breaks after
-        // the download — nothing on that path awaits the notifier.
-        manage_epoch_votes(
+        // Drive the round directly: the vote windows auto-advance under the paused clock and the
+        // recovery download returns the mismatched record, so the fork is detected and returned.
+        let err = manage_epoch_votes(
             local_rec,
             kc1,
             primary_network,
@@ -1594,9 +1602,12 @@ mod epoch_vote_collector_tests {
             node_shutdown,
         )
         .await
-        .expect("no local store failure");
-
-        assert!(noticer.noticed(), "digest mismatch must trigger node shutdown");
+        .expect_err("a digest mismatch must end the round with the fork");
+        assert!(err.to_string().contains("this node has forked"), "unexpected error: {err:#}");
+        assert!(
+            !noticer.noticed(),
+            "the round leaves the stop to its error, which the collector returns",
+        );
         // Fail-stop, NOT adopt: the peer's forked record must be neither certified nor stored.
         assert!(
             consensus_chain.epochs().cert_by_digest(alt_rec.digest()).await.is_none(),
@@ -1651,7 +1662,7 @@ mod epoch_vote_collector_tests {
         let task_manager = TaskManager::default();
         let spawner = task_manager.get_spawner();
         let node_shutdown = ShutdownNotifier::new();
-        let (store_failed, _store_failed_rx) = mpsc::channel(1);
+        let (round_failed, _round_failed_rx) = mpsc::channel(1);
 
         // Seed the queue with a DEAD collector entry: receiver dropped, so a forward send fails.
         let (dead_tx, dead_rx) = mpsc::channel::<EpochVote>(1);
@@ -1668,7 +1679,7 @@ mod epoch_vote_collector_tests {
             primary_network,
             &spawner,
             node_shutdown,
-            &store_failed,
+            &round_failed,
         )
         .await;
 
@@ -1721,7 +1732,7 @@ mod epoch_vote_collector_tests {
         let task_manager = TaskManager::default();
         let spawner = task_manager.get_spawner();
         let node_shutdown = ShutdownNotifier::new();
-        let (store_failed, _store_failed_rx) = mpsc::channel(1);
+        let (round_failed, _round_failed_rx) = mpsc::channel(1);
 
         // `EpochVote` is `Copy`, so the same vote drives both cases.
         let vote = epoch_rec.sign_vote(&kc1);
@@ -1736,7 +1747,7 @@ mod epoch_vote_collector_tests {
             primary_network.clone(),
             &spawner,
             node_shutdown.clone(),
-            &store_failed,
+            &round_failed,
         )
         .await;
         assert!(vote_queues.is_empty(), "vote for an unknown record must be dropped");
@@ -1757,7 +1768,7 @@ mod epoch_vote_collector_tests {
             primary_network,
             &spawner,
             node_shutdown,
-            &store_failed,
+            &round_failed,
         )
         .await;
         assert!(vote_queues.is_empty(), "vote for a certified record must be dropped");

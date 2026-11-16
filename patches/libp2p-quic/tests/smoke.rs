@@ -465,6 +465,91 @@ async fn test_local_listener_reuse() {
     assert_eq!(send_back_addr, a_listen_addr);
 }
 
+/// A dial to a non-loopback address never leaves from a listener bound to a loopback IP, which
+/// cannot send to another host:
+/// - A listens on 127.0.0.1:0 and 0.0.0.0:0, and dials B on a non-loopback IP: every dial leaves
+///   from A's 0.0.0.0 listener.
+/// - C listens on 127.0.0.1:0 only, and dials B: the dial leaves from a fresh socket.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn non_loopback_dial_skips_loopback_listener() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+    let Some(ip) = non_loopback_ipv4() else {
+        eprintln!("skipped: this host has no non-loopback IPv4 address");
+        return;
+    };
+    let (_, mut b_transport) = create_default_transport::<quic::tokio::Provider>();
+    // The transport picks among eligible listeners by a hash of the dialed address, so dial
+    // several addresses: with a loopback listener eligible, some would pick it.
+    let mut b_addrs = Vec::new();
+    for _ in 0..8 {
+        b_addrs.push(start_listening(&mut b_transport, &format!("/ip4/{ip}/udp/0/quic-v1")).await);
+    }
+
+    let (_, mut a_transport) = create_default_transport::<quic::tokio::Provider>();
+    let a_loopback = start_listening(&mut a_transport, "/ip4/127.0.0.1/udp/0/quic-v1").await;
+    let a_wildcard = start_listening(&mut a_transport, "/ip4/0.0.0.0/udp/0/quic-v1").await;
+    // Take the wildcard listener's other `NewAddress` events, as `test_local_listener_reuse` does.
+    poll_fn(|cx| {
+        let mut pinned = Pin::new(&mut a_transport);
+        while pinned.as_mut().poll(cx).is_ready() {}
+        Poll::Ready(())
+    })
+    .await;
+    assert_ne!(udp_port(&a_loopback), udp_port(&a_wildcard));
+    for b_addr in &b_addrs {
+        let send_back_addr = connect_within(&mut b_transport, &mut a_transport, b_addr).await;
+        assert_eq!(
+            udp_port(&send_back_addr),
+            udp_port(&a_wildcard),
+            "dial to {b_addr}"
+        );
+    }
+
+    let (_, mut c_transport) = create_default_transport::<quic::tokio::Provider>();
+    let c_loopback = start_listening(&mut c_transport, "/ip4/127.0.0.1/udp/0/quic-v1").await;
+    let send_back_addr = connect_within(&mut b_transport, &mut c_transport, &b_addrs[0]).await;
+    assert_eq!(send_back_addr.iter().next(), Some(Protocol::Ip4(ip)));
+    assert_ne!(udp_port(&send_back_addr), udp_port(&c_loopback));
+}
+
+/// The IPv4 address this host would send from to a public address, if it has one that is not
+/// loopback. A connected UDP socket only selects a route; it sends nothing.
+fn non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // TEST-NET-1 (RFC 5737): never assigned, so this reaches no one.
+    socket.connect("192.0.2.1:9").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+fn udp_port(addr: &Multiaddr) -> u16 {
+    addr.iter()
+        .find_map(|protocol| match protocol {
+            Protocol::Udp(port) => Some(port),
+            _ => None,
+        })
+        .expect("a QUIC address has a UDP port")
+}
+
+/// [`connect`] with a bound: a dial from a socket that cannot reach the listener fails the test
+/// instead of hanging it. Returns the dialer's address as the listener saw it.
+async fn connect_within(
+    listener: &mut Boxed<(PeerId, StreamMuxerBox)>,
+    dialer: &mut Boxed<(PeerId, StreamMuxerBox)>,
+    addr: &Multiaddr,
+) -> Multiaddr {
+    let connecting = connect(listener, dialer, addr.clone());
+    match tokio::time::timeout(Duration::from_secs(10), connecting).await {
+        Ok(((_, send_back_addr, _), _)) => send_back_addr,
+        Err(_) => panic!("no connection to {addr} within 10s"),
+    }
+}
+
 async fn smoke<P: Provider>() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -491,7 +576,7 @@ async fn build_streams<P: Provider + Spawn>() -> (SubstreamBox, SubstreamBox) {
     let (stream_a_tx, stream_a_rx) = oneshot::channel();
     let (stream_b_tx, stream_b_rx) = oneshot::channel();
 
-    P::spawn(async move {
+    <P as Spawn>::spawn(async move {
         let mut stream_a_tx = Some(stream_a_tx);
         let mut stream_b_tx = Some(stream_b_tx);
         poll_fn::<(), _>(move |cx| {
@@ -598,7 +683,7 @@ fn prop<P: Provider + BlockOn + Spawn>(
 
     // Spawn the listener nodes.
     for _ in 0..number_listeners {
-        P::spawn({
+        <P as Spawn>::spawn({
             let mut listeners_tx = listeners_tx.clone();
 
             async move {
@@ -613,7 +698,7 @@ fn prop<P: Provider + BlockOn + Spawn>(
                     {
                         let (_, connection) = upgrade.await.unwrap();
 
-                        P::spawn(answer_inbound_streams::<P, BUFFER_SIZE>(connection));
+                        <P as Spawn>::spawn(answer_inbound_streams::<P, BUFFER_SIZE>(connection));
                     }
                 }
             }
@@ -624,13 +709,13 @@ fn prop<P: Provider + BlockOn + Spawn>(
         mpsc::channel(number_streams * number_listeners);
 
     // For each listener node start `number_streams` requests.
-    P::spawn(async move {
+    <P as Spawn>::spawn(async move {
         let (_, mut dialer) = create_default_transport::<P>();
 
         while let Some((_, listener_addr)) = listeners_rx.next().await {
             let (_, connection) = dial(&mut dialer, listener_addr.clone()).await.unwrap();
 
-            P::spawn(open_outbound_streams::<P, BUFFER_SIZE>(
+            <P as Spawn>::spawn(open_outbound_streams::<P, BUFFER_SIZE>(
                 connection,
                 number_streams,
                 completed_streams_tx.clone(),
@@ -669,7 +754,7 @@ async fn answer_inbound_streams<P: Provider + Spawn, const BUFFER_SIZE: usize>(
             return;
         };
 
-        P::spawn(async move {
+        <P as Spawn>::spawn(async move {
             // FIXME: Need to write _some_ data before we can read on both sides.
             // Do a ping-pong exchange.
             {
@@ -703,7 +788,7 @@ async fn open_outbound_streams<P: Provider + Spawn, const BUFFER_SIZE: usize>(
         .await
         .unwrap();
 
-        P::spawn({
+        <P as Spawn>::spawn({
             let mut completed_streams_tx = completed_streams_tx.clone();
 
             async move {

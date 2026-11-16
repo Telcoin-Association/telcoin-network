@@ -133,25 +133,33 @@ fn check_output(fixture: &Fixture, blocks: &[HashedPostState]) -> eyre::Result<u
     Ok(STORAGE_SPLITS_COMPOSED.with(|n| n.get()) - composed_before)
 }
 
-/// `f`'s result and the storage-walk fallbacks this thread counted while it ran, by reason.
-fn counting_fallbacks<T>(f: impl FnOnce() -> T) -> (T, HashMap<String, u64>) {
+/// `f`'s result, the storage-walk fallbacks this thread counted while it ran (by reason), and the
+/// storage tries whose root the split composed, as the node's metrics count them.
+fn counting_splits<T>(f: impl FnOnce() -> T) -> (T, HashMap<String, u64>, u64) {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     let result = metrics::with_local_recorder(&recorder, f);
-    let counts = snapshotter
-        .snapshot()
-        .into_vec()
-        .into_iter()
-        .filter(|(key, ..)| key.key().name() == "tn_reth.storage_walk_fallbacks_total")
-        .filter_map(|(key, _, _, value)| {
-            let reason = key.key().labels().find(|l| l.key() == "reason")?.value().to_string();
-            match value {
-                DebugValue::Counter(n) => Some((reason, n)),
-                _ => None,
+    let mut fallbacks = HashMap::new();
+    let mut splits = 0;
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        let DebugValue::Counter(n) = value else { continue };
+        match key.key().name() {
+            "tn_reth.storage_walk_fallbacks_total" => {
+                if let Some(reason) = key.key().labels().find(|l| l.key() == "reason") {
+                    fallbacks.insert(reason.value().to_string(), n);
+                }
             }
-        })
-        .collect();
-    (result, counts)
+            "tn_reth.storage_walk_splits_total" => splits = n,
+            _ => {}
+        }
+    }
+    (result, fallbacks, splits)
+}
+
+/// `f`'s result and the storage-walk fallbacks this thread counted while it ran, by reason.
+fn counting_fallbacks<T>(f: impl FnOnce() -> T) -> (T, HashMap<String, u64>) {
+    let (result, fallbacks, _) = counting_splits(f);
+    (result, fallbacks)
 }
 
 /// Both hot contracts' tries split over a multi-block output: every storage root composed, the
@@ -160,9 +168,10 @@ fn counting_fallbacks<T>(f: impl FnOnce() -> T) -> (T, HashMap<String, u64>) {
 async fn hot_tries_split() -> eyre::Result<()> {
     let fixture = Fixture::new(base())?;
     let blocks: Vec<_> = (0..3).map(|b| hot_block(300, b)).collect();
-    let (composed, fallbacks) = counting_fallbacks(|| check_output(&fixture, &blocks));
+    let (composed, fallbacks, splits) = counting_splits(|| check_output(&fixture, &blocks));
     // per block: two tries, under two unchecked walks and the shadow run
     assert_eq!(composed?, 3 * 2 * 3, "every hot storage root is composed");
+    assert_eq!(splits, 3 * 2 * 3, "the split counter counts every composed storage root");
     assert!(fallbacks.values().all(|n| *n == 0), "fallbacks: {fallbacks:?}");
     Ok(())
 }
@@ -186,8 +195,9 @@ async fn small_tries_and_few_slots_stay_one_task() -> eyre::Result<()> {
         assert_eq!(splittable(&trie, medium())?, Splittable::SmallTrie);
         assert_eq!(splittable(&trie, hot(0))?, Splittable::Yes);
     }
-    let (composed, fallbacks) = counting_fallbacks(|| check_output(&fixture, &[block]));
+    let (composed, fallbacks, splits) = counting_splits(|| check_output(&fixture, &[block]));
     assert_eq!(composed?, 0, "a small trie or a hot trie with few changes was split");
+    assert_eq!(splits, 0, "the split counter moved on a fallback");
     // the medium trie, under two unchecked walks and the shadow run
     assert_eq!(fallbacks.get("small_trie"), Some(&3), "fallbacks: {fallbacks:?}");
     assert_eq!(fallbacks.get("shape"), None, "fallbacks: {fallbacks:?}");
@@ -215,9 +225,11 @@ async fn whole_nibble_emptied() -> eyre::Result<()> {
         ),
     );
     let refill = hot_block(300, 2);
-    let (composed, fallbacks) = counting_fallbacks(|| check_output(&fixture, &[block, refill]));
+    let (composed, fallbacks, splits) =
+        counting_splits(|| check_output(&fixture, &[block, refill]));
     // both tries in the first block, the other one in the second; two walks and the shadow run
     assert_eq!(composed?, 3 * 3);
+    assert_eq!(splits, 3 * 3, "the refused trie moved the split counter");
     assert_eq!(fallbacks.get("small_trie"), Some(&3), "fallbacks: {fallbacks:?}");
     Ok(())
 }
@@ -246,8 +258,9 @@ async fn emptied_and_single_nibble_storage_fall_back() -> eyre::Result<()> {
                 ),
             ),
         ]);
-    let (composed, fallbacks) = counting_fallbacks(|| check_output(&fixture, &[block]));
+    let (composed, fallbacks, splits) = counting_splits(|| check_output(&fixture, &[block]));
     assert_eq!(composed?, 0, "an emptied or single-nibble storage root was composed");
+    assert_eq!(splits, 0, "the split counter moved on a `shape` fallback");
     // two tries, under two unchecked walks and the shadow run
     assert_eq!(fallbacks.get("shape"), Some(&(2 * 3)), "fallbacks: {fallbacks:?}");
     Ok(())

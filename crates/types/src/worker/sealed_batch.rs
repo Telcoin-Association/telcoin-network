@@ -4,8 +4,8 @@
 //! have reached quorum.
 
 use crate::{
-    crypto, encode, Address, BlockHash, BlsPublicKey, ByteSlice, ByteVec, Epoch, ExecHeader,
-    RpcInfo, TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    crypto, encode_into_buffer, Address, BlockHash, BlsPublicKey, ByteSlice, ByteVec, Epoch,
+    ExecHeader, RpcInfo, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use serde::{
     de::{self, SeqAccess, Visitor},
@@ -135,11 +135,38 @@ impl Batch {
     /// Digest for this batch (the hash of the sealed header).
     ///
     /// NOTE: `Self::received_at` is skipped during serialization and is excluded from the digest.
+    ///
+    /// The hash of [`crate::encode`]'s bytes, encoded into a buffer allocated once at the
+    /// encoding's length (`Self::encoded_len`) rather than grown as the bytes are written.
     pub fn digest(&self) -> BlockHash {
+        let mut bytes = Vec::with_capacity(self.encoded_len());
+        encode_into_buffer(&mut bytes, self)
+            .unwrap_or_else(|_| panic!("Serialization should not fail"));
         let mut hasher = crypto::DefaultHashFunction::new();
-        hasher.update(encode(self).as_ref());
+        hasher.update(&bytes);
         // finalize
         BlockHash::from_slice(hasher.finalize().as_bytes())
+    }
+
+    /// The length of this batch's encoding, `encode(self).len()`, computed from its fields: a
+    /// ULEB128 transaction count, each transaction as a ULEB128 length and its bytes, the epoch,
+    /// the beneficiary as a byte string, the base fee and the worker id. Only sizes
+    /// [`Self::digest`]'s buffer: a wrong length would cost a reallocation, never another digest.
+    fn encoded_len(&self) -> usize {
+        /// The bytes of `n` as ULEB128.
+        fn uleb128_len(n: usize) -> usize {
+            (usize::BITS - (n | 1).leading_zeros()).div_ceil(7) as usize
+        }
+        // every serialized field, so a new one fails to compile here until it is counted
+        let Self { transactions, epoch, beneficiary, base_fee_per_gas, worker_id, received_at: _ } =
+            self;
+        uleb128_len(transactions.len())
+            + transactions.iter().map(|tx| uleb128_len(tx.len()) + tx.len()).sum::<usize>()
+            + size_of_val(epoch)
+            + uleb128_len(beneficiary.len())
+            + beneficiary.len()
+            + size_of_val(base_fee_per_gas)
+            + size_of_val(worker_id)
     }
 
     /// Pass a reference to a collection of transaction bytes;
@@ -603,5 +630,141 @@ mod codec_bench {
         time("decode", &mut || {
             black_box(decode::<Batch>(black_box(&bytes)));
         });
+    }
+
+    /// [`Batch::digest`] against the hash of [`encode`]'s growing buffer (the digest's computation
+    /// before it sized its buffer) on batches shaped like real ones: 500, 1,000 and 2,000
+    /// transactions of 150 to 300 bytes, and two of about 1 MiB (4,000 of 250 bytes; 8 of 125 kB).
+    /// Interleaved, the order swapped every round; p50 and min per shape, in µs.
+    /// `cargo test --release -p tn-types batch_digest_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "on-demand batch digest benchmark; run with --release --ignored --nocapture"]
+    fn batch_digest_bench() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut batch = |count: usize, min: usize, max: usize| Batch {
+            transactions: (0..count)
+                .map(|_| {
+                    let len = min + (next() as usize) % (max - min + 1);
+                    (0..len).map(|_| next() as u8).collect()
+                })
+                .collect(),
+            epoch: 7,
+            beneficiary: Address::repeat_byte(3),
+            base_fee_per_gas: 42,
+            worker_id: 1,
+            received_at: None,
+        };
+        let shapes = [
+            ("500 x 150-300 B", batch(500, 150, 300)),
+            ("1000 x 150-300 B", batch(1_000, 150, 300)),
+            ("2000 x 150-300 B", batch(2_000, 150, 300)),
+            ("4000 x 250 B", batch(4_000, 250, 250)),
+            ("8 x 125 kB", batch(8, 125_000, 125_000)),
+        ];
+        let rounds = 2_000;
+        let grown = |batch: &Batch| {
+            let mut hasher = crate::crypto::DefaultHashFunction::new();
+            hasher.update(&encode(batch));
+            crate::BlockHash::from_slice(hasher.finalize().as_bytes())
+        };
+        let stats = |samples: &mut Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            (samples[samples.len() / 2], samples[0])
+        };
+        println!(
+            "{:<18} {:>14} {:>14} {:>14} {:>14}",
+            "batch", "grown p50", "grown min", "digest p50", "digest min"
+        );
+        for (label, batch) in &shapes {
+            assert_eq!(batch.digest(), grown(batch), "{label}: the digest must not change");
+            let (mut before, mut after) = (Vec::new(), Vec::new());
+            for round in 0..rounds {
+                for first in [round % 2 == 0, round % 2 != 0] {
+                    let start = Instant::now();
+                    if first {
+                        black_box(grown(black_box(batch)));
+                        before.push(start.elapsed().as_secs_f64() * 1e6);
+                    } else {
+                        black_box(black_box(batch).digest());
+                        after.push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+            }
+            let ((before_p50, before_min), (after_p50, after_min)) =
+                (stats(&mut before), stats(&mut after));
+            println!(
+                "{label:<18} {before_p50:>14.1} {before_min:>14.1} {after_p50:>14.1} {after_min:>14.1}"
+            );
+        }
+    }
+}
+
+/// [`Batch::digest`] is the hash of [`crate::encode`]'s bytes, and [`Batch::encoded_len`] their
+/// length, whatever the batch holds.
+#[cfg(test)]
+mod digest_tests {
+    use super::Batch;
+    use crate::{crypto::DefaultHashFunction, encode, Address, BlockHash};
+
+    /// The digest's computation before it sized its buffer: the hash of `encode(batch)`.
+    fn hash_of_encoding(batch: &Batch) -> BlockHash {
+        let mut hasher = DefaultHashFunction::new();
+        hasher.update(&encode(batch));
+        BlockHash::from_slice(hasher.finalize().as_bytes())
+    }
+
+    fn batch_of(lengths: &[usize]) -> Batch {
+        Batch {
+            transactions: lengths
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| (0..len).map(|b| (b * 31 + i) as u8).collect())
+                .collect(),
+            ..Batch::default()
+        }
+    }
+
+    /// Empty, one transaction, many, large, the ULEB128 length boundaries of a transaction and of
+    /// the count, and every field set: the digest is the hash of the encoding and the computed
+    /// length is the encoding's. `received_at` stays out of both.
+    #[test]
+    fn digest_is_the_hash_of_the_encoding() {
+        let mut batches = vec![
+            Batch::default(),
+            batch_of(&[1]),
+            batch_of(&[200]),
+            batch_of(&[127, 128, 129]),
+            batch_of(&[16_383, 16_384, 16_385]),
+            batch_of(&[2_097_151, 2_097_152]),
+            batch_of(&[1 << 20]),
+            batch_of(&[150; 127]),
+            batch_of(&[150; 128]),
+            batch_of(&[1; 16_384]),
+            batch_of(&(0..2_000).map(|i| 150 + i % 151).collect::<Vec<_>>()),
+        ];
+        let every_field = Batch {
+            epoch: u32::MAX,
+            beneficiary: Address::repeat_byte(0xab),
+            base_fee_per_gas: u64::MAX,
+            worker_id: u16::MAX,
+            received_at: Some(1_234),
+            ..batch_of(&[300, 1, 70_000])
+        };
+        batches.push(every_field.clone());
+        batches.push(Batch { received_at: None, ..every_field });
+        for batch in &batches {
+            let shape = batch.transactions.iter().map(Vec::len).take(4).collect::<Vec<_>>();
+            let count = batch.transactions.len();
+            assert_eq!(batch.encoded_len(), encode(batch).len(), "{count} txs {shape:?}: length");
+            assert_eq!(batch.digest(), hash_of_encoding(batch), "{count} txs {shape:?}: digest");
+        }
+        let (stamped, unstamped) = (&batches[batches.len() - 2], &batches[batches.len() - 1]);
+        assert_eq!(stamped.digest(), unstamped.digest(), "received_at is not in the digest");
     }
 }

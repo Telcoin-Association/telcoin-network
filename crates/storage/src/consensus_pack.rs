@@ -68,7 +68,7 @@ use crate::{
         pack_iter::AsyncPackIter,
         position_index::index::{PosIndexValue, PositionIndex},
     },
-    pack_validate::CorruptionKind,
+    pack_validate::{lost_pack_remedy, CorruptionKind},
 };
 
 /// Current version for new pack files.
@@ -485,8 +485,9 @@ pub enum EpochRepair {
     /// write happened. The string describes what a repair would do.
     WouldRepair(String),
     /// The epoch is damaged in a way local repair cannot fix (a torn/corrupt epoch-meta, or
-    /// mid-log data corruption): the data is lost and the epoch must be re-synced from peers.
-    /// Nothing was written. The string is the operator-facing reason.
+    /// mid-log data corruption): the data is lost, and only a backup or starting the node over
+    /// brings it back ([`lost_pack_remedy`]). Nothing was written. The string is the
+    /// operator-facing reason, with that recovery.
     Unrepairable(String),
 }
 
@@ -510,8 +511,8 @@ pub enum EpochMigrate {
     /// The string describes what was done.
     Migrated(String),
     /// The legacy pack's data log is damaged and cannot be migrated without losing committed data;
-    /// nothing was written and the epoch must be re-synced from peers. The string is the
-    /// operator-facing reason.
+    /// nothing was written. The string is the operator-facing reason, with the recovery
+    /// ([`lost_pack_remedy`]).
     Corrupt(String),
 }
 
@@ -832,7 +833,7 @@ impl ConsensusPack {
     /// [`classify_physical_corruption`](crate::pack_validate::classify_physical_corruption) to
     /// decide whether a truncate-and-rebuild can recover it — a torn trailing record, or a
     /// physically-sound log whose sidecar indexes are missing/corrupt — or whether the damage
-    /// is a lost epoch-meta / mid-log corruption that only a re-sync can fix.
+    /// is a lost epoch-meta / mid-log corruption no local repair can fix ([`lost_pack_remedy`]).
     ///
     /// When repairable and `apply`, [`Self::open_append_exists`] truncates any torn tail and
     /// rebuilds every index from the data log, and the clean-close drop re-seals the pack; the
@@ -868,7 +869,8 @@ impl ConsensusPack {
                     if report.verdict != crate::pack_validate::Verdict::Valid {
                         return Ok(EpochRepair::Unrepairable(format!(
                             "epoch {epoch}: migrated to v2 but validation still reports damage; the \
-                             data itself is likely corrupt — re-sync the epoch from peers.\n{report}"
+                             data itself is likely corrupt. {}\n{report}",
+                            lost_pack_remedy(format!("epoch-{epoch}"))
                         )));
                     }
                     return Ok(EpochRepair::Repaired(what));
@@ -889,12 +891,23 @@ impl ConsensusPack {
             // An all-zero `data` file (a first write that sized the file but crashed before the
             // header was durable) is unwritten, not repairable: there is nothing to rebuild.
             // Report it with an actionable message rather than letting the classifier surface a
-            // bare open error.
+            // bare open error. The newest epoch's is harmless: the writable open that creates the
+            // epoch re-initializes it (`Pack::init_header`). A past epoch held outputs, now lost.
             Err(e) if e.is_unwritten_data_file() => {
-                return Ok(EpochRepair::Unrepairable(format!(
-                    "epoch {epoch}: the data file is all zeros (an interrupted first write); \
-                     remove `epoch-{epoch}/` -- it is recreated on the next epoch transition."
-                )));
+                return Ok(EpochRepair::Unrepairable(if has_later_epoch(epochs_dir, epoch)? {
+                    format!(
+                        "epoch {epoch}: the data file is all zeros, and a later epoch exists, so \
+                         this past epoch's outputs are lost. {}",
+                        lost_pack_remedy(format!("epoch-{epoch}"))
+                    )
+                } else {
+                    format!(
+                        "epoch {epoch}: the data file is all zeros (an interrupted first write \
+                         when the node created this epoch); it holds no output. It is the newest \
+                         epoch: the node re-initializes the file in place when it enters the \
+                         epoch at its next start, so nothing needs to be done."
+                    )
+                }));
             }
             // A failure the environment caused (descriptor or memory exhaustion) is no verdict:
             // it must not turn a healthy pack into a repair plan.
@@ -946,7 +959,8 @@ impl ConsensusPack {
                                 "epoch {epoch}: the data log has a logical defect a rebuild cannot \
                                  fix (a chain break, non-sequential number, missing/extra/unsorted \
                                  batches, an empty sub-dag, or an epoch-meta mismatch); the indexes \
-                                 are not the problem. Re-sync the epoch from peers.\n{}",
+                                 are not the problem. {}\n{}",
+                                lost_pack_remedy(format!("epoch-{epoch}")),
                                 validation.as_ref().map(ToString::to_string).unwrap_or_default()
                             )));
                         }
@@ -960,37 +974,49 @@ impl ConsensusPack {
                     "truncate the torn trailing record and rebuild indexes".to_string()
                 }
                 CorruptionKind::TornMetaEmpty => {
-                    return Ok(EpochRepair::Unrepairable(format!(
-                        "epoch {epoch}: the epoch-meta record is torn with no outputs behind it; the \
-                         committee cannot be reconstructed locally. Remove `epoch-{epoch}/` and \
-                         re-sync the epoch from peers."
-                    )));
+                    return Ok(EpochRepair::Unrepairable(if has_later_epoch(epochs_dir, epoch)? {
+                        format!(
+                            "epoch {epoch}: the epoch-meta record is torn with nothing behind it, \
+                             and a later epoch exists, so this past epoch's outputs are lost. {}",
+                            lost_pack_remedy(format!("epoch-{epoch}"))
+                        )
+                    } else {
+                        format!(
+                            "epoch {epoch}: the epoch-meta record is torn with no outputs behind \
+                             it; the committee cannot be reconstructed locally. It is the newest \
+                             epoch and holds no output: with the node stopped, remove \
+                             `epoch-{epoch}/`, and the node creates it again when it enters the \
+                             epoch."
+                        )
+                    }));
                 }
                 CorruptionKind::CorruptMetaWithData => {
                     return Ok(EpochRepair::Unrepairable(format!(
                         "epoch {epoch}: the epoch-meta is unreadable but complete outputs sit behind \
                          it (offset {}); those outputs are unreachable and truncation would lose \
-                         them. Re-sync the epoch from peers.",
-                        c.offset
+                         them. {}",
+                        c.offset,
+                        lost_pack_remedy(format!("epoch-{epoch}"))
                     )));
                 }
                 CorruptionKind::MidLogCorruption => {
                     return Ok(EpochRepair::Unrepairable(format!(
                         "epoch {epoch}: mid-log corruption at offset {} with valid records past it. \
-                         If this data was durably committed it cannot be recovered by truncation — \
-                         re-sync the epoch from peers. (Classification is conservative: for the \
-                         current/most-recent epoch an unacked partial write can look the same, and a \
-                         normal node restart runs full recovery, which may heal it.)",
-                        c.offset
+                         If this data was durably committed it cannot be recovered by truncation. \
+                         (Classification is conservative: for the current/most-recent epoch an \
+                         unacked partial write can look the same, and a normal node restart runs \
+                         full recovery, which may heal it.) {}",
+                        c.offset,
+                        lost_pack_remedy(format!("epoch-{epoch}"))
                     )));
                 }
                 CorruptionKind::CorruptSealedRecord => {
                     return Ok(EpochRepair::Unrepairable(format!(
                         "epoch {epoch}: a committed record failed its CRC in a cleanly-sealed pack \
                          at offset {}; the clean-close sentinel proves the log was complete, so this \
-                         is at-rest corruption (bit rot), not a truncatable tail. Re-sync the epoch \
-                         from peers.",
-                        c.offset
+                         is at-rest corruption (bit rot), not a truncatable tail. {}",
+                        c.offset,
+                        lost_pack_remedy(format!("epoch-{epoch}"))
                     )));
                 }
             },
@@ -1012,7 +1038,7 @@ impl ConsensusPack {
             // A read the disk failed, an OS failure ([`PackError::IO`], whatever its kind), or a
             // failure the environment caused (descriptor or memory exhaustion, a permission
             // problem) is no verdict on the pack: report it as an error to retry, not as data
-            // loss to re-sync.
+            // loss.
             Err(e)
                 if matches!(e, PackError::ReadError(_) | PackError::IO(_))
                     || e.is_environmental() =>
@@ -1022,7 +1048,8 @@ impl ConsensusPack {
             Err(e) => {
                 return Ok(EpochRepair::Unrepairable(format!(
                     "epoch {epoch}: the data log cannot be recovered without losing committed \
-                     data ({e}); nothing was changed. Re-sync the epoch from peers."
+                     data ({e}); nothing was changed. {}",
+                    lost_pack_remedy(format!("epoch-{epoch}"))
                 )));
             }
         }
@@ -1080,8 +1107,9 @@ impl ConsensusPack {
             }
             Err(e) => {
                 return Ok(EpochRepair::Unrepairable(format!(
-                    "epoch {epoch}: repair aborted, the data is damaged beyond truncation ({e}); \
-                     re-sync the epoch from peers."
+                    "epoch {epoch}: repair aborted, the data is damaged beyond truncation ({e}). \
+                     {}",
+                    lost_pack_remedy(format!("epoch-{epoch}"))
                 )));
             }
         }
@@ -1093,7 +1121,8 @@ impl ConsensusPack {
         if report.verdict != crate::pack_validate::Verdict::Valid {
             return Ok(EpochRepair::Unrepairable(format!(
                 "epoch {epoch}: rebuilt the indexes but validation still reports damage; the data \
-                 itself is likely corrupt — re-sync the epoch from peers.\n{report}"
+                 itself is likely corrupt. {}\n{report}",
+                lost_pack_remedy(format!("epoch-{epoch}"))
             )));
         }
         Ok(EpochRepair::Repaired(plan))
@@ -1112,10 +1141,10 @@ impl ConsensusPack {
     ///
     /// The source is validated as it is read: any record that fails to decode, a size-prefix that
     /// desyncs the walk past a committed output, or a v0 output whose batch count disagrees with
-    /// its header, yields [`EpochMigrate::Corrupt`] with nothing changed on disk (the operator
-    /// re-syncs). An unacked crash tail of the newest epoch's header-first log is dropped, exactly
-    /// as normal recovery would; a past epoch (a later `epoch-{M}` directory exists) was complete,
-    /// so any tail its replay cannot reach is refused as damage.
+    /// its header, yields [`EpochMigrate::Corrupt`] with nothing changed on disk (the recovery is
+    /// [`lost_pack_remedy`]'s). An unacked crash tail of the newest epoch's header-first log is
+    /// dropped, exactly as normal recovery would; a past epoch (a later `epoch-{M}` directory
+    /// exists) was complete, so any tail its replay cannot reach is refused as damage.
     ///
     /// Runs on the blocking pool: it is synchronous file work with no live actor, and can rewrite a
     /// large log, so it must not stall an async worker.
@@ -1925,12 +1954,17 @@ pub fn legacy_migration_dry_run(data_path: &Path, epoch: Epoch) -> Result<u64, S
 }
 
 /// Whether `epoch` is a past epoch of the pack tree in `epochs_dir`: an `epoch-{M}` directory with
-/// `M > epoch` exists there (the same "newest is current" rule `db repair` skips by). A past
-/// epoch's pack was complete when the next one began, so its legacy migration expects the whole
-/// log (see `Inner::migrate_consistent_end`); only the newest epoch can carry an unacked tail.
+/// `M > epoch` exists there, or an interrupted install of such an `M` (`epoch-{M}.replaced` with no
+/// `epoch-{M}`: [`interrupted_installs`](crate::consensus::ConsensusChain::interrupted_installs)),
+/// which the node's next start puts back (the same "newest is current" rule `db repair` skips
+/// by). A past epoch's pack was complete when the next one began, so its legacy migration expects
+/// the whole log (see `Inner::migrate_consistent_end`); only the newest epoch can carry an unacked
+/// tail.
 fn has_later_epoch(epochs_dir: &Path, epoch: Epoch) -> io::Result<bool> {
     let epochs_dir = if epochs_dir.as_os_str().is_empty() { Path::new(".") } else { epochs_dir };
-    Ok(ConsensusPack::epoch_dirs(epochs_dir)?.last().is_some_and(|&newest| newest > epoch))
+    let later = |epochs: Vec<Epoch>| epochs.last().is_some_and(|&newest| newest > epoch);
+    Ok(later(ConsensusPack::epoch_dirs(epochs_dir)?)
+        || later(crate::consensus::ConsensusChain::interrupted_installs(epochs_dir)?))
 }
 
 /// The byte offset just past the last COMPLETE consensus output in a pack's data log, computed by a
@@ -2535,7 +2569,7 @@ impl Inner {
     /// rather than healing, so recovery only runs on the writable append opens. Those may open
     /// a legacy v1 pack (the in-flight epoch at upgrade) as well as current v2 packs; both
     /// replay identically. An inconsistent v0 (batches-first) pack cannot be replayed and is
-    /// rejected up front with a re-sync message — see the guard below.
+    /// rejected up front as corrupt — see the guard below.
     fn recover_pack<P: AsRef<Path>>(
         data: &mut Pack<PackRecord>,
         base_dir: P,
@@ -2569,9 +2603,9 @@ impl Inner {
         if data.version() == 0 {
             return Err(PackError::CorruptPack(format!(
                 "epoch pack {} is a pre-mmap v0 (batches-first) log left inconsistent after an \
-                 unclean shutdown; it cannot be rebuilt by replay and must be re-synced from peers. \
-                 Do NOT delete the chain-data directories (`db`, `static_files`, `consensus-db`)",
+                 unclean shutdown; it cannot be rebuilt by replay. {}",
                 base_dir.display(),
+                lost_pack_remedy(base_dir.display()),
             )));
         }
         // Recovery replays the whole data-file WAL, so it can take time proportional to pack size.
@@ -2909,10 +2943,10 @@ impl Inner {
             "epoch pack {} is corrupt. Inspect it with `telcoin-network db validate {}`: if it \
              reports a truncatable torn tail or an index problem, `telcoin-network db repair` (node \
              stopped) can repair it; if it reports durably-committed data damaged, that cannot be \
-             repaired by truncation and the epoch must be re-synced from peers. Do NOT delete the \
-             chain-data directories (`db`, `static_files`, `consensus-db`)",
+             repaired by truncation. {}",
             base_dir.display(),
             base_dir.display(),
+            lost_pack_remedy(base_dir.display()),
         ))
     }
 
@@ -3215,7 +3249,7 @@ impl Inner {
     /// v2 before it is opened for write — v2 is the only writable format, so writing v2
     /// records/sentinels onto a v0/v1-versioned header would produce an inconsistent
     /// mixed-format pack. A cheap read-only no-op for a pack already at v2 (the common case). A
-    /// genuinely corrupt legacy log aborts with [`PackError::CorruptPack`] (re-sync) — the same
+    /// genuinely corrupt legacy log aborts with [`PackError::CorruptPack`] (data loss) — the same
     /// failure class as an unreadable meta.
     fn migrate_legacy_if_needed(epochs_dir: &Path, epoch: Epoch) -> Result<(), PackError> {
         // Only a readable pre-v2 pack is migrated. If the data file cannot even be opened read-only
@@ -3485,30 +3519,33 @@ impl Inner {
         if logically_sealed && end < src.file_len() {
             return Err(MigrateAbort::Corrupt(format!(
                 "epoch {epoch}: a complete (length-consistent) legacy pack replays only to {end} of \
-                 {}; committed data is damaged, not a truncatable tail. Re-sync the epoch from peers.",
-                src.file_len()
+                 {}; committed data is damaged, not a truncatable tail. {}",
+                src.file_len(),
+                lost_pack_remedy(format!("epoch-{epoch}"))
             )));
         }
         if expect_complete && end < src.file_len() {
             return Err(MigrateAbort::Corrupt(format!(
                 "epoch {epoch}: the legacy pack of a past epoch replays only to {end} of {}; a past \
-                 epoch is complete, so committed data is damaged, not a truncatable tail. Re-sync \
-                 the epoch from peers.",
-                src.file_len()
+                 epoch is complete, so committed data is damaged, not a truncatable tail. {}",
+                src.file_len(),
+                lost_pack_remedy(format!("epoch-{epoch}"))
             )));
         }
         if let Some(committed_end) = src.committed_end() {
             if end < committed_end {
                 return Err(MigrateAbort::Corrupt(format!(
                     "epoch {epoch}: the data log replays only to {end} but a durable commit marker \
-                     attests {committed_end}; committed data is damaged. Re-sync the epoch from peers."
+                     attests {committed_end}; committed data is damaged. {}",
+                    lost_pack_remedy(format!("epoch-{epoch}"))
                 )));
             }
         }
         if attested_output_survives_past(data_file, epoch, end).map_err(MigrateAbort::Fatal)? {
             return Err(MigrateAbort::Corrupt(format!(
                 "epoch {epoch}: a committed output starts past the recoverable end {end}; committed \
-                 data is damaged. Re-sync the epoch from peers."
+                 data is damaged. {}",
+                lost_pack_remedy(format!("epoch-{epoch}"))
             )));
         }
         Ok(end)
@@ -4246,12 +4283,11 @@ impl Inner {
                 return Err(PackError::EpochLoad(format!(
                     "epoch {epoch} pack {} ({pack_len} bytes): the epoch meta's length prefix is \
                      zeroed but committed data remains past the header -- refusing to \
-                     re-initialize, which would erase it. The data is intact; inspect it with \
-                     `telcoin-network db validate {}` and re-sync this epoch from peers. Do NOT \
-                     delete this `epoch-{epoch}` directory or the chain-data directories (`db`, \
-                     `static_files`, `consensus-db`)",
+                     re-initialize, which would erase it. Inspect it with `telcoin-network db \
+                     validate {}`. {}",
                     pack_file.display(),
                     base_dir.display(),
+                    lost_pack_remedy(base_dir.display()),
                 )));
             }
             // Genuinely header-only: brand new, or a crash landed between the header write and the
@@ -12288,10 +12324,18 @@ pub(crate) mod test {
                 .await
                 .expect("repair must not err");
             match res {
-                EpochRepair::Unrepairable(msg) => assert!(
-                    msg.contains("all zeros"),
-                    "an unwritten file must be Unrepairable with an actionable message, got: {msg}"
-                ),
+                EpochRepair::Unrepairable(msg) => {
+                    assert!(
+                        msg.contains("all zeros"),
+                        "an unwritten file must be Unrepairable with an actionable message, got: \
+                         {msg}"
+                    );
+                    // The newest epoch's is re-initialized when the node enters the epoch.
+                    assert!(
+                        msg.contains("nothing needs to be done"),
+                        "the newest epoch needs no action: {msg}"
+                    );
+                }
                 other => {
                     panic!("an unwritten file must be Unrepairable (apply={apply}), got {other:?}")
                 }
@@ -12302,6 +12346,45 @@ pub(crate) mod test {
             1 << 20,
             "repair must not mutate the unwritten data file"
         );
+
+        // A past epoch's all-zero data file lost its outputs: nothing recreates it, and removing
+        // it is never the advice.
+        std::fs::create_dir(temp_dir.path().join("epoch-1")).expect("later epoch");
+        let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, true).await.expect("repair");
+        let EpochRepair::Unrepairable(msg) = res else {
+            panic!("a past epoch's unwritten file must be Unrepairable, got {res:?}")
+        };
+        assert!(msg.contains("outputs are lost"), "a past epoch lost its outputs: {msg}");
+        assert!(!msg.contains("recreated"), "a past epoch is never recreated: {msg}");
+        assert!(!msg.contains("re-sync") && !msg.contains("from peers"), "no re-sync: {msg}");
+        assert!(msg.contains("from a backup"), "must name a backup: {msg}");
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("stat").len(),
+            1 << 20,
+            "repair must not mutate the unwritten data file"
+        );
+    }
+
+    /// A later epoch left only as an interrupted install (`epoch-1.replaced` with no `epoch-1`,
+    /// which the node's next start puts back) makes epoch 0 a past epoch: its all-zero data file
+    /// lost its outputs, and the dry run never calls it the newest epoch that needs nothing.
+    #[tokio::test]
+    async fn test_repair_epoch_counts_an_interrupted_install_as_a_later_epoch() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_repair_aside").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; 1 << 20]).expect("zeros");
+        std::fs::create_dir(temp_dir.path().join("epoch-1.replaced")).expect("aside");
+        assert!(super::has_later_epoch(temp_dir.path(), 0).expect("look"));
+        assert!(!super::has_later_epoch(temp_dir.path(), 1).expect("look"));
+
+        let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, false).await.expect("repair");
+        let EpochRepair::Unrepairable(msg) = res else {
+            panic!("a past epoch's unwritten file must be Unrepairable, got {res:?}")
+        };
+        assert!(msg.contains("outputs are lost"), "a past epoch lost its outputs: {msg}");
+        assert!(!msg.contains("nothing needs to be done"), "it is not the newest epoch: {msg}");
+        assert!(msg.contains("from a backup"), "must name a backup: {msg}");
     }
 
     /// A torn trailing tail (stray bytes appended past the sealed data) is truncated back to the
@@ -12681,15 +12764,32 @@ pub(crate) mod test {
         let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
             .await
             .expect("repair must not err");
-        assert!(
-            matches!(outcome, EpochRepair::Unrepairable(_)),
-            "a torn meta is unrepairable, got {outcome:?}"
-        );
+        let EpochRepair::Unrepairable(why) = outcome else {
+            panic!("a torn meta is unrepairable, got {outcome:?}")
+        };
         assert_eq!(
             std::fs::read(&data).expect("reread data"),
             before,
             "unrepairable epoch untouched"
         );
+        // The newest epoch holds no output: removing it is safe, the node creates it again.
+        assert!(why.contains("newest epoch"), "must name the newest-epoch case: {why}");
+        assert!(why.contains("remove `epoch-0/`"), "the newest epoch's fix is removal: {why}");
+
+        // With a later epoch beside it, it is a past epoch whose outputs are lost: never removal,
+        // and no re-sync (nothing fetches a past epoch's pack again).
+        std::fs::create_dir(temp_dir.path().join("epoch-1")).expect("later epoch");
+        let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("repair must not err");
+        let EpochRepair::Unrepairable(why) = outcome else {
+            panic!("a past epoch's torn meta is unrepairable, got {outcome:?}")
+        };
+        assert!(why.contains("outputs are lost"), "a past epoch lost its outputs: {why}");
+        assert!(!why.contains("remove `epoch-0/`"), "never remove a past epoch: {why}");
+        assert!(!why.contains("re-sync") && !why.contains("from peers"), "no re-sync: {why}");
+        assert!(why.contains("from a backup"), "must name a backup: {why}");
+        assert_eq!(std::fs::read(&data).expect("reread data"), before, "still untouched");
     }
 
     /// Mid-log corruption — a damaged byte with valid records still behind it — is `Unrepairable`
@@ -12754,6 +12854,12 @@ pub(crate) mod test {
             before,
             "an unrepairable mid-log pack must be left untouched"
         );
+        // The reason names the recovery that exists (nothing fetches the pack again) and warns off
+        // removing the epoch's directory.
+        let EpochRepair::Unrepairable(why) = applied else { unreachable!() };
+        assert!(!why.contains("re-sync") && !why.contains("from peers"), "no re-sync: {why}");
+        assert!(why.contains("from a backup"), "must name a backup: {why}");
+        assert!(why.contains("Do NOT delete `epoch-0`"), "must keep the pack: {why}");
     }
 
     /// `epoch_dirs` lists only `epoch-{N}` directories (not files, not `staging-*`), sorted
