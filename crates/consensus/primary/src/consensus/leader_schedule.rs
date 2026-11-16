@@ -6,14 +6,14 @@ use rand::{seq::IndexedRandom as _, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use std::{
     collections::HashMap,
-    fmt::{Debug, Formatter},
+    fmt::{Debug, Formatter, Write as _},
     sync::Arc,
 };
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, Committee, ConsensusChainReader, ReputationScores,
     Round, VotingPower,
 };
-use tracing::{debug, trace};
+use tracing::{info, trace};
 
 #[cfg(test)]
 #[path = "tests/leader_schedule_tests.rs"]
@@ -60,6 +60,11 @@ impl LeaderSwapTable {
     /// If we have bad nodes then we MUST have good nodes to swap with (an empty good list will lead
     /// to panics later).  We want at least `bad_nodes_percent_threshold` of nodes on the good list
     /// if we have bad nodes (more is fine).
+    ///
+    /// Every table built here is logged once as `leader schedule updated` (target
+    /// `consensus::metrics`) with the scores it was built from and its good and bad nodes. That
+    /// covers a commit that closes a schedule window and a restart that restores the latest final
+    /// scores from the store.
     pub fn new(
         committee: &Committee,
         round: Round,
@@ -171,38 +176,41 @@ impl LeaderSwapTable {
                 (good_nodes, bad_nodes)
             };
 
-        good_nodes.iter().for_each(|good_node| {
-            debug!(
-                target: "primary::leader_schedule",
-                "Good node on round {}: {} -> {}",
-                round,
-                good_node.id(),
-                reputation_scores
-                    .scores_per_authority
-                    .get(&good_node.id())
-                    .expect("good node in scores per authority")
-            );
-        });
+        let table = Self { round, good_nodes, bad_nodes };
 
-        bad_nodes.iter().for_each(|(_id, bad_node)| {
-            debug!(
-                target: "primary::leader_schedule",
-                "Bad node on round {}: {} -> {}",
-                round,
-                bad_node.id(),
-                reputation_scores
-                    .scores_per_authority
-                    .get(&bad_node.id())
-                    .expect("bad node in scores by authority")
-            );
-        });
-
-        debug!(
-            target: "primary::leader_schedule",
-            "Reputation scores on round {round}: {reputation_scores:?}"
+        // one line per table: the scores it was built from and the authorities it swaps in and out
+        info!(
+            target: "consensus::metrics",
+            epoch = committee.epoch(),
+            round,
+            scores = %Self::render_scores(reputation_scores),
+            good = %table.render_good(),
+            bad = %table.render_bad(),
+            final_of_schedule = reputation_scores.final_of_schedule,
+            "leader schedule updated"
         );
 
-        Self { round, good_nodes, bad_nodes }
+        table
+    }
+
+    /// Renders every authority's score as `[id:score,id:score,…]`, in authority identifier order,
+    /// for the `scores` field of the `leader schedule updated` line.
+    pub(crate) fn render_scores(reputation_scores: &ReputationScores) -> String {
+        render_bounded_list(reputation_scores.scores_per_authority.iter(), |out, (id, score)| {
+            write!(out, "{id}:{score}")
+        })
+    }
+
+    /// Renders the authorities this table swaps in (its good nodes) as `[id,id,…]`, in authority
+    /// identifier order, for the `good` field of the `leader schedule updated` line.
+    pub(crate) fn render_good(&self) -> String {
+        render_sorted_ids(self.good_nodes.iter().map(Authority::id).collect())
+    }
+
+    /// Renders the authorities this table swaps out (its bad nodes) as `[id,id,…]`, in authority
+    /// identifier order, for the `bad` field of the `leader schedule updated` line.
+    pub(crate) fn render_bad(&self) -> String {
+        render_sorted_ids(self.bad_nodes.keys().cloned().collect())
     }
 
     /// Checks whether the provided leader is a bad performer and needs to be swapped in the
@@ -368,6 +376,38 @@ impl LeaderSchedule {
         let read = self.leader_swap_table.read();
         read.bad_nodes.len()
     }
+}
+
+/// The most authorities one list field of the `leader schedule updated` line names; any further
+/// ones are counted by a closing `+N` element, so the line stays bounded for any committee size.
+const MAX_LOGGED_AUTHORITIES: usize = 10;
+
+/// Sorts `ids` into authority identifier order and renders them as `[id,id,…]`.
+fn render_sorted_ids(mut ids: Vec<AuthorityIdentifier>) -> String {
+    ids.sort();
+    render_bounded_list(ids.iter(), |out, id| write!(out, "{id}"))
+}
+
+/// Renders `items` as `[a,b,…]`: commas without spaces, at most [`MAX_LOGGED_AUTHORITIES`] items,
+/// then `+N` for the `N` items left out.
+fn render_bounded_list<I: ExactSizeIterator>(
+    items: I,
+    mut render_item: impl FnMut(&mut String, I::Item) -> std::fmt::Result,
+) -> String {
+    let total = items.len();
+    let mut out = String::from("[");
+    for (index, item) in items.take(MAX_LOGGED_AUTHORITIES).enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        // writing into a string cannot fail
+        let _ = render_item(&mut out, item);
+    }
+    if total > MAX_LOGGED_AUTHORITIES {
+        let _ = write!(out, ",+{}", total - MAX_LOGGED_AUTHORITIES);
+    }
+    out.push(']');
+    out
 }
 
 #[cfg(test)]

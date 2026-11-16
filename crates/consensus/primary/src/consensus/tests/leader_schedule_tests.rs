@@ -517,3 +517,62 @@ async fn test_swap_good_node_selection_is_pinned() {
     let again = table.swap(&authority_ids[7], 2).expect("a bad node is always swapped out");
     assert_eq!(first.id(), again.id());
 }
+
+// ---- bench8 leader-schedule-scores ----
+
+/// The `leader schedule updated` line renders every authority's score, the good nodes and the bad
+/// nodes in authority identifier order, commas without spaces, and names ten authorities at most.
+#[test]
+fn leader_schedule_updated_fields() {
+    tn_types::test_utils::init_test_tracing();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+    assert_eq!(ids.len(), 4);
+
+    // scores 0, 10, 20, 30 in fixture order: the authority at 0 is the one bad node and the
+    // authorities at 20 and 30 are the good nodes
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    for (index, id) in ids.iter().enumerate() {
+        scores.add_score(id, 10 * index as u64);
+    }
+    let mut sorted = ids.clone();
+    sorted.sort();
+    let score_of =
+        |id: &AuthorityIdentifier| 10 * ids.iter().position(|other| other == id).unwrap();
+    let expected: Vec<String> = sorted.iter().map(|id| format!("{id}:{}", score_of(id))).collect();
+    let rendered = LeaderSwapTable::render_scores(&scores);
+    assert_eq!(rendered, format!("[{}]", expected.join(",")));
+    assert!(!rendered.contains(' '));
+
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+    let mut good = [ids[2].clone(), ids[3].clone()];
+    good.sort();
+    assert_eq!(table.render_good(), format!("[{},{}]", good[0], good[1]));
+    assert_eq!(table.render_bad(), format!("[{}]", ids[0]));
+
+    // equal scores swap nobody: both lists are empty
+    let mut equal = ReputationScores::new(&committee);
+    equal.final_of_schedule = true;
+    for id in &ids {
+        equal.add_score(id, 5);
+    }
+    let table = LeaderSwapTable::new(&committee, 4, &equal, 33);
+    assert_eq!(table.render_good(), "[]");
+    assert_eq!(table.render_bad(), "[]");
+
+    // twelve authorities: the first ten in authority identifier order, then the count left out
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .committee_size(NonZeroUsize::new(12).unwrap())
+        .build();
+    let committee = fixture.committee();
+    let mut sorted: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+    sorted.sort();
+    let mut scores = ReputationScores::new(&committee);
+    for id in &sorted {
+        scores.add_score(id, 7);
+    }
+    let expected: Vec<String> = sorted.iter().take(10).map(|id| format!("{id}:7")).collect();
+    assert_eq!(LeaderSwapTable::render_scores(&scores), format!("[{},+2]", expected.join(",")));
+}
