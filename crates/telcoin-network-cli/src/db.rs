@@ -146,12 +146,17 @@ enum DbSubcommand {
     ///
     /// Puts back the pack of past epoch N (`<datadir>/consensus-db/epochs/epoch-N`) from a copy:
     /// this node's backup of `epoch-N`, or another node's sealed `epoch-N` (only its `data` file
-    /// is read). The copy is not trusted: it goes through the import a peer's stream takes,
+    /// is read). A legacy v0 (batches-first) copy, a backup from before the header-first format,
+    /// is refused: convert it first with `db migrate --force` in a scratch datadir, as the
+    /// refusal says. The copy is not trusted: it goes through the import a peer's stream takes,
     /// which checks its last output against this node's certified record of epoch N and every
     /// earlier one by its parent links, and it is installed only once verified, sealed and
     /// read back, renamed into place as the node installs an import. It replaces a missing
-    /// pack, a damaged one, or an interrupted install whose copy is damaged. It refuses epoch
-    /// 0, the epoch the node resumes and any later one, an epoch whose certified record (or
+    /// pack, a damaged one, or an interrupted install whose copy is damaged. Epoch 0's copy is
+    /// checked against certified record 0 and the genesis committee (the datadir's
+    /// `genesis/committee.yaml`), which the node opens epoch 0 with. It refuses the epoch
+    /// the node resumes and any later one (and a datadir with no latest-consensus hint, whose
+    /// resume epoch is unknown), an epoch whose certified record (or
     /// the record before it) this node lacks, a copy inside the epochs directory (put it
     /// elsewhere: the import and the node remove directories there), and a pack in place that
     /// validates and ends with the epoch's certified final output. The node MUST be stopped: it
@@ -1249,7 +1254,9 @@ pub struct DbImportEpochArgs {
     pub epoch: Epoch,
 
     /// The copy: an `epoch-N` directory (this node's backup, or another node's sealed one), or
-    /// its `data` file, outside `<datadir>/consensus-db/epochs`.
+    /// its `data` file, outside `<datadir>/consensus-db/epochs`. A v1 or v2 pack is read as it
+    /// is; a legacy v0 (batches-first) one is refused until `db migrate --force` converts it in a
+    /// scratch datadir (the refusal gives the steps).
     #[arg(long, value_name = "PATH")]
     pub from: PathBuf,
 
@@ -1291,6 +1298,9 @@ impl DbImportEpochArgs {
         // The install replaces files a running node reads: refuse while a node holds the datadir,
         // and hold it so a node cannot start mid-import; released when this returns.
         let _pid_lock = PidLock::acquire(&datadir)?;
+        // Epoch 0's pack chains to the stand-in the node opens epoch 0 with, built from the
+        // genesis committee; no other epoch reads it.
+        let genesis = (self.epoch == 0).then(|| load_genesis_committee(&datadir)).transpose()?;
         let runtime =
             tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
         let import = runtime
@@ -1301,6 +1311,7 @@ impl DbImportEpochArgs {
                 self.force,
                 STREAM_IMPORT_TIMEOUT,
                 self.min_free(),
+                genesis.as_ref(),
             ))
             .map_err(|e| eyre!("epoch {}: {e}", self.epoch))?;
         if import.installed {
@@ -5042,9 +5053,41 @@ mod tests {
         assert!(err.to_string().contains("Invalid unit"), "{err}");
     }
 
+    /// The conversion `db import-epoch` names for a legacy v0 copy runs: `db migrate --epoch N
+    /// --force` on a scratch datadir that holds nothing but the copy's `data` file at
+    /// `consensus-db/epochs/epoch-N/data` (no records, no later epoch, no lock file) leaves a
+    /// sealed v2 pack there.
+    #[test]
+    fn db_import_epoch_v0_conversion_runs_in_a_bare_scratch_datadir() {
+        use tn_config::TelcoinDirs as _;
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression},
+            consensus_pack::{pack_unsealed_version, EpochMeta, PackRecord},
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let epoch_dir = scratch.path().to_path_buf().epochs_db_path().join("epoch-1");
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let data = epoch_dir.join(super::DATA_NAME);
+        let mut committee = tn_types::CommitteeBuilder::new(1);
+        for (i, signer) in test_signers(41, 4).iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        let meta = EpochMeta { epoch: 1, committee: committee.build(), ..Default::default() };
+        let mut pack = Pack::<PackRecord>::open(&data, 1, false, PackCompression::ZStd, 0).unwrap();
+        pack.append(&PackRecord::EpochMeta(meta)).unwrap();
+        pack.commit().unwrap();
+        drop(pack);
+        assert_eq!(pack_unsealed_version(&data, 1).map(|(version, _)| version), Some(0));
+        super::DbMigrateArgs { epoch: Some(1), force: true }
+            .execute(scratch.path().to_path_buf())
+            .expect("db migrate converts the copy");
+        assert_eq!(pack_unsealed_version(&data, 1), Some((2, false)), "a sealed v2 pack");
+    }
+
     /// `db import-epoch` refuses while a node holds the datadir, before reading anything; with
-    /// the lock free it refuses epoch 0 (verified against the pre-genesis descriptor, which no
-    /// copy carries) and a datadir with no epochs directory, and writes nothing.
+    /// the lock free it refuses a datadir with no epochs directory, epoch 0 without the genesis
+    /// committee it is verified against, and a datadir with no latest-consensus hint (whose
+    /// resume epoch is unknown), and writes nothing.
     #[cfg(unix)]
     #[test]
     fn db_import_epoch_refuses_a_running_node_and_what_it_cannot_verify() {
@@ -5067,10 +5110,10 @@ mod tests {
         assert!(err.to_string().contains("another telcoin process"), "{err}");
         drop(held);
         let before = tree_listing(&epochs);
-        let err = import(0).execute(datadir.clone()).expect_err("epoch 0");
-        assert!(format!("{err:#}").contains("epoch 0 cannot be imported"), "{err:#}");
-        let err = import(1).execute(datadir.clone()).expect_err("nothing to verify against");
-        assert!(format!("{err:#}").contains("not a past epoch"), "{err:#}");
+        let err = import(0).execute(datadir.clone()).expect_err("no genesis committee");
+        assert!(format!("{err:#}").contains("failed to load genesis committee"), "{err:#}");
+        let err = import(1).execute(datadir.clone()).expect_err("no resume epoch to judge by");
+        assert!(format!("{err:#}").contains("no readable latest-consensus hint"), "{err:#}");
         assert_eq!(tree_listing(&epochs), before, "a refusal wrote nothing");
     }
 }

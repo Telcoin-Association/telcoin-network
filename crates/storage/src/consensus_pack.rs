@@ -1931,6 +1931,16 @@ pub(crate) fn legacy_migration_refusal(data_path: &Path, epoch: Epoch) -> Option
 /// refused. This is the only check a legacy v0 pack gets, since it is only ever read by its
 /// migration.
 pub fn legacy_migration_dry_run(data_path: &Path, epoch: Epoch) -> Result<u64, String> {
+    legacy_migration_dry_run_last(data_path, epoch).map(|(outputs, _)| outputs)
+}
+
+/// [`legacy_migration_dry_run`], also returning the number and digest of the last output the
+/// migration would copy (`None` for a pack with no output), so a caller can compare it with the
+/// epoch's certified final output.
+pub fn legacy_migration_dry_run_last(
+    data_path: &Path,
+    epoch: Epoch,
+) -> Result<(u64, Option<ConsensusNumHash>), String> {
     let base_dir = data_path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", data_path.display()))?;
@@ -3104,7 +3114,7 @@ impl Inner {
                     epoch,
                     expect_complete,
                 ) {
-                    Ok(n) => EpochMigrate::WouldMigrate(format!(
+                    Ok((n, _)) => EpochMigrate::WouldMigrate(format!(
                         "v{version} -> v{PACK_VERSION}, {n} output(s)"
                     )),
                     Err(MigrateAbort::Corrupt(why)) => EpochMigrate::Corrupt(why),
@@ -3326,7 +3336,7 @@ impl Inner {
             PACK_VERSION,
         )
         .map_err(|e| MigrateAbort::Fatal(e.into()))?;
-        let copied = Self::migrate_copy(
+        let (copied, _) = Self::migrate_copy(
             src,
             Some(&mut dst),
             version,
@@ -3406,8 +3416,8 @@ impl Inner {
     /// Walk the legacy `src` data log record-by-record, validating as it reads. When `dst` is
     /// `Some`, each record is re-appended to the fresh v2 log in header-first order (reordering a
     /// v0 batches-first log). When `dst` is `None` this only validates and counts (the dry-run
-    /// path). Returns the number of outputs. See [`Self::migrate_consistent_end`] for
-    /// `expect_complete`.
+    /// path). Returns the number of outputs and the number and digest of the last one. See
+    /// [`Self::migrate_consistent_end`] for `expect_complete`.
     fn migrate_copy(
         src: &Pack<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
@@ -3416,7 +3426,7 @@ impl Inner {
         data_file: &Path,
         epoch: Epoch,
         expect_complete: bool,
-    ) -> Result<u64, MigrateAbort> {
+    ) -> Result<(u64, Option<ConsensusNumHash>), MigrateAbort> {
         // For a header-first (v1) log, compute the safe consistent end with the same WAL replay +
         // committed-data guards recovery uses: an unacked crash tail past `end` is dropped, but a
         // committed output is never silently lost. A v0 (batches-first) log cannot be replayed; it
@@ -3474,11 +3484,20 @@ impl Inner {
                 )))
             }
         }
-        if version == 0 {
-            Self::migrate_copy_v0(&mut iter, dst, base_dir, epoch)
+        let mut last = None;
+        let count = if version == 0 {
+            Self::migrate_copy_v0(&mut iter, dst, base_dir, epoch, &mut last)
         } else {
-            Self::migrate_copy_v1(&mut iter, dst, base_dir, end, epoch)
-        }
+            Self::migrate_copy_v1(&mut iter, dst, base_dir, end, epoch, &mut last)
+        }?;
+        // one digest per migration, of the last header only
+        let last = match last {
+            Some(PackRecord::Consensus(header)) => {
+                Some(ConsensusNumHash::new(header.number, header.digest()))
+            }
+            _ => None,
+        };
+        Ok((count, last))
     }
 
     /// Compute the recoverable end of a header-first legacy log and reject any damage below the
@@ -3554,13 +3573,14 @@ impl Inner {
 
     /// Copy a header-first (v1) log up to `end`, output by output (`Consensus` header followed by
     /// the exact number of `Batch` records its sub-dag names). Records at/after `end` are the
-    /// discarded unacked tail.
+    /// discarded unacked tail. `last` is set to each output's header record as it is copied.
     fn migrate_copy_v1(
         iter: &mut crate::archive::pack::RawIter<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
         base_dir: &Path,
         end: u64,
         epoch: Epoch,
+        last: &mut Option<PackRecord>,
     ) -> Result<u64, MigrateAbort> {
         let mut count = 0u64;
         loop {
@@ -3572,10 +3592,12 @@ impl Inner {
                 None => break,
                 Some(Ok(PackRecord::Consensus(header))) => {
                     let expected = Self::expected_batch_count(&header);
+                    let record = PackRecord::Consensus(header);
                     if let Some(d) = dst.as_deref_mut() {
-                        d.append(&PackRecord::Consensus(header))
+                        d.append(&record)
                             .map_err(|e| MigrateAbort::Fatal(PackError::append_failed(e)))?;
                     }
+                    *last = Some(record);
                     for _ in 0..expected {
                         let batch_pos = iter.logical_position();
                         match iter.next() {
@@ -3631,12 +3653,14 @@ impl Inner {
     /// Copy a v0 batches-first log, reordering each output into header-first form: batches are
     /// buffered until their `Consensus` header appears, then the header and its batches are
     /// appended. Any decode failure or a batch count that disagrees with the header is
-    /// corruption; a read the disk failed is a [`PackError::ReadError`] (nothing is cut).
+    /// corruption; a read the disk failed is a [`PackError::ReadError`] (nothing is cut). `last`
+    /// is set to each output's header record as it is copied.
     fn migrate_copy_v0(
         iter: &mut crate::archive::pack::RawIter<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
         base_dir: &Path,
         epoch: Epoch,
+        last: &mut Option<PackRecord>,
     ) -> Result<u64, MigrateAbort> {
         let mut count = 0u64;
         let mut pending: Vec<Batch> = Vec::new();
@@ -3662,8 +3686,9 @@ impl Inner {
                             pending.len()
                         )));
                     }
+                    let record = PackRecord::Consensus(header);
                     if let Some(d) = dst.as_deref_mut() {
-                        d.append(&PackRecord::Consensus(header))
+                        d.append(&record)
                             .map_err(|e| MigrateAbort::Fatal(PackError::append_failed(e)))?;
                         for batch in pending.drain(..) {
                             d.append(&PackRecord::Batch(batch))
@@ -3672,6 +3697,7 @@ impl Inner {
                     } else {
                         pending.clear();
                     }
+                    *last = Some(record);
                     count += 1;
                 }
                 Some(Ok(PackRecord::EpochMeta(_))) => {

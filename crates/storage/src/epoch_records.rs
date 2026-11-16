@@ -621,6 +621,26 @@ impl EpochRecordDb {
         Ok(certs)
     }
 
+    /// Read every [`EpochRecord`] of this node's records log at `path` at rest (read-only, no
+    /// index), as the node's open recovers the log (`replay_records`, `drop_torn_tail`): a log
+    /// an unclean stop left unsealed (no clean-close sentinel, zero padding past its data) ends at
+    /// its first record that does not decode, the unacked tail the open drops. A sealed log that
+    /// stops decoding is at-rest damage, and a read the disk fails is never a torn tail: both
+    /// are errors, as at the open. Records come back in stored order (one stored twice comes
+    /// back twice; the open keeps the first).
+    ///
+    /// For `db import-epoch`, which reads the datadir's own records with the node stopped. A
+    /// bundle's records are read strictly ([`Self::read_records_from_pack`]).
+    pub fn read_records_at_rest(path: &Path) -> Result<Vec<EpochRecord>, EpochDbError> {
+        read_log_at_rest(path, Inner::PACK_EPOCH, "records")
+    }
+
+    /// Read every [`EpochCertificate`] of this node's certificates log at `path` at rest, as the
+    /// node's open recovers the log (`replay_certs`): see [`Self::read_records_at_rest`].
+    pub fn read_certs_at_rest(path: &Path) -> Result<Vec<EpochCertificate>, EpochDbError> {
+        read_log_at_rest(path, Inner::CERT_PACK_EPOCH, "certs")
+    }
+
     /// Send one write to the background thread and wait for its verdict on it.
     async fn write(
         &self,
@@ -1265,6 +1285,34 @@ fn read_failure(name: &str, pos: u64, source: FetchError) -> EpochDbError {
     EpochDbError::Unreadable {
         what: format!("the {name} log at offset {pos} (a read error, not a torn tail)"),
         source: Arc::new(source),
+    }
+}
+
+/// The values of the `name` log at `path`, read at rest as the open's replay recovers it: see
+/// [`EpochRecordDb::read_records_at_rest`].
+fn read_log_at_rest<V>(path: &Path, uid_idx: u64, name: &str) -> Result<Vec<V>, EpochDbError>
+where
+    V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let log = Pack::<V>::open(path, uid_idx, true, PackCompression::ZStd, EPOCH_PACK_VERSION)?;
+    let mut iter = log.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
+    let mut values = Vec::new();
+    loop {
+        let pos = iter.logical_position();
+        match iter.next() {
+            None => return Ok(values),
+            Some(Ok(value)) => values.push(value),
+            Some(Err(e)) if e.is_read_failure() => return Err(read_failure(name, pos, e)),
+            // the unacked torn tail the open drops (`Inner::drop_torn_tail`)
+            Some(Err(_)) if log.opened_unclean() => return Ok(values),
+            Some(Err(e)) => {
+                return Err(EpochDbError::CorruptLog(format!(
+                    "sealed {name} log stops decoding at offset {pos} of {} ({e}); at-rest \
+                     corruption",
+                    log.file_len()
+                )))
+            }
+        }
     }
 }
 
