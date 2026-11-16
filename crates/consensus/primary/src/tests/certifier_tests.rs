@@ -399,7 +399,9 @@ fn start_proposal<DB: Database>(
     header: Header,
 ) -> JoinHandle<DagResult<Certificate>> {
     let certifier = certifier.clone();
-    tokio::spawn(async move { certifier.propose_header(header, &Notify::new()).await })
+    tokio::spawn(async move {
+        certifier.propose_header(header, &Notify::new(), &VoteRound::default()).await
+    })
 }
 
 /// The result of a proposal started with [`start_proposal`].
@@ -1323,8 +1325,9 @@ async fn run_vote_request_row(row: VoteRequestRow, committee: Committee) {
     let mut replies = replies.into_iter();
     let (mut network, handle) = MockNetwork::new();
     let cancel_proposal = Notifier::new();
+    let vote_round = VoteRound::default();
     let call = Certifier::request_vote(
-        authority,
+        vote_round.voter(authority),
         header,
         peer_id,
         store,
@@ -1444,8 +1447,9 @@ impl IndirectParent {
     async fn request_vote(&self) -> (DagResult<Vote>, Vec<Vec<Certificate>>) {
         let (mut network, handle) = MockNetwork::new();
         let cancel_proposal = Notifier::new();
+        let vote_round = VoteRound::default();
         let call = Certifier::request_vote(
-            self.peer.clone(),
+            vote_round.voter(self.peer.clone()),
             self.header.clone(),
             self.peer_key,
             self.store.clone(),
@@ -1631,7 +1635,7 @@ fn votes_aggregator_append_outcomes() {
     for AppendRow { name, steps } in rows {
         let mut aggregator = VotesAggregator::new();
         for (ordinal, (vote, expected)) in (1..).zip(steps) {
-            let result = aggregator.append(vote, &committee, &header);
+            let result = aggregator.append(vote, &committee, &header, &VoteRound::default());
             if !same_outcome(&result, &expected) {
                 failures
                     .push(format!("{name}: vote {ordinal}: expected {expected:?}, got {result:?}"));
@@ -1725,7 +1729,8 @@ fn certificate_forms_exactly_at_quorum_threshold() {
         let mut weight = 0;
         for (count, (voter, expected)) in (1..).zip(voters.iter().zip(outcomes)) {
             weight += committee.voting_power_by_id(&voter.id());
-            let result = aggregator.append(voter.vote(&header), &committee, &header);
+            let result =
+                aggregator.append(voter.vote(&header), &committee, &header, &VoteRound::default());
             if !same_outcome(&result, &expected) {
                 failures.push(format!(
                     "{size} authorities: vote {count} brings the weight to {weight} of quorum \
@@ -2850,7 +2855,12 @@ fn report_and_count(certifier: &Certifier<MemDatabase>, header: &Header) -> Vec<
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
-        certifier.report_canceled(header.round(), header.epoch(), header.digest())
+        certifier.report_canceled(
+            header.round(),
+            header.epoch(),
+            header.digest(),
+            &VoteRound::default(),
+        )
     });
     dropped_reports(&snapshotter)
 }
@@ -2908,4 +2918,103 @@ async fn shutdown_drops_the_cancel_report_and_counts_it() {
     let lines = capture.events("uncertified own header report dropped");
     assert_eq!(lines.len(), 1, "one line for the dropped report");
     assert_eq!(lines[0].field("reason"), Some("shutdown"));
+}
+
+// ---- bench8 vote-round ----
+
+/// A voter that refuses the header is listed under `vote_errors` on the `quorum reached` line,
+/// and the votes are listed under `vote_arrivals` in the order they reached the author.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn quorum_reached_lists_a_refusing_voter() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let mut cx = CertifierContext::new();
+    let header = cx.proposer_header();
+    let votes = cx.peer_votes(&header);
+    // the peers in authority order, so their roles do not depend on map order
+    let mut peers: Vec<_> = votes.iter().map(|(key, vote)| (vote.author().clone(), *key)).collect();
+    peers.sort_by(|a, b| a.0.cmp(&b.0));
+    let [(refusing, refusing_key), (first, first_key), (last, last_key)] =
+        <[_; 3]>::try_from(peers).expect("three peers");
+    let mut cert_rx = cx.subscribe_new_certificates();
+
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    let mut responses = cx
+        .network
+        .respond(votes.len(), "one peer refuses, one votes, one is held", |peer, _| {
+            if *peer == refusing_key {
+                Reply::Fail(NetworkError::RPCError("mock refusal".to_string()))
+            } else if *peer == first_key {
+                Reply::Vote(votes[peer].clone())
+            } else {
+                Reply::Hold
+            }
+        })
+        .await;
+    // on the paused clock a sleep ends only once every task is idle, so the refusal and the first
+    // vote have reached the round before the held peer answers
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let held = responses.held.pop().expect("the last peer's request is held");
+    let reply = PrimaryResponse::Vote(votes[&last_key].clone());
+    assert!(
+        held.send(Ok(NetworkResponseMessage { peer: last_key, result: reply })).is_ok(),
+        "the requester waits for the held vote"
+    );
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("the header is certified")
+        .expect("certificate channel open");
+    assert_eq!(certificate.header().digest(), header.digest());
+
+    let events = capture.events("quorum reached");
+    let [event] = events.as_slice() else { panic!("one quorum reached line: {events:?}") };
+    let arrivals = event.field("vote_arrivals").expect("vote_arrivals");
+    let first_at = arrivals.find(&format!("{first}:")).expect("the first vote is listed");
+    let last_at = arrivals.find(&format!("{last}:")).expect("the held vote is listed");
+    assert!(arrivals.starts_with('[') && arrivals.ends_with(']'), "{arrivals}");
+    assert!(first_at < last_at, "votes are listed in arrival order: {arrivals}");
+    assert_eq!(arrivals.split(',').count(), 2, "two votes listed: {arrivals}");
+    assert!(!arrivals.contains(&refusing.to_string()), "a refusal is not a vote: {arrivals}");
+    let errors = event.field("vote_errors").expect("vote_errors");
+    assert!(
+        errors.starts_with(&format!("[{refusing}:")) && errors.ends_with(":refused:1]"),
+        "the refusing voter is listed once: {errors}"
+    );
+    assert_eq!(event.u64_field("votes_at_end"), Some(3), "own vote and two peer votes");
+    assert_eq!(event.u64_field("stake_at_end"), event.u64_field("voting_power"));
+}
+
+/// A round given up after every voter refused lists each refusal under `vote_errors` on its
+/// `header uncertified` line, with only the author's own vote counted.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn uncertified_round_lists_every_refusal() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let mut cx = CertifierContext::new();
+    let header = cx.proposer_header();
+    let votes = cx.peer_votes(&header);
+
+    cx.consensus_bus.headers().send(header).await.unwrap();
+    cx.network
+        .respond(votes.len(), "every peer refuses", |_, _| {
+            Reply::Fail(NetworkError::RPCError("mock refusal".to_string()))
+        })
+        .await;
+    // on the paused clock a sleep ends only once every task is idle: the round has ended
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    let events = capture.events("header uncertified");
+    let [event] = events.as_slice() else { panic!("one header uncertified line: {events:?}") };
+    assert_eq!(event.field("reason"), Some("no_certificate"));
+    assert_eq!(event.field("vote_arrivals"), Some("[]"));
+    let errors = event.field("vote_errors").expect("vote_errors");
+    for vote in votes.values() {
+        assert!(errors.contains(&format!("{}:", vote.author())), "every voter is listed: {errors}");
+    }
+    assert_eq!(errors.matches(":refused:1").count(), votes.len(), "{errors}");
+    assert_eq!(event.u64_field("votes_at_end"), Some(1), "only the author's own vote");
 }

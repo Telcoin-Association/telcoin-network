@@ -1,6 +1,7 @@
 //! Aggregate votes after proposing a header.
 
-use std::collections::HashSet;
+use parking_lot::Mutex;
+use std::{collections::HashSet, fmt::Write as _, sync::Arc, time::Instant};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
@@ -30,12 +31,15 @@ impl VotesAggregator {
     /// Append the vote to the collection.
     ///
     /// This method protects against equivocation by keeping track of peers that have already voted.
+    /// Each counted vote updates the tally of `vote_round`; the vote that reaches quorum ends the
+    /// round, and the `quorum reached` line carries the round's answers.
     #[instrument(level = "debug", skip_all, fields(voter = ?vote.author(), weight = self.weight))]
     pub(crate) fn append(
         &mut self,
         vote: Vote,
         committee: &Committee,
         header: &Header,
+        vote_round: &VoteRound,
     ) -> DagResult<Option<Certificate>> {
         // ensure authority hasn't voted already
         let author = vote.author();
@@ -60,6 +64,7 @@ impl VotesAggregator {
         // note that we have verified the vote already so are good to save and count it
         self.verified_votes.push((author.clone(), *vote.signature()));
         self.weight += committee.voting_power_by_id(author);
+        vote_round.set_tally(self.verified_votes.len(), self.weight);
 
         // check if this vote reaches quorum
         if self.weight >= committee.quorum_threshold() {
@@ -69,6 +74,8 @@ impl VotesAggregator {
                 self.verified_votes.clone(),
             )?;
 
+            // the vote that reaches quorum ends the vote round
+            let answers = vote_round.finish();
             // Metric: quorum_reached - tracks when vote quorum is achieved
             info!(
                 target: "consensus::metrics",
@@ -77,6 +84,10 @@ impl VotesAggregator {
                 voting_power = self.weight,
                 quorum_threshold = committee.quorum_threshold(),
                 num_votes = self.verified_votes.len(),
+                vote_arrivals = %answers.arrivals,
+                vote_errors = %answers.errors,
+                votes_at_end = answers.votes,
+                stake_at_end = answers.stake,
                 "quorum reached"
             );
 
@@ -89,5 +100,275 @@ impl VotesAggregator {
             return Ok(Some(cert));
         }
         Ok(None)
+    }
+}
+
+/// The answers the author of a header received during its vote round, kept for the line that ends
+/// the round: `quorum reached`, or `header uncertified` for a round given up.
+///
+/// A cheap handle: the round's vote request tasks share one copy. Time zero is the instant
+/// [`Self::start`] marks just before the round's vote requests are spawned, read on the monotonic
+/// clock; a request issued again later in the round is still timed from that instant. Each voter
+/// has at most one entry per list, so both lists are bounded by the committee size. Answers
+/// recorded after [`Self::finish`] are not listed: the round has ended.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VoteRound {
+    /// The answers, behind a lock that only this round's request tasks take, each briefly.
+    answers: Arc<Mutex<VoteRoundAnswers>>,
+}
+
+impl VoteRound {
+    /// The handle that lists the answers of `voter` in this round.
+    pub(crate) fn voter(&self, voter: AuthorityIdentifier) -> RoundVoter {
+        RoundVoter { round: self.clone(), voter }
+    }
+
+    /// Mark time zero: the round's vote requests are about to be spawned.
+    pub(crate) fn start(&self) {
+        self.answers.lock().started = Instant::now();
+    }
+
+    /// List the vote `voter` sent, timed now.
+    pub(crate) fn vote(&self, voter: &AuthorityIdentifier) {
+        let mut answers = self.answers.lock();
+        let ms = answers.elapsed_ms();
+        answers.record_vote(voter, ms);
+    }
+
+    /// List an answer from `voter` that was not a vote, under the outcome code `kind`, timed now.
+    pub(crate) fn answer(&self, voter: &AuthorityIdentifier, kind: &'static str) {
+        let mut answers = self.answers.lock();
+        let ms = answers.elapsed_ms();
+        answers.record_error(voter, ms, kind);
+    }
+
+    /// Record the votes, this node's own included, and the voting power counted so far.
+    fn set_tally(&self, votes: usize, stake: VotingPower) {
+        let mut answers = self.answers.lock();
+        if !answers.ended {
+            answers.votes = votes;
+            answers.stake = stake;
+        }
+    }
+
+    /// End the round and render its answers. Later answers are not listed, and a second call
+    /// renders the same answers.
+    pub(crate) fn finish(&self) -> VoteRoundEnd {
+        let mut answers = self.answers.lock();
+        answers.ended = true;
+        answers.render()
+    }
+}
+
+/// One voter's handle on a [`VoteRound`]: it lists that voter's answers.
+#[derive(Clone, Debug)]
+pub(crate) struct RoundVoter {
+    /// The round the answers are listed in.
+    round: VoteRound,
+    /// The voter whose answers are listed.
+    voter: AuthorityIdentifier,
+}
+
+impl RoundVoter {
+    /// The voter whose answers this handle lists.
+    pub(crate) fn id(&self) -> &AuthorityIdentifier {
+        &self.voter
+    }
+
+    /// List the voter's vote, timed now.
+    pub(crate) fn vote(&self) {
+        self.round.vote(&self.voter);
+    }
+
+    /// List an answer of the voter that was not a vote, under the outcome code `kind`, timed now.
+    pub(crate) fn answer(&self, kind: &'static str) {
+        self.round.answer(&self.voter, kind);
+    }
+}
+
+/// A vote round's answers, rendered for the line that ends the round.
+///
+/// A voter is rendered as its full authority id (base58, which has no `:` or `,`).
+#[derive(Debug)]
+pub(crate) struct VoteRoundEnd {
+    /// `[voter:ms,…]`: every voter whose vote reached this node before the round ended, in arrival
+    /// order, with the milliseconds since the round's requests were sent; `[]` if none.
+    pub(crate) arrivals: String,
+    /// `[voter:first_ms:last_ms:kind:count,…]`: every voter that answered other than with a vote
+    /// before the round ended, in the order of its first such answer, with the milliseconds of its
+    /// first and latest such answer, the outcome code of the latest and how many there were; `[]`
+    /// if none.
+    pub(crate) errors: String,
+    /// The votes the round counted, this node's own included; 0 for a round that never started.
+    pub(crate) votes: usize,
+    /// The voting power of those votes.
+    pub(crate) stake: VotingPower,
+}
+
+/// What a [`VoteRound`] holds behind its lock.
+#[derive(Debug)]
+struct VoteRoundAnswers {
+    /// Time zero of the round.
+    started: Instant,
+    /// Set once the round's end has been rendered.
+    ended: bool,
+    /// The voter and milliseconds of each vote, in arrival order.
+    arrivals: Vec<(AuthorityIdentifier, u64)>,
+    /// One entry per voter that answered other than with a vote.
+    errors: Vec<VoteRoundError>,
+    /// The votes counted.
+    votes: usize,
+    /// The voting power counted.
+    stake: VotingPower,
+}
+
+impl Default for VoteRoundAnswers {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            ended: false,
+            arrivals: Vec::new(),
+            errors: Vec::new(),
+            votes: 0,
+            stake: 0,
+        }
+    }
+}
+
+impl VoteRoundAnswers {
+    /// Milliseconds since time zero.
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// List the vote of `voter` at `ms`, unless the round has ended or the voter is listed.
+    fn record_vote(&mut self, voter: &AuthorityIdentifier, ms: u64) {
+        // a request ends with its vote and only a failed one is issued again, so a voter votes
+        // once per round; the check keeps the list bounded by the committee all the same
+        if self.ended || self.arrivals.iter().any(|(listed, _)| listed == voter) {
+            return;
+        }
+        self.arrivals.push((voter.clone(), ms));
+    }
+
+    /// List an answer of `voter` other than a vote at `ms`, unless the round has ended.
+    fn record_error(&mut self, voter: &AuthorityIdentifier, ms: u64, kind: &'static str) {
+        if self.ended {
+            return;
+        }
+        match self.errors.iter_mut().find(|listed| listed.voter == *voter) {
+            Some(listed) => {
+                listed.last_ms = ms;
+                listed.kind = kind;
+                listed.count = listed.count.saturating_add(1);
+            }
+            None => self.errors.push(VoteRoundError {
+                voter: voter.clone(),
+                first_ms: ms,
+                last_ms: ms,
+                kind,
+                count: 1,
+            }),
+        }
+    }
+
+    /// Render both lists and the tally.
+    fn render(&self) -> VoteRoundEnd {
+        // writing to a string cannot fail, so the results of `write!` are discarded
+        let mut arrivals = String::from("[");
+        for (index, (voter, ms)) in self.arrivals.iter().enumerate() {
+            if index > 0 {
+                arrivals.push(',');
+            }
+            let _ = write!(arrivals, "{voter}:{ms}");
+        }
+        arrivals.push(']');
+        let mut errors = String::from("[");
+        for (index, listed) in self.errors.iter().enumerate() {
+            if index > 0 {
+                errors.push(',');
+            }
+            let _ = write!(
+                errors,
+                "{}:{}:{}:{}:{}",
+                listed.voter, listed.first_ms, listed.last_ms, listed.kind, listed.count
+            );
+        }
+        errors.push(']');
+        VoteRoundEnd { arrivals, errors, votes: self.votes, stake: self.stake }
+    }
+}
+
+/// One voter's answers, other than votes, in a vote round.
+#[derive(Debug)]
+struct VoteRoundError {
+    /// The voter.
+    voter: AuthorityIdentifier,
+    /// Milliseconds of its first such answer.
+    first_ms: u64,
+    /// Milliseconds of its latest such answer.
+    last_ms: u64,
+    /// The outcome code of its latest such answer.
+    kind: &'static str,
+    /// How many such answers it sent.
+    count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vote_round_lists_answers_in_arrival_order() {
+        let round = VoteRound::default();
+        let [a, b, c] = [1, 2, 3].map(AuthorityIdentifier::dummy_for_test);
+        {
+            let mut answers = round.answers.lock();
+            answers.record_error(&a, 5, "deferred");
+            answers.record_vote(&c, 41);
+            answers.record_error(&b, 60, "missing_parents");
+            answers.record_error(&a, 260, "refused");
+            answers.record_vote(&b, 44);
+        }
+        round.set_tally(3, 3);
+        let end = round.finish();
+        assert_eq!(end.arrivals, format!("[{c}:41,{b}:44]"));
+        assert_eq!(end.errors, format!("[{a}:5:260:refused:2,{b}:60:60:missing_parents:1]"));
+        assert_eq!((end.votes, end.stake), (3, 3));
+
+        // the round has ended: later answers and tallies are not listed
+        round.vote(&a);
+        round.answer(&c, "timeout");
+        round.set_tally(4, 4);
+        let again = round.finish();
+        assert_eq!((again.arrivals, again.errors), (end.arrivals, end.errors));
+        assert_eq!((again.votes, again.stake), (3, 3));
+
+        // a round that never started renders empty lists and no votes
+        let never = VoteRound::default().finish();
+        assert_eq!((never.arrivals.as_str(), never.errors.as_str()), ("[]", "[]"));
+        assert_eq!((never.votes, never.stake), (0, 0));
+    }
+
+    #[test]
+    fn vote_round_lists_each_voter_once() {
+        let round = VoteRound::default();
+        let voters: Vec<_> = (0..10).map(AuthorityIdentifier::dummy_for_test).collect();
+        {
+            let mut answers = round.answers.lock();
+            for (ms, voter) in (0u64..).zip(&voters) {
+                for retry in 0..3 {
+                    answers.record_error(voter, ms + retry * 100, "deferred");
+                }
+                answers.record_vote(voter, ms + 1_000);
+                answers.record_vote(voter, ms + 2_000);
+            }
+        }
+        let end = round.finish();
+        assert_eq!(end.arrivals.split(',').count(), voters.len());
+        assert_eq!(end.errors.split(',').count(), voters.len());
+        assert!(end.arrivals.starts_with(&format!("[{}:1000,{}:1001,", voters[0], voters[1])));
+        assert!(end.errors.starts_with(&format!("[{}:0:200:deferred:3,", voters[0])));
+        assert!(end.arrivals.ends_with(&format!("{}:1009]", voters[9])));
     }
 }

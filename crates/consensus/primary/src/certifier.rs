@@ -1,7 +1,7 @@
 //! Certifier broadcasts headers and certificates for this primary.
 
 use crate::{
-    aggregators::VotesAggregator,
+    aggregators::{RoundVoter, VoteRound, VotesAggregator},
     network::{PrimaryNetworkHandle, RequestVoteResult},
     state_sync::{verify_stored_certificate, StateSynchronizer},
     ConsensusBus,
@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_config::{ConsensusConfig, KeyConfig};
-use tn_network_libp2p::error::NetworkError;
+use tn_network_libp2p::error::{NetworkError, RpcFailure};
 use tn_storage::{tables::ProposedCertificates, CertificateStore};
 use tn_types::{
     ensure,
@@ -149,9 +149,9 @@ impl<DB: Database> Certifier<DB> {
 
     /// Requests a vote for a Header from the given peer. Retries indefinitely until either a
     /// vote is received, or a permanent error is returned.
-    #[instrument(level = "debug", skip_all, fields(peer = ?authority, round = header.round()))]
+    #[instrument(level = "debug", skip_all, fields(peer = ?voter.id(), round = header.round()))]
     async fn request_vote(
-        authority: AuthorityIdentifier,
+        voter: RoundVoter,
         header: Header,
         peer_id: BlsPublicKey,
         certificate_store: DB,
@@ -159,6 +159,7 @@ impl<DB: Database> Certifier<DB> {
         committee: Committee,
         cancel_proposal: Noticer,
     ) -> DagResult<Vote> {
+        let authority = voter.id().clone();
         let mut missing_parents: Option<Vec<HeaderDigest>> = None;
         let mut attempt: u32 = 0;
         let round = header.round();
@@ -243,6 +244,7 @@ impl<DB: Database> Certifier<DB> {
                                 ?parents,
                                 "Ok missing parents response received after request vote"
                             );
+                            voter.answer("missing_parents");
                             // retrieve missing parents so peer can vote
                             missing_parents = Some(parents);
                         }
@@ -262,6 +264,7 @@ impl<DB: Database> Certifier<DB> {
                                     "irrecoverable error requesting vote for {header}: {error}"
                                 )));
                             }
+                            voter.answer(retry_answer_kind(&error));
                             // retries are unbounded until the proposal is superseded, so a peer
                             // that keeps failing must not produce a line per attempt
                             if attempt == VOTE_RETRY_CEILING_ATTEMPT {
@@ -352,11 +355,16 @@ impl<DB: Database> Certifier<DB> {
     ///
     /// Each wake of `reissue_failed` asks again every peer whose vote request has ended in an error
     /// since the last wake. The requests still in flight and the votes already received are kept.
+    ///
+    /// The request tasks list every answer in `vote_round`, timed from just before the requests
+    /// are spawned; the line that ends the round (`quorum reached`, or `header uncertified` with
+    /// `reason=no_certificate`) carries them. A canceled round's answers are logged by the caller.
     #[instrument(level = "debug", skip_all, fields(round = header.round(), epoch = header.epoch()))]
     async fn propose_header(
         &self,
         header: Header,
         reissue_failed: &Notify,
+        vote_round: &VoteRound,
     ) -> DagResult<Certificate> {
         debug!(target: "primary::certifier", auth=?self.authority_id, "proposing header");
         let proposal_start = Instant::now();
@@ -381,15 +389,17 @@ impl<DB: Database> Certifier<DB> {
         // reset the votes aggregator and sign own header
         let mut votes_aggregator = VotesAggregator::new();
         let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
-        let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
+        let mut certificate =
+            votes_aggregator.append(vote, &self.committee, &header, vote_round)?;
 
         // create a channel for receiving votes from peers. this method keeps a sender to re-issue
         // failed requests, so the channel never closes: `outstanding` counts the vote tasks that
         // have not reported yet
         let (tx_votes, mut rx_votes) = mpsc::unbounded_channel();
         let mut outstanding = 0usize;
+        vote_round.start();
         for (name, target) in self.committee.others_primaries_by_id(Some(&self.authority_id)) {
-            self.spawn_vote_request(&header, name, target, &tx_votes);
+            self.spawn_vote_request(&header, name, target, &tx_votes, vote_round);
             outstanding += 1;
         }
 
@@ -439,6 +449,7 @@ impl<DB: Database> Certifier<DB> {
                                 vote,
                                 &self.committee,
                                 &header,
+                                vote_round,
                             ) {
                                 Ok(cert) => cert,
                                 Err(e) => {
@@ -472,7 +483,7 @@ impl<DB: Database> Certifier<DB> {
                         debug!(target: "primary::certifier", auth=?self.authority_id, peers = failed.len(), "re-issuing failed vote requests");
                     }
                     for (name, target) in failed.drain(..) {
-                        self.spawn_vote_request(&header, name, target, &tx_votes);
+                        self.spawn_vote_request(&header, name, target, &tx_votes, vote_round);
                         outstanding += 1;
                     }
                 },
@@ -487,11 +498,16 @@ impl<DB: Database> Certifier<DB> {
 
         // log detailed header info if we failed to form a certificate
         let certificate = certificate.ok_or_else(|| {
+            let answers = vote_round.finish();
             info!(
                 target: "consensus::metrics",
                 round = header.round(),
                 epoch = header.epoch(),
                 reason = "no_certificate",
+                vote_arrivals = %answers.arrivals,
+                vote_errors = %answers.errors,
+                votes_at_end = answers.votes,
+                stake_at_end = answers.stake,
                 "header uncertified"
             );
             if enabled!(tracing::Level::WARN) {
@@ -540,15 +556,18 @@ impl<DB: Database> Certifier<DB> {
     /// Spawn a task that asks the peer `name`, at network key `target`, for its vote on `header`.
     ///
     /// The task reports the outcome on `tx_votes` together with the peer, so a request that ended
-    /// in an error can be issued again.
+    /// in an error can be issued again. It lists the outcome in `vote_round` first, so the line
+    /// that ends the round includes the answer that ended it.
     fn spawn_vote_request(
         &self,
         header: &Header,
         name: AuthorityIdentifier,
         target: BlsPublicKey,
         tx_votes: &mpsc::UnboundedSender<(AuthorityIdentifier, BlsPublicKey, DagResult<Vote>)>,
+        vote_round: &VoteRound,
     ) {
         let header = header.clone();
+        let voter = vote_round.voter(name.clone());
         let tx_votes = tx_votes.clone();
         let network = self.network.clone();
         let certificate_store = self.certificate_store.clone();
@@ -558,7 +577,7 @@ impl<DB: Database> Certifier<DB> {
         self.task_spawner.spawn_task(task_name, async move {
             // this will exit early on cancel_proposal
             let result = Self::request_vote(
-                name.clone(),
+                voter.clone(),
                 header,
                 target,
                 certificate_store,
@@ -567,6 +586,14 @@ impl<DB: Database> Certifier<DB> {
                 cancel_proposal,
             )
             .await;
+            match &result {
+                Ok(_) => voter.vote(),
+                Err(error) => {
+                    if let Some(kind) = final_answer_kind(error) {
+                        voter.answer(kind);
+                    }
+                }
+            }
             let _ = tx_votes.send((name, target, result));
             Ok(())
         });
@@ -611,7 +638,13 @@ impl<DB: Database> Certifier<DB> {
                 self.config.node_storage().get::<ProposedCertificates>(&header_digest),
                 Ok(None)
             ) {
-                self.report_canceled(header.round(), header.epoch(), header_digest);
+                // the header's vote round never started
+                self.report_canceled(
+                    header.round(),
+                    header.epoch(),
+                    header_digest,
+                    &VoteRound::default(),
+                );
             }
             return Ok(());
         }
@@ -664,19 +697,21 @@ impl<DB: Database> Certifier<DB> {
         }
         // the header moves into its proposal below; a cancel reports it by round, epoch and digest
         let (header_round, header_epoch) = (header.round(), header.epoch());
+        // the answers of this header's vote round, for a cancel's `header uncertified` line
+        let vote_round = VoteRound::default();
         tokio::select! {
             // listen for new_proposal notification to exit
             // NOTE: sub here is okay bc no loop
             _ = new_proposal_noticer => {
                 debug!(target: "primary::certifier", "new proposal notification received");
                 if report_on_cancel {
-                    self.report_canceled(header_round, header_epoch, header_digest);
+                    self.report_canceled(header_round, header_epoch, header_digest, &vote_round);
                 }
                 Ok(())
             },
 
             // receive enough votes for certification (or exit early)
-            proposal_result = self.propose_header(header, reissue_failed) => {
+            proposal_result = self.propose_header(header, reissue_failed, &vote_round) => {
                 match proposal_result {
                     Ok(mut certificate) => {
                         // A failed insert leaves no guard record, so a later proposal of this header
@@ -773,7 +808,7 @@ impl<DB: Database> Certifier<DB> {
                                     "certifier cancelled proposed header task"
                                 );
                                 if report_on_cancel {
-                                    self.report_canceled(header_round, header_epoch, header_digest);
+                                    self.report_canceled(header_round, header_epoch, header_digest, &vote_round);
                                 }
                                 Ok(())
                             }
@@ -821,16 +856,30 @@ impl<DB: Database> Certifier<DB> {
     ///   reports the proposer has not read;
     /// - `unsubscribed`: no proposer is subscribed to the queue (its task has ended, or never
     ///   started), or the channel closed. Plain `try_send` reports this case as a success.
-    fn report_canceled(&self, round: Round, epoch: Epoch, digest: HeaderDigest) {
+    ///
+    /// The line carries the answers of the header's vote round as they stood when it ended
+    /// (`vote_arrivals`, `vote_errors`, `votes_at_end`, `stake_at_end`; see [`VoteRound`]).
+    fn report_canceled(
+        &self,
+        round: Round,
+        epoch: Epoch,
+        digest: HeaderDigest,
+        vote_round: &VoteRound,
+    ) {
         if self.config.shutdown().is_notified() {
             Self::report_dropped(round, digest, "shutdown");
             return;
         }
+        let answers = vote_round.finish();
         info!(
             target: "consensus::metrics",
             round,
             epoch,
             reason = "canceled",
+            vote_arrivals = %answers.arrivals,
+            vote_errors = %answers.errors,
+            votes_at_end = answers.votes,
+            stake_at_end = answers.stake,
             "header uncertified"
         );
         let dropped =
@@ -994,6 +1043,39 @@ type InFlightMarker = Arc<parking_lot::Mutex<Option<(HeaderDigest, Arc<Notify>, 
 /// certifier's log lines.
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The outcome code a vote round lists for a failed exchange that the vote request retries.
+///
+/// `deferred`: the voter kept answering that it cannot vote yet through the network handle's own
+/// quick retries (its execution is behind the header, it is not yet an active validator, its
+/// request timed out, or it holds a newer request); `timeout`: no answer came in time; `network`:
+/// any other failed exchange.
+fn retry_answer_kind(error: &NetworkError) -> &'static str {
+    match error {
+        NetworkError::RPCRetryable(_) => "deferred",
+        NetworkError::Timeout | NetworkError::Outbound(RpcFailure::Timeout) => "timeout",
+        _ => "network",
+    }
+}
+
+/// The outcome code a vote round lists for a vote request that ended without a vote, or `None`
+/// for a request canceled because its proposal ended.
+///
+/// `refused`: the voter refused the header for good; `parents_unavailable`: this node could not
+/// send the parents the voter asked for; `invalid_vote`: the vote failed this node's checks;
+/// `other`: any other error.
+fn final_answer_kind(error: &DagError) -> Option<&'static str> {
+    match error {
+        DagError::Canceled => None,
+        DagError::NetworkError(_) => Some("refused"),
+        DagError::ProposedHeaderMissingCertificates => Some("parents_unavailable"),
+        DagError::UnexpectedVote(_)
+        | DagError::InvalidEpoch { .. }
+        | DagError::InvalidRound { .. }
+        | DagError::UnknownAuthority(_) => Some("invalid_vote"),
+        _ => Some("other"),
+    }
 }
 
 #[cfg(test)]
