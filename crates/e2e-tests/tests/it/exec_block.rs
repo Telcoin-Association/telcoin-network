@@ -221,7 +221,7 @@ struct ProposedHeader {
 
 /// A node's own headers in a window of its log: proposed, certified and cancelled.
 #[derive(Debug)]
-pub(crate) struct HeaderWindow {
+struct HeaderWindow {
     /// The `header proposed` lines in the window, in order.
     headers: Vec<ProposedHeader>,
     /// `(epoch, round)` of every `quorum reached` line from the window's start to the log's end,
@@ -233,13 +233,8 @@ pub(crate) struct HeaderWindow {
 
 impl HeaderWindow {
     /// Read node `node`'s run-0 log of `test` between the line marks `start` and `end`.
-    pub(crate) fn read(test: &str, node: usize, start: usize, end: usize) -> eyre::Result<Self> {
-        Self::read_run(test, node, 0, start, end)
-    }
-
-    /// Read node `node`'s run-`run` log of `test` between the line marks `start` and `end`.
-    fn read_run(test: &str, node: usize, run: u32, start: usize, end: usize) -> eyre::Result<Self> {
-        let lines = node_log_lines(test, node, run)?;
+    fn read(test: &str, node: usize, start: usize, end: usize) -> eyre::Result<Self> {
+        let lines = node_log_lines(test, node, 0)?;
         let window = lines.get(start..end.min(lines.len())).unwrap_or_default();
         let at = |line: &str| Some((log_field(line, "epoch")?, log_field(line, "round")?));
         let header = |line: &str| {
@@ -257,7 +252,7 @@ impl HeaderWindow {
             .map(|line| {
                 header(line).ok_or_else(|| {
                     eyre::eyre!(
-                        "node {node} run {run} of {test}: a `header proposed` line lacks epoch, \
+                        "node {node} of {test}: a `header proposed` line lacks epoch, \
                          round, exec_basis, exec_tip or exec_block: {line}"
                     )
                 })
@@ -280,7 +275,7 @@ impl HeaderWindow {
     }
 
     /// The share of the distinct rounds proposed in the window that certified.
-    pub(crate) fn certified_share(&self) -> f64 {
+    fn certified_share(&self) -> f64 {
         let proposed = self.headers.iter().map(|h| h.at).collect::<BTreeSet<_>>();
         if proposed.is_empty() {
             return 0.0;
@@ -298,26 +293,23 @@ impl HeaderWindow {
     }
 
     /// The largest `exec_tip - exec_block` of the window's headers, 0 when there are none.
-    pub(crate) fn max_lag(&self) -> u64 {
+    fn max_lag(&self) -> u64 {
         self.headers.iter().map(|h| h.lag).max().unwrap_or_default()
     }
 
     /// A one-line account of the window for a test's summary.
-    pub(crate) fn describe(&self) -> String {
-        let count = |pick: fn(&ProposedHeader) -> &str| {
-            self.headers.iter().fold(BTreeMap::<&str, usize>::new(), |mut counts, h| {
-                *counts.entry(pick(h)).or_default() += 1;
-                counts
-            })
-        };
+    fn describe(&self) -> String {
+        let bases = self.headers.iter().fold(BTreeMap::<&str, usize>::new(), |mut counts, h| {
+            *counts.entry(h.basis.as_str()).or_default() += 1;
+            counts
+        });
         let max_lag = self.max_lag();
         format!(
-            "{} headers proposed, {:.3} certified, {} cancelled, exec_basis {:?}, max \
+            "{} headers proposed, {:.3} certified, {} cancelled, exec_basis {bases:?}, max \
              exec_tip-exec_block {max_lag}",
             self.headers.len(),
             self.certified_share(),
             self.cancelled,
-            count(|h| h.basis.as_str()),
         )
     }
 }
