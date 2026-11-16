@@ -3276,7 +3276,10 @@ impl PrimaryNetworkHandle {
                 // epoch is retryable against another peer. The responder applies
                 // `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` to a public requester's serve, so a pack cut
                 // there ends the stream before its `End` frame (the reader reports an early EOF as
-                // `ConnectionAborted`), and the requester retries from the next peer.
+                // `ConnectionAborted`), and the requester retries from the next peer. The import
+                // itself is bounded by what it writes, not by the bytes the reader counts: it must
+                // write at least its progress bound per window (`ImportStalled`, charged Mild
+                // below) and re-checks the free-space floor on a clock (`StorageFull`, local).
                 match import.await {
                     Ok(()) => Ok(()),
                     Err(e) => {
@@ -3352,6 +3355,10 @@ impl PrimaryNetworkHandle {
                 // trying to wedge a fetch/import with a non-advancing chain); charge Severe.
                 | PackError::InvalidConsensusNumber(_, _)
                 | PackError::InvalidEpoch(_, _) => Some(Penalty::Severe),
+                // A stream that stores far less than its progress bound while the reader holds the
+                // peer to its throughput bound: its records store to almost nothing, which an
+                // honest pack's do not. Mild: the cut also marks the peer for the epoch.
+                PackError::ImportStalled { .. } => Some(Penalty::Mild),
                 PackError::IO(_)
                 | PackError::BatchLoad(_)
                 | PackError::EpochLoad(_)
@@ -3421,7 +3428,8 @@ impl PrimaryNetworkHandle {
                 | PackError::BatchTooLarge { .. }
                 | PackError::OutputTooLarge { .. }
                 | PackError::InvalidConsensusNumber(_, _)
-                | PackError::InvalidEpoch(_, _) => true,
+                | PackError::InvalidEpoch(_, _)
+                | PackError::ImportStalled { .. } => true,
                 // Local storage / IO / decode-of-our-own-state, or ambiguous: never charge the
                 // peer. `CorruptPack` is excluded deliberately — it is also
                 // produced by local recovery, so on the import path it is treated
@@ -3781,8 +3789,8 @@ where
         // The default budget is unbounded, so this only observes until an operator sets
         // `serve_budget.vote`. An enforcing vote class also caps each peer at
         // `MAX_PERMITS_PER_PEER`, so one committee peer cannot hold the whole pool while its
-        // requests wait in `RequestHandler::vote`: on its author lock, and with `vote_queue_fix`
-        // on also in the bounded wait for execution before that lock.
+        // requests wait in `RequestHandler::vote`: on its author lock, and in the bounded wait for
+        // execution before that lock.
         if let Some(serve_permit) =
             self.network_handle.handle.serve_permits().try_acquire(ServiceClass::Vote, peer)
         {

@@ -1,3 +1,10 @@
+## 0.14.0 with the telcoin-network carried patch
+
+- Do not dial a non-loopback address from a listener bound to a loopback IP: such a socket cannot
+  send to another host. With no other listener of the address family, the dial uses a socket
+  bound to the unspecified address, as it does when no listener exists.
+  See `PATCH.md`, which also lists the incoming-attempt changes of the carried patch.
+
 ## 0.14.0
 
 - Prefer and advertise the X25519MLKEM768 key exchange group for QUIC.

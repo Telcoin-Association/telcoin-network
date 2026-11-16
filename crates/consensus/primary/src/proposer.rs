@@ -198,26 +198,26 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     headers_proposed: HeadersProposedHandles,
     /// The `tn_primary_digests_requeued_total{cause}` counters, resolved once per epoch.
     digests_requeued: DigestsRequeuedHandles,
-    /// Which rule names the execution block of each new header (the `quorum_exec_block`
-    /// switches), and the adaptive policy's window state. Epoch-scoped with the proposer.
-    exec_block_policy: ExecBlockPolicy,
     /// Each worker lane's sequence of reported digests and where the drained ones are, for the
     /// out-of-order re-queue counter (issue #1807). Observability only.
     lane_seqs: LaneSequences,
     /// The highest own round a commit notice named in this proposer's life. Handling that notice
-    /// takes every tracked header at or below it out of [`Self::proposed_headers`], so a header
-    /// tracked there afterwards was put back by a re-send (the max-delay tick, or the restart
-    /// re-propose) and its digests are counted as `stale_resend`, never as out of order.
+    /// takes every tracked header at or below it out of [`Self::proposed_headers`], and that is
+    /// the only place it rises; a proposal result at or below it is not tracked again (the
+    /// guard in `Self::handle_proposal_result`). Every tracked header therefore lies above it,
+    /// a re-queue never meets a header tracked again after its own commit, and the
+    /// `stale_resend` reason of `tn_primary_requeued_order_unknown_total` stays 0. It starts
+    /// at 0 after a restart, so a committed header the restarted proposer re-sends from the
+    /// store is tracked, and its digests count as `unknown_seq` when they are re-queued.
     committed_own_round: Round,
     /// The `tn_primary_requeued_out_of_order_total{cause}` counters, resolved once per epoch.
     requeued_out_of_order: RequeuedOutOfOrderHandles,
     /// The `tn_primary_requeued_order_unknown_total{reason}` counters, resolved once per epoch.
     requeued_order_unknown: RequeuedOrderUnknownHandles,
-    /// The own-chain order hold of issue #1807: `Some` when the `digest_order_hold` switch is on,
-    /// and then consulted for every new header. `None` keeps the drain the base's, byte for byte.
-    /// A field of the epoch's proposer because its record names a header by round alone, and
-    /// rounds restart every epoch.
-    order_hold: Option<OwnChainOrder>,
+    /// The own-chain order hold of issue #1807, consulted for every new header. A field of the
+    /// epoch's proposer because its record names a header by round alone, and rounds restart
+    /// every epoch.
+    order_hold: OwnChainOrder,
     /// The `tn_primary_headers_held_total` and `tn_primary_digests_held` handles, resolved once
     /// per epoch.
     order_hold_metrics: OrderHoldHandles,
@@ -262,12 +262,11 @@ struct ProposalTrigger {
 
 /// The order-hold fields of a new header's `header proposed` line (issue #1807).
 ///
-/// Observability only. With the `digest_order_hold` switch off the proposer holds nothing, so the
-/// three counts are zero; `own_parent` is measured either way.
+/// Observability only. The three counts are zero when the hold keeps nothing back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HoldReport {
     /// The header's parents carry this node's certificate of the own header tracked at the
-    /// previous round (see [`Proposer::cites_own_parent`] and [`HoldPlan::own_parent`]).
+    /// previous round (see [`HoldPlan::own_parent`]).
     own_parent: bool,
     /// Digests the hold left in the queue: those still queued in a held lane once the header took
     /// its share.
@@ -308,10 +307,6 @@ impl<DB: Database> Proposer<DB> {
     /// backwards. The genesis certificates are the parents of round 1 only, so they seed
     /// `last_parents` only when the round starts at 0; a proposer seeded above round 0 waits for
     /// parents of its own round (see `Self::has_parents_for_round`).
-    ///
-    /// The `quorum_exec_block` switch values are checked here, where they take effect: values the
-    /// proposer cannot use as written are logged as a warning (see
-    /// [`ExecBlockPolicy::starved_rounds_warning`]).
     pub(crate) fn new(
         config: ConsensusConfig<DB>,
         authority_id: AuthorityIdentifier, // We need to be a validator so must have an id.
@@ -356,21 +351,6 @@ impl<DB: Database> Proposer<DB> {
         // (`InvalidParentRound`), so genesis seeds the parents of round 1 and nothing else
         let last_parents = if round == 0 { genesis } else { Vec::new() };
 
-        let quorum_exec_block = config.parameters().quorum_exec_block;
-        let quorum_exec_block_starved_rounds = config.parameters().quorum_exec_block_starved_rounds;
-        if let Some(warning) = ExecBlockPolicy::starved_rounds_warning(
-            quorum_exec_block,
-            quorum_exec_block_starved_rounds,
-        ) {
-            warn!(
-                target: "primary::proposer",
-                quorum_exec_block,
-                quorum_exec_block_starved_rounds,
-                bound = QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS,
-                "{warning}"
-            );
-        }
-
         Self {
             authority_id,
             committee: config.committee().clone(),
@@ -398,15 +378,11 @@ impl<DB: Database> Proposer<DB> {
             key_config: config.key_config().clone(),
             headers_proposed: HeadersProposedHandles::new(),
             digests_requeued: DigestsRequeuedHandles::new(),
-            exec_block_policy: ExecBlockPolicy::new(
-                quorum_exec_block,
-                quorum_exec_block_starved_rounds,
-            ),
             lane_seqs: LaneSequences::default(),
             committed_own_round: 0,
             requeued_out_of_order: RequeuedOutOfOrderHandles::new(),
             requeued_order_unknown: RequeuedOrderUnknownHandles::new(),
-            order_hold: config.parameters().digest_order_hold.then(OwnChainOrder::default),
+            order_hold: OwnChainOrder::default(),
             order_hold_metrics: OrderHoldHandles::new(),
         }
     }
@@ -538,7 +514,6 @@ impl<DB: Database> Proposer<DB> {
             exec_block = exec.block.number,
             exec_tip = exec.tip.number,
             exec_basis = exec.basis.as_str(),
-            exec_policy = exec_inputs.policy.as_str(),
             own_parent = trigger.hold.own_parent,
             held = trigger.hold.held,
             held_lanes = trigger.hold.held_lanes,
@@ -988,8 +963,10 @@ impl<DB: Database> Proposer<DB> {
         // a re-queued digest's wait since it was last queued restarts here; its first receipt
         // comes back from `proposed_first_received`
         let requeued_at = Instant::now();
-        // a header tracked at or below an own round an earlier notice settled was re-sent after it
-        // left; its digests keep no sequence and are counted apart
+        // a header tracked at or below an own round an earlier notice settled would be a re-send
+        // tracked again after it left, its digests without a sequence and counted apart as
+        // `stale_resend`. Every tracked header lies above `committed_own_round` (see its doc), so
+        // `resent` is false here and `stale_resend` stays 0
         let settled_round = self.committed_own_round;
         let mut stale_resend = 0;
 
@@ -1069,22 +1046,14 @@ impl<DB: Database> Proposer<DB> {
     /// The commit path re-queues every expired header in one call and keeps them oldest first
     /// across rounds. With `max_header_num_of_batches` capping a header, the older batches here
     /// can wait one header longer. This is rare, and #1807 covers what out-of-order carriage
-    /// does to transaction nonces; `tn_primary_requeued_out_of_order_total` counts it. With the
-    /// `digest_order_hold` switch on, two tracked headers that carry one worker are own-chain
-    /// linked, so the older is certified and never canceled, and the reverse order cannot
-    /// reorder a lane.
-    ///
-    /// Every report, acted on here or not, also reaches [`ExecBlockPolicy::on_cancelled`]: under
-    /// the adaptive `quorum_exec_block` policy a cancelled own header opens a window, counted in
-    /// headers this node builds, not rounds, in which the next headers name a block a quorum
-    /// already holds.
+    /// does to transaction nonces; `tn_primary_requeued_out_of_order_total` counts it. Under the
+    /// order hold, two tracked headers that carry one worker are own-chain linked, so the older
+    /// is certified and never canceled, and the reverse order cannot reorder a lane.
     fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
-        // every cancel report is evidence for the execution-block policy, whatever happens to the
-        // header's digests below
-        self.exec_block_policy.on_cancelled(round, self.round);
         let mut requeued = BTreeMap::new();
         // see `process_committed_headers`: a header tracked again after an own commit settled its
-        // round keeps no sequence
+        // round would keep no sequence; a tracked header lies above `committed_own_round`, so
+        // `resent` is false here
         let resent = round <= self.committed_own_round;
         let stale_resend = match self.proposed_headers.get(&round) {
             Some(header) if round < self.round && header.digest() == digest => {
@@ -1125,21 +1094,17 @@ impl<DB: Database> Proposer<DB> {
         self.prepend_requeued(requeued, round, RequeueCause::Canceled, stale_resend);
     }
 
-    /// Tell the order hold, when the `digest_order_hold` switch is on, that the own header at
-    /// `round` left [`Self::proposed_headers`]. Called beside every removal from it.
+    /// Tell the order hold that the own header at `round` left [`Self::proposed_headers`].
+    /// Called beside every removal from it.
     fn forget_held(&mut self, round: Round) {
-        if let Some(order) = self.order_hold.as_mut() {
-            order.forget(round);
-        }
+        self.order_hold.forget(round);
     }
 
-    /// Tell the order hold, when the `digest_order_hold` switch is on, that the own header at
-    /// `round` is sent again without a new plan: the restart re-propose and the max-delay re-send.
-    /// A header that has a record keeps it; one without (the restart) proves no older header.
+    /// Tell the order hold that the own header at `round` is sent again without a new plan: the
+    /// restart re-propose and the max-delay re-send. A header that has a record keeps it; one
+    /// without (the restart) proves no older header.
     fn record_held_resent(&mut self, round: Round) {
-        if let Some(order) = self.order_hold.as_mut() {
-            order.record_resent(round);
-        }
+        self.order_hold.record_resent(round);
     }
 
     /// Prepend `requeued`, the batch digests of own headers that will not be committed (oldest
@@ -1153,8 +1118,11 @@ impl<DB: Database> Proposer<DB> {
     /// those that return behind a newer digest of their worker count in
     /// `tn_primary_requeued_out_of_order_total{cause}` and in the line's `out_of_order`, those
     /// without a known sequence in `tn_primary_requeued_order_unknown_total{reason}`.
-    /// `stale_resend` digests came from headers tracked again by a re-send after an own commit
-    /// settled their round; their callers gave them no sequence.
+    /// `stale_resend` digests would come from headers tracked again by a re-send after an own
+    /// commit settled their round, which the callers give no sequence. No such header is tracked
+    /// (see `Self::committed_own_round`), so the callers pass 0 and the `stale_resend` reason stays
+    /// 0; the digests of a committed header that a restarted proposer re-sent from the store have
+    /// no sequence either and count as `unknown_seq`.
     fn prepend_requeued(
         &mut self,
         mut requeued: BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
@@ -1179,10 +1147,10 @@ impl<DB: Database> Proposer<DB> {
             out_of_order = order.out_of_order,
             "digests resent"
         );
-        // invariant I2 of the order hold: with the switch on, a digest re-queued behind a newer
-        // digest of its lane means the hold did not cover that lane, through the garbage-collection
-        // cut its module doc describes or a fault; one line per re-queue, not per digest
-        if self.order_hold.is_some() && order.out_of_order > 0 {
+        // invariant I2 of the order hold: a digest re-queued behind a newer digest of its lane
+        // means the hold did not cover that lane, through the garbage-collection cut its module
+        // doc describes or a fault; one line per re-queue, not per digest
+        if order.out_of_order > 0 {
             warn!(
                 target: "primary::proposer",
                 count,
@@ -1196,6 +1164,8 @@ impl<DB: Database> Proposer<DB> {
         let total = |digests: usize| u64::try_from(digests).unwrap_or(u64::MAX);
         self.digests_requeued.counter(cause).increment(total(count));
         self.requeued_out_of_order.counter(cause).increment(total(order.out_of_order));
+        // every tracked header lies above `committed_own_round`, so `stale_resend` is 0 and every
+        // digest without a sequence counts as `unknown_seq`
         self.requeued_order_unknown
             .counter(RequeueOrderUnknown::UnknownSeq)
             .increment(total(order.unknown.saturating_sub(stale_resend)));
@@ -1234,14 +1204,9 @@ impl<DB: Database> Proposer<DB> {
     /// and the cursor advances past the last lane served, so slots rotate across headers
     /// and no lane is excluded permanently when more workers have digests than a header
     /// holds. With one worker this is exactly the old single-queue FIFO drain.
-    fn drain_digests_for_header(&mut self) -> VecDeque<ProposerDigest> {
-        self.drain_digests_except(&BTreeSet::new())
-    }
-
-    /// [`Self::drain_digests_for_header`] over every lane but those of `held` workers, whose
-    /// digests stay queued in order (the order hold of issue #1807). The held lanes take no slot
-    /// and the cursor advances past the last lane served, as without a hold; an empty `held` is
-    /// exactly that drain.
+    ///
+    /// Every lane of a `held` worker is left out: its digests stay queued in order (the order
+    /// hold of issue #1807) and take no slot, and the cursor advances past the last lane served.
     fn drain_digests_except(&mut self, held: &BTreeSet<WorkerId>) -> VecDeque<ProposerDigest> {
         let queues = &self.digests;
         // Ascending worker ids, rotated to start at the cursor, without the held lanes.
@@ -1306,23 +1271,6 @@ impl<DB: Database> Proposer<DB> {
             blockers: plan.blockers.len(),
         };
         (digests, hold)
-    }
-
-    /// Whether `parents` carry this node's certificate of the own header tracked at the round
-    /// below `round`: the `own_parent` field of the `header proposed` line (issue #1807).
-    ///
-    /// Only a tracked previous header counts, so round 1 (its genesis parents have no tracked own
-    /// header below them) and a header whose previous own header already left the tracked set
-    /// report `false`. Observability only: the header's contents never depend on it.
-    fn cites_own_parent(&self, round: Round, parents: &[Certificate]) -> bool {
-        let Some(previous) = round.checked_sub(1).and_then(|r| self.proposed_headers.get(&r))
-        else {
-            return false;
-        };
-        let previous = previous.digest();
-        parents.iter().any(|parent| {
-            parent.origin() == &self.authority_id && parent.header().digest() == previous
-        })
     }
 
     /// Conditions are met to propose the next header.
@@ -1404,28 +1352,13 @@ impl<DB: Database> Proposer<DB> {
                 // plans on exactly this set (issue #1807)
                 let parents = std::mem::take(&mut self.last_parents);
                 let pending_before = self.pending_digests_len();
-                // with the hold on, plan and record at the drain: a record is read only through a
-                // tracked own parent, so the record of a header whose proposal fails is inert
-                let plan = self.order_hold.as_mut().map(|order| {
-                    let plan = order.plan(
-                        current_round,
-                        &parents,
-                        &self.proposed_headers,
-                        &self.authority_id,
-                    );
-                    order.record(&plan);
-                    plan
-                });
-                let (digests, hold) = match plan {
-                    Some(plan) => self.drain_held(&plan),
-                    None => {
-                        let own_parent = self.cites_own_parent(current_round, &parents);
-                        (
-                            self.drain_digests_for_header(),
-                            HoldReport { own_parent, ..HoldReport::default() },
-                        )
-                    }
-                };
+                // plan and record at the drain: a record is read only through a tracked own
+                // parent, so the record of a header whose proposal fails is inert
+                let order = &mut self.order_hold;
+                let plan =
+                    order.plan(current_round, &parents, &self.proposed_headers, &self.authority_id);
+                order.record(&plan);
+                let (digests, hold) = self.drain_held(&plan);
                 // collect values from &mut self for this header
                 let trigger = ProposalTrigger {
                     reason,
@@ -1436,19 +1369,7 @@ impl<DB: Database> Proposer<DB> {
                 let authority_id = self.authority_id.clone();
                 let prior_epoch_record = self.prior_epoch_record;
                 let key_config = self.key_config.clone();
-                // an own certificate among the parents is the previous own header, certified
-                if let Some(own) = parents
-                    .iter()
-                    .find(|parent| parent.round() > 0 && parent.origin() == &authority_id)
-                {
-                    self.exec_block_policy.on_certified(own.round());
-                }
-                let exec_inputs = ExecBlockInputs::new(
-                    self.exec_block_policy.for_round(current_round),
-                    &self.committee,
-                    &authority_id,
-                    &parents,
-                );
+                let exec_inputs = ExecBlockInputs::new(&self.committee, &authority_id, &parents);
 
                 let consensus_bus = self.consensus_bus.clone();
                 // spawn tokio task to create, store, and send new header to certifier
@@ -1497,18 +1418,20 @@ impl<DB: Database> Proposer<DB> {
         // reschedule intervals
         self.min_delay_interval.reset_after(self.calc_min_delay());
         self.max_delay_interval.reset_after(self.calc_max_delay());
-        // with the order hold on, a header at or below an own round a commit notice already
-        // settled is not tracked again. That notice took every tracked header at or below it out
-        // of `proposed_headers`, and the newest own header is the only one sent again, so this is
-        // a committed header: a re-send (the max-delay tick or the restart re-propose) that raced
-        // its notice, or a new header whose notice came before this result. Its digests leave the
-        // order bookkeeping as a committed header's do. Tracked again, it would hold its lanes
-        // behind every later header without an own parent until the next own commit at or above
-        // its round, and that commit would re-queue its committed digests (`stale_resend`).
+        // a header at or below an own round a commit notice already settled is not tracked again.
+        // That notice took every tracked header at or below it out of `proposed_headers`, and the
+        // newest own header is the only one sent again, so this is a committed header: a re-send
+        // (the max-delay tick or the restart re-propose) that raced its notice, or a new header
+        // whose notice came before this result. Its digests leave the order bookkeeping as a
+        // committed header's do. Tracked again, it would hold its lanes behind every later header
+        // without an own parent until the next own commit at or above its round, and that commit
+        // would re-queue its committed digests a second time. The insert below is the only one into
+        // `proposed_headers`, so every tracked header lies above `committed_own_round` and the
+        // `stale_resend` reason of `tn_primary_requeued_order_unknown_total` stays 0.
         // `committed_own_round` starts at 0 after a restart, so this guard does not catch the
         // max-delay re-send of a last own header that committed before the restart (see the order
-        // hold's module doc).
-        if self.order_hold.is_some() && header.round() <= self.committed_own_round {
+        // hold's module doc); its digests count as `unknown_seq` when that commit re-queues them.
+        if header.round() <= self.committed_own_round {
             header.payload().keys().for_each(|digest| {
                 self.proposed_first_received.remove(digest);
                 self.lane_seqs.committed(digest);
@@ -1598,9 +1521,7 @@ impl<DB: Database> Proposer<DB> {
             "proposer stopped"
         );
         // the held digests leave with the proposer, for the orphan re-pool
-        if self.order_hold.is_some() {
-            self.order_hold_metrics.digests_held.set(0.0);
-        }
+        self.order_hold_metrics.digests_held.set(0.0);
     }
 
     /// Wrapper async function to either query the pending header or never resolve.
@@ -1705,13 +1626,13 @@ impl<DB: Database> Proposer<DB> {
             //      - this is happy path
             //      - vote for leader or leader already has enough votes to trigger commit
             let enough_parents = self.has_parents_for_round();
-            // with `digest_order_hold` on, digests held back in a lane still count here, as every
-            // queued digest did before: a held backlog of at least the threshold builds the next
-            // header without waiting for the min delay, and that header can carry none of it.
-            // Under load this fires as with the switch off (the queue is above the threshold
-            // either way); at light load a held backlog fires earlier. Leaving held digests out of
-            // the count while the only blocker is the previous round's own header, so that the
-            // min delay waits for its certificate, is not built (see the order hold's module doc)
+            // digests held back in a lane count here as every queued digest does: a held backlog
+            // of at least the threshold builds the next header without waiting for the min delay,
+            // and that header can carry none of it. Under load this changes nothing (the queue is
+            // above the threshold either way); at light load a held backlog fires earlier.
+            // Leaving held digests out of the count while the only blocker is the previous round's
+            // own header, so that the min delay waits for its certificate, is not built (see the
+            // order hold's module doc)
             let enough_digests = self.pending_digests_len() >= self.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
@@ -1949,100 +1870,25 @@ fn duration_ms(duration: Duration) -> u64 {
 /// How far below its own tip the quorum rule may name a block, in entries of the recent-blocks
 /// ring (executed outputs that produced a block, not block numbers).
 ///
-/// The ring's capacity is `gc_depth`, so the floor is its own constant. Under the `always` policy
-/// every proposer of an in-step fleet settles exactly here: the blocks its parents name are earlier
-/// picks of the same rule, not tips, so the quorum value can only rise through the floor.
+/// The ring's capacity is `gc_depth`, so the floor is its own constant. Every proposer of an
+/// in-step fleet settles exactly here: the blocks its parents name are earlier picks of the same
+/// rule, not tips, so the quorum value can only rise through the floor.
 ///
 /// An output without transactions produces no block and adds no ring entry, so the floor has no
-/// bound in rounds or in time: under the `always` policy with light traffic the named block can be
-/// arbitrarily old. What that delays is an honest node noticing its own execution fork. If its
-/// execution diverges at block N and the next outputs are empty, it keeps naming a block below N,
-/// and neither a voter's check of the header's block (`Fork`) nor the subscriber's or state
-/// sync's check of a leader's block sees the divergence until up to eight more outputs have
-/// produced blocks. With the switch off its next header names the forked tip, and voters refuse
-/// it at once. A faulty author gains nothing from this: a voter already accepts any canonical
-/// block above its restore floor.
+/// bound in rounds or in time: with light traffic the named block can be arbitrarily old. What that
+/// delays is an honest node noticing its own execution fork. If its execution diverges at block N
+/// and the next outputs are empty, it keeps naming a block below N, and neither a voter's check of
+/// the header's block (`Fork`) nor the subscriber's or state sync's check of a leader's block sees
+/// the divergence until up to eight more outputs have produced blocks. A header naming the own tip
+/// would name the forked tip, and voters would refuse it at once. A faulty author gains nothing
+/// from this: a voter already accepts any canonical block above its restore floor.
 pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
-
-/// The bound on the adaptive policy's window, in headers built under the quorum rule (the switch
-/// keeps its name, `quorum_exec_block_starved_rounds`): repeated cancels double the configured
-/// value up to this one. A proposer in step with its committee builds one header a round, so for
-/// it a header is a round.
-///
-/// Each failed return to the own tip costs one or two cancelled headers: the probe, and the next
-/// header if it fails too (it is proposed before the probe's cancel report arrives). With p the
-/// chance that a header naming the own tip certifies, a proposer that spends a share f of its
-/// rounds on the tip loses about f × (1 − p) of its headers, never more than with the switch off
-/// (f = 1) as long as headers under the quorum rule certify. Holding the loss under the 2 % the
-/// bench-6 certification target (98 %) leaves needs f ≤ 0.02 ÷ (1 − p). At this bound a proposer
-/// whose tip never certifies loses 2 of every 130 headers; the model in the proposer tests loses
-/// about 1 % over 4000 rounds at p = 0.5 to 0.9 (1.3 % at p = 0.6).
-///
-/// What the policy cannot do: know p. Its only evidence is a streak of certified tip headers (see
-/// [`QUORUM_EXEC_BLOCK_RESET_STREAK`]). Between p = 0.9 and 0.98 such a streak is common enough to
-/// reset the window, so f grows and the share lost moves toward 1 − p: about 1 % at p = 0.97 in
-/// the model, 1.5 % in its worst 4000-round sample. Every climb to the bound also costs one or two
-/// headers per doubling (five doublings from a window of 4), so a measurement that starts as a
-/// regime starts loses 5 to 10 headers before the steady state: the e2e test, about 100 rounds
-/// long, lost 7 or 8 and certified 0.92 to 0.93. The policy is built afresh with each epoch's
-/// proposer, so a node that stays starved pays that climb again at every epoch start.
-///
-/// A configured value above the bound is lowered to it, and the proposer warns at the start of
-/// each epoch (see [`ExecBlockPolicy::starved_rounds_warning`]): a first window that long keeps the
-/// rule on for most of the epoch after one cancel, the `always` policy under another name.
-pub(crate) const QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS: Round = 128;
-
-/// How many consecutive own headers, proposed outside a window (under the tip policy) and
-/// certified, reset the adaptive policy's next window to the configured value.
-///
-/// One certified tip header says little about the chance that the tip certifies: where it
-/// certifies every other round, a reset on each success brought the proposer back to its tip every
-/// six rounds and lost one header in six (0.81 certified in the e2e test). A streak of 64 happens
-/// in about 0.1 % of returns at p = 0.9 (0.9^64), so the windows stay long while the tip fails
-/// often and reset once it certifies reliably. Waiting for the streak costs no headers: a policy
-/// back on a tip that keeps certifying stays there, since only a cancel opens a window. It only
-/// makes a cancel within 64 rounds of the return open a long window. The streak counts the own
-/// certificates found among the next header's parents, so a header certified after the proposer
-/// moved on neither counts nor breaks it, and the reset can take longer than 64 rounds.
-pub(crate) const QUORUM_EXEC_BLOCK_RESET_STREAK: u32 = 64;
-
-/// The rule that names a header's execution block, as the `quorum_exec_block` switches and the
-/// adaptive window select it for one header. Reported as `exec_policy` on `header proposed`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExecPolicy {
-    /// `quorum_exec_block: false`: the own tip, read exactly as before the switch existed.
-    Off,
-    /// `quorum_exec_block: true`, `quorum_exec_block_starved_rounds: 0`: the quorum rule on every
-    /// header.
-    Always,
-    /// The adaptive policy outside a window: the own tip.
-    Tip,
-    /// The adaptive policy inside a window opened by a cancelled own header: the quorum rule.
-    Starved,
-}
-
-impl ExecPolicy {
-    /// The value of the `exec_policy` field on `header proposed`.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Always => "always",
-            Self::Tip => "tip",
-            Self::Starved => "starved",
-        }
-    }
-
-    /// Whether the header's block comes from the quorum rule rather than the own tip.
-    fn applies_quorum_rule(self) -> bool {
-        matches!(self, Self::Always | Self::Starved)
-    }
-}
 
 /// Why a header names the execution block it names. Reported as `exec_basis` on `header proposed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExecBasis {
-    /// The own tip: the policy names the tip, the ring is empty, fewer than a quorum of voting
-    /// power named usable blocks, or the quorum value is at or above the own tip (the cap).
+    /// The own tip: the ring is empty, fewer than a quorum of voting power named usable blocks,
+    /// or the quorum value is at or above the own tip (the cap).
     Tip,
     /// The quorum value is below the own tip and no older than the floor; the block is the newest
     /// own ring entry at or below it.
@@ -2061,190 +1907,6 @@ impl ExecBasis {
             Self::Tip => "tip",
             Self::Quorum => "quorum",
             Self::Floor => "floor",
-        }
-    }
-}
-
-/// The proposer's state for the `quorum_exec_block` switches.
-///
-/// With the switch off every header is [`ExecPolicy::Off`]; with a window of 0 every header is
-/// [`ExecPolicy::Always`]. Otherwise headers name the own tip until the certifier reports an own
-/// header cancelled uncertified; the next headers this proposer builds, as many as the current
-/// window, use the quorum rule, and the policy returns to the tip once it has built them. The
-/// return is by headers built, never by comparing blocks: once several proposers use the rule, the
-/// blocks they name ratchet down, so a test such as "the quorum value reached my tip" would never
-/// pass. The window counts headers, not rounds, because a lagging proposer jumps rounds (its next
-/// round is its parents' round plus one): a window of rounds could pass without one header built
-/// under the rule and still double the next window.
-///
-/// A cancel that is counted doubles the next window, up to
-/// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`], when the next header under the rule is built: a
-/// window that gets no header built under it gives no evidence that the rule's blocks fail too, so
-/// it does not double, and several counted cancels with no such header between them double once.
-/// The next window returns to the configured value only after [`QUORUM_EXEC_BLOCK_RESET_STREAK`]
-/// consecutive own headers proposed outside a window (under the tip policy) certified; every
-/// cancel report restarts the count. A single certified tip header is not enough where the tip
-/// certifies part of the time. A header certified inside a window does not count, even when its
-/// quorum value reached the tip: it shows the quorum rule works, not that the tip would, and
-/// counting it would make every return to the tip fail at the configured window's rate (about one
-/// probe and two lost headers every `K + 2` headers) while the proposer stays ahead.
-///
-/// Every input comes from the proposer itself, never from a clock: the rounds of the headers it
-/// built, the cancel and certificate reports for them, and its round when a cancel arrives (which
-/// parents of a later round can move up between two headers; only where a new run starts depends
-/// on it).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExecBlockPolicy {
-    /// `quorum_exec_block`.
-    enabled: bool,
-    /// `quorum_exec_block_starved_rounds`: 0 for the quorum rule on every header, otherwise the
-    /// window a first cancel opens, in headers.
-    base_window: Round,
-    /// The window the next counted cancel opens, in headers.
-    next_window: Round,
-    /// The proposer's round when the current run of windows opened. Every own header built after
-    /// it, up to [`Self::rule_through`], was built under the quorum rule. A header at or below it
-    /// was built before that run, so its cancel belongs to the episode that opened the run and is
-    /// not counted again.
-    window_start: Round,
-    /// The round of the newest header built under the quorum rule in the current run; equal to
-    /// [`Self::window_start`] until the run's first such header, 0 before any run.
-    rule_through: Round,
-    /// Headers still to build under the quorum rule in the current window; 0 when no window is
-    /// open.
-    remaining: Round,
-    /// A counted cancel asked to double [`Self::next_window`] and no header has been built under
-    /// the rule since; the next one applies the doubling.
-    doubling_pending: bool,
-    /// Own headers proposed outside a window and certified since the last cancel report.
-    certified_streak: u32,
-}
-
-impl ExecBlockPolicy {
-    /// The policy for the switch values `quorum_exec_block` and
-    /// `quorum_exec_block_starved_rounds`, the window lowered to
-    /// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`] when it is above it.
-    pub(crate) fn new(enabled: bool, starved_rounds: u32) -> Self {
-        let window = starved_rounds.min(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS);
-        Self {
-            enabled,
-            base_window: window,
-            next_window: window,
-            window_start: 0,
-            rule_through: 0,
-            remaining: 0,
-            doubling_pending: false,
-            certified_streak: 0,
-        }
-    }
-
-    /// The warning for switch values the proposer does not use as written, or `None`.
-    ///
-    /// A window with `quorum_exec_block` off has no effect, and a window above
-    /// [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`] is lowered to it by [`Self::new`]. Neither stops
-    /// the node: the first is a valid configuration of the switch-off behaviour, and the second
-    /// still runs the adaptive policy. The proposer logs the warning when it starts, once per
-    /// epoch, so the mistake shows in the node's log instead of passing silently. An upstream
-    /// default may want `Parameters::validate` to refuse a window above the bound, where the other
-    /// protocol ceilings are refused, and keep only the switch-off case a warning, since setting
-    /// the window before turning the switch on is a valid rollout step; this build warns because a
-    /// refusal would keep a node down in the middle of a rolling restart.
-    pub(crate) fn starved_rounds_warning(
-        enabled: bool,
-        starved_rounds: u32,
-    ) -> Option<&'static str> {
-        if !enabled && starved_rounds > 0 {
-            Some("quorum_exec_block_starved_rounds has no effect while quorum_exec_block is off")
-        } else if enabled && starved_rounds > QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS {
-            Some("quorum_exec_block_starved_rounds is above its bound; the bound is used")
-        } else {
-            None
-        }
-    }
-
-    /// Whether the adaptive policy (own tip, quorum rule in windows) is in force.
-    fn adaptive(&self) -> bool {
-        self.enabled && self.base_window > 0
-    }
-
-    /// Whether the own header at `round` was built under the quorum rule in the current run.
-    ///
-    /// Every header built after the run opened, up to the newest one under the rule, was built
-    /// under it: the window is spent only by building headers, so none in between named the tip.
-    fn built_under_rule(&self, round: Round) -> bool {
-        round > self.window_start && round <= self.rule_through
-    }
-
-    /// The rule for the new header this proposer is building at `round`.
-    ///
-    /// The proposer calls this once for each header it builds, in round order; a header re-sent
-    /// unchanged is not built again and does not call it. Inside a window the header spends one of
-    /// the window's headers, and a doubling a counted cancel asked for is applied.
-    pub(crate) fn for_round(&mut self, round: Round) -> ExecPolicy {
-        if !self.enabled {
-            ExecPolicy::Off
-        } else if self.base_window == 0 {
-            ExecPolicy::Always
-        } else if self.remaining == 0 {
-            ExecPolicy::Tip
-        } else {
-            self.remaining -= 1;
-            self.rule_through = self.rule_through.max(round);
-            if std::mem::take(&mut self.doubling_pending) {
-                self.next_window = self
-                    .next_window
-                    .saturating_mul(2)
-                    .min(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS)
-                    .max(self.base_window);
-            }
-            ExecPolicy::Starved
-        }
-    }
-
-    /// The certifier cancelled the own header at `header_round` uncertified while the proposer is
-    /// at `proposer_round` (at or above the round of its newest header, whose block is already
-    /// chosen; parents from a later round can move it up without a header).
-    ///
-    /// A header built before the current run of windows opened is ignored: the cancel of the
-    /// header that opened the run lags the next header by a round, and that next header named its
-    /// tip too. Any other cancel, of a tip header after a window or of a header inside one, opens a
-    /// window of the next [`Self::next_window`] headers (or extends the open one to at least that
-    /// many) and asks for the next window to double once a header is built under the rule. Every
-    /// report, ignored or not, restarts the streak of certified tip headers.
-    pub(crate) fn on_cancelled(&mut self, header_round: Round, proposer_round: Round) {
-        if !self.adaptive() {
-            return;
-        }
-        self.certified_streak = 0;
-        if header_round <= self.window_start {
-            return;
-        }
-        // a cancel that arrives once the window's last header is built, before the proposer has
-        // moved past it, extends the run instead: that header was built under the rule and must
-        // stay inside it, or its certificate would count toward the streak as a certified tip
-        // header
-        if self.remaining == 0 && proposer_round > self.rule_through {
-            // the previous window is spent: a new run starts after the proposer's round
-            self.window_start = proposer_round;
-            self.rule_through = proposer_round;
-        }
-        self.remaining = self.remaining.max(self.next_window);
-        self.doubling_pending = true;
-    }
-
-    /// The own header at `header_round` certified: its certificate is a parent of the next header.
-    ///
-    /// A header proposed outside a window, under the tip policy, extends the streak of certified
-    /// tip headers; once the streak reaches [`QUORUM_EXEC_BLOCK_RESET_STREAK`] the next window
-    /// returns to the configured value. A header built under the rule, even one whose quorum value
-    /// reached the own tip (`exec_basis=tip`), neither counts nor breaks the streak.
-    pub(crate) fn on_certified(&mut self, header_round: Round) {
-        if !self.adaptive() || self.built_under_rule(header_round) {
-            return;
-        }
-        self.certified_streak = self.certified_streak.saturating_add(1);
-        if self.certified_streak >= QUORUM_EXEC_BLOCK_RESET_STREAK {
-            self.next_window = self.base_window;
         }
     }
 }
@@ -2281,8 +1943,6 @@ impl ParentExecBlock {
 /// spawned.
 #[derive(Clone, Debug)]
 pub(crate) struct ExecBlockInputs {
-    /// The rule for this header.
-    pub(crate) policy: ExecPolicy,
     /// This proposer's authority: its tip stands for it, and its own certificate is skipped.
     pub(crate) author: AuthorityIdentifier,
     /// This proposer's voting power.
@@ -2291,25 +1951,16 @@ pub(crate) struct ExecBlockInputs {
     pub(crate) epoch: Epoch,
     /// The committee's quorum threshold (2f+1) in voting power.
     pub(crate) quorum_threshold: VotingPower,
-    /// The header's parents' named blocks; empty unless the policy applies the quorum rule.
+    /// The header's parents' named blocks.
     pub(crate) parents: Vec<ParentExecBlock>,
 }
 
 impl ExecBlockInputs {
-    /// The inputs for a header by `author` on `parents` under `policy`.
-    fn new(
-        policy: ExecPolicy,
-        committee: &Committee,
-        author: &AuthorityIdentifier,
-        parents: &[Certificate],
-    ) -> Self {
-        let parents = if policy.applies_quorum_rule() {
-            parents.iter().map(|parent| ParentExecBlock::new(parent, committee)).collect()
-        } else {
-            Vec::new()
-        };
+    /// The inputs for a header by `author` on `parents`.
+    fn new(committee: &Committee, author: &AuthorityIdentifier, parents: &[Certificate]) -> Self {
+        let parents =
+            parents.iter().map(|parent| ParentExecBlock::new(parent, committee)).collect();
         Self {
-            policy,
             author: author.clone(),
             own_power: committee.voting_power_by_id(author),
             epoch: committee.epoch(),
@@ -2323,11 +1974,6 @@ impl ExecBlockInputs {
     /// Synchronous on purpose: the ring is read once per proposal and the watch's read guard is
     /// dropped on return, before the caller reaches an await.
     fn choose(&self, consensus_bus: &ConsensusBus) -> ExecBlockChoice {
-        if self.policy == ExecPolicy::Off {
-            // the switch is off: the call headers have always used, so their bytes do not change
-            let tip = consensus_bus.app().latest_execution_block_num_hash();
-            return ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
-        }
         let ring = consensus_bus.app().recent_blocks().borrow();
         choose_exec_block(&ring, self)
     }
@@ -2347,7 +1993,7 @@ pub(crate) struct ExecBlockChoice {
 /// Choose the execution block for a header from this node's recent-blocks `ring` (its newest
 /// entry is the own tip) and the header's parents (issue #1804, design D).
 ///
-/// Under a policy that applies the quorum rule:
+/// How the quorum rule chooses:
 /// - the own tip counts once, for the own authority; each parent from another author counts when it
 ///   is of the header's epoch and not genesis (round 0). An own certificate among the parents is
 ///   skipped, and an author is counted at most once (its first usable certificate);
@@ -2379,14 +2025,13 @@ pub(crate) struct ExecBlockChoice {
 ///   below it, so the guarantee no longer rests on the ring's numbers rising in push order. On an
 ///   honest node it never fires, and a debug assertion says so. It cannot cover a proposer that
 ///   starts the epoch before executing the previous epoch's closing block: that block is not in its
-///   ring yet, its own tip stands in for it, and the rule names that tip, as the switch-off form
-///   does.
+///   ring yet, its own tip stands in for it, and the rule names that tip.
 ///
 /// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
-/// An empty ring names the default block, as the tip read did before the switch existed.
+/// An empty ring names the default block.
 pub(crate) fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -> ExecBlockChoice {
     let tip = ring.latest_execution_block_num_hash();
-    if !inputs.policy.applies_quorum_rule() || ring.is_empty() {
+    if ring.is_empty() {
         return ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
     }
     // the epoch's opening block, while the ring still holds it; once the ring holds only this

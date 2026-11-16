@@ -1,21 +1,22 @@
-//! The own-chain order hold (issue #1807, switch `digest_order_hold`) keeps every accepted
+//! The own-chain order hold (issue #1807) keeps every accepted
 //! transaction while one validator's own chain of headers keeps breaking.
 //!
 //! A proposer drains its workers' batch digests into its header at round r. When that header is
 //! cancelled by a newer own header, or certified too late to commit, its digests are re-queued
 //! after the header at r+1 already drained newer digests of the same worker. A sender's later
 //! transaction then executes before its earlier one, fails as "nonce too high" and is lost unless
-//! the sender sends it again. With the hold on, a header drains nothing from a worker named in an
+//! the sender sends it again. With the hold, a header drains nothing from a worker named in an
 //! older own header that is not proven to be its own-chain ancestor.
 //!
 //! Every test here starts four validators as processes. The certifier hook
 //! (`TN_TEST_OWN_CERT_DELAY_MS`, `_STAGE`, `_EVERY`, see `tn_types::test_hooks::own_cert_delay`)
 //! holds back the own certificate of [`HOOKED`], so its header at a held round is not a parent of
 //! its next header: what a far validator sees on a fleet. [`SLOWED`] executes every output with
-//! batches late (the engine's execution-delay hook), so the vote form of `quorum_exec_block`
-//! matters. Senders spread over all four validators submit consecutive nonces, up to [`WINDOW`]
-//! unexecuted each, and never send an accepted transaction again; the load runs across epoch
-//! boundaries. At the end every node's chain is walked block by block.
+//! batches late (the engine's execution-delay hook), so execution is uneven across the fleet and
+//! the execution block each header names follows a quorum, not the fastest node. Senders spread
+//! over all four validators submit consecutive nonces, up to [`WINDOW`] unexecuted each, and never
+//! send an accepted transaction again; the load runs across epoch boundaries. At the end every
+//! node's chain is walked block by block.
 
 use super::{
     common::{
@@ -24,9 +25,8 @@ use super::{
         WEI_PER_TEL,
     },
     fleet::{
-        all_validators, assert_switches, expected_switches, node_epoch, wait_for_epoch_on_all,
-        Fleet, Load, EXECUTION_DELAY_ENV, PRODUCTION_CADENCE, SLOW_EXECUTION_DELAY_MS,
-        STACK_SWITCHES_ON,
+        all_validators, node_epoch, wait_for_epoch_on_all, Fleet, Load, EXECUTION_DELAY_ENV,
+        PRODUCTION_CADENCE, SLOW_EXECUTION_DELAY_MS,
     },
 };
 use e2e_tests::FleetOverrides;
@@ -101,10 +101,6 @@ const LOAD_EPOCHS: u32 = 2;
 /// stopped.
 const DRAIN_LIMIT: Duration = Duration::from_secs(240);
 
-/// In the control, how long the landed count may stand still before the test stops waiting for
-/// transactions that may be lost.
-const CONTROL_QUIESCENCE: Duration = Duration::from_secs(45);
-
 /// How long the senders of the killed node pause before the kill, so its pool has sealed what
 /// they sent into batches (a SIGKILL loses a node's pool; sealed batches come back through the
 /// orphan re-pool). Three batch delays at [`PRODUCTION_CADENCE`].
@@ -120,8 +116,7 @@ const HOOK_EVERY_ENV: &str = "TN_TEST_OWN_CERT_DELAY_EVERY";
 /// The line the certifier logs for every own certificate the hook holds.
 const HOOK_LOG: &str = "test hook: holding own certificate";
 
-/// The warning of invariant I2: a digest re-queued behind a newer digest of its lane with the
-/// hold on.
+/// The warning of invariant I2: a digest re-queued behind a newer digest of its lane.
 const HOLD_WARN_LOG: &str = "digests re-queued out of order under the order hold";
 
 /// The proposer's line for every re-queue.
@@ -152,31 +147,29 @@ const ORPHAN_RESULTS: [&str; 5] =
 /// The re-queue causes; the hold covers both.
 const CAUSES: [&str; 2] = ["canceled", "committed"];
 
-/// With the hold on, every transaction a validator accepted lands exactly once while the own chain
-/// of one validator keeps breaking, with the adaptive vote form (`quorum_exec_block_starved_rounds:
-/// 4`), every stack switch on and the hook at `before_store` (see [`Form::hook`]). See
-/// [`check_form`] for the assertions.
+/// Every transaction a validator accepted lands exactly once while the own chain of one validator
+/// keeps breaking, with the hook at `before_store` (see [`Form::hook`]). See [`check_form`] for the
+/// assertions.
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_hold_keeps_every_transaction_adaptive() -> eyre::Result<()> {
+fn test_hold_keeps_every_transaction_before_store() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
-    run_form(Form::Adaptive)
+    run_form(Form::BeforeStore)
 }
 
-/// [`test_hold_keeps_every_transaction_adaptive`] with the `always` vote form
-/// (`quorum_exec_block_starved_rounds: 0`) and the hook at `after_store` (see [`Form::hook`]).
+/// [`test_hold_keeps_every_transaction_before_store`] with the hook at `after_store` (see
+/// [`Form::hook`]).
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_hold_keeps_every_transaction_always() -> eyre::Result<()> {
+fn test_hold_keeps_every_transaction_after_store() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
-    run_form(Form::Always)
+    run_form(Form::AfterStore)
 }
 
-/// The adaptive form (the stack's own switch list, [`STACK_SWITCHES_ON`]), with the hook at
-/// `after_store` so a lane waits on a commit notice when the kill lands: the hooked validator is
-/// killed by SIGKILL under load once an epoch boundary has passed, and restarted on its datadir
-/// with the same overrides while the load to the other three continues. Its senders pause
-/// [`SEAL_WAIT`] before the kill, so what the node accepted is sealed in batches (held or in
+/// The hook at `after_store` so a lane waits on a commit notice when the kill lands: the hooked
+/// validator is killed by SIGKILL under load once an epoch boundary has passed, and restarted on
+/// its datadir with the same overrides while the load to the other three continues. Its senders
+/// pause [`SEAL_WAIT`] before the kill, so what the node accepted is sealed in batches (held or in
 /// uncommitted headers) and comes back through the orphan re-pool; a submission the node refuses
 /// while down or inactive is sent again with the same bytes until it is accepted. The run goes on
 /// until the restarted node accepts its senders again and one more epoch boundary has closed.
@@ -187,55 +180,25 @@ fn test_hold_survives_a_kill_of_the_far_validator() -> eyre::Result<()> {
     run_form(Form::Kill)
 }
 
-/// The control: the fleet of [`test_hold_keeps_every_transaction_adaptive`] with only
-/// `digest_order_hold` off. The hooked validator re-queues digests out of order
-/// ([`OUT_OF_ORDER`] > 0); the transactions lost are reported, not asserted.
-#[test]
-#[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_without_the_hold_the_far_validator_reorders() -> eyre::Result<()> {
-    let _permit = acquire_test_permit();
-    run_form(Form::Control)
-}
-
-/// One test's fleet: the switches every node gets and what happens to the hooked node.
+/// One test's fleet: what happens to the hooked node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
-    /// Every stack switch on (`quorum_exec_block_starved_rounds: 4`).
-    Adaptive,
-    /// Every stack switch on with `quorum_exec_block_starved_rounds: 0`.
-    Always,
-    /// [`Self::Adaptive`], with the hooked node killed and restarted under load.
+    /// The hook at `before_store`.
+    BeforeStore,
+    /// The hook at `after_store`.
+    AfterStore,
+    /// [`Self::AfterStore`], with the hooked node killed and restarted under load.
     Kill,
-    /// [`Self::Adaptive`] with `digest_order_hold: false`.
-    Control,
 }
 
 impl Form {
     /// The test-log directory.
     fn test_name(self) -> &'static str {
         match self {
-            Self::Adaptive => "hold_adaptive",
-            Self::Always => "hold_always",
+            Self::BeforeStore => "hold_before_store",
+            Self::AfterStore => "hold_after_store",
             Self::Kill => "hold_kill",
-            Self::Control => "hold_off_control",
         }
-    }
-
-    /// Whether `digest_order_hold` is on.
-    fn hold(self) -> bool {
-        self != Self::Control
-    }
-
-    /// The `parameters.yaml` switch entries every node gets.
-    fn switches(self) -> Vec<(&'static str, &'static str)> {
-        STACK_SWITCHES_ON
-            .iter()
-            .map(|&(key, value)| match (self, key) {
-                (Self::Always, "quorum_exec_block_starved_rounds") => (key, "0"),
-                (Self::Control, "digest_order_hold") => (key, "false"),
-                _ => (key, value),
-            })
-            .collect()
     }
 
     /// The hook settings of the hooked node: `(stage, milliseconds, every)`.
@@ -244,16 +207,16 @@ impl Form {
     /// cancels the held header when the next own header reaches the certifier (cause `canceled`),
     /// `after_store` keeps a certified header out of the next header's parents until a later own
     /// header commits without it (cause `committed`). Measured in the first runs: `before_store`
-    /// re-queued 16 and 15 digests as `canceled` and none as `committed`, `after_store` 32 as
-    /// `committed` and none as `canceled`. The adaptive test and its control take `before_store`,
-    /// the `always` test and the kill take `after_store`, so the adaptive form runs both paths and
-    /// the kill lands while a lane waits on a commit notice. Holds last 5 s, past the next own
-    /// header at this cadence, on every third round: the round after a held one carries no own
-    /// parent, and the one after that does, so the lane is free again and drains.
+    /// re-queued digests only as `canceled`, `after_store` 32 only as `committed`.
+    /// [`Self::BeforeStore`] takes `before_store`, [`Self::AfterStore`] and the kill take
+    /// `after_store`, so the hold runs on both paths and the kill lands while a lane waits on a
+    /// commit notice. Holds last 5 s, past the next own header at this cadence, on every third
+    /// round: the round after a held one carries no own parent, and the one after that does, so the
+    /// lane is free again and drains.
     fn hook(self) -> (&'static str, u64, u64) {
         match self {
-            Self::Adaptive | Self::Control => ("before_store", 5_000, 3),
-            Self::Always | Self::Kill => ("after_store", 5_000, 3),
+            Self::BeforeStore => ("before_store", 5_000, 3),
+            Self::AfterStore | Self::Kill => ("after_store", 5_000, 3),
         }
     }
 
@@ -265,7 +228,7 @@ impl Form {
         }
     }
 
-    /// Every node's switch entries, the hook on [`HOOKED`], the execution delay on [`SLOWED`],
+    /// The hook on [`HOOKED`], the execution delay on [`SLOWED`],
     /// and the production cadence on every node.
     fn overrides(self) -> FleetOverrides {
         let (stage, ms, every) = self.hook();
@@ -279,9 +242,8 @@ impl Form {
                 EXECUTION_DELAY_ENV,
                 SLOW_EXECUTION_DELAY_MS.to_string(),
             );
-        self.switches()
+        PRODUCTION_CADENCE
             .into_iter()
-            .chain(PRODUCTION_CADENCE)
             .fold(fleet, |fleet, (key, value)| fleet.parameter(all_validators(), key, value))
     }
 }
@@ -305,10 +267,6 @@ fn run_form(form: Form) -> eyre::Result<()> {
 fn drive(form: Form, fleet: &mut Fleet, runtime: &Runtime) -> eyre::Result<String> {
     let test = fleet.test.clone();
     network_advancing(&fleet.urls)?;
-    let expected = expected_switches(&form.switches())?;
-    for node in 0..4 {
-        assert_switches(&test, node, 0, &expected)?;
-    }
     let clients = {
         let _entered = runtime.enter();
         fleet.urls.iter().map(|url| client(url)).collect::<eyre::Result<Vec<_>>>()?
@@ -318,7 +276,7 @@ fn drive(form: Form, fleet: &mut Fleet, runtime: &Runtime) -> eyre::Result<Strin
     let mut counters = Vec::new();
     let kill = match form {
         Form::Kill => {
-            let (run0, kill) = kill_and_restart(fleet, &load, &expected)?;
+            let (run0, kill) = kill_and_restart(fleet, &load)?;
             counters.push((HOOKED, 0, run0));
             Some(kill)
         }
@@ -329,17 +287,13 @@ fn drive(form: Form, fleet: &mut Fleet, runtime: &Runtime) -> eyre::Result<Strin
     };
     let mut reports = load.stop(runtime)?;
     reports.push(funding);
-    let drained = if form.hold() {
-        runtime.block_on(wait_for_landing(&clients, &reports))
-    } else {
-        runtime.block_on(wait_quiescent(&clients, &reports))
-    };
+    let drained = runtime.block_on(wait_for_landing(&clients, &reports));
     let head = fleet.settle()?;
     let walk = runtime.block_on(walk_chain(&clients))?;
     let runs = node_runs(form);
     for &(node, run) in &runs {
         if node != HOOKED || form != Form::Kill || run == 1 {
-            counters.push((node, run, Counters::read(&fleet.metrics[node], form.hold())?));
+            counters.push((node, run, Counters::read(&fleet.metrics[node])?));
         }
     }
     let measured = Measured::new(form, &test, &reports, &walk, counters, kill)?;
@@ -418,11 +372,7 @@ struct KillSeen {
 /// Run the load past one epoch boundary, kill [`HOOKED`] with SIGKILL, let the others advance,
 /// restart it on its datadir with the same overrides, and run on until an epoch boundary closes
 /// with it back. Returns its run-0 counters, read just before the kill.
-fn kill_and_restart(
-    fleet: &mut Fleet,
-    load: &HoldLoad,
-    expected: &[(&str, &str)],
-) -> eyre::Result<(Counters, KillSeen)> {
+fn kill_and_restart(fleet: &mut Fleet, load: &HoldLoad) -> eyre::Result<(Counters, KillSeen)> {
     let url = fleet.urls[FUNDER].clone();
     let start = node_epoch(&url)?;
     let started = Instant::now();
@@ -442,7 +392,7 @@ fn kill_and_restart(
     )?;
     std::thread::sleep(SEAL_WAIT);
     let accepted_at_kill = load.accepted(HOOKED);
-    let run0 = Counters::read(&fleet.metrics[HOOKED], true)?;
+    let run0 = Counters::read(&fleet.metrics[HOOKED])?;
     let mut child =
         fleet.guard.take(HOOKED).ok_or_else(|| eyre::eyre!("node {HOOKED} is not running"))?;
     // std's kill is SIGKILL on unix: no shutdown path runs
@@ -463,7 +413,6 @@ fn kill_and_restart(
     )?;
     let restarted = fleet.spawn(HOOKED, 1)?;
     fleet.guard.replace(HOOKED, restarted);
-    assert_switches(&fleet.test, HOOKED, 1, expected)?;
     let back_at = get_block_number(&url)?;
     wait_until_blocking(
         Duration::from_secs(180),
@@ -789,34 +738,6 @@ async fn landing_behind(
     Ok(behind)
 }
 
-/// The control's drain: wait until every accepted transaction executed on every validator, or
-/// until the executed nonces summed over the senders on validator 1 stood still for
-/// [`CONTROL_QUIESCENCE`] (a lost transaction never executes). Bounded by [`DRAIN_LIMIT`].
-async fn wait_quiescent(clients: &[HttpClient], reports: &[SenderReport]) -> eyre::Result<()> {
-    let deadline = Instant::now() + DRAIN_LIMIT;
-    let (mut last, mut since) = (u64::MAX, Instant::now());
-    loop {
-        if landing_behind(clients, reports).await?.is_empty() {
-            return Ok(());
-        }
-        let mut total = 0;
-        for report in reports {
-            total += executed_nonce(&clients[0], report.address).await?;
-        }
-        if total != last {
-            (last, since) = (total, Instant::now());
-        }
-        eyre::ensure!(Instant::now() < deadline, "the control did not settle in {DRAIN_LIMIT:?}");
-        if since.elapsed() >= CONTROL_QUIESCENCE {
-            return Err(eyre::eyre!(
-                "executed nonces stood still for {CONTROL_QUIESCENCE:?} with transactions \
-                 unexecuted"
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
 /// Every block of the chain as the four validators hold it.
 struct ChainWalk {
     /// The lowest head of the four when the walk started.
@@ -889,13 +810,11 @@ struct Counters {
 
 impl Counters {
     /// Read the counters at `addr`. The series a check reads must be served (a renamed series
-    /// fails the read); [`HEADERS_HELD`] only with the hold on. The certifier's drop counter and
-    /// the orphan counters register on first use: absent means zero.
-    fn read(addr: &str, hold: bool) -> eyre::Result<Self> {
+    /// fails the read). The certifier's drop counter and the orphan counters register on first use:
+    /// absent means zero.
+    fn read(addr: &str) -> eyre::Result<Self> {
         let mut required = vec![OUT_OF_ORDER, REQUEUED, INVALID_SKIPPED, ORDER_UNKNOWN];
-        if hold {
-            required.push(HEADERS_HELD);
-        }
+        required.push(HEADERS_HELD);
         for name in required {
             scrape_metric_value(addr, name)?;
         }
@@ -1252,11 +1171,9 @@ impl Measured {
 
 /// The checks of every form.
 ///
-/// Every form: every node's `node switches` line shows the switches it was given (checked at
-/// start), no node logged a line of `fleet::FATAL_LOGS`, all four validators hold the same
+/// Every form: no node logged a line of `fleet::FATAL_LOGS`, all four validators hold the same
 /// block at every height up to the lowest head (the chain walk), the hook held own certificates
-/// on the hooked node and nowhere else, and its digests were re-queued. With the hold on (every
-/// form but the control):
+/// on the hooked node and nowhere else, and its digests were re-queued. Then:
 /// - every accepted transaction is in exactly one block, with no resend by the test;
 /// - [`OUT_OF_ORDER`] is 0 for both causes on every node and run, and no node logged
 ///   [`HOLD_WARN_LOG`]; [`ORDER_UNKNOWN`] is reported, not asserted;
@@ -1269,9 +1186,8 @@ impl Measured {
 ///   [`ORPHAN_TXS`] by result equals the sum of its lines' `txs_<result>` fields (except the killed
 ///   run, whose counters are read before the kill while its log runs to the kill).
 ///
-/// The control asserts [`OUT_OF_ORDER`] > 0 and [`HEADERS_HELD`] = 0 on the hooked node, and
-/// reports what was lost. Every form checks that each run of the hooked node logged [`HOOK_LOG`]
-/// lines, all at the stage of [`Form::hook`] and on rounds divisible by its rate.
+/// Every form checks that each run of the hooked node logged [`HOOK_LOG`] lines, all at the
+/// stage of [`Form::hook`] and on rounds divisible by its rate.
 fn check_form(
     form: Form,
     fleet: &Fleet,
@@ -1315,71 +1231,59 @@ fn check_form(
     if hooked.requeued.values().sum::<f64>() == 0.0 {
         failed.push("the hooked node re-queued no digest: its own chain never broke".to_owned());
     }
-    if form.hold() {
-        if let Some(e) = drained {
-            failed.push(format!("{e:#}"));
-        }
-        if !measured.lost.is_empty() || !measured.repeated.is_empty() {
-            failed.push(format!(
-                "{} accepted transactions are in no block (first {:?}) and {} in more than one \
-                 (first {:?})",
-                measured.lost.len(),
-                measured.lost.first(),
-                measured.repeated.len(),
-                measured.repeated.first()
-            ));
-        }
-        for (node, run, counters) in &measured.counters {
-            if counters.out_of_order_covered() > 0.0 {
-                let warned = lines_with(test, *node, *run, HOLD_WARN_LOG, None)?;
-                let resent = lines_with(test, *node, *run, RESENT_LOG, Some("out_of_order"))?;
-                failed.push(format!(
-                    "node {node} run {run} re-queued digests out of order with the hold on: {:?}; \
-                     warnings {warned:#?}; re-queues {resent:#?}",
-                    counters.out_of_order
-                ));
-            }
-            if counters.nonce_too_high > 0.0 {
-                failed.push(format!(
-                    "node {node} run {run} skipped {} transactions as nonce too high",
-                    counters.nonce_too_high
-                ));
-            }
-        }
-        for &(node, run) in runs {
-            let warned = lines_with(test, node, run, HOLD_WARN_LOG, None)?;
-            if !warned.is_empty() {
-                failed.push(format!("node {node} run {run} logged {warned:#?}"));
-            }
-        }
-        if hooked.headers_held == 0.0 || measured.cost.held_headers == 0 {
-            failed.push(format!(
-                "the hold never held a lane on the hooked node: {HEADERS_HELD} {}, `header \
-                 proposed` lines with held > 0: {}",
-                hooked.headers_held, measured.cost.held_headers
-            ));
-        }
-        let cause = form.requeue_cause();
-        if hooked.requeued.get(cause).copied().unwrap_or_default() == 0.0 {
-            failed.push(format!(
-                "the hooked node re-queued no digest with cause {cause}, the path its hook stage \
-                 {:?} breaks the own chain through: {:?}",
-                form.hook().0,
-                hooked.requeued
-            ));
-        }
-        failed.extend(check_orphans(form, test, runs, measured)?);
-    } else if hooked.headers_held != 0.0 {
+    if let Some(e) = drained {
+        failed.push(format!("{e:#}"));
+    }
+    if !measured.lost.is_empty() || !measured.repeated.is_empty() {
         failed.push(format!(
-            "the control held {} headers on the hooked node with the switch off",
-            hooked.headers_held
-        ));
-    } else if hooked.out_of_order_covered() == 0.0 {
-        failed.push(format!(
-            "the control re-queued nothing out of order on the hooked node: {:?}",
-            hooked.out_of_order
+            "{} accepted transactions are in no block (first {:?}) and {} in more than one \
+             (first {:?})",
+            measured.lost.len(),
+            measured.lost.first(),
+            measured.repeated.len(),
+            measured.repeated.first()
         ));
     }
+    for (node, run, counters) in &measured.counters {
+        if counters.out_of_order_covered() > 0.0 {
+            let warned = lines_with(test, *node, *run, HOLD_WARN_LOG, None)?;
+            let resent = lines_with(test, *node, *run, RESENT_LOG, Some("out_of_order"))?;
+            failed.push(format!(
+                "node {node} run {run} re-queued digests out of order: {:?}; \
+                 warnings {warned:#?}; re-queues {resent:#?}",
+                counters.out_of_order
+            ));
+        }
+        if counters.nonce_too_high > 0.0 {
+            failed.push(format!(
+                "node {node} run {run} skipped {} transactions as nonce too high",
+                counters.nonce_too_high
+            ));
+        }
+    }
+    for &(node, run) in runs {
+        let warned = lines_with(test, node, run, HOLD_WARN_LOG, None)?;
+        if !warned.is_empty() {
+            failed.push(format!("node {node} run {run} logged {warned:#?}"));
+        }
+    }
+    if hooked.headers_held == 0.0 || measured.cost.held_headers == 0 {
+        failed.push(format!(
+            "the hold never held a lane on the hooked node: {HEADERS_HELD} {}, `header \
+             proposed` lines with held > 0: {}",
+            hooked.headers_held, measured.cost.held_headers
+        ));
+    }
+    let cause = form.requeue_cause();
+    if hooked.requeued.get(cause).copied().unwrap_or_default() == 0.0 {
+        failed.push(format!(
+            "the hooked node re-queued no digest with cause {cause}, the path its hook stage \
+             {:?} breaks the own chain through: {:?}",
+            form.hook().0,
+            hooked.requeued
+        ));
+    }
+    failed.extend(check_orphans(form, test, runs, measured)?);
     eyre::ensure!(failed.is_empty(), "{} checks failed: {failed:#?}", failed.len());
     Ok(())
 }

@@ -540,7 +540,7 @@ mod tests {
         assert!(matches!(PrimaryResponse::into_error_ref(&error), PrimaryResponse::Error(_)));
     }
 
-    // ---- bench6 voter-lock ----
+    // ---- the voter's per-author lock ----
 
     /// A request superseded by a newer one from the same author is stale, not a fault: no penalty,
     /// and a retryable answer, so a requester that still waits for it asks again instead of

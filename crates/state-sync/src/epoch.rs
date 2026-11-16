@@ -11,7 +11,6 @@ use std::{
     time::Duration,
 };
 
-use tn_config::Parameters;
 use tn_network_libp2p::error::NetworkError;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{
@@ -57,8 +56,7 @@ const STARTUP_SYNC_UNANSWERED_BUDGET: Duration = Duration::from_secs(2);
 
 /// Most epochs a record collection holds open as walked-past gaps at a time (see
 /// [`Collection::gaps`]). It bounds the record collector's gap retry to this many record requests
-/// per retry interval; past it, collection stops at the next uncertified epoch as it does with the
-/// walk off.
+/// per retry interval; past it, collection stops at the next uncertified epoch.
 const MAX_UNCERTIFIED_GAPS: usize = 16;
 
 /// Longest one gap retry may hold the record collector loop (see [`retry_gaps`]): one retry
@@ -99,31 +97,14 @@ struct StartupSyncState<Collect, Progress> {
     progress: Progress,
 }
 
-/// The record collection's switch, read from [`Parameters`]. It defaults off, which is the
-/// collection from before it existed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct EpochRecordCollectSwitches {
-    /// [`Parameters::epoch_record_collect_past_uncertified`]: walk past an epoch this node holds as
-    /// its own uncertified record (see [`Collection::may_walk_past`]).
-    past_uncertified: bool,
-}
-
-impl From<&Parameters> for EpochRecordCollectSwitches {
-    fn from(parameters: &Parameters) -> Self {
-        Self { past_uncertified: parameters.epoch_record_collect_past_uncertified }
-    }
-}
-
 /// What the passes of one record collection share: the record collector keeps one for its whole
 /// life, the startup sync makes a new one for every pass.
 struct Collection<'m> {
-    /// The switches the collection runs with.
-    switches: EpochRecordCollectSwitches,
     /// Epochs this node holds as its own uncertified record that a pass walked past: a certified
     /// record after the epoch validated against this node's own record and is stored. The record
     /// collector asks for each once per retry interval ([`retry_gaps`]) and drops it once any path
     /// (the collector, this node's vote round, a re-vote) stores its certificate. At most
-    /// [`MAX_UNCERTIFIED_GAPS`]; empty with the walk off.
+    /// [`MAX_UNCERTIFIED_GAPS`].
     gaps: BTreeSet<Epoch>,
     /// The gap the next [`retry_gaps`] asks for first (or the first gap after it). A gap the
     /// previous retry's deadline cut short after other gaps had used part of the window leads the
@@ -140,36 +121,32 @@ struct Collection<'m> {
 
 impl<'m> Collection<'m> {
     /// A collection with no gap open yet.
-    fn new(switches: EpochRecordCollectSwitches, metrics: &'m StateSyncMetrics) -> Self {
-        Self { switches, gaps: BTreeSet::new(), retry_from: 0, unlanded_walk: None, metrics }
+    fn new(metrics: &'m StateSyncMetrics) -> Self {
+        Self { gaps: BTreeSet::new(), retry_from: 0, unlanded_walk: None, metrics }
     }
 
     /// Whether a pass told by a peer that it holds no certified record of `epoch` may go on to the
     /// next epoch, `walked` being the epochs this pass already walked past without a record after
     /// them landing yet.
     ///
-    /// Only with the walk switched on, only while fewer than [`MAX_UNCERTIFIED_GAPS`] gaps would
-    /// be open, not for a new walk from the epoch a walk that did not land started at less than a
-    /// retry interval ago ([`Collection::unlanded_walk`]: its extra requests are made at most once
-    /// per interval, not on every wake-up), and only when this node holds `epoch` as its own
-    /// stored, uncertified record that is not the epoch-0 dummy anchor. The next epoch's record is
-    /// then anchored on that record: its digest and its `next_committee` come from this node's
-    /// own execution of the epoch, so a record past it is checked exactly as it would be had
-    /// the epoch been certified. An uncertified record is stored by this node's own epoch
-    /// close, or is a peer's record that validated with a super-quorum certificate whose own
-    /// write then failed. A node without its own record of the epoch (a fresh node, an observer
-    /// far behind) never walks: the epoch's `next_committee` is not constrained by anything
-    /// such a node can check, so a fabricated record of the epoch could name the committee that
-    /// certifies a fabricated next one.
+    /// Only while fewer than [`MAX_UNCERTIFIED_GAPS`] gaps would be open, not for a new walk from
+    /// the epoch a walk that did not land started at less than a retry interval ago
+    /// ([`Collection::unlanded_walk`]: its extra requests are made at most once per interval, not
+    /// on every wake-up), and only when this node holds `epoch` as its own stored, uncertified
+    /// record that is not the epoch-0 dummy anchor. The next epoch's record is then anchored on
+    /// that record: its digest and its `next_committee` come from this node's own execution of the
+    /// epoch, so a record past it is checked exactly as it would be had the epoch been certified.
+    /// An uncertified record is stored by this node's own epoch close, or is a peer's record that
+    /// validated with a super-quorum certificate whose own write then failed. A node without its
+    /// own record of the epoch (a fresh node, an observer far behind) never walks: the epoch's
+    /// `next_committee` is not constrained by anything such a node can check, so a fabricated
+    /// record of the epoch could name the committee that certifies a fabricated next one.
     async fn may_walk_past(
         &self,
         epoch: Epoch,
         walked: &[Epoch],
         consensus_chain: &ConsensusChain,
     ) -> bool {
-        if !self.switches.past_uncertified {
-            return false;
-        }
         let retry_interval = Duration::from_secs(EPOCH_COLLECT_RETRY_SECS);
         if walked.is_empty()
             && self
@@ -371,20 +348,18 @@ pub async fn sync_epoch_records_to_tip(
     primary_handle: &PrimaryNetworkHandle,
     consensus_bus: &ConsensusBusApp,
     node_shutdown: Noticer,
-    parameters: &Parameters,
 ) -> eyre::Result<()> {
     sync_epoch_records_to_tip_with(
         consensus_chain,
         primary_handle,
         consensus_bus,
         node_shutdown,
-        parameters.into(),
         &STATE_SYNC_METRICS,
     )
     .await
 }
 
-/// [`sync_epoch_records_to_tip`], with `switches` and reporting to `metrics`.
+/// [`sync_epoch_records_to_tip`], reporting to `metrics`.
 ///
 /// The certified prefix is read from the store before the first pass, so a restarted node
 /// reports the certificates it already holds before any peer answers, and again around every
@@ -395,14 +370,13 @@ async fn sync_epoch_records_to_tip_with(
     primary_handle: &PrimaryNetworkHandle,
     consensus_bus: &ConsensusBusApp,
     node_shutdown: Noticer,
-    switches: EpochRecordCollectSwitches,
     metrics: &StateSyncMetrics,
 ) -> eyre::Result<()> {
     certified_prefix_end(consensus_chain, metrics).await;
     drive_epoch_record_sync(
         || async { primary_handle.inner_handle().established_peer_count().await.unwrap_or(0) },
         |epoch| async move {
-            let mut collection = Collection::new(switches, metrics);
+            let mut collection = Collection::new(metrics);
             collect_epoch_records(
                 epoch,
                 consensus_chain,
@@ -557,21 +531,20 @@ fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
 ///
 /// Fails when our own epoch store fails to save or persist, or when a certified record conflicts
 /// with this node's own (see [`stop_on_local_failure`]); a peer's invalid or otherwise refused
-/// record is logged and asked for again on a later pass. Each
-/// certified record stored is published on [`ConsensusBusApp::certified_record_epoch`], so an
-/// active validator still running an epoch the network already closed leaves it to catch up.
+/// record is logged and asked for again on a later pass. Each certified record stored is published
+/// on [`ConsensusBusApp::certified_record_epoch`], so an active validator still running an epoch
+/// the network already closed leaves it to catch up.
 ///
-/// With [`Parameters::epoch_record_collect_past_uncertified`] on, a pass told by a peer that it
-/// holds no certified record of an epoch this node holds as its own uncertified record goes on to
-/// the next epoch (see [`Collection::may_walk_past`]). Once a certified record after it is stored,
-/// the epoch is a gap of `collection`, which the record collector asks for again
-/// ([`retry_gaps`]). If the walk ends before that, on a record naming another parent (this node's
-/// own record differs from the one the network built on), a peer without the next record or no
-/// answer, the pass stops where it would have stopped with the walk off. A pass that walked ends
-/// with the persist and the final-consensus publish below, a refused record included, unless it
-/// fails: a conflicting certified record or our own store failing to save a record ends it at
-/// once, before the persist, as it ends a pass with the walk off; a failed persist ends it before
-/// the publish.
+/// A pass told by a peer that it holds no certified record of an epoch this node holds as its own
+/// uncertified record goes on to the next epoch (see [`Collection::may_walk_past`]). Once a
+/// certified record after it is stored, the epoch is a gap of `collection`, which the record
+/// collector asks for again ([`retry_gaps`]). If the walk ends before that, on a record naming
+/// another parent (this node's own record differs from the one the network built on), a peer
+/// without the next record or no answer, the pass stops at the walked epoch, as if it had not
+/// walked. A pass that walked ends with the persist and the final-consensus publish below, a
+/// refused record included, unless it fails: a conflicting certified record or our own store
+/// failing to save a record ends it at once, before the persist, as it ends a pass that did not
+/// walk; a failed persist ends it before the publish.
 async fn collect_epoch_records(
     last_epoch: Epoch,
     consensus_chain: &ConsensusChain,
@@ -638,8 +611,8 @@ async fn collect_epoch_records(
                     // record of that epoch differs from the one the network built on
                     collection.metrics.epoch_record_walk_parent_mismatches_total.increment(1);
                 }
-                // the cursor stays where it is: before a walk that did not land, where a pass with
-                // the walk off stops, so the next pass meets the walked epoch again rather than
+                // the cursor stays where it is: before a walk that did not land, where a pass that
+                // does not walk stops, so the next pass meets the walked epoch again rather than
                 // starting on it; after one that landed, on the last stored epoch. The pass ends
                 // below, so what it stored is persisted.
                 definitive = true;
@@ -873,7 +846,6 @@ pub async fn spawn_epoch_record_collector(
     consensus_bus: ConsensusBusApp,
     node_task_spawner: TaskSpawner,
     node_shutdown: Noticer,
-    parameters: &Parameters,
 ) -> eyre::Result<()> {
     spawn_epoch_record_collector_with(
         consensus_chain,
@@ -881,13 +853,12 @@ pub async fn spawn_epoch_record_collector(
         consensus_bus,
         node_task_spawner,
         node_shutdown,
-        parameters.into(),
         STATE_SYNC_METRICS.clone(),
     )
     .await
 }
 
-/// [`spawn_epoch_record_collector`], with `switches` and reporting to `metrics`.
+/// [`spawn_epoch_record_collector`], reporting to `metrics`.
 ///
 /// After every pass the certified prefix is read from the store, not from the pass, so a
 /// certificate stored by another path (this node's own vote round, the startup sync) shows on the
@@ -904,7 +875,6 @@ async fn spawn_epoch_record_collector_with(
     consensus_bus: ConsensusBusApp,
     node_task_spawner: TaskSpawner,
     node_shutdown: Noticer,
-    switches: EpochRecordCollectSwitches,
     metrics: StateSyncMetrics,
 ) -> eyre::Result<()> {
     let mut epoch_rx = consensus_bus.requested_missing_epoch().subscribe();
@@ -915,7 +885,7 @@ async fn spawn_epoch_record_collector_with(
         // a certificate are skipped immediately by get_epoch_by_number, so this
         // is cheap for nodes that are fully caught up.
         let mut last_epoch: Epoch = 0;
-        let mut collection = Collection::new(switches, &metrics);
+        let mut collection = Collection::new(&metrics);
         let retry_interval = Duration::from_secs(EPOCH_COLLECT_RETRY_SECS);
         let mut gaps_retried_at = tokio::time::Instant::now();
         loop {
@@ -1140,7 +1110,7 @@ mod tests {
             &consensus_chain,
             &handle,
             consensus_bus.app(),
-            &mut walk_off(),
+            &mut new_collection(),
         )
         .await
         .expect("no local store failure");
@@ -1210,7 +1180,7 @@ mod tests {
             &consensus_chain,
             &handle,
             consensus_bus.app(),
-            &mut walk_off(),
+            &mut new_collection(),
         )
         .await
         .expect("an invalid peer record is not a local failure");
@@ -1274,7 +1244,7 @@ mod tests {
                 &consensus_chain,
                 &handle,
                 consensus_bus.app(),
-                &mut walk_off(),
+                &mut new_collection(),
             )
             .await
             .expect_err("a certified record conflicting with ours stops the collector");
@@ -1322,7 +1292,7 @@ mod tests {
             chain.epochs().save(record0.clone(), cert0.clone()).await?;
             let handle = mock_epoch_record_network_with(served.clone(), peer, 1, answer_unserved);
             let collected =
-                collect_epoch_records(0, &chain, &handle, bus.app(), &mut walk_off()).await?;
+                collect_epoch_records(0, &chain, &handle, bus.app(), &mut new_collection()).await?;
             assert_eq!(collected, CollectedPass { epoch: 1, definitive }, "{answer_unserved}");
         }
         Ok(())
@@ -1346,21 +1316,16 @@ mod tests {
         let handle = mock_epoch_record_network(HashMap::new(), peer, 1);
         let bus = ConsensusBus::new();
 
-        let Err(err) = collect_epoch_records(0, &chain, &handle, bus.app(), &mut walk_off()).await
+        let Err(err) =
+            collect_epoch_records(0, &chain, &handle, bus.app(), &mut new_collection()).await
         else {
             panic!("a failed epoch store must end collection with an error");
         };
         assert!(format!("{err:#}").contains("failed to persist"), "unexpected error: {err:#}");
 
         let shutdown = tn_types::ShutdownNotifier::new();
-        let Err(err) = sync_epoch_records_to_tip(
-            &chain,
-            &handle,
-            bus.app(),
-            shutdown.subscribe(),
-            &Parameters::default(),
-        )
-        .await
+        let Err(err) =
+            sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await
         else {
             panic!("a failed epoch store must fail startup sync");
         };
@@ -1373,7 +1338,6 @@ mod tests {
             bus.app().clone(),
             task_manager.get_spawner(),
             shutdown.subscribe(),
-            &Parameters::default(),
         )
         .await?;
         let ended =
@@ -1451,14 +1415,7 @@ mod tests {
         );
         let bus = ConsensusBus::new();
         let shutdown = tn_types::ShutdownNotifier::new();
-        sync_epoch_records_to_tip(
-            &chain,
-            &handle,
-            bus.app(),
-            shutdown.subscribe(),
-            &Parameters::default(),
-        )
-        .await?;
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await?;
         assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(1));
         assert!(!chain.epochs().contains_dummy_epoch0().await);
         assert_eq!(chain.epochs().get_epoch_by_number(1).await, Some((record1, Some(cert1))));
@@ -1484,20 +1441,11 @@ mod tests {
         let handle = mock_epoch_record_network(HashMap::from([(0, (record, cert))]), peer, 0);
         let bus = ConsensusBus::new();
         let shutdown = tn_types::ShutdownNotifier::new();
-        sync_epoch_records_to_tip(
-            &chain,
-            &handle,
-            bus.app(),
-            shutdown.subscribe(),
-            &Parameters::default(),
-        )
-        .await?;
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await?;
         assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(0));
         assert!(chain.epochs().contains_dummy_epoch0().await);
         Ok(())
     }
-
-    // ---- bench7 epoch-record-collector-hardening ----
 
     /// Records every `epoch-manager` info and error line as `message key=value ...` on the thread
     /// it is installed on with [`tracing::subscriber::set_default`].
@@ -1592,7 +1540,7 @@ mod tests {
 
         let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
-        collect_epoch_records(0, &chain, &handle, bus.app(), &mut walk_off()).await?;
+        collect_epoch_records(0, &chain, &handle, bus.app(), &mut new_collection()).await?;
 
         let lines = lines.lock().clone();
         let prefix = format!("retrieved cert for epoch 1: {digest} from a peer");
@@ -1685,15 +1633,8 @@ mod tests {
             Some(-1.0),
             "the dummy anchor is not certified"
         );
-        sync_epoch_records_to_tip_with(
-            &chain,
-            &handle,
-            bus.app(),
-            shutdown.subscribe(),
-            EpochRecordCollectSwitches::default(),
-            &metrics,
-        )
-        .await?;
+        sync_epoch_records_to_tip_with(&chain, &handle, bus.app(), shutdown.subscribe(), &metrics)
+            .await?;
         assert_eq!(certified_through(&snapshotter), Some(1.0));
         Ok(())
     }
@@ -1723,15 +1664,8 @@ mod tests {
         let shutdown = tn_types::ShutdownNotifier::new();
         shutdown.notify();
         let (metrics, snapshotter) = local_metrics();
-        sync_epoch_records_to_tip_with(
-            &chain,
-            &handle,
-            bus.app(),
-            shutdown.subscribe(),
-            EpochRecordCollectSwitches::default(),
-            &metrics,
-        )
-        .await?;
+        sync_epoch_records_to_tip_with(&chain, &handle, bus.app(), shutdown.subscribe(), &metrics)
+            .await?;
         assert_eq!(certified_through(&snapshotter), Some(1.0));
         Ok(())
     }
@@ -1778,7 +1712,6 @@ mod tests {
             bus.app().clone(),
             task_manager.get_spawner(),
             shutdown.subscribe(),
-            EpochRecordCollectSwitches::default(),
             metrics,
         )
         .await?;
@@ -1799,9 +1732,6 @@ mod tests {
         Ok(())
     }
 
-    /// The walk switched on.
-    const WALK: EpochRecordCollectSwitches = EpochRecordCollectSwitches { past_uncertified: true };
-
     /// `tn_state_sync.epoch_record_gap_walks_total`.
     const GAP_WALKS: &str = "tn_state_sync.epoch_record_gap_walks_total";
 
@@ -1811,10 +1741,9 @@ mod tests {
     /// `tn_state_sync.epoch_record_conflicts_total`.
     const CONFLICTS: &str = "tn_state_sync.epoch_record_conflicts_total";
 
-    /// A collection with the walk off, reporting to the process-wide metrics: the collection from
-    /// before the switch existed.
-    fn walk_off() -> Collection<'static> {
-        Collection::new(EpochRecordCollectSwitches::default(), &STATE_SYNC_METRICS)
+    /// A collection reporting to the process-wide metrics.
+    fn new_collection() -> Collection<'static> {
+        Collection::new(&STATE_SYNC_METRICS)
     }
 
     /// Every registered counter's increments since the previous snapshot, by name: the debugging
@@ -1880,10 +1809,10 @@ mod tests {
             .collect()
     }
 
-    /// With the walk on, a peer's "not held" for the epoch this node holds as its own uncertified
-    /// record no longer ends the pass: the certified records after it validate against that record
-    /// and are stored, the epoch is an open gap, counted and logged once, and the certified-prefix
-    /// gauge stays below it.
+    /// A peer's "not held" for the epoch this node holds as its own uncertified record no longer
+    /// ends the pass: the certified records after it validate against that record and are stored,
+    /// the epoch is an open gap, counted and logged once, and the certified-prefix gauge stays
+    /// below it.
     #[tokio::test]
     async fn test_collect_epoch_records_walks_past_an_own_uncertified_epoch() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -1892,7 +1821,7 @@ mod tests {
         let handle = mock_epoch_record_network(served(&records, &[2, 3]), peer, 1);
         let bus = ConsensusBus::new();
         let (metrics, snapshotter) = local_metrics();
-        let mut collection = Collection::new(WALK, &metrics);
+        let mut collection = Collection::new(&metrics);
 
         let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let _log_guard = tracing::subscriber::set_default(EpochManagerLines(lines.clone()));
@@ -1933,31 +1862,9 @@ mod tests {
         Ok(())
     }
 
-    /// With the walk off (the default) the pass stops at the epoch the network left uncertified,
-    /// however many certified records the network holds after it, pass after pass: gap G1 of
-    /// issue #1850.
-    #[tokio::test]
-    async fn test_collect_epoch_records_stops_at_an_uncertified_epoch_with_the_walk_off(
-    ) -> eyre::Result<()> {
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 3).await?;
-        let peer = keys_and_signers(&fixture).0[0];
-        let handle = mock_epoch_record_network(served(&records, &[2, 3]), peer, 1);
-        let bus = ConsensusBus::new();
-        let mut collection = walk_off();
-        for _ in 0..2 {
-            let collected =
-                collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?;
-            assert_eq!(collected, CollectedPass { epoch: 0, definitive: true });
-        }
-        assert!(collection.gaps.is_empty());
-        assert_eq!(chain.epochs().get_epoch_by_number(2).await, None);
-        Ok(())
-    }
-
-    /// A node without its own record of the epoch never walks past it, walk on or not: an observer
-    /// behind (record 0 certified, no record 1) stops as before, and the epoch-0 dummy anchor of a
-    /// fresh node is no record to walk past, while a real record 0 of its own is.
+    /// A node without its own record of the epoch never walks past it: an observer behind (record 0
+    /// certified, no record 1) stops as before, and the epoch-0 dummy anchor of a fresh node is no
+    /// record to walk past, while a real record 0 of its own is.
     #[tokio::test]
     async fn test_collect_epoch_records_does_not_walk_past_a_missing_record() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -1972,7 +1879,7 @@ mod tests {
             ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
         let (record0, cert0) = records[0].clone();
         chain.epochs().save(record0.clone(), cert0).await?;
-        let mut collection = Collection::new(WALK, &metrics);
+        let mut collection = Collection::new(&metrics);
         let collected =
             collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?;
         assert_eq!(collected, CollectedPass { epoch: 0, definitive: true });
@@ -1991,8 +1898,8 @@ mod tests {
     }
 
     /// When this node's own record of the walked epoch differs from the one the network built on,
-    /// the next epoch's certified record names another parent: the walk stops there as a pass
-    /// with the walk off would, opens no gap, and the case is counted.
+    /// the next epoch's certified record names another parent: the walk stops there, opens no gap,
+    /// and the case is counted.
     #[tokio::test]
     async fn test_collect_epoch_records_stops_at_a_parent_mismatch_after_a_walk() -> eyre::Result<()>
     {
@@ -2017,7 +1924,7 @@ mod tests {
         // the cursor stays before the walked epoch, so the next pass meets it again (in a new
         // collection: one collection holds a walk that did not land back for a retry interval)
         for _ in 0..2 {
-            let mut collection = Collection::new(WALK, &metrics);
+            let mut collection = Collection::new(&metrics);
             let collected =
                 collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?;
             assert_eq!(collected, CollectedPass { epoch: 0, definitive: true });
@@ -2031,7 +1938,7 @@ mod tests {
     }
 
     /// At most [`MAX_UNCERTIFIED_GAPS`] gaps are open: with all of them open the pass stops at the
-    /// next uncertified epoch as with the walk off; with one closed it walks and fills the bound.
+    /// next uncertified epoch; with one closed it walks and fills the bound.
     #[tokio::test]
     async fn test_collect_epoch_records_bounds_the_open_gaps() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -2040,7 +1947,7 @@ mod tests {
         let handle = mock_epoch_record_network(served(&records, &[2, 3]), peer, 1);
         let bus = ConsensusBus::new();
         let (metrics, _snapshotter) = local_metrics();
-        let mut collection = Collection::new(WALK, &metrics);
+        let mut collection = Collection::new(&metrics);
         let full = 100..100 + MAX_UNCERTIFIED_GAPS as Epoch;
         collection.gaps.extend(full.clone());
 
@@ -2070,7 +1977,7 @@ mod tests {
         let handle = mock_epoch_record_network(HashMap::new(), peer, 1);
         let bus = ConsensusBus::new();
         let (metrics, _snapshotter) = local_metrics();
-        let mut collection = Collection::new(WALK, &metrics);
+        let mut collection = Collection::new(&metrics);
         collection.gaps.insert(1);
         let shutdown = tn_types::ShutdownNotifier::new();
 
@@ -2161,7 +2068,6 @@ mod tests {
             bus.app().clone(),
             task_manager.get_spawner(),
             shutdown.subscribe(),
-            WALK,
             metrics,
         )
         .await?;
@@ -2188,9 +2094,9 @@ mod tests {
     }
 
     /// A peer's certified record that validates against this node's record 0 but differs from its
-    /// own record 1 is counted and stops the collection with the walk off or on: the pass, a gap
-    /// retry and the critical record collector all end with the error that says this node's
-    /// execution diverged, and the node's own record stays.
+    /// own record 1 is counted and stops the collection: the pass, a gap retry and the critical
+    /// record collector all end with the error that says this node's execution diverged, and the
+    /// node's own record stays.
     #[tokio::test]
     async fn test_collect_epoch_records_counts_and_stops_on_a_conflicting_certified_record(
     ) -> eyre::Result<()> {
@@ -2210,16 +2116,14 @@ mod tests {
             text.contains("epoch 1") && text.contains("diverged")
         };
 
-        for switches in [EpochRecordCollectSwitches::default(), WALK] {
-            let mut collection = Collection::new(switches, &metrics);
-            let err = collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection)
-                .await
-                .expect_err("a conflicting certified record ends the pass");
-            assert!(diverged(&err), "unexpected error: {err:#}");
-            assert_eq!(counters(&snapshotter).get(CONFLICTS), Some(&1), "{switches:?}");
-        }
+        let mut collection = Collection::new(&metrics);
+        let err = collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection)
+            .await
+            .expect_err("a conflicting certified record ends the pass");
+        assert!(diverged(&err), "unexpected error: {err:#}");
+        assert_eq!(counters(&snapshotter).get(CONFLICTS), Some(&1));
 
-        let mut walking = Collection::new(WALK, &metrics);
+        let mut walking = Collection::new(&metrics);
         walking.gaps.insert(1);
         let shutdown = tn_types::ShutdownNotifier::new();
         let err = retry_gaps(&chain, &handle, bus.app(), &mut walking, &shutdown.subscribe())
@@ -2237,7 +2141,6 @@ mod tests {
             bus.app().clone(),
             task_manager.get_spawner(),
             shutdown.subscribe(),
-            EpochRecordCollectSwitches::default(),
             metrics,
         )
         .await?;
@@ -2253,60 +2156,37 @@ mod tests {
         Ok(())
     }
 
-    /// The startup sync runs under the same switch, read from [`Parameters`]: with the walk on it
-    /// stores the certified records past this node's own uncertified epoch 1 and with it off it
-    /// stops there; a conflicting certified record fails it either way.
+    /// The startup sync stores the certified records past this node's own uncertified epoch 1, and
+    /// a conflicting certified record fails it.
     #[tokio::test]
-    async fn test_startup_sync_walks_under_the_switch_and_stops_on_a_conflict() -> eyre::Result<()>
-    {
+    async fn test_startup_sync_walks_past_its_own_uncertified_epoch_and_stops_on_a_conflict(
+    ) -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let (keys, signers) = keys_and_signers(&fixture);
         let bus = ConsensusBus::new();
         let shutdown = tn_types::ShutdownNotifier::new();
-        for walk in [false, true] {
-            let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 3).await?;
-            let handle = mock_epoch_record_network(served(&records, &[2, 3]), keys[0], 1);
-            let parameters =
-                Parameters { epoch_record_collect_past_uncertified: walk, ..Parameters::default() };
-            sync_epoch_records_to_tip(
-                &chain,
-                &handle,
-                bus.app(),
-                shutdown.subscribe(),
-                &parameters,
-            )
-            .await?;
-            let stored3 = chain.epochs().get_epoch_by_number(3).await;
-            assert_eq!(stored3.is_some(), walk, "walk {walk}");
-        }
+        let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 3).await?;
+        let handle = mock_epoch_record_network(served(&records, &[2, 3]), keys[0], 1);
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await?;
+        let stored3 = chain.epochs().get_epoch_by_number(3).await;
+        assert!(stored3.is_some(), "the walk stores the record of epoch 3");
 
-        for walk in [false, true] {
-            let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 1).await?;
-            let mut theirs = records[1].0.clone();
-            theirs.final_state.number = 7;
-            let cert = make_cert(&theirs, &signers, &[0, 1, 2]);
-            let handle =
-                mock_epoch_record_network(HashMap::from([(1, (theirs, cert))]), keys[0], 1);
-            let parameters =
-                Parameters { epoch_record_collect_past_uncertified: walk, ..Parameters::default() };
-            let err = sync_epoch_records_to_tip(
-                &chain,
-                &handle,
-                bus.app(),
-                shutdown.subscribe(),
-                &parameters,
-            )
+        let (_directory, chain, records) = own_uncertified_epoch1(&fixture, 1).await?;
+        let mut theirs = records[1].0.clone();
+        theirs.final_state.number = 7;
+        let cert = make_cert(&theirs, &signers, &[0, 1, 2]);
+        let handle = mock_epoch_record_network(HashMap::from([(1, (theirs, cert))]), keys[0], 1);
+        let err = sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe())
             .await
             .expect_err("a conflicting certified record fails startup");
-            assert!(format!("{err:#}").contains("diverged"), "walk {walk}: {err:#}");
-        }
+        assert!(format!("{err:#}").contains("diverged"), "{err:#}");
         Ok(())
     }
 
     /// Every conflicting certified record a collection meets is counted in
     /// `tn_state_sync.epoch_record_conflicts_total` and then handed to [`stop_on_local_failure`],
-    /// which counts it in `tn_epoch.final_state_mismatches_total` and stops the node, with the walk
-    /// off or on; any other refusal is neither counted as a conflict nor fatal.
+    /// which counts it in `tn_epoch.final_state_mismatches_total` and stops the node; any other
+    /// refusal is neither counted as a conflict nor fatal.
     #[tokio::test]
     async fn test_every_conflict_reaches_the_final_state_mismatch_stop() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -2321,21 +2201,19 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let _recorder_guard = ::metrics::set_default_local_recorder(&recorder);
         let metrics = StateSyncMetrics::new_with_labels(Vec::<::metrics::Label>::new());
-        for switches in [EpochRecordCollectSwitches::default(), WALK] {
-            let collection = Collection::new(switches, &metrics);
-            let conflict = EpochDbError::ConflictingRecord { epoch: 1, stored, offered };
-            let err = collection
-                .refused(conflict, 1, keys[0], (&theirs, &cert), &chain)
-                .await
-                .expect_err("a conflict stops the node");
-            assert!(format!("{err:#}").contains("diverged"), "unexpected error: {err:#}");
-            let mismatch = EpochDbError::CertificateMismatch { record: offered, certified: stored };
-            let refused = collection.refused(mismatch, 1, keys[0], (&theirs, &cert), &chain).await;
-            assert!(refused.is_ok(), "{switches:?}: {refused:?}");
-        }
+        let collection = Collection::new(&metrics);
+        let conflict = EpochDbError::ConflictingRecord { epoch: 1, stored, offered };
+        let err = collection
+            .refused(conflict, 1, keys[0], (&theirs, &cert), &chain)
+            .await
+            .expect_err("a conflict stops the node");
+        assert!(format!("{err:#}").contains("diverged"), "unexpected error: {err:#}");
+        let mismatch = EpochDbError::CertificateMismatch { record: offered, certified: stored };
+        let refused = collection.refused(mismatch, 1, keys[0], (&theirs, &cert), &chain).await;
+        assert!(refused.is_ok(), "{refused:?}");
         let counted = counters(&snapshotter);
-        assert_eq!(counted.get(CONFLICTS), Some(&2));
-        assert_eq!(counted.get(FINAL_STATE_MISMATCHES), Some(&2));
+        assert_eq!(counted.get(CONFLICTS), Some(&1));
+        assert_eq!(counted.get(FINAL_STATE_MISMATCHES), Some(&1));
         Ok(())
     }
 
@@ -2371,7 +2249,7 @@ mod tests {
         let bus = ConsensusBus::new();
         let (metrics, _snapshotter) = local_metrics();
 
-        let mut collection = Collection::new(EpochRecordCollectSwitches::default(), &metrics);
+        let mut collection = Collection::new(&metrics);
         let (collected, lines) =
             lines_of(collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection)).await;
         let err = collected.expect_err("a conflicting certified record stops the collection");
@@ -2415,7 +2293,7 @@ mod tests {
         // two signers of four: the certificate fails validation
         let short = make_cert(&theirs, &signers, &[0, 1]);
         let handle = mock_epoch_record_network(HashMap::from([(1, (theirs, short))]), peer, 1);
-        let mut collection = walk_off();
+        let mut collection = new_collection();
         let (collected, lines) =
             lines_of(collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection)).await;
         assert_eq!(collected?, CollectedPass { epoch: 0, definitive: true });
@@ -2449,7 +2327,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let _recorder_guard = ::metrics::set_default_local_recorder(&recorder);
         let metrics = StateSyncMetrics::new_with_labels(Vec::<::metrics::Label>::new());
-        let collection = Collection::new(EpochRecordCollectSwitches::default(), &metrics);
+        let collection = Collection::new(&metrics);
         let stop = "a certified epoch record from peers conflicts with this node's own record";
 
         let conflict = EpochDbError::ConflictingRecord { epoch: 1, stored, offered };
@@ -2515,7 +2393,6 @@ mod tests {
             bus.app().clone(),
             task_manager.get_spawner(),
             collector_shutdown.subscribe(),
-            WALK,
             metrics,
         )
         .await?;
@@ -2558,7 +2435,7 @@ mod tests {
             mock_changing_network(Default::default(), Default::default(), peer, requests_tx);
         let bus = ConsensusBus::new();
         let (metrics, _snapshotter) = local_metrics();
-        let mut collection = Collection::new(WALK, &metrics);
+        let mut collection = Collection::new(&metrics);
         collection.gaps.extend([1, 5]);
         let shutdown = tn_types::ShutdownNotifier::new();
 
@@ -2605,7 +2482,7 @@ mod tests {
         let handle = mock_epoch_record_network(answers, keys[0], 1);
         let bus = ConsensusBus::new();
         let (metrics, snapshotter) = local_metrics();
-        let mut collection = Collection::new(WALK, &metrics);
+        let mut collection = Collection::new(&metrics);
 
         let collected =
             collect_epoch_records(0, &chain, &handle, bus.app(), &mut collection).await?;
@@ -2623,10 +2500,10 @@ mod tests {
         Ok(())
     }
 
-    /// A walk that does not land is not repeated on every wake-up: right after one, a pass from
-    /// the same epoch stops at the walked epoch as with the walk off, and the walk is tried again
-    /// once a retry interval has passed. Here no peer holds a certified record of epoch 1 (this
-    /// node's own, uncertified) or of epoch 2.
+    /// A walk that does not land is not repeated on every wake-up: right after one, a pass from the
+    /// same epoch stops at the walked epoch, and the walk is tried again once a retry interval has
+    /// passed. Here no peer holds a certified record of epoch 1 (this node's own, uncertified) or
+    /// of epoch 2.
     #[tokio::test(start_paused = true)]
     async fn test_a_walk_that_does_not_land_waits_a_retry_interval() -> eyre::Result<()> {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -2637,7 +2514,7 @@ mod tests {
             mock_changing_network(Default::default(), Default::default(), peer, requests_tx);
         let bus = ConsensusBus::new();
         let (metrics, _snapshotter) = local_metrics();
-        let mut collection = Collection::new(WALK, &metrics);
+        let mut collection = Collection::new(&metrics);
         let stopped = CollectedPass { epoch: 0, definitive: true };
 
         assert_eq!(
@@ -2698,7 +2575,7 @@ mod tests {
         let handle = PrimaryNetworkHandle::new_for_test(tx);
         let bus = ConsensusBus::new();
         let (metrics, _snapshotter) = local_metrics();
-        let mut collection = Collection::new(WALK, &metrics);
+        let mut collection = Collection::new(&metrics);
         collection.gaps.extend([1, 2]);
         let shutdown = tn_types::ShutdownNotifier::new();
 

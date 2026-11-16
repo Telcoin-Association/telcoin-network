@@ -270,9 +270,9 @@ where
     /// config's epoch.
     ///
     /// Fails when `vote_timeout` is shorter than `max_header_delay` plus the voter's longest drift
-    /// wait, does not exceed the voter's 1 s execution wait ([`VOTE_EXECUTION_WAIT`]), or is not
-    /// below the libp2p request timeout, alone or, with `vote_queue_fix` on, plus that execution
-    /// wait. The drift wait depends on the epoch's fork regime: with sub-second timestamps active
+    /// wait, does not exceed the voter's 1 s execution wait ([`VOTE_EXECUTION_WAIT`]), or with
+    /// that execution wait added is not below the libp2p request timeout. The drift wait depends
+    /// on the epoch's fork regime: with sub-second timestamps active
     /// it is the network config's `max_header_time_drift_tolerance`, and without them the voter
     /// compares whole seconds and waits out the tolerance rounded up to whole seconds. The same
     /// parameters can therefore pass for a post-fork epoch and fail for a pre-fork one. Also
@@ -502,14 +502,12 @@ fn validate_epoch_timing(
 /// starts, so at or below the wait the vote timeout fires while a voter behind on execution is
 /// still waiting, and the requester never sees the quick recoverable refusal that wait exists for.
 ///
-/// The upper bound is [`LIBP2P_REQUEST_TIMEOUT`], exclusive: at or above it the transport cancels
-/// a slow vote before `vote_timeout` can fire. The transport also counts the time to read and
-/// dispatch the request, so a value just below the bound leaves little margin.
-///
-/// With `vote_queue_fix` on, the voter waits up to [`VOTE_EXECUTION_WAIT`] for execution before
-/// it takes the author lock and starts the vote timeout, so `vote_timeout` plus that wait must
-/// also stay below [`LIBP2P_REQUEST_TIMEOUT`]. Neither bound counts the time a request waits for
-/// the author lock behind the same author's earlier requests.
+/// The voter waits up to [`VOTE_EXECUTION_WAIT`] for execution before it takes the author lock
+/// and starts the vote timeout, so the upper bound is `vote_timeout` plus that wait below
+/// [`LIBP2P_REQUEST_TIMEOUT`], exclusive: at or above it the transport cancels a slow vote before
+/// `vote_timeout` can fire. The transport also counts the time to read and dispatch the request,
+/// so a value just below the bound leaves little margin. Neither bound counts the time a request
+/// waits for the author lock behind the same author's earlier requests.
 fn validate_vote_timeout(
     parameters: &Parameters,
     sync_config: &SyncConfig,
@@ -545,30 +543,19 @@ fn validate_vote_timeout(
         VOTE_EXECUTION_WAIT,
         VOTE_EXECUTION_WAIT,
     );
-    // with the switch on this comes before the check below, so a vote_timeout at or past the
-    // transport timeout is told the lower ceiling that applies to it
-    if parameters.vote_queue_fix {
-        // saturating, as above: an overflowing sum is refused, not a panic
-        let prelock_bound = parameters.vote_timeout.saturating_add(VOTE_EXECUTION_WAIT);
-        eyre::ensure!(
-            prelock_bound < LIBP2P_REQUEST_TIMEOUT,
-            "vote_timeout {:?} plus the voter's execution wait before the author lock \
-             VOTE_EXECUTION_WAIT {:?} is {:?}, which must stay below the libp2p request timeout \
-             {:?} while vote_queue_fix is on, or the transport cancels a slow vote before \
-             vote_timeout fires; lower vote_timeout below {:?} or turn vote_queue_fix off",
-            parameters.vote_timeout,
-            VOTE_EXECUTION_WAIT,
-            prelock_bound,
-            LIBP2P_REQUEST_TIMEOUT,
-            LIBP2P_REQUEST_TIMEOUT.saturating_sub(VOTE_EXECUTION_WAIT),
-        );
-    }
+    // saturating, as above: an overflowing sum is refused, not a panic
+    let prelock_bound = parameters.vote_timeout.saturating_add(VOTE_EXECUTION_WAIT);
     eyre::ensure!(
-        parameters.vote_timeout < LIBP2P_REQUEST_TIMEOUT,
-        "vote_timeout {:?} must stay below the libp2p request timeout {:?}, which otherwise \
-         cancels a slow vote before vote_timeout fires; lower vote_timeout",
+        prelock_bound < LIBP2P_REQUEST_TIMEOUT,
+        "vote_timeout {:?} plus the voter's execution wait before the author lock \
+         VOTE_EXECUTION_WAIT {:?} is {:?}, which must stay below the libp2p request timeout \
+         {:?}, or the transport cancels a slow vote before vote_timeout fires; lower \
+         vote_timeout below {:?}",
         parameters.vote_timeout,
+        VOTE_EXECUTION_WAIT,
+        prelock_bound,
         LIBP2P_REQUEST_TIMEOUT,
+        LIBP2P_REQUEST_TIMEOUT.saturating_sub(VOTE_EXECUTION_WAIT),
     );
     Ok(())
 }
@@ -780,34 +767,6 @@ mod tests {
         .expect("a whole-second tolerance is not rounded further");
     }
 
-    /// A `vote_timeout` at or above the libp2p request timeout is rejected whether or not
-    /// sub-second timestamps are active, and anything below it that covers the header window is
-    /// accepted.
-    #[test]
-    fn vote_timeout_must_stay_below_the_libp2p_request_timeout() {
-        for subsecond_active in [true, false] {
-            for vote_timeout in [LIBP2P_REQUEST_TIMEOUT, LIBP2P_REQUEST_TIMEOUT * 2] {
-                let err = validate_vote_timeout(
-                    &two_second_rounds(vote_timeout),
-                    &tolerance_ms(250),
-                    subsecond_active,
-                )
-                .expect_err("the transport would cancel the vote first");
-                assert!(
-                    err.to_string().contains("libp2p request timeout"),
-                    "subsecond_active {subsecond_active}, {vote_timeout:?}: {err}"
-                );
-            }
-            let just_below = LIBP2P_REQUEST_TIMEOUT - Duration::from_millis(1);
-            validate_vote_timeout(
-                &two_second_rounds(just_below),
-                &tolerance_ms(250),
-                subsecond_active,
-            )
-            .expect("just below the transport timeout must be accepted");
-        }
-    }
-
     /// A `vote_timeout` that covers the header window but does not exceed [`VOTE_EXECUTION_WAIT`]
     /// is rejected, since the vote timeout would fire before a voter behind on execution refuses;
     /// one just above the wait is accepted.
@@ -830,21 +789,17 @@ mod tests {
             .expect("a vote_timeout above the execution wait must be accepted");
     }
 
-    /// With `vote_queue_fix` on, the voter waits up to [`VOTE_EXECUTION_WAIT`] before the author
-    /// lock and only then starts the vote timeout, so `vote_timeout` plus that wait must stay below
-    /// the libp2p request timeout. A `vote_timeout` that reaches the bound with the wait added is
-    /// refused with the switch on and accepted with it off; one just under the bound is accepted.
-    /// With the switch on, one at or past the transport timeout is told the lower bound too.
+    /// The voter waits up to [`VOTE_EXECUTION_WAIT`] before the author lock and only then starts
+    /// the vote timeout, so `vote_timeout` plus that wait must stay below the libp2p request
+    /// timeout. A `vote_timeout` that reaches the bound with the wait added is refused, and one at
+    /// or past the transport timeout is told the lower bound too; one just under the bound is
+    /// accepted.
     #[test]
-    fn vote_queue_fix_keeps_vote_timeout_plus_the_prelock_wait_below_the_request_timeout() {
+    fn vote_timeout_plus_the_prelock_wait_stays_below_the_request_timeout() {
         let bound = LIBP2P_REQUEST_TIMEOUT - VOTE_EXECUTION_WAIT;
-        let params = |vote_timeout, vote_queue_fix| Parameters {
-            vote_queue_fix,
-            ..two_second_rounds(vote_timeout)
-        };
-        let refused_on = |vote_timeout, subsecond_active| {
+        let refused = |vote_timeout, subsecond_active| {
             let err = validate_vote_timeout(
-                &params(vote_timeout, true),
+                &two_second_rounds(vote_timeout),
                 &tolerance_ms(250),
                 subsecond_active,
             )
@@ -856,34 +811,32 @@ mod tests {
         };
         for subsecond_active in [true, false] {
             for vote_timeout in [bound, LIBP2P_REQUEST_TIMEOUT - Duration::from_millis(1)] {
-                refused_on(vote_timeout, subsecond_active);
-                validate_vote_timeout(
-                    &params(vote_timeout, false),
-                    &tolerance_ms(250),
-                    subsecond_active,
-                )
-                .expect("with the switch off only the transport timeout bounds vote_timeout");
+                refused(vote_timeout, subsecond_active);
             }
-            refused_on(LIBP2P_REQUEST_TIMEOUT, subsecond_active);
+            refused(LIBP2P_REQUEST_TIMEOUT, subsecond_active);
+            refused(LIBP2P_REQUEST_TIMEOUT * 2, subsecond_active);
             let just_under = bound - Duration::from_millis(1);
-            validate_vote_timeout(&params(just_under, true), &tolerance_ms(250), subsecond_active)
-                .expect("just under the bound with the wait added must be accepted");
+            validate_vote_timeout(
+                &two_second_rounds(just_under),
+                &tolerance_ms(250),
+                subsecond_active,
+            )
+            .expect("just under the bound with the wait added must be accepted");
         }
     }
 
     /// The default parameters and both shipped `parameters.yaml` presets pass the epoch timing
-    /// check with `vote_queue_fix` on.
+    /// check.
     #[test]
-    fn default_and_shipped_timing_pass_with_vote_queue_fix() {
-        let default = Parameters { vote_queue_fix: true, ..Default::default() };
+    fn default_and_shipped_timing_pass() {
+        let default = Parameters::default();
         validate_epoch_timing(&default, &SyncConfig::default(), 0)
             .expect("the default vote_timeout plus the wait before the lock must pass");
         for (name, yaml) in [("mainnet", MAINNET_PARAMETERS), ("adiri", TESTNET_PARAMETERS)] {
             let preset: Parameters = serde_yaml::from_str(yaml)
                 .unwrap_or_else(|e| panic!("{name} parameters.yaml must parse: {e}"));
-            let params = Parameters { vote_queue_fix: true, ..preset };
-            validate_epoch_timing(&params, &SyncConfig::default(), 0)
-                .unwrap_or_else(|e| panic!("{name} preset must pass with vote_queue_fix on: {e}"));
+            validate_epoch_timing(&preset, &SyncConfig::default(), 0)
+                .unwrap_or_else(|e| panic!("{name} preset must pass: {e}"));
         }
     }
 

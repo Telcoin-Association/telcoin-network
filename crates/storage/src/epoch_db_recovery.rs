@@ -214,8 +214,8 @@ fn scan_table<T: Table, DB: RawRows>(
              directory `{}` under the datadir, which holds only the epoch in progress (keep \
              `consensus-db/epochs` and `db`), and start again once the network has closed that \
              epoch, since the directory also held this node's guards against voting or proposing \
-             twice in it; or restore the node into a fresh datadir from a state export bundle \
-             with `db load-state`",
+             twice in it; or, also once the network has closed that epoch, restore the node \
+             into a fresh datadir from a state export bundle with `db load-state`",
             row.table,
             row.rows,
             row.key,

@@ -1,15 +1,14 @@
 //! Fleet helpers the stack's e2e tests share.
 //!
 //! [`Fleet`] starts four validators as processes, each with an RPC and a metrics endpoint, and
-//! [`Load`] drives transfers through every node. [`assert_switches`] checks the `node switches`
-//! line of a node against [`expected_switches`], which reads the switch lists here, and
-//! [`Fleet::assert_no_fatal_log`] checks a node's log for the lines of [`FATAL_LOGS`].
+//! [`Load`] drives transfers through every node. [`Fleet::assert_no_fatal_log`] checks a node's
+//! log for the lines of [`FATAL_LOGS`].
 //! [`node_epoch`], [`wait_for_epoch_on_all`] and [`assert_epoch_records`] read the epochs and their
 //! certified records.
 
 use super::common::{
-    address_from_word, call_rpc, get_block, get_block_number, get_key, node_log_lines,
-    scrape_metric_value, send_tel, start_validator_with_overrides, ProcessGuard,
+    address_from_word, call_rpc, get_block, get_block_number, get_key, node_log_lines, send_tel,
+    start_validator_with_overrides, ProcessGuard,
 };
 use alloy::{primitives::utils::parse_ether, providers::ProviderBuilder};
 use e2e_tests::{
@@ -42,8 +41,7 @@ pub(crate) const EXECUTION_DELAY_ENV: &str = "TN_TEST_EXECUTION_DELAY_MS";
 /// header names only after the fast node has moved on, and shorter than the commit interval, so
 /// the slow nodes keep pace and trail the fast node by one or two outputs, inside the quorum rule's
 /// floor of eight ring entries. A delay longer than the commit interval makes the slow nodes' lag
-/// grow without bound; past the floor the fix cannot help by design (measured at the quick cadence:
-/// the adaptive arm then certified 0.59 of the fast node's headers, nearly all named at the floor).
+/// grow without bound; past the floor the quorum rule cannot help by design.
 pub(crate) const SLOW_EXECUTION_DELAY_MS: u64 = 1750;
 
 /// Time limit for the first transfers of every load thread to be accepted.
@@ -51,9 +49,6 @@ pub(crate) const LOAD_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Time limit for every node to execute up to the highest head seen when the load stopped.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Time limit for a node's `node switches` line to appear once it was started.
-const SWITCHES_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The error a voter logs when a header names a block its own execution contradicts: the canary
 /// the proposer fix must keep alive and silent.
@@ -94,51 +89,6 @@ pub(crate) const FATAL_LOGS: [&str; 5] =
 
 /// The passphrase [`start_validator_with_overrides`] gives every node.
 pub(crate) const PASSPHRASE: &str = "restart_test";
-
-/// Every runtime switch of the node turned on, as `parameters.yaml` entries, in the order of the
-/// node's `runtime_switches!` list (`crates/config/src/node.rs`).
-///
-/// A switch that arrives later adds its entry at the end, here and in [`STACK_SWITCHES_OFF`].
-pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 6] = [
-    ("quorum_exec_block", "true"),
-    ("quorum_exec_block_starved_rounds", "4"),
-    ("epoch_record_recertify", "true"),
-    ("epoch_record_collect_past_uncertified", "true"),
-    ("vote_queue_fix", "true"),
-    ("digest_order_hold", "true"),
-];
-
-/// Every runtime switch of the node at its default, as the `node switches` line renders it, in the
-/// order of [`STACK_SWITCHES_ON`].
-pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 6] = [
-    ("quorum_exec_block", "false"),
-    ("quorum_exec_block_starved_rounds", "0"),
-    ("epoch_record_recertify", "false"),
-    ("epoch_record_collect_past_uncertified", "false"),
-    ("vote_queue_fix", "false"),
-    ("digest_order_hold", "false"),
-];
-
-/// What the `node switches` line of a node given the switch entries `given` must show: every
-/// switch of [`STACK_SWITCHES_OFF`], with the value of `given` where it names the switch.
-///
-/// An entry of `given` that names no switch of the list is an error: the node would ignore the key
-/// and the test would check nothing for it.
-pub(crate) fn expected_switches(
-    given: &[(&'static str, &'static str)],
-) -> eyre::Result<Vec<(&'static str, &'static str)>> {
-    let unknown = given
-        .iter()
-        .filter(|(key, _)| STACK_SWITCHES_OFF.iter().all(|(k, _)| k != key))
-        .collect::<Vec<_>>();
-    eyre::ensure!(unknown.is_empty(), "entries {unknown:?} name no switch of STACK_SWITCHES_OFF");
-    Ok(STACK_SWITCHES_OFF
-        .iter()
-        .map(|(key, default)| {
-            given.iter().find(|(k, _)| k == key).copied().unwrap_or((*key, *default))
-        })
-        .collect())
-}
 
 /// The node's own defaults for its header and batch cadence, in place of the e2e harness's quick
 /// one (headers every 250 to 500 ms, batches every 250 ms).
@@ -311,14 +261,6 @@ impl Fleet {
         Ok(())
     }
 
-    /// Node `node`'s epoch-record collector has found no certified record of the network that
-    /// differs from its own ([`RECORD_CONFLICTS`] is zero) since the node last started.
-    pub(crate) fn assert_no_record_conflicts(&self, node: usize) -> eyre::Result<()> {
-        let conflicts = scrape_metric_value(&self.metrics[node], RECORD_CONFLICTS)?;
-        eyre::ensure!(conflicts == 0.0, "node {node} counted {conflicts} epoch record conflicts");
-        Ok(())
-    }
-
     /// Node `node`'s run-`run` log has no line of [`FATAL_LOGS`].
     pub(crate) fn assert_no_fatal_log(&self, node: usize, run: u32) -> eyre::Result<()> {
         FATAL_LOGS.iter().try_for_each(|text| self.assert_no_log(node, run, text))
@@ -335,90 +277,6 @@ fn block_hash(url: &str, height: u64) -> eyre::Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| eyre::eyre!("block {height} on {url} has no hash"))
-}
-
-/// The message of the line a node logs once at start with every runtime switch and its value.
-const SWITCHES_LOG: &str = "node switches";
-
-/// Wait until node `node`'s run-`run` log of `test` has a `node switches` line, then check that it
-/// shows every `(key, value)` of `expected` and no other switch. A duration is compared by value.
-///
-/// A switch the line shows that `expected` does not name fails the check: the switch lists here
-/// must name every switch the node has, or a fleet meant to run all of them silently runs one at
-/// its default.
-pub(crate) fn assert_switches(
-    test: &str,
-    node: usize,
-    run: u32,
-    expected: &[(&str, &str)],
-) -> eyre::Result<()> {
-    let find = |lines: Vec<String>| lines.into_iter().find(|l| l.contains(SWITCHES_LOG));
-    wait_until_blocking(SWITCHES_LINE_TIMEOUT, "a `node switches` line", || {
-        Ok(find(node_log_lines(test, node, run)?).is_some())
-    })
-    .wrap_err_with(|| format!("node {node} run {run} of {test}"))?;
-    let line = find(node_log_lines(test, node, run)?)
-        .ok_or_else(|| eyre::eyre!("node {node} run {run} lost its `node switches` line"))?;
-    let fields = line.split_once(SWITCHES_LOG).map_or("", |(_, fields)| fields);
-    let shown = switch_fields(fields);
-    for (key, value) in expected {
-        let (_, shown) = shown
-            .iter()
-            .find(|(k, _)| k == key)
-            .ok_or_else(|| eyre::eyre!("node {node} run {run} shows no `{key}` in: {line}"))?;
-        let same = match (duration_nanos(value), duration_nanos(shown)) {
-            (Some(want), Some(got)) => want == got,
-            _ => shown == value,
-        };
-        eyre::ensure!(same, "node {node} run {run} shows {key}={shown}, it was given {value}");
-    }
-    let unlisted =
-        shown.iter().filter(|(key, _)| expected.iter().all(|(k, _)| k != key)).collect::<Vec<_>>();
-    eyre::ensure!(
-        unlisted.is_empty(),
-        "node {node} run {run} runs switches the lists here do not name: {unlisted:?}; add them to \
-         STACK_SWITCHES_ON and STACK_SWITCHES_OFF"
-    );
-    Ok(())
-}
-
-/// The `key=value` fields of a `node switches` line after its message, each value running to the
-/// next field, so a humantime duration printed in parts (`2s 500ms`) reads whole.
-fn switch_fields(fields: &str) -> Vec<(String, String)> {
-    let mut parsed: Vec<(String, String)> = Vec::new();
-    for token in fields.split_whitespace() {
-        match (token.split_once('='), parsed.last_mut()) {
-            (Some((key, value)), _) => parsed.push((key.to_owned(), value.to_owned())),
-            (None, Some((_, value))) => {
-                value.push(' ');
-                value.push_str(token);
-            }
-            (None, None) => {}
-        }
-    }
-    parsed
-}
-
-/// Nanoseconds of a humantime duration made of `<number><unit>` parts (`150ms`, `2s 500ms`,
-/// `1m`), `None` for any other text.
-fn duration_nanos(text: &str) -> Option<u128> {
-    const UNITS: [(&str, u128); 6] = [
-        ("ns", 1),
-        ("us", 1_000),
-        ("ms", 1_000_000),
-        ("s", 1_000_000_000),
-        ("m", 60_000_000_000),
-        ("h", 3_600_000_000_000),
-    ];
-    text.split_whitespace()
-        .map(|part| {
-            let digits = part.find(|c: char| !c.is_ascii_digit()).filter(|&at| at > 0)?;
-            let (number, unit) = part.split_at(digits);
-            let scale = UNITS.iter().find(|(name, _)| *name == unit)?.1;
-            number.parse::<u128>().ok()?.checked_mul(scale)
-        })
-        .try_fold(0u128, |total, part| total.checked_add(part?))
-        .filter(|_| !text.trim().is_empty())
 }
 
 /// The value of the `name=value` field of a plain log line, without the quotes of a string field.
@@ -572,7 +430,3 @@ pub(crate) fn assert_epoch_records(
         Ok(())
     })
 }
-
-/// The prometheus counter of the certified records of the network a node's epoch-record collector
-/// found to differ from its own stored record.
-const RECORD_CONFLICTS: &str = "tn_state_sync_epoch_record_conflicts_total";

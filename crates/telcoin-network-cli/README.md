@@ -54,7 +54,7 @@ telcoin-network keytool generate observer \
     --address 0xYOUR_EXECUTION_ADDRESS
 ```
 
-Without `--external-*-addr` flags the listeners bind 127.0.0.1, which reaches only peers on the same host; an observer joining a public network binds every interface at startup, as [Run an observer against testnet](#run-an-observer-against-testnet) shows.
+Without `--external-*-addr` flags the listeners bind 127.0.0.1, so peers on other hosts cannot connect to the node; it still dials them, which is all an observer needs (see [Run an observer against testnet](#run-an-observer-against-testnet)).
 
 ### keytool generate flags
 
@@ -319,21 +319,11 @@ Generate a config and keys for your observer node:
 
 This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
 
-Find the two UDP ports keytool picked for the node's listeners, the primary's first and then worker 0's:
-`grep -o 'udp/[0-9]*' DATADIR/node-info.yaml`
+Start your observer node:
+`target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR`
 
-Start your observer node, binding those two ports on every interface:
-
-```bash
-PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/PRIMARY_PORT/quic-v1 \
-WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/WORKER_PORT/quic-v1 \
-target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR
-```
-
-keytool writes a 127.0.0.1 listener when no `--external-*-addr` flag is given, and a QUIC dial leaves from the listener's socket, which cannot send from 127.0.0.1 to a public address, so without the two variables every dial to the bootstrap peers times out and the node finds no peers.
-The variables change only what the node binds: the address it advertises stays the one in `node-info.yaml`.
-Binding 0.0.0.0 accepts inbound QUIC on those ports wherever a firewall allows it; an observer works outbound-only, so the firewall can drop inbound UDP.
-[Transport](../../docs/src/network/transport.md#listener-addresses) describes the override.
+keytool writes 127.0.0.1 listeners when no `--external-*-addr` flag is given. Peers on other hosts cannot connect to them, and an observer needs none to: it dials the bootstrap peers from a socket bound to every interface, so it works outbound-only and a firewall can drop inbound UDP.
+[Transport](../../docs/src/network/transport.md#listener-addresses) describes the listener addresses.
 
 Make sure DATADIR matches the config command above and use the same password for reading the key.
 
@@ -465,6 +455,10 @@ Complete tree after the node has run:
     epochs/                       #   per-epoch consensus packs, epoch records, certificate packs
 ```
 
+[Database commands](../../docs/src/getting-started/validator-operations.md#database-commands) lists
+the `telcoin-network db` commands: what each does and checks, whether it needs the node stopped, and
+whether it writes. Each prints the datadir it acts on to stderr first.
+
 `telcoin-network db stats` prints the static files and each table of the execution database:
 rows, pages and size. The default (tn-lmdb) build needs the node stopped: it refuses while a node
 holds the datadir, and holds the datadir while it runs, so a node started meanwhile is refused
@@ -480,8 +474,9 @@ anything opens it.
 
 `db load-state` writes `load-state-in-progress` into the datadir once it has found no chain data
 there, before it writes any, and removes it when the restore is complete. A run stopped part-way
-(killed, out of memory, power lost) leaves it, and the node refuses to start while it is there:
-the execution and consensus databases are incomplete. Run `db load-state` again with the same
+(killed, out of memory, power lost) leaves it, and the node refuses to start while it is there
+(`db reset-execution` and `db migrate-execution` refuse the datadir too): the execution and
+consensus databases are incomplete. Run `db load-state` again with the same
 bundle: it removes the chain data the stopped run created (`db/`, `static_files/`, `consensus-db/`
 and `restored-state-floor`) and restores again. Keys and config stay. If the stopped run wrote into
 a chain-data directory that was there before it, the rerun names it and stops: remove it, and the
@@ -498,14 +493,25 @@ build with the legacy `mdbx` feature refuses it.
 `telcoin-network db reset-execution --force` moves the execution database (`db/`, `static_files/`
 and `restored-state-floor`) into `execution-reset-<UTC time>/` under the datadir, so the next start
 rebuilds it from genesis in the storage layout new datadirs get; without `--force` it prints what
-would move. It refuses while a node holds the datadir. It also refuses a datadir whose consensus
-database holds a later epoch's pack and none for epoch 0, as a datadir bootstrapped with `db
-load-state` does (it holds consensus only from the restored epoch on): the rebuild replays epoch 0
-from the node's own packs, so the node could not start. Such a node rebuilds as a new one, with
-`consensus-db/` moved aside first; a validator rebuilt that way stays stopped until the network has
-closed the last epoch it took part in, because its votes and proposals for that epoch leave with
-`consensus-db/`. `--for-swap` skips this refusal for the side-observer swap, which copies a synced
-observer's execution database in and keeps `consensus-db/`. While a reset is unfinished (an `execution-reset-*.partial`
+would move. It refuses while a node holds the datadir. It also refuses, dry run included, a
+datadir whose consensus database lacks the pack of an epoch below the latest one it holds, at or
+below the epoch the node resumes from (its latest-consensus hint; a pack counts as the node's start
+finds it: the epoch's `data` log), as a datadir bootstrapped with `db load-state` does (it holds
+consensus only from the restored epoch on) and one that lost a past pack does: the rebuild
+re-executes every epoch from 0 from the node's own packs, and the node fetches only the packs of
+the epochs after the one it resumes from, so every start would stop at the gap. A pack missing
+after that epoch (a catch-up stopped while several pack imports ran) does not refuse: the next start
+fetches it from peers. Such a node puts back each missing past `epoch-N/` from a backup taken
+after that epoch closed (a sealed epoch's pack never changes; check the copy with `db validate`
+first), or rebuilds as a new one, with `consensus-db/` moved aside first. A validator whose whole `consensus-db/` is
+restored from a backup, or moved aside to rebuild as a new one, stays stopped until the network has
+closed the last epoch it took part in: the votes and proposals it made since the backup (or all of
+them) leave with the `consensus-db/` it replaces ([Consensus database
+backups](../../docs/src/getting-started/validator-operations.md#consensus-database-backups)).
+`--for-swap` skips this refusal for the side-observer swap, which copies a synced observer's
+execution database in and keeps `consensus-db/`. Both modes refuse a datadir an
+unfinished `db load-state` left (its `load-state-in-progress` marker), with the node's message:
+rerun `db load-state` with the same bundle instead. While a reset is unfinished (an `execution-reset-*.partial`
 directory holding an entry), the node, `db load-state`, `db stats`, `db check` and `db
 migrate-execution` refuse the datadir, and running the reset again finishes it. An empty one (left
 when the entries are moved back to undo an unfinished reset) blocks nothing. The layouts, the
@@ -651,7 +657,7 @@ The `parameters.yaml` file controls consensus timing and behavior. The node read
 | `max_header_num_of_batches`             | `10`     | Maximum batch digests per header                    |
 | `max_header_delay`                      | `2500ms` | Maximum wait time between header proposals          |
 | `min_header_delay`                      | `1000ms` | Minimum wait time; allows early header proposal     |
-| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + [`max_header_time_drift_tolerance`](#max_header_time_drift_tolerance-network-config) (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout (below 9 s with `vote_queue_fix` on) |
+| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + [`max_header_time_drift_tolerance`](#max_header_time_drift_tolerance-network-config) (rounded up to whole seconds pre-fork) and below 9 s: the 10 s libp2p request timeout less the voter's 1 s execution wait |
 | `gc_depth`                              | `50`     | Consensus rounds retained before garbage collection |
 | `sync_retry_delay`                      | `5s`     | Delay before retrying sync requests                 |
 | `sync_retry_nodes`                      | `3`      | Number of random committee nodes to query on retry  |
@@ -719,7 +725,7 @@ The only input to these checks that changes between epochs is whether the sub-se
 | `header_num_of_batches_threshold` from 1 to `max_header_num_of_batches`  | At 0 the proposer seals empty headers; above the maximum the two limits contradict each other                                                                                                        |
 | `min_header_delay` at most `max_header_delay`                            | The minimum is an early-proposal point inside the maximum's window; inverted, the maximum always expires first and the minimum never takes effect                                                   |
 | `vote_timeout` at least `max_header_delay` plus the voter's longest drift wait | A vote request must stay open for a full header cadence plus the time the voter may spend waiting out a future-dated header. The drift wait is `max_header_time_drift_tolerance` once the sub-second timestamp fork is active for the epoch, and the tolerance rounded up to whole seconds before it (1 s for the 250 ms default) |
-| `vote_timeout` below 10 s; below 9 s with `vote_queue_fix` on            | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires. With `vote_queue_fix` on, the voter waits up to 1 s for execution before it takes the author lock and starts `vote_timeout`, so that wait plus `vote_timeout` must stay below 10 s |
+| `vote_timeout` below 9 s                                                 | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires. The voter waits up to 1 s for execution before it takes the author lock and starts `vote_timeout`, so that wait plus `vote_timeout` must stay below 10 s |
 
 With `--chain adiri` or `--chain mainnet`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
 Neither preset sets `vote_timeout`, so it is 5 s.

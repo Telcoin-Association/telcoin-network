@@ -2639,7 +2639,7 @@ async fn full_report_queue_drops_the_report_without_stalling() {
     }
 }
 
-// ---- bench7 digest-order-hold ----
+// ---- the digest order hold ----
 
 /// How long the own-certificate hook holds a certificate in these tests: virtual time on the
 /// paused clock, shorter than [`STEP_TIMEOUT`] and [`QUIET_WINDOW`].

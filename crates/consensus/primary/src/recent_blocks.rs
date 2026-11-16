@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(wrapped.newest_at_or_below(14), None, "13 left the ring");
     }
 
-    // ---- bench7 quorum-exec-block ----
+    // ---- the quorum execution block ----
 
     /// `newest_before_epoch` reads each entry's epoch from its nonce and answers with the newest
     /// entry of an earlier epoch: the closing block of the epoch before, while the ring holds it.

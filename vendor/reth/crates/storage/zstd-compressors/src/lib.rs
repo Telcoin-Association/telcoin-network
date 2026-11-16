@@ -105,7 +105,11 @@ pub fn with_tx_compressor<R>(f: impl FnOnce(&mut Compressor<'_>) -> R) -> R {
 pub fn with_tx_decompressor<R>(f: impl FnOnce(&mut ReusableDecompressor) -> R) -> R {
     #[cfg(feature = "std")]
     {
-        TRANSACTION_DECOMPRESSOR.with_borrow_mut(f)
+        TRANSACTION_DECOMPRESSOR.with_borrow_mut(|decompressor| {
+            let result = f(decompressor);
+            decompressor.release_oversized_buffer();
+            result
+        })
     }
     #[cfg(not(feature = "std"))]
     {
@@ -131,13 +135,27 @@ pub fn with_receipt_compressor<R>(f: impl FnOnce(&mut Compressor<'_>) -> R) -> R
 pub fn with_receipt_decompressor<R>(f: impl FnOnce(&mut ReusableDecompressor) -> R) -> R {
     #[cfg(feature = "std")]
     {
-        RECEIPT_DECOMPRESSOR.with_borrow_mut(f)
+        RECEIPT_DECOMPRESSOR.with_borrow_mut(|decompressor| {
+            let result = f(decompressor);
+            decompressor.release_oversized_buffer();
+            result
+        })
     }
     #[cfg(not(feature = "std"))]
     {
         f(&mut create_receipt_decompressor())
     }
 }
+
+/// The largest buffer, in bytes, a thread-local decompressor keeps between calls.
+///
+/// TN(TN-0192): a buffer grows to the largest item decompressed into it, and the thread-local
+/// ones live as long as their thread. After a call that needed more than this, the buffer is
+/// shrunk back to it, so a thread keeps at most this much per decompressor whatever it decoded
+/// last. 128 KiB is the transaction pool's default limit on a transaction's encoded size
+/// (`DEFAULT_MAX_TX_INPUT_BYTES`), so every transaction the default pool admits, and the receipt
+/// of any ordinary transaction (a few KiB), is decoded without a reallocation.
+const MAX_RETAINED_BUFFER_CAPACITY: usize = 128 * 1024;
 
 /// Reusable decompressor that uses its own internal buffer.
 #[expect(missing_debug_implementations)]
@@ -191,6 +209,15 @@ impl ReusableDecompressor {
         &self.buf
     }
 
+    /// Shrinks the buffer to [`MAX_RETAINED_BUFFER_CAPACITY`] if a decompression grew it past
+    /// that. The next decompression grows it again as needed.
+    fn release_oversized_buffer(&mut self) {
+        if self.buf.capacity() > MAX_RETAINED_BUFFER_CAPACITY {
+            self.buf.clear();
+            self.buf.shrink_to(MAX_RETAINED_BUFFER_CAPACITY);
+        }
+    }
+
     #[track_caller]
     fn reserve(&mut self, additional: usize, src_len: usize) {
         if let Err(e) = self.buf.try_reserve(additional) {
@@ -231,5 +258,40 @@ mod tests {
         let decompressed = decompressor.decompress(&compressed);
 
         assert_eq!(decompressed, &*data);
+    }
+
+    /// Compresses `len` bytes that do not compress to nothing with `compressor`.
+    fn compressed_payload(compressor: &mut Compressor<'_>, len: usize) -> (Vec<u8>, Vec<u8>) {
+        let data: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let compressed = compressor.compress(&data).expect("compress");
+        (data, compressed)
+    }
+
+    // TN(TN-0192): the thread-local decompressors keep at most `MAX_RETAINED_BUFFER_CAPACITY`
+    // bytes between calls, and keep a buffer within it for reuse.
+    #[test]
+    fn thread_local_decompressors_release_oversized_buffers() {
+        let large = 4 * MAX_RETAINED_BUFFER_CAPACITY;
+        let small = MAX_RETAINED_BUFFER_CAPACITY / 2;
+
+        let (data, compressed) = compressed_payload(&mut create_receipt_compressor(), large);
+        let decoded = with_receipt_decompressor(|d| d.decompress(&compressed).to_vec());
+        assert_eq!(decoded, data);
+        let capacity = with_receipt_decompressor(|d| d.buf.capacity());
+        assert!(capacity <= MAX_RETAINED_BUFFER_CAPACITY, "receipt buffer kept {capacity} bytes");
+
+        let (data, compressed) = compressed_payload(&mut create_tx_compressor(), large);
+        let decoded = with_tx_decompressor(|d| d.decompress(&compressed).to_vec());
+        assert_eq!(decoded, data);
+        let capacity = with_tx_decompressor(|d| d.buf.capacity());
+        assert!(capacity <= MAX_RETAINED_BUFFER_CAPACITY, "tx buffer kept {capacity} bytes");
+
+        // A buffer within the limit is kept, and a shrunk buffer decodes a large item again.
+        let (data, compressed) = compressed_payload(&mut create_receipt_compressor(), small);
+        let decoded = with_receipt_decompressor(|d| d.decompress(&compressed).to_vec());
+        assert_eq!(decoded, data);
+        assert!(with_receipt_decompressor(|d| d.buf.capacity()) >= small);
+        let (data, compressed) = compressed_payload(&mut create_receipt_compressor(), large);
+        assert_eq!(with_receipt_decompressor(|d| d.decompress(&compressed).to_vec()), data);
     }
 }

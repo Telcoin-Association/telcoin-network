@@ -251,7 +251,7 @@ pub fn own_cert_delay() -> Option<OwnCertDelay> {
 /// and withholds that vote (no local count, no gossip) when it returns `Some`; the rest of the
 /// round runs as usual. Each call for the named epoch counts one round, from 1, and the first `n`
 /// rounds are withheld. A node signs for one record in the original round at the record's close,
-/// in the failsafe at the next close and, with the switch `epoch_record_recertify`, in the
+/// in the failsafe at the next close and in the
 /// re-certify picks of later closes, in that order. So `n` = 1 (the default) withholds the
 /// original round only, after which the failsafe can certify the record one close later; `n` = 2
 /// withholds the failsafe too; a large `n` keeps this node's vote off until it restarts without
@@ -682,8 +682,6 @@ mod tests {
         }
     }
 
-    // ---- bench7 digest-order-hold ----
-
     /// A hold of `ms` milliseconds at `stage` on every `every`-th round.
     fn hold(ms: u64, stage: OwnCertDelayStage, every: u32) -> OwnCertDelay {
         let every = NonZeroU32::new(every).expect("non-zero every");
@@ -783,8 +781,6 @@ mod tests {
             );
         }
     }
-
-    // ---- bench7 epoch-record-collector-hardening: withhold hook ----
 
     /// The withhold hook withholds the first rounds of the named epoch and no other. This is the
     /// only test in the crate that sets the two variables, and the values latch on first read, so

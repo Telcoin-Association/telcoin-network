@@ -68,7 +68,7 @@ use crate::{
         pack_iter::AsyncPackIter,
         position_index::index::{PosIndexValue, PositionIndex},
     },
-    pack_validate::CorruptionKind,
+    pack_validate::{lost_pack_remedy, CorruptionKind},
 };
 
 /// Current version for new pack files.
@@ -485,8 +485,9 @@ pub enum EpochRepair {
     /// write happened. The string describes what a repair would do.
     WouldRepair(String),
     /// The epoch is damaged in a way local repair cannot fix (a torn/corrupt epoch-meta, or
-    /// mid-log data corruption): the data is lost and the epoch must be re-synced from peers.
-    /// Nothing was written. The string is the operator-facing reason.
+    /// mid-log data corruption): the data is lost, and only a backup or starting the node over
+    /// brings it back ([`lost_pack_remedy`]). Nothing was written. The string is the
+    /// operator-facing reason, with that recovery.
     Unrepairable(String),
 }
 
@@ -510,8 +511,8 @@ pub enum EpochMigrate {
     /// The string describes what was done.
     Migrated(String),
     /// The legacy pack's data log is damaged and cannot be migrated without losing committed data;
-    /// nothing was written and the epoch must be re-synced from peers. The string is the
-    /// operator-facing reason.
+    /// nothing was written. The string is the operator-facing reason, with the recovery
+    /// ([`lost_pack_remedy`]).
     Corrupt(String),
 }
 
@@ -832,7 +833,7 @@ impl ConsensusPack {
     /// [`classify_physical_corruption`](crate::pack_validate::classify_physical_corruption) to
     /// decide whether a truncate-and-rebuild can recover it — a torn trailing record, or a
     /// physically-sound log whose sidecar indexes are missing/corrupt — or whether the damage
-    /// is a lost epoch-meta / mid-log corruption that only a re-sync can fix.
+    /// is a lost epoch-meta / mid-log corruption no local repair can fix ([`lost_pack_remedy`]).
     ///
     /// When repairable and `apply`, [`Self::open_append_exists`] truncates any torn tail and
     /// rebuilds every index from the data log, and the clean-close drop re-seals the pack; the
@@ -868,7 +869,8 @@ impl ConsensusPack {
                     if report.verdict != crate::pack_validate::Verdict::Valid {
                         return Ok(EpochRepair::Unrepairable(format!(
                             "epoch {epoch}: migrated to v2 but validation still reports damage; the \
-                             data itself is likely corrupt — re-sync the epoch from peers.\n{report}"
+                             data itself is likely corrupt. {}\n{report}",
+                            lost_pack_remedy(format!("epoch-{epoch}"))
                         )));
                     }
                     return Ok(EpochRepair::Repaired(what));
@@ -889,12 +891,23 @@ impl ConsensusPack {
             // An all-zero `data` file (a first write that sized the file but crashed before the
             // header was durable) is unwritten, not repairable: there is nothing to rebuild.
             // Report it with an actionable message rather than letting the classifier surface a
-            // bare open error.
+            // bare open error. The newest epoch's is harmless: the writable open that creates the
+            // epoch re-initializes it (`Pack::init_header`). A past epoch held outputs, now lost.
             Err(e) if e.is_unwritten_data_file() => {
-                return Ok(EpochRepair::Unrepairable(format!(
-                    "epoch {epoch}: the data file is all zeros (an interrupted first write); \
-                     remove `epoch-{epoch}/` -- it is recreated on the next epoch transition."
-                )));
+                return Ok(EpochRepair::Unrepairable(if has_later_epoch(epochs_dir, epoch)? {
+                    format!(
+                        "epoch {epoch}: the data file is all zeros, and a later epoch exists, so \
+                         this past epoch's outputs are lost. {}",
+                        lost_pack_remedy(format!("epoch-{epoch}"))
+                    )
+                } else {
+                    format!(
+                        "epoch {epoch}: the data file is all zeros (an interrupted first write \
+                         when the node created this epoch); it holds no output. It is the newest \
+                         epoch: the node re-initializes the file in place when it enters the \
+                         epoch at its next start, so nothing needs to be done."
+                    )
+                }));
             }
             // A failure the environment caused (descriptor or memory exhaustion) is no verdict:
             // it must not turn a healthy pack into a repair plan.
@@ -946,7 +959,8 @@ impl ConsensusPack {
                                 "epoch {epoch}: the data log has a logical defect a rebuild cannot \
                                  fix (a chain break, non-sequential number, missing/extra/unsorted \
                                  batches, an empty sub-dag, or an epoch-meta mismatch); the indexes \
-                                 are not the problem. Re-sync the epoch from peers.\n{}",
+                                 are not the problem. {}\n{}",
+                                lost_pack_remedy(format!("epoch-{epoch}")),
                                 validation.as_ref().map(ToString::to_string).unwrap_or_default()
                             )));
                         }
@@ -960,37 +974,49 @@ impl ConsensusPack {
                     "truncate the torn trailing record and rebuild indexes".to_string()
                 }
                 CorruptionKind::TornMetaEmpty => {
-                    return Ok(EpochRepair::Unrepairable(format!(
-                        "epoch {epoch}: the epoch-meta record is torn with no outputs behind it; the \
-                         committee cannot be reconstructed locally. Remove `epoch-{epoch}/` and \
-                         re-sync the epoch from peers."
-                    )));
+                    return Ok(EpochRepair::Unrepairable(if has_later_epoch(epochs_dir, epoch)? {
+                        format!(
+                            "epoch {epoch}: the epoch-meta record is torn with nothing behind it, \
+                             and a later epoch exists, so this past epoch's outputs are lost. {}",
+                            lost_pack_remedy(format!("epoch-{epoch}"))
+                        )
+                    } else {
+                        format!(
+                            "epoch {epoch}: the epoch-meta record is torn with no outputs behind \
+                             it; the committee cannot be reconstructed locally. It is the newest \
+                             epoch and holds no output: with the node stopped, remove \
+                             `epoch-{epoch}/`, and the node creates it again when it enters the \
+                             epoch."
+                        )
+                    }));
                 }
                 CorruptionKind::CorruptMetaWithData => {
                     return Ok(EpochRepair::Unrepairable(format!(
                         "epoch {epoch}: the epoch-meta is unreadable but complete outputs sit behind \
                          it (offset {}); those outputs are unreachable and truncation would lose \
-                         them. Re-sync the epoch from peers.",
-                        c.offset
+                         them. {}",
+                        c.offset,
+                        lost_pack_remedy(format!("epoch-{epoch}"))
                     )));
                 }
                 CorruptionKind::MidLogCorruption => {
                     return Ok(EpochRepair::Unrepairable(format!(
                         "epoch {epoch}: mid-log corruption at offset {} with valid records past it. \
-                         If this data was durably committed it cannot be recovered by truncation — \
-                         re-sync the epoch from peers. (Classification is conservative: for the \
-                         current/most-recent epoch an unacked partial write can look the same, and a \
-                         normal node restart runs full recovery, which may heal it.)",
-                        c.offset
+                         If this data was durably committed it cannot be recovered by truncation. \
+                         (Classification is conservative: for the current/most-recent epoch an \
+                         unacked partial write can look the same, and a normal node restart runs \
+                         full recovery, which may heal it.) {}",
+                        c.offset,
+                        lost_pack_remedy(format!("epoch-{epoch}"))
                     )));
                 }
                 CorruptionKind::CorruptSealedRecord => {
                     return Ok(EpochRepair::Unrepairable(format!(
                         "epoch {epoch}: a committed record failed its CRC in a cleanly-sealed pack \
                          at offset {}; the clean-close sentinel proves the log was complete, so this \
-                         is at-rest corruption (bit rot), not a truncatable tail. Re-sync the epoch \
-                         from peers.",
-                        c.offset
+                         is at-rest corruption (bit rot), not a truncatable tail. {}",
+                        c.offset,
+                        lost_pack_remedy(format!("epoch-{epoch}"))
                     )));
                 }
             },
@@ -1012,7 +1038,7 @@ impl ConsensusPack {
             // A read the disk failed, an OS failure ([`PackError::IO`], whatever its kind), or a
             // failure the environment caused (descriptor or memory exhaustion, a permission
             // problem) is no verdict on the pack: report it as an error to retry, not as data
-            // loss to re-sync.
+            // loss.
             Err(e)
                 if matches!(e, PackError::ReadError(_) | PackError::IO(_))
                     || e.is_environmental() =>
@@ -1022,7 +1048,8 @@ impl ConsensusPack {
             Err(e) => {
                 return Ok(EpochRepair::Unrepairable(format!(
                     "epoch {epoch}: the data log cannot be recovered without losing committed \
-                     data ({e}); nothing was changed. Re-sync the epoch from peers."
+                     data ({e}); nothing was changed. {}",
+                    lost_pack_remedy(format!("epoch-{epoch}"))
                 )));
             }
         }
@@ -1080,8 +1107,9 @@ impl ConsensusPack {
             }
             Err(e) => {
                 return Ok(EpochRepair::Unrepairable(format!(
-                    "epoch {epoch}: repair aborted, the data is damaged beyond truncation ({e}); \
-                     re-sync the epoch from peers."
+                    "epoch {epoch}: repair aborted, the data is damaged beyond truncation ({e}). \
+                     {}",
+                    lost_pack_remedy(format!("epoch-{epoch}"))
                 )));
             }
         }
@@ -1093,7 +1121,8 @@ impl ConsensusPack {
         if report.verdict != crate::pack_validate::Verdict::Valid {
             return Ok(EpochRepair::Unrepairable(format!(
                 "epoch {epoch}: rebuilt the indexes but validation still reports damage; the data \
-                 itself is likely corrupt — re-sync the epoch from peers.\n{report}"
+                 itself is likely corrupt. {}\n{report}",
+                lost_pack_remedy(format!("epoch-{epoch}"))
             )));
         }
         Ok(EpochRepair::Repaired(plan))
@@ -1112,10 +1141,10 @@ impl ConsensusPack {
     ///
     /// The source is validated as it is read: any record that fails to decode, a size-prefix that
     /// desyncs the walk past a committed output, or a v0 output whose batch count disagrees with
-    /// its header, yields [`EpochMigrate::Corrupt`] with nothing changed on disk (the operator
-    /// re-syncs). An unacked crash tail of the newest epoch's header-first log is dropped, exactly
-    /// as normal recovery would; a past epoch (a later `epoch-{M}` directory exists) was complete,
-    /// so any tail its replay cannot reach is refused as damage.
+    /// its header, yields [`EpochMigrate::Corrupt`] with nothing changed on disk (the recovery is
+    /// [`lost_pack_remedy`]'s). An unacked crash tail of the newest epoch's header-first log is
+    /// dropped, exactly as normal recovery would; a past epoch (a later `epoch-{M}` directory
+    /// exists) was complete, so any tail its replay cannot reach is refused as damage.
     ///
     /// Runs on the blocking pool: it is synchronous file work with no live actor, and can rewrite a
     /// large log, so it must not stall an async worker.
@@ -1925,12 +1954,17 @@ pub fn legacy_migration_dry_run(data_path: &Path, epoch: Epoch) -> Result<u64, S
 }
 
 /// Whether `epoch` is a past epoch of the pack tree in `epochs_dir`: an `epoch-{M}` directory with
-/// `M > epoch` exists there (the same "newest is current" rule `db repair` skips by). A past
-/// epoch's pack was complete when the next one began, so its legacy migration expects the whole
-/// log (see `Inner::migrate_consistent_end`); only the newest epoch can carry an unacked tail.
+/// `M > epoch` exists there, or an interrupted install of such an `M` (`epoch-{M}.replaced` with no
+/// `epoch-{M}`: [`interrupted_installs`](crate::consensus::ConsensusChain::interrupted_installs)),
+/// which the node's next start puts back (the same "newest is current" rule `db repair` skips
+/// by). A past epoch's pack was complete when the next one began, so its legacy migration expects
+/// the whole log (see `Inner::migrate_consistent_end`); only the newest epoch can carry an unacked
+/// tail.
 fn has_later_epoch(epochs_dir: &Path, epoch: Epoch) -> io::Result<bool> {
     let epochs_dir = if epochs_dir.as_os_str().is_empty() { Path::new(".") } else { epochs_dir };
-    Ok(ConsensusPack::epoch_dirs(epochs_dir)?.last().is_some_and(|&newest| newest > epoch))
+    let later = |epochs: Vec<Epoch>| epochs.last().is_some_and(|&newest| newest > epoch);
+    Ok(later(ConsensusPack::epoch_dirs(epochs_dir)?)
+        || later(crate::consensus::ConsensusChain::interrupted_installs(epochs_dir)?))
 }
 
 /// The byte offset just past the last COMPLETE consensus output in a pack's data log, computed by a
@@ -2535,7 +2569,7 @@ impl Inner {
     /// rather than healing, so recovery only runs on the writable append opens. Those may open
     /// a legacy v1 pack (the in-flight epoch at upgrade) as well as current v2 packs; both
     /// replay identically. An inconsistent v0 (batches-first) pack cannot be replayed and is
-    /// rejected up front with a re-sync message — see the guard below.
+    /// rejected up front as corrupt — see the guard below.
     fn recover_pack<P: AsRef<Path>>(
         data: &mut Pack<PackRecord>,
         base_dir: P,
@@ -2569,9 +2603,9 @@ impl Inner {
         if data.version() == 0 {
             return Err(PackError::CorruptPack(format!(
                 "epoch pack {} is a pre-mmap v0 (batches-first) log left inconsistent after an \
-                 unclean shutdown; it cannot be rebuilt by replay and must be re-synced from peers. \
-                 Do NOT delete the chain-data directories (`db`, `static_files`, `consensus-db`)",
+                 unclean shutdown; it cannot be rebuilt by replay. {}",
                 base_dir.display(),
+                lost_pack_remedy(base_dir.display()),
             )));
         }
         // Recovery replays the whole data-file WAL, so it can take time proportional to pack size.
@@ -2909,10 +2943,10 @@ impl Inner {
             "epoch pack {} is corrupt. Inspect it with `telcoin-network db validate {}`: if it \
              reports a truncatable torn tail or an index problem, `telcoin-network db repair` (node \
              stopped) can repair it; if it reports durably-committed data damaged, that cannot be \
-             repaired by truncation and the epoch must be re-synced from peers. Do NOT delete the \
-             chain-data directories (`db`, `static_files`, `consensus-db`)",
+             repaired by truncation. {}",
             base_dir.display(),
             base_dir.display(),
+            lost_pack_remedy(base_dir.display()),
         ))
     }
 
@@ -3215,7 +3249,7 @@ impl Inner {
     /// v2 before it is opened for write — v2 is the only writable format, so writing v2
     /// records/sentinels onto a v0/v1-versioned header would produce an inconsistent
     /// mixed-format pack. A cheap read-only no-op for a pack already at v2 (the common case). A
-    /// genuinely corrupt legacy log aborts with [`PackError::CorruptPack`] (re-sync) — the same
+    /// genuinely corrupt legacy log aborts with [`PackError::CorruptPack`] (data loss) — the same
     /// failure class as an unreadable meta.
     fn migrate_legacy_if_needed(epochs_dir: &Path, epoch: Epoch) -> Result<(), PackError> {
         // Only a readable pre-v2 pack is migrated. If the data file cannot even be opened read-only
@@ -3485,30 +3519,33 @@ impl Inner {
         if logically_sealed && end < src.file_len() {
             return Err(MigrateAbort::Corrupt(format!(
                 "epoch {epoch}: a complete (length-consistent) legacy pack replays only to {end} of \
-                 {}; committed data is damaged, not a truncatable tail. Re-sync the epoch from peers.",
-                src.file_len()
+                 {}; committed data is damaged, not a truncatable tail. {}",
+                src.file_len(),
+                lost_pack_remedy(format!("epoch-{epoch}"))
             )));
         }
         if expect_complete && end < src.file_len() {
             return Err(MigrateAbort::Corrupt(format!(
                 "epoch {epoch}: the legacy pack of a past epoch replays only to {end} of {}; a past \
-                 epoch is complete, so committed data is damaged, not a truncatable tail. Re-sync \
-                 the epoch from peers.",
-                src.file_len()
+                 epoch is complete, so committed data is damaged, not a truncatable tail. {}",
+                src.file_len(),
+                lost_pack_remedy(format!("epoch-{epoch}"))
             )));
         }
         if let Some(committed_end) = src.committed_end() {
             if end < committed_end {
                 return Err(MigrateAbort::Corrupt(format!(
                     "epoch {epoch}: the data log replays only to {end} but a durable commit marker \
-                     attests {committed_end}; committed data is damaged. Re-sync the epoch from peers."
+                     attests {committed_end}; committed data is damaged. {}",
+                    lost_pack_remedy(format!("epoch-{epoch}"))
                 )));
             }
         }
         if attested_output_survives_past(data_file, epoch, end).map_err(MigrateAbort::Fatal)? {
             return Err(MigrateAbort::Corrupt(format!(
                 "epoch {epoch}: a committed output starts past the recoverable end {end}; committed \
-                 data is damaged. Re-sync the epoch from peers."
+                 data is damaged. {}",
+                lost_pack_remedy(format!("epoch-{epoch}"))
             )));
         }
         Ok(end)
@@ -4246,12 +4283,11 @@ impl Inner {
                 return Err(PackError::EpochLoad(format!(
                     "epoch {epoch} pack {} ({pack_len} bytes): the epoch meta's length prefix is \
                      zeroed but committed data remains past the header -- refusing to \
-                     re-initialize, which would erase it. The data is intact; inspect it with \
-                     `telcoin-network db validate {}` and re-sync this epoch from peers. Do NOT \
-                     delete this `epoch-{epoch}` directory or the chain-data directories (`db`, \
-                     `static_files`, `consensus-db`)",
+                     re-initialize, which would erase it. Inspect it with `telcoin-network db \
+                     validate {}`. {}",
                     pack_file.display(),
                     base_dir.display(),
+                    lost_pack_remedy(base_dir.display()),
                 )));
             }
             // Genuinely header-only: brand new, or a crash landed between the header write and the
@@ -4500,8 +4536,11 @@ impl Inner {
     /// stream that ends before it is the sender's (`NotConsensus`).
     ///
     /// The import stops before the filesystem's free space drops below `min_free` (see
-    /// [`IMPORT_MIN_FREE_BYTES`]), counted in `in_flight` among the imports whose growth each check
-    /// makes room for ([`DiskFloor`]).
+    /// [`import_min_free`]), counted in `in_flight` among the imports whose growth each check
+    /// makes room for ([`DiskFloor`]), checked as the data log grows and every
+    /// [`IMPORT_FREE_CHECK_INTERVAL`]; and a floored import that writes less than
+    /// [`IMPORT_MIN_PROGRESS_BYTES`] per [`IMPORT_PROGRESS_WINDOW`] stops as
+    /// [`PackError::ImportStalled`] ([`ImportClock`]). A stream declared uncompressed is refused.
     ///
     /// Only the stream reads run here ([`pump_import_frames`]). Each record's CPU work
     /// (decompress, decode, digest, re-encode) and every file write run on the blocking pool
@@ -4548,6 +4587,14 @@ impl Inner {
         if stream_iter.version() == 0 {
             return Err(PackError::InvalidVersion(PACK_VERSION, 0));
         }
+        // Every pack writer compresses its records with zstd, and a pack is served as the file it
+        // is, so a stream declared uncompressed was not written by a pack writer: the sender's
+        // bytes, refused before anything is written.
+        if !matches!(stream_iter.compression(), PackCompression::ZStd) {
+            return Err(PackError::UndecodableRecord(
+                "stream header: the pack's records are not zstd-compressed".to_string(),
+            ));
+        }
         // One frame in the channel: with the one in each half's hands, the import holds at most
         // three undecoded records.
         let (frames, receiver) = tokio::sync::mpsc::channel(1);
@@ -4557,6 +4604,8 @@ impl Inner {
             payload: Vec::new(),
         };
         let previous_epoch = previous_epoch.clone();
+        let floor = DiskFloor::new(path.join(format!("epoch-{epoch}")), min_free, in_flight);
+        let mut clock = floor.clock();
         #[cfg(test)]
         let fail_index_open = FAIL_NEXT_IMPORT_INDEX_OPEN.with(|fail| fail.replace(false));
         let mut worker = tokio::task::spawn_blocking(move || {
@@ -4565,26 +4614,39 @@ impl Inner {
             // A failed import was discarded inside `import_records`, before `lease` drops here. A
             // completed one stays guarded until this future takes it, so one abandoned at the
             // last moment is discarded too (the guard drops before the lease).
-            let floor = DiskFloor::new(path.join(format!("epoch-{epoch}")), min_free, in_flight);
             Self::import_records(&path, epoch, &previous_epoch, final_consensus, floor, records)
                 .map(|pack| (pack, lease))
         });
         // Read the stream until the blocking half finishes: it stops taking frames at the final
-        // (or on a failure), and a reader still waiting on the peer then is just dropped.
+        // (or on a failure), and a reader still waiting on the peer then is just dropped. The
+        // clock's checks run beside it; when one fails, the reader is dropped, which closes the
+        // channel, so the blocking half stops at its next record and discards the import, and its
+        // error is what this returns. The files are gone (and `lease` dropped) before it returns.
         use std::{future::Future as _, pin::Pin, task::Poll};
-        let mut pump = std::pin::pin!(pump_import_frames(&mut stream_iter, timeout, frames));
-        let mut pumping = true;
-        let (pack, lease) = std::future::poll_fn(|cx| {
+        let mut pump = Some(Box::pin(pump_import_frames(&mut stream_iter, timeout, frames)));
+        let mut stopped = None;
+        let joined = std::future::poll_fn(|cx| {
             if let Poll::Ready(joined) = Pin::new(&mut worker).poll(cx) {
                 return Poll::Ready(joined);
             }
-            if pumping && pump.as_mut().poll(cx).is_ready() {
-                pumping = false;
+            if pump.as_mut().is_some_and(|pump| pump.as_mut().poll(cx).is_ready()) {
+                pump = None;
+            }
+            if stopped.is_none() {
+                if let Some(Poll::Ready(error)) = clock.as_mut().map(|clock| clock.poll_check(cx)) {
+                    stopped = Some(error);
+                    pump = None;
+                }
             }
             Poll::Pending
         })
         .await
-        .map_err(|e| PackError::PersistError(format!("stream import task join error: {e}")))??;
+        .map_err(|e| PackError::PersistError(format!("stream import task join error: {e}")))?;
+        let (pack, lease) = match (joined, stopped) {
+            (Ok(imported), _) => imported,
+            (Err(_), Some(stopped)) => return Err(stopped),
+            (Err(e), None) => return Err(e),
+        };
         Ok((pack.keep(), lease))
     }
 
@@ -5583,14 +5645,56 @@ fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
     batches
 }
 
-/// Free space a stream import leaves on the filesystem it writes to. An import appends up to a
-/// whole epoch of peer-supplied bytes before its only authentication (the final header against the
-/// certified epoch record), and it shares that filesystem with the live pack and the node's other
-/// stores, so it stops here rather than filling the disk under them.
-pub const IMPORT_MIN_FREE_BYTES: u64 = 256 << 20;
+/// The execution database's largest single growth step that [`IMPORT_MIN_FREE_BYTES`] makes room
+/// for: tn-lmdb's default (1 GiB, `--db.growth-step` unset). A node whose execution database grows
+/// by other steps gets its floor from [`import_min_free`]
+/// (`ConsensusChain::with_execution_growth_step`).
+pub const DEFAULT_EXECUTION_GROWTH_STEP: u64 = 1 << 30;
+
+/// What an import's floor keeps free beside one growth step of the execution database: a growth
+/// step of the live pack and one of a tndb log (one mmap step each, which may land in the same
+/// moment as the execution database's), and 256 MiB for every other writer of the datadir.
+const IMPORT_FREE_MARGIN: u64 = (256 << 20) + 2 * crate::archive::data_file::DEFAULT_MAX_MAP_SIZE;
+
+/// The free-space floor of a stream import on a node whose execution database grows by at most
+/// `execution_growth_step` bytes at a time: that step plus [`IMPORT_FREE_MARGIN`].
+///
+/// An import appends up to a whole epoch of peer-supplied bytes before its only authentication
+/// (the final header against the certified epoch record), on the filesystem of the node's own
+/// stores, which fail-stop the node when a write or a growth step fails. The import stops before
+/// free space drops below this floor, re-checking it on a clock as well as on growth
+/// ([`IMPORT_FREE_CHECK_INTERVAL`]), so a store's next growth step always fits, and an import still
+/// open when the node's own writes eat into the margin stops and gives its space back within one
+/// interval.
+pub const fn import_min_free(execution_growth_step: u64) -> u64 {
+    execution_growth_step.saturating_add(IMPORT_FREE_MARGIN)
+}
+
+/// The free-space floor of a stream import with the default execution growth step
+/// ([`import_min_free`] of [`DEFAULT_EXECUTION_GROWTH_STEP`]).
+pub const IMPORT_MIN_FREE_BYTES: u64 = import_min_free(DEFAULT_EXECUTION_GROWTH_STEP);
 
 /// How far an import's data log may grow between free-space checks.
 const IMPORT_FREE_CHECK_EVERY: u64 = 64 << 20;
+
+/// How often an import re-checks the free space whatever its files did: a stream whose records
+/// store to almost nothing never grows the data log by [`IMPORT_FREE_CHECK_EVERY`], while the
+/// node's own stores keep growing on the same filesystem. The check is one `statvfs`.
+const IMPORT_FREE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The window over which a floored import must write at least [`IMPORT_MIN_PROGRESS_BYTES`] to its
+/// data log, or stop as [`PackError::ImportStalled`]. Progress is measured in what the import
+/// writes, not in what the peer streams: the pack's records are re-encoded with zstd as they are
+/// written, so the bytes a peer streams say nothing about the disk an import holds, or for how
+/// long.
+const IMPORT_PROGRESS_WINDOW: Duration = Duration::from_secs(300);
+
+/// The data an import must write per [`IMPORT_PROGRESS_WINDOW`]. A requester holds a serving peer
+/// to at least 1 MiB of pack per 30 s (the sync reader's throughput floor), 10 MiB per window, and
+/// an honest pack's records are written as compressed as they were served (every pack writer uses
+/// the same zstd encoder), so an honest import writes about ten times this, less the few records
+/// still in flight.
+const IMPORT_MIN_PROGRESS_BYTES: u64 = 1 << 20;
 
 /// Free space a check needs beyond the floor for each import in flight: what one import's files
 /// may still take before its next check. Mmap growth preallocates real blocks up to one growth
@@ -5635,6 +5739,10 @@ impl Drop for ImportSlot {
 /// blocking half returns, whatever its outcome. A floor of `0` takes no slot: it never checks, and
 /// its only user is `db load-state`'s restore, which runs offline in its own process, where no
 /// floored import runs beside it.
+///
+/// The import's blocking half checks the floor as its data log grows; the reader's task checks it
+/// again on a clock ([`ImportClock`], from [`Self::clock`]), with the data length the blocking half
+/// last reported, which is also what the clock's progress bound measures.
 struct DiskFloor {
     dir: PathBuf,
     min_free: u64,
@@ -5642,6 +5750,8 @@ struct DiskFloor {
     checked_at: Option<u64>,
     /// This import's place among the imports in flight; `None` for a floor of `0`.
     slot: Option<ImportSlot>,
+    /// The data length at the last call of [`Self::check`], shared with the import's clock.
+    written: Arc<AtomicU64>,
 }
 
 impl DiskFloor {
@@ -5649,38 +5759,109 @@ impl DiskFloor {
     /// `0`.
     fn new(dir: PathBuf, min_free: u64, in_flight: &'static AtomicU64) -> Self {
         let slot = (min_free != 0).then(|| ImportSlot::take(in_flight));
-        Self { dir, min_free, checked_at: None, slot }
+        Self { dir, min_free, checked_at: None, slot, written: Arc::default() }
+    }
+
+    /// The checks on a clock that go with this floor, for the import's reader task; `None` for a
+    /// floor of `0`, which never stops an import.
+    fn clock(&self) -> Option<ImportClock> {
+        let in_flight = self.slot.as_ref()?.0;
+        Some(ImportClock::new(self.dir.clone(), self.min_free, in_flight, self.written.clone()))
     }
 
     /// Check the free space once the import's data log has grown by [`IMPORT_FREE_CHECK_EVERY`]
-    /// since the last check (and on the first call). A check needs [`IMPORT_FREE_HEADROOM`] above
-    /// the floor for each import in flight, so what their files take before their next checks
-    /// cannot carry the filesystem below it. A floor of `0` (an operator's own restore) never
-    /// stops the import, and an unknown free space does not either: a real shortage still surfaces
-    /// as a write error.
+    /// since the last check (and on the first call), and report `data_len` to the import's clock.
+    /// A floor of `0` (an operator's own restore) never stops the import.
     fn check(&mut self, data_len: u64) -> Result<(), PackError> {
         let Some(slot) = &self.slot else { return Ok(()) };
+        self.written.store(data_len, Ordering::Relaxed);
         if self.checked_at.is_some_and(|at| data_len < at.saturating_add(IMPORT_FREE_CHECK_EVERY)) {
             return Ok(());
         }
         self.checked_at = Some(data_len);
-        let imports = slot.imports();
-        let headroom = IMPORT_FREE_HEADROOM.saturating_mul(imports);
-        match available_space(&self.dir) {
-            Ok(free) if free < self.min_free.saturating_add(headroom) => {
-                Err(PackError::IO(Arc::new(io::Error::new(
-                    io::ErrorKind::StorageFull,
-                    format!(
-                        "stream import into {} stopped: {free} bytes free, below the {} bytes an \
-                         import must leave plus the {headroom} the files of the {imports} \
-                         import(s) in flight may take before their next checks",
-                        self.dir.display(),
-                        self.min_free
-                    ),
-                ))))
-            }
-            _ => Ok(()),
+        check_free_space(&self.dir, self.min_free, slot.imports())
+    }
+}
+
+/// Stop an import into `dir` unless the filesystem has `min_free` free plus
+/// [`IMPORT_FREE_HEADROOM`] for each of the `imports` in flight, so what their files take before
+/// their next checks cannot carry the filesystem below the floor. An unknown free space does not
+/// stop it: a real shortage still surfaces as a write error.
+fn check_free_space(dir: &Path, min_free: u64, imports: u64) -> Result<(), PackError> {
+    let headroom = IMPORT_FREE_HEADROOM.saturating_mul(imports);
+    match available_space(dir) {
+        Ok(free) if free < min_free.saturating_add(headroom) => {
+            Err(PackError::IO(Arc::new(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "stream import into {} stopped: {free} bytes free, below the {min_free} bytes \
+                     an import must leave plus the {headroom} the files of the {imports} \
+                     import(s) in flight may take before their next checks",
+                    dir.display(),
+                ),
+            ))))
         }
+        _ => Ok(()),
+    }
+}
+
+/// A floored import's checks on a clock, run by its reader task beside the stream every
+/// [`IMPORT_FREE_CHECK_INTERVAL`], so they hold whatever the stream does:
+/// - the free-space floor, as [`DiskFloor::check`] runs it (a held import gives its space back once
+///   the node's own writes eat into the headroom above the floor);
+/// - progress measured in what the import writes: at least [`IMPORT_MIN_PROGRESS_BYTES`] per
+///   [`IMPORT_PROGRESS_WINDOW`], else [`PackError::ImportStalled`]. Together with the floor this
+///   ends every import: one that keeps writing reaches the floor.
+struct ImportClock {
+    dir: PathBuf,
+    min_free: u64,
+    in_flight: &'static AtomicU64,
+    /// The import's data length, as its blocking half last reported it.
+    written: Arc<AtomicU64>,
+    ticks: tokio::time::Interval,
+    /// When the current progress window started, and the data length then.
+    window_start: tokio::time::Instant,
+    window_written: u64,
+}
+
+impl ImportClock {
+    fn new(
+        dir: PathBuf,
+        min_free: u64,
+        in_flight: &'static AtomicU64,
+        written: Arc<AtomicU64>,
+    ) -> Self {
+        let now = tokio::time::Instant::now();
+        let mut ticks =
+            tokio::time::interval_at(now + IMPORT_FREE_CHECK_INTERVAL, IMPORT_FREE_CHECK_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let window_written = written.load(Ordering::Relaxed);
+        Self { dir, min_free, in_flight, written, ticks, window_start: now, window_written }
+    }
+
+    /// Run the checks at every tick that is due; `Ready` with the error of the first that fails.
+    fn poll_check(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<PackError> {
+        while self.ticks.poll_tick(cx).is_ready() {
+            if let Err(e) = self.check(tokio::time::Instant::now()) {
+                return std::task::Poll::Ready(e);
+            }
+        }
+        std::task::Poll::Pending
+    }
+
+    fn check(&mut self, now: tokio::time::Instant) -> Result<(), PackError> {
+        check_free_space(&self.dir, self.min_free, self.in_flight.load(Ordering::SeqCst).max(1))?;
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed >= IMPORT_PROGRESS_WINDOW {
+            let written = self.written.load(Ordering::Relaxed);
+            let progress = written.saturating_sub(self.window_written);
+            if progress < IMPORT_MIN_PROGRESS_BYTES {
+                return Err(PackError::ImportStalled { written: progress, window: elapsed });
+            }
+            self.window_start = now;
+            self.window_written = written;
+        }
+        Ok(())
     }
 }
 
@@ -6571,6 +6752,16 @@ pub enum PackError {
         /// The per-output budget it exceeded.
         max: usize,
     },
+    /// A peer stream import wrote less than its progress bound to its data log in one window
+    /// (`IMPORT_MIN_PROGRESS_BYTES` per `IMPORT_PROGRESS_WINDOW`). An honest pack's records store
+    /// about as large as they were served, and a requester reads a serving peer at well above the
+    /// bound, so a stream that stores far less than it sends is the sender's.
+    ImportStalled {
+        /// The bytes the import wrote in the window.
+        written: u64,
+        /// How long the window ran.
+        window: Duration,
+    },
 }
 
 impl PackError {
@@ -6798,6 +6989,12 @@ impl Display for PackError {
                     f,
                     "buffered batches for one output decode to {size} bytes, exceeds the \
                      {max}-byte per-output budget"
+                )
+            }
+            PackError::ImportStalled { written, window } => {
+                write!(
+                    f,
+                    "stream import wrote {written} bytes in {window:?}, under its progress bound"
                 )
             }
         }
@@ -8211,7 +8408,7 @@ pub(crate) mod test {
         drop(pack);
     }
 
-    fn test_previous_epoch(committee: &Committee) -> EpochRecord {
+    pub(crate) fn test_previous_epoch(committee: &Committee) -> EpochRecord {
         EpochRecord {
             epoch: 0,
             committee: committee.bls_keys().iter().copied().collect(),
@@ -12127,10 +12324,18 @@ pub(crate) mod test {
                 .await
                 .expect("repair must not err");
             match res {
-                EpochRepair::Unrepairable(msg) => assert!(
-                    msg.contains("all zeros"),
-                    "an unwritten file must be Unrepairable with an actionable message, got: {msg}"
-                ),
+                EpochRepair::Unrepairable(msg) => {
+                    assert!(
+                        msg.contains("all zeros"),
+                        "an unwritten file must be Unrepairable with an actionable message, got: \
+                         {msg}"
+                    );
+                    // The newest epoch's is re-initialized when the node enters the epoch.
+                    assert!(
+                        msg.contains("nothing needs to be done"),
+                        "the newest epoch needs no action: {msg}"
+                    );
+                }
                 other => {
                     panic!("an unwritten file must be Unrepairable (apply={apply}), got {other:?}")
                 }
@@ -12141,6 +12346,45 @@ pub(crate) mod test {
             1 << 20,
             "repair must not mutate the unwritten data file"
         );
+
+        // A past epoch's all-zero data file lost its outputs: nothing recreates it, and removing
+        // it is never the advice.
+        std::fs::create_dir(temp_dir.path().join("epoch-1")).expect("later epoch");
+        let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, true).await.expect("repair");
+        let EpochRepair::Unrepairable(msg) = res else {
+            panic!("a past epoch's unwritten file must be Unrepairable, got {res:?}")
+        };
+        assert!(msg.contains("outputs are lost"), "a past epoch lost its outputs: {msg}");
+        assert!(!msg.contains("recreated"), "a past epoch is never recreated: {msg}");
+        assert!(!msg.contains("re-sync") && !msg.contains("from peers"), "no re-sync: {msg}");
+        assert!(msg.contains("from a backup"), "must name a backup: {msg}");
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("stat").len(),
+            1 << 20,
+            "repair must not mutate the unwritten data file"
+        );
+    }
+
+    /// A later epoch left only as an interrupted install (`epoch-1.replaced` with no `epoch-1`,
+    /// which the node's next start puts back) makes epoch 0 a past epoch: its all-zero data file
+    /// lost its outputs, and the dry run never calls it the newest epoch that needs nothing.
+    #[tokio::test]
+    async fn test_repair_epoch_counts_an_interrupted_install_as_a_later_epoch() {
+        let temp_dir = TempDir::with_prefix("test_unwritten_repair_aside").expect("temp dir");
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&epoch_dir).expect("mkdir");
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), vec![0_u8; 1 << 20]).expect("zeros");
+        std::fs::create_dir(temp_dir.path().join("epoch-1.replaced")).expect("aside");
+        assert!(super::has_later_epoch(temp_dir.path(), 0).expect("look"));
+        assert!(!super::has_later_epoch(temp_dir.path(), 1).expect("look"));
+
+        let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, false).await.expect("repair");
+        let EpochRepair::Unrepairable(msg) = res else {
+            panic!("a past epoch's unwritten file must be Unrepairable, got {res:?}")
+        };
+        assert!(msg.contains("outputs are lost"), "a past epoch lost its outputs: {msg}");
+        assert!(!msg.contains("nothing needs to be done"), "it is not the newest epoch: {msg}");
+        assert!(msg.contains("from a backup"), "must name a backup: {msg}");
     }
 
     /// A torn trailing tail (stray bytes appended past the sealed data) is truncated back to the
@@ -12520,15 +12764,32 @@ pub(crate) mod test {
         let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
             .await
             .expect("repair must not err");
-        assert!(
-            matches!(outcome, EpochRepair::Unrepairable(_)),
-            "a torn meta is unrepairable, got {outcome:?}"
-        );
+        let EpochRepair::Unrepairable(why) = outcome else {
+            panic!("a torn meta is unrepairable, got {outcome:?}")
+        };
         assert_eq!(
             std::fs::read(&data).expect("reread data"),
             before,
             "unrepairable epoch untouched"
         );
+        // The newest epoch holds no output: removing it is safe, the node creates it again.
+        assert!(why.contains("newest epoch"), "must name the newest-epoch case: {why}");
+        assert!(why.contains("remove `epoch-0/`"), "the newest epoch's fix is removal: {why}");
+
+        // With a later epoch beside it, it is a past epoch whose outputs are lost: never removal,
+        // and no re-sync (nothing fetches a past epoch's pack again).
+        std::fs::create_dir(temp_dir.path().join("epoch-1")).expect("later epoch");
+        let outcome = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("repair must not err");
+        let EpochRepair::Unrepairable(why) = outcome else {
+            panic!("a past epoch's torn meta is unrepairable, got {outcome:?}")
+        };
+        assert!(why.contains("outputs are lost"), "a past epoch lost its outputs: {why}");
+        assert!(!why.contains("remove `epoch-0/`"), "never remove a past epoch: {why}");
+        assert!(!why.contains("re-sync") && !why.contains("from peers"), "no re-sync: {why}");
+        assert!(why.contains("from a backup"), "must name a backup: {why}");
+        assert_eq!(std::fs::read(&data).expect("reread data"), before, "still untouched");
     }
 
     /// Mid-log corruption — a damaged byte with valid records still behind it — is `Unrepairable`
@@ -12593,6 +12854,12 @@ pub(crate) mod test {
             before,
             "an unrepairable mid-log pack must be left untouched"
         );
+        // The reason names the recovery that exists (nothing fetches the pack again) and warns off
+        // removing the epoch's directory.
+        let EpochRepair::Unrepairable(why) = applied else { unreachable!() };
+        assert!(!why.contains("re-sync") && !why.contains("from peers"), "no re-sync: {why}");
+        assert!(why.contains("from a backup"), "must name a backup: {why}");
+        assert!(why.contains("Do NOT delete `epoch-0`"), "must keep the pack: {why}");
     }
 
     /// `epoch_dirs` lists only `epoch-{N}` directories (not files, not `staging-*`), sorted
@@ -15777,18 +16044,28 @@ pub(crate) mod test {
 
     /// The logical bytes of an epoch-0 pack holding the meta for `committee` (linked to
     /// `previous_epoch`) and then `records`, as a peer streams them. Written under `dir`.
-    fn peer_stream_bytes(
+    pub(crate) fn peer_stream_bytes(
         dir: &Path,
         committee: &Committee,
         previous_epoch: &EpochRecord,
         records: &[PackRecord],
     ) -> Vec<u8> {
+        peer_stream_bytes_with(dir, committee, previous_epoch, records, PackCompression::ZStd)
+    }
+
+    /// [`peer_stream_bytes`], with the pack's records stored with `compression`.
+    fn peer_stream_bytes_with(
+        dir: &Path,
+        committee: &Committee,
+        previous_epoch: &EpochRecord,
+        records: &[PackRecord],
+        compression: PackCompression,
+    ) -> Vec<u8> {
         let path = dir.join("peer_stream");
         // A fresh file each time: `Pack::open` appends to an existing one.
         let _ = std::fs::remove_file(&path);
         let mut pack: Pack<PackRecord> =
-            Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
-                .expect("open peer stream");
+            Pack::open(&path, 0, false, compression, PACK_VERSION).expect("open peer stream");
         pack.append(&PackRecord::EpochMeta(EpochMeta {
             epoch: 0,
             committee: committee.clone(),
@@ -15829,8 +16106,337 @@ pub(crate) mod test {
         (res, target)
     }
 
+    /// A fabricated, parent-linked chain of `outputs` epoch-0 outputs from number 1, each
+    /// declaring `batches` distinct batches of one transaction, `tx(number, index)`, as the
+    /// records of a header-first pack; and the last output's number and digest.
+    pub(crate) fn fabricated_chain(
+        committee: &Committee,
+        outputs: u64,
+        batches: u32,
+        tx: impl Fn(u64, u32) -> Vec<u8>,
+    ) -> (Vec<PackRecord>, ConsensusNumHash) {
+        let author = committee.authorities().first().expect("committee has authorities").id();
+        let mut records = Vec::new();
+        let mut parent = ConsensusHeaderDigest::default();
+        for number in 1..=outputs {
+            let mut declared: Vec<Batch> = (0..batches)
+                .map(|i| {
+                    let nonce = (number as u32) * 1000 + i;
+                    Batch::new_for_test(vec![tx(number, i)], ExecHeader::default(), 0, nonce)
+                })
+                .collect();
+            let leader = leader_with_batches(committee, author.clone(), &declared);
+            let header = ConsensusHeader {
+                parent_hash: parent,
+                sub_dag: CommittedSubDag::new(
+                    vec![leader.clone()],
+                    leader,
+                    number,
+                    ReputationScores::default(),
+                    None,
+                    tn_types::EpochSeedChainValue::genesis_placeholder(),
+                ),
+                number,
+                extra: Default::default(),
+            };
+            parent = header.digest();
+            records.push(PackRecord::Consensus(Box::new(header)));
+            declared.sort_by_key(|b| b.digest());
+            records.extend(declared.into_iter().map(PackRecord::Batch));
+        }
+        (records, ConsensusNumHash::new(outputs, parent))
+    }
+
+    /// `len` bytes no compressor shrinks (xorshift), different for each `seed`.
+    pub(crate) fn incompressible(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    /// Feed `bytes` to an import through `peer`, `chunk` bytes at a time, advancing the paused
+    /// clock by `step` after each, until `import` finishes (the rest is never sent); then wait for
+    /// it in real time (its blocking half runs on a thread of its own) and return its result.
+    /// Writes into a small duplex buffer wait for the import to read, so what it has written
+    /// keeps up with what was sent.
+    pub(crate) async fn drip_into<T: Send + 'static>(
+        mut peer: tokio::io::DuplexStream,
+        bytes: &[u8],
+        chunk: usize,
+        step: Duration,
+        import: tokio::task::JoinHandle<T>,
+    ) -> T {
+        use tokio::io::AsyncWriteExt as _;
+        for piece in bytes.chunks(chunk) {
+            if import.is_finished() {
+                break;
+            }
+            peer.write_all(piece).await.expect("the import reads the stream");
+            settle().await;
+            tokio::time::advance(step).await;
+            settle().await;
+        }
+        let result = finish(import).await;
+        drop(peer);
+        result
+    }
+
+    /// Let the runtime's tasks and an import's blocking half (a thread of its own) run a little.
+    async fn settle() {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Wait in real time for `import` to finish (the paused clock does not move meanwhile) and
+    /// return its result.
+    pub(crate) async fn finish<T: Send + 'static>(import: tokio::task::JoinHandle<T>) -> T {
+        let started = std::time::Instant::now();
+        while !import.is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(60), "the import never finished");
+            settle().await;
+        }
+        import.await.expect("join the import")
+    }
+
+    /// A pack is served as the file it is, and every pack writer compresses its records with
+    /// zstd, so a stream declared uncompressed is refused before anything is written, as the
+    /// sender's bytes. Uncompressed, a fabricated chain of zero batches would import while its
+    /// data log grew by a tiny fraction of what was streamed.
+    #[tokio::test]
+    async fn test_stream_import_refuses_an_uncompressed_stream() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let (records, last) = fabricated_chain(&committee, 3, 8, |_, _| vec![0_u8; 999_000]);
+        let dir = TempDir::with_prefix("test_import_uncompressed").expect("temp dir");
+        let bytes = peer_stream_bytes_with(
+            dir.path(),
+            &committee,
+            &previous_epoch,
+            &records,
+            PackCompression::None,
+        );
+        assert!(bytes.len() > 20_000_000, "the stream carries ~24 MB of batches");
+        let (res, target) = import_peer_stream(bytes, &previous_epoch, last).await;
+        let err = res.expect_err("an uncompressed stream is refused");
+        assert!(matches!(err, super::PackError::UndecodableRecord(_)), "got {err:?}");
+        assert_nothing_imported(&target);
+
+        // The same chain served as a pack writer stores it imports.
+        let bytes = peer_stream_bytes(dir.path(), &committee, &previous_epoch, &records);
+        let (res, _target) = import_peer_stream(bytes, &previous_epoch, last).await;
+        res.expect("a zstd stream of the chain imports").close().await;
+    }
+
+    /// The free-space floor keeps one growth step of the execution database free beside a growth
+    /// step of the live pack and of a tndb log, plus a margin, so the node's own next growth step
+    /// always fits beside an import held at the floor.
+    #[test]
+    fn test_import_floor_fits_the_stores_growth_steps() {
+        use crate::{
+            archive::data_file::DEFAULT_MAX_MAP_SIZE,
+            consensus_pack::{
+                import_min_free, DEFAULT_EXECUTION_GROWTH_STEP, IMPORT_MIN_FREE_BYTES,
+            },
+        };
+        let stores = 2 * DEFAULT_MAX_MAP_SIZE + (256 << 20);
+        assert_eq!(DEFAULT_EXECUTION_GROWTH_STEP, 1 << 30, "tn-lmdb's default largest step");
+        assert!(IMPORT_MIN_FREE_BYTES >= DEFAULT_EXECUTION_GROWTH_STEP + stores);
+        for step in [1 << 20, 64 << 20, 1 << 30, 4 << 30, 16 << 30] {
+            assert!(import_min_free(step) >= step + stores, "a {step}-byte step");
+        }
+        assert_eq!(import_min_free(u64::MAX), u64::MAX, "saturates");
+    }
+
+    /// An import must make progress in what it writes, not in what the peer streams: a stream of
+    /// records that store to almost nothing is stopped as `ImportStalled` once a progress window
+    /// passes with under `IMPORT_MIN_PROGRESS_BYTES` written, however long the stream would have
+    /// gone on, and the partial pack is discarded. Without the bound this stream imports in full.
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_import_stops_when_it_stops_writing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::consensus_pack::{PackError, IMPORT_PROGRESS_WINDOW};
+
+        static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let (records, last) = fabricated_chain(&committee, 3, 8, |_, _| vec![0_u8; 999_000]);
+        let dir = TempDir::with_prefix("test_import_stall").expect("temp dir");
+        let bytes = peer_stream_bytes(dir.path(), &committee, &previous_epoch, &records);
+        // 64 bytes every 10 s: the whole stream would take longer than two windows.
+        let step = Duration::from_secs(10);
+        let windows = (bytes.len() as u64).div_ceil(64) * step.as_secs();
+        assert!(windows > 2 * IMPORT_PROGRESS_WINDOW.as_secs(), "{} bytes", bytes.len());
+
+        let target = TempDir::with_prefix("test_import_stall_dst").expect("temp dir");
+        let (peer, stream) = tokio::io::duplex(64 << 10);
+        let path = target.path().to_owned();
+        let started = tokio::time::Instant::now();
+        let import = tokio::spawn(async move {
+            Inner::stream_import(
+                path,
+                stream,
+                0,
+                &previous_epoch,
+                last,
+                Duration::from_secs(3600),
+                1,
+                &IN_FLIGHT,
+                (),
+            )
+            .await
+            .map(|_| ())
+        });
+        let err = drip_into(peer, &bytes, 64, step, import)
+            .await
+            .expect_err("a stream that stores to almost nothing is stopped");
+        assert!(matches!(err, PackError::ImportStalled { .. }), "got {err:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= IMPORT_PROGRESS_WINDOW && elapsed < 2 * IMPORT_PROGRESS_WINDOW,
+            "stopped after {elapsed:?}"
+        );
+        assert_nothing_imported(&target);
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0, "the stopped import released its slot");
+    }
+
+    /// An import that writes at least its progress bound in every window goes on past the first
+    /// window and completes: about 1 MB of incompressible batches every 30 s, ten times the
+    /// bound, for longer than one window.
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_import_that_keeps_writing_outlasts_the_window() {
+        use std::sync::atomic::AtomicU64;
+
+        use crate::consensus_pack::IMPORT_PROGRESS_WINDOW;
+
+        static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let (records, last) = fabricated_chain(&committee, 2, 7, |number, i| {
+            incompressible(number * 100 + u64::from(i), 999_000)
+        });
+        let dir = TempDir::with_prefix("test_import_progress").expect("temp dir");
+        let bytes = peer_stream_bytes(dir.path(), &committee, &previous_epoch, &records);
+
+        let target = TempDir::with_prefix("test_import_progress_dst").expect("temp dir");
+        let (peer, stream) = tokio::io::duplex(64 << 10);
+        let path = target.path().to_owned();
+        let started = tokio::time::Instant::now();
+        let import = tokio::spawn(async move {
+            Inner::stream_import(
+                path,
+                stream,
+                0,
+                &previous_epoch,
+                last,
+                Duration::from_secs(3600),
+                1,
+                &IN_FLIGHT,
+                (),
+            )
+            .await
+            .map(|(pack, ())| pack)
+        });
+        // 256 KiB every 7.5 s: about 1 MiB per 30 s.
+        let imported = drip_into(peer, &bytes, 256 << 10, Duration::from_millis(7_500), import)
+            .await
+            .expect("an import that keeps writing completes");
+        assert!(started.elapsed() > IMPORT_PROGRESS_WINDOW, "the import outlasted one window");
+        drop(imported);
+    }
+
+    /// The floor is re-checked on a clock, not only as the import's data log grows: an import
+    /// held open while it writes nothing stops with a local `StorageFull` once the free space
+    /// falls under the floor plus headroom (here, by two more imports taking their share of the
+    /// headroom), within a check interval, and gives its space back. Without the clock this import
+    /// would wait on its stream until the record timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_import_rechecks_the_floor_on_a_clock() {
+        use std::{
+            io,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use tokio::io::AsyncWriteExt as _;
+
+        use crate::consensus_pack::{
+            available_space, PackError, IMPORT_FREE_CHECK_INTERVAL, IMPORT_FREE_HEADROOM,
+        };
+
+        static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let dir = TempDir::with_prefix("test_import_floor_clock").expect("temp dir");
+        // The stream's header and meta only: the import then waits for the outputs.
+        let bytes = peer_stream_bytes(dir.path(), &committee, &previous_epoch, &[]);
+        let (mut peer, stream) = tokio::io::duplex(bytes.len() + 1);
+        peer.write_all(&bytes).await.expect("write the stream's start");
+        let free = available_space(dir.path()).expect("free space");
+        assert!(
+            free > 4 * IMPORT_FREE_HEADROOM,
+            "the test needs {} bytes free",
+            4 * IMPORT_FREE_HEADROOM
+        );
+        // Room for two imports' headroom above the floor (a margin either way for other writers).
+        let min_free = free - 2 * IMPORT_FREE_HEADROOM;
+
+        let target = TempDir::with_prefix("test_import_floor_clock_dst").expect("temp dir");
+        let path = target.path().to_owned();
+        let import = tokio::spawn(async move {
+            Inner::stream_import(
+                path,
+                stream,
+                0,
+                &previous_epoch,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Duration::from_secs(3600),
+                min_free,
+                &IN_FLIGHT,
+                (),
+            )
+            .await
+            .map(|_| ())
+        });
+        // Several checks pass while the import holds (it wrote its meta and waits).
+        let started = std::time::Instant::now();
+        while target.path().join("epoch-0").join(Inner::DATA_NAME).metadata().is_err() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the import never started");
+            settle().await;
+        }
+        for _ in 0..3 {
+            tokio::time::advance(IMPORT_FREE_CHECK_INTERVAL).await;
+            settle().await;
+        }
+        assert!(!import.is_finished(), "an import with room keeps going");
+        // The free space shrinks under it: two more imports' headroom no longer fits.
+        IN_FLIGHT.fetch_add(2, Ordering::SeqCst);
+        tokio::time::advance(IMPORT_FREE_CHECK_INTERVAL).await;
+        let err = finish(import).await;
+        IN_FLIGHT.fetch_sub(2, Ordering::SeqCst);
+        drop(peer);
+        let err = err.expect_err("the clock's floor check stops the import");
+        assert!(
+            matches!(&err, PackError::IO(e) if e.kind() == io::ErrorKind::StorageFull),
+            "got {err:?}"
+        );
+        assert_nothing_imported(&target);
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0, "the stopped import released its slot");
+    }
+
     /// A rejected import leaves no pack behind: its data log was discarded, not sealed in place.
-    fn assert_nothing_imported(target: &TempDir) {
+    pub(crate) fn assert_nothing_imported(target: &TempDir) {
         let left = imported_files(target);
         assert!(left.is_empty(), "a rejected import must leave no files behind: {left:?}");
     }

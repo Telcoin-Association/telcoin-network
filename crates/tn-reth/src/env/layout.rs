@@ -366,8 +366,11 @@ pub(crate) fn stored_marker(row: Option<Vec<u8>>) -> eyre::Result<Option<LayoutM
         (LAYOUT_VERSION_TX_POINTERS, StorageLayout::V1) => eyre::bail!(
             "the reth database is in TN's storage format version {LAYOUT_VERSION_TX_POINTERS} \
              ({TN_LAYOUT_KEY}) with layout v1, which no TN build writes: version \
-             {LAYOUT_VERSION_TX_POINTERS} needs layout v2. Restore the datadir from a backup, or \
-             rebuild the execution database (`telcoin-network db reset-execution`)"
+             {LAYOUT_VERSION_TX_POINTERS} needs layout v2. Restore the execution database \
+             (`db`, `static_files` and any `restored-state-floor`, all from one stop) from a \
+             backup, or rebuild it (`telcoin-network db reset-execution`). A restore of the \
+             whole datadir rolls `consensus-db` back too: a validator restored that way stays \
+             stopped until the network has closed the epoch it was last in"
         ),
         (version, _) => eyre::bail!(
             "the reth database is in TN's storage format version {version} ({TN_LAYOUT_KEY}), and \
@@ -426,8 +429,11 @@ fn existing(
         Some(marker) if marker.layout != layout => eyre::bail!(
             "the reth database's storage_settings say layout {layout}, but TN's marker \
              ({TN_LAYOUT_KEY}) says {}: the settings were changed without converting the data, \
-             which would misread every history index. Restore the datadir from a backup, or \
-             rebuild the execution database (`telcoin-network db reset-execution`)",
+             which would misread every history index. Restore the execution database (`db`, \
+             `static_files` and any `restored-state-floor`, all from one stop) from a backup, or \
+             rebuild it (`telcoin-network db reset-execution`). A restore of the whole datadir \
+             rolls `consensus-db` back too: a validator restored that way stays stopped until the \
+             network has closed the epoch it was last in",
             marker.layout,
         ),
         Some(_) => {}
