@@ -82,6 +82,7 @@ pub(crate) fn execute_consensus_output_with_signers(
 ) -> EngineResult<SealedHeader> {
     // observability only: start of the `execute_ms` span in the `output executed` line
     let execute_start = Instant::now();
+    let execute_cpu_start = thread_cpu_time();
     // rename canonical header for clarity
     let BuildArguments { reth_env, output, parent_header } = args;
     // Last canonical header executed.
@@ -383,6 +384,10 @@ pub(crate) fn execute_consensus_output_with_signers(
 
     span.record("executed_blocks", executed_blocks.len().to_string());
     let execute_elapsed = execute_start.elapsed();
+    // this thread's own cpu time over the execute span: the parallel signer recovery and any other
+    // pool thread the build hands work to are not counted
+    let execute_cpu =
+        thread_cpu_time().zip(execute_cpu_start).map(|(end, start)| end.saturating_sub(start));
     let block_count = executed_blocks.len();
     // `tn_engine_recover_seconds` is recorded by the recovery itself (see `recover_signers`)
     crate::metrics::ENGINE_METRICS.evm_seconds.record(timings.evm);
@@ -441,6 +446,7 @@ pub(crate) fn execute_consensus_output_with_signers(
         other_ms = duration_ms(execute_elapsed.saturating_sub(timings.laps())),
         max_block_root_ms = duration_ms(timings.max_block_root),
         max_block_evm_ms = duration_ms(timings.max_block_evm),
+        cpu_ms = execute_cpu.map(duration_ms),
         "output executed"
     );
 
@@ -682,6 +688,19 @@ fn rollback_in_memory_output(
     canonical_in_memory_state
         .update_chain(NewCanonicalChain::Reorg { new: Vec::new(), old: advanced.to_vec() });
     canonical_in_memory_state.set_canonical_head(anchor_header.clone());
+}
+
+/// CPU time the calling thread has used so far: the first field of
+/// `/proc/thread-self/schedstat` (nanoseconds on a CPU).
+///
+/// Observability only (the `output executed` line's `cpu_ms`). `None` where the file is absent
+/// or does not parse (any non-Linux host), and the line then leaves the field out. The kernel
+/// advances the figure at scheduler ticks and context switches, so a reading of the running thread
+/// can lag by up to one tick. One small file read per call, two per output.
+fn thread_cpu_time() -> Option<std::time::Duration> {
+    let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    let nanos = schedstat.split_whitespace().next()?.parse::<u64>().ok()?;
+    Some(std::time::Duration::from_nanos(nanos))
 }
 
 #[cfg(test)]

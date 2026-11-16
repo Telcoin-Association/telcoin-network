@@ -4844,8 +4844,9 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
     assert_eq!(finished.len(), 1);
     assert_eq!(
         field_names(&finished[0]),
-        ["consensus_number", "queue_wait_ms", "task_ms", "forward_wait_ms"]
+        ["consensus_number", "queue_wait_ms", "task_ms", "forward_wait_ms", "outputs_behind"]
     );
+    assert_eq!(field_value(&finished[0], "outputs_behind"), Some("0"), "nothing queued behind");
 
     let output_executed = captured_engine_events("output executed");
     assert_eq!(output_executed.len(), 1);
@@ -4867,9 +4868,24 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
             "other_ms",
             "max_block_root_ms",
             "max_block_evm_ms",
+            "cpu_ms",
         ]
     );
     assert_eq!(field_value(&output_executed[0], "txs"), Some(expected_txs.to_string().as_str()));
+    let cpu_ms: u64 = field_value(&output_executed[0], "cpu_ms").expect("cpu_ms").parse()?;
+    let execute_ms: u64 =
+        field_value(&output_executed[0], "execute_ms").expect("execute_ms").parse()?;
+    // the thread's cpu time stays within the span's wall time, give or take a scheduler tick
+    assert!(cpu_ms <= execute_ms + 25, "cpu_ms {cpu_ms} vs execute_ms {execute_ms}");
+
+    // each persist logs the store's used size after its commit, last on the line
+    let persisted = captured_engine_events("persisted output");
+    assert!(!persisted.is_empty(), "the output's blocks were persisted");
+    for line in &persisted {
+        let store_bytes: u64 = field_value(line, "store_bytes").expect("store_bytes").parse()?;
+        assert!(store_bytes > 0, "the store holds at least the genesis state");
+        assert!(field_names(line).last().is_some_and(|name| *name == "store_bytes"));
+    }
 
     // the background recovery job started when the output was queued logs once per output
     let recovered = captured_engine_events("signers recovered");

@@ -33,6 +33,10 @@ pub use payload_builder::{execute_consensus_output, PERSIST_OUTPUT_ATTEMPTS};
 use recovery::RecoveryHandle;
 use std::{
     collections::VecDeque,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tn_reth::{payload::BuildArguments, RethEnv};
@@ -114,6 +118,9 @@ pub struct ExecutorEngine {
     /// (an epoch boundary) starts a fresh window, which at worst misses a poach racing across
     /// the boundary.
     repack_monitor: RepackMonitor,
+    /// The length of [`Self::queued`], mirrored for the execution task, which reads it as it
+    /// finishes to log `outputs_behind`. Observability only.
+    queue_depth: Arc<AtomicUsize>,
 }
 
 impl ExecutorEngine {
@@ -149,6 +156,7 @@ impl ExecutorEngine {
             gas_accumulator,
             engine_update_tx,
             repack_monitor,
+            queue_depth: Default::default(),
         }
     }
 
@@ -163,6 +171,7 @@ impl ExecutorEngine {
         if let Some(Dequeued { output, signers, queue_wait, forward_wait }) =
             take_next_queued(&mut self.queued, Instant::now())
         {
+            self.queue_depth.store(self.queued.len(), Ordering::Relaxed);
             ENGINE_METRICS.queue_wait_seconds.record(queue_wait);
             let consensus_number = output.number();
             let reth_env = self.reth_env.clone();
@@ -173,6 +182,7 @@ impl ExecutorEngine {
             let gas_accumulator = self.gas_accumulator.clone();
             let repack_monitor = self.repack_monitor.clone();
             let engine_update_tx = self.engine_update_tx.clone();
+            let queue_depth = Arc::clone(&self.queue_depth);
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
                 let execution_start = Instant::now();
@@ -203,6 +213,8 @@ impl ExecutorEngine {
                     task_ms = duration_ms(task_elapsed),
                     // zero for an output nothing stamped (only tests bypass the forwarder)
                     forward_wait_ms = duration_ms(forward_wait.unwrap_or_default()),
+                    // outputs queued behind this one as it finishes
+                    outputs_behind = queue_depth.load(Ordering::Relaxed),
                     "output execution task finished"
                 );
                 if let Err(e) = tx.send(result) {
@@ -251,6 +263,7 @@ impl ExecutorEngine {
             RecoveryHandle::spawn(&output, &self.task_spawner, &ENGINE_METRICS)
         };
         self.queued.push_back((queued_at, output, signers));
+        self.queue_depth.store(self.queued.len(), Ordering::Relaxed);
     }
 
     /// TESTING ONLY
@@ -347,6 +360,7 @@ impl ExecutorEngine {
                             );
                             // backlog growth means execution is falling behind consensus
                             ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
+                            self.queue_depth.store(self.queued.len(), Ordering::Relaxed);
                         })
                         .unwrap_or_else(|| {
                             // the stream has ended; the top-of-loop check returns the error once
@@ -367,6 +381,7 @@ impl ExecutorEngine {
                     ENGINE_METRICS.outputs_executed_total.increment(1);
                     ENGINE_METRICS.canonical_height.set(self.parent_header.number as f64);
                     ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
+                    self.queue_depth.store(self.queued.len(), Ordering::Relaxed);
                     // the stream is not polled while the queue is full, so the channel depth
                     // also refreshes here, once per executed output
                     ENGINE_METRICS
