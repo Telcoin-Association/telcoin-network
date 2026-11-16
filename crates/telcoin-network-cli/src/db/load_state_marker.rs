@@ -5,9 +5,10 @@
 //! memory, power lost) leaves a datadir no node can run on: its canonical tip is the snapshot's
 //! block while its state, or its consensus, is missing. The marker names that state:
 //!
-//! - [`write`] puts it in place, fsynced, once the restore has checked that the datadir holds no
-//!   chain data and before it writes any (the restored-state floor marker included). It lists the
-//!   chain-data directories the run created, one name per line.
+//! - [`write`] puts it in place, fsynced, before the restore writes any chain data (the
+//!   restored-state floor marker included): in a datadir holding none, before it creates the
+//!   execution database; where some was there before, once the restore has found the execution
+//!   database at genesis. It lists the chain-data directories the run created, one name per line.
 //! - [`remove`] takes it away once every step has committed.
 //! - A node refuses to start while it is there ([`refuse_interrupted_load_state`]).
 //! - A rerun of `db load-state` removes what the stopped run created, then restores again

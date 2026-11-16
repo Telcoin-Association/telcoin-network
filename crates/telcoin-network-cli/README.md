@@ -472,8 +472,10 @@ datadir, and the default build refuses a `db/` holding `mdbx.dat`, or an unfinis
 (`db/tn-lmdb-migrating/` beside `tn-lmdb.dat`, which the node's next start finishes), before
 anything opens it.
 
-`db load-state` writes `load-state-in-progress` into the datadir once it has found no chain data
-there, before it writes any, and removes it when the restore is complete. A run stopped part-way
+`db load-state` writes `load-state-in-progress` into the datadir before it writes any chain data
+there (in a datadir that holds none, before it creates the execution database; where some was there
+before, once it has found the execution database at genesis), and removes it when the restore is
+complete. A run stopped part-way
 (killed, out of memory, power lost) leaves it, and the node refuses to start while it is there
 (`db reset-execution` and `db migrate-execution` refuse the datadir too): the execution and
 consensus databases are incomplete. Run `db load-state` again with the same

@@ -179,10 +179,12 @@ enum DbSubcommand {
     /// certificate chain against the genesis committee, and the state against the last epoch
     /// record. The import can run for hours on a large state. A failed run removes the chain data
     /// it created (never keys or config); a stopped one (killed, power lost) leaves a marker the
-    /// node refuses, and a rerun with the same bundle removes what it created and restores again.
-    /// `--verify-only` runs those checks and the ones the restore makes as it writes (the state
-    /// data read whole, its header window, the consensus pack's import in the system temp
-    /// directory) on the bundle and stops, writing nothing to the datadir.
+    /// node refuses (written before the run creates the execution database or, in a datadir that
+    /// held chain data, once it has found that database at genesis), and a rerun with the same
+    /// bundle removes what it created and restores again. `--verify-only` runs those checks and
+    /// the ones the restore makes as it writes (the state data read whole, its header window,
+    /// the consensus pack's import in the system temp directory) on the bundle and stops,
+    /// writing nothing to the datadir.
     ///
     /// The database gets the format new datadirs get: it holds no transaction up to the pack's
     /// block, and in the default build stores each later transaction as its position in the
@@ -1561,12 +1563,20 @@ impl DbLoadStateArgs {
             .collect();
 
         let outcome = (|| -> eyre::Result<(BlockNumHash, B256)> {
-            // the marker goes in once the restore has found the datadir free of chain data, before
-            // it writes any: from there until it is removed below, a node refuses this datadir
-            let (block, root) =
-                restore_pack(&reth_config, datadir.reth_db_path(), &self.pack, || {
-                    load_state_marker::write(&datadir, &created)
-                })?;
+            // From the marker's write until its removal below, a node refuses this datadir. In a
+            // datadir holding no chain data it goes in before the execution database is created,
+            // so a stop at any later point leaves it. Where chain data was there before, it goes in
+            // only once the restore has found the execution database at genesis, before it writes
+            // any: a marker before the freshness refusal would make the node refuse a datadir this
+            // run never wrote into, and the rerun would name that data to move aside.
+            let marker_first = preexisting.is_empty();
+            let (block, root) = restore_pack(
+                &reth_config,
+                datadir.reth_db_path(),
+                &self.pack,
+                marker_first,
+                || load_state_marker::write(&datadir, &created),
+            )?;
 
             // Rebuild the consensus + epoch-records packs from the bundle's data-only files. A
             // plain copy would not work: these files have no index sidecars and the
@@ -1695,13 +1705,13 @@ fn refuse_restore_datadir(datadir: &Path, epoch: Epoch) -> eyre::Result<()> {
 /// (`load_state_marker`). Skipping pre-existing dirs is a safety guard: even if `db load-state`
 /// were pointed at a populated datadir, this never deletes data the import did not create.
 ///
-/// The import writes both markers only once it has found the datadir free of chain data, so
-/// without its own marker a floor marker here is not its own (a restored node's, which the
-/// freshness check refused) and stays. With a pre-existing chain-data dir the import may have
-/// written into, both markers stay: the datadir holds part of a restore, which a node refuses
-/// and a rerun names. The markers go last: removing them before the dirs could leave restored
-/// chain data without them if this cleanup itself dies midway. Removal errors are logged, not
-/// fatal (the import is already failing). Returns whether the datadir is back as it was.
+/// The import writes its own marker before the floor marker, so without its own marker a floor
+/// marker here is not its own (a restored node's, which the freshness check refused) and stays.
+/// With a pre-existing chain-data dir the import may have written into, both markers stay: the
+/// datadir holds part of a restore, which a node refuses and a rerun names. The markers go last:
+/// removing them before the dirs could leave restored chain data without them if this cleanup
+/// itself dies midway. Removal errors are logged, not fatal (the import is already failing).
+/// Returns whether the datadir is back as it was.
 fn clean_created_chain_data(datadir: &Path, preexisting: &HashSet<PathBuf>) -> bool {
     let mut back = true;
     for dir in chain_data_dirs(datadir) {
@@ -1941,9 +1951,9 @@ fn verify_bundle_state(pack: &Path) -> eyre::Result<VerifyReport> {
 }
 
 /// Build a fresh reth DB from `reth_config` and restore the exec-state pack at `pack` into it,
-/// returning the snapshot block and its recomputed state root. `before_writes` runs once
-/// `SnapshotRestorer::open` has found the database free of chain data, before the restore writes
-/// anything into it.
+/// returning the snapshot block and its recomputed state root. `write_marker` runs before the
+/// database is opened (created) when `marker_first`, else once `SnapshotRestorer::open` has found
+/// the database free of chain data, before the restore writes anything into it.
 ///
 /// Runs inside a one-shot tokio runtime because `SnapshotRestorer::open` (reth provider setup)
 /// requires a runtime context; the restore steps themselves are synchronous.
@@ -1951,7 +1961,8 @@ fn restore_pack(
     reth_config: &RethConfig,
     db_path: PathBuf,
     pack: &Path,
-    before_writes: impl FnOnce() -> eyre::Result<()>,
+    marker_first: bool,
+    write_marker: impl FnOnce() -> eyre::Result<()>,
 ) -> eyre::Result<(BlockNumHash, B256)> {
     // The reth provider setup (`RethEnv::new` inside `SnapshotRestorer::open`) captures the current
     // tokio handle, so establish a runtime context. The restore steps are otherwise synchronous;
@@ -1959,6 +1970,12 @@ fn restore_pack(
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
     let _guard = runtime.enter();
 
+    let write_marker = if marker_first {
+        write_marker()?;
+        None
+    } else {
+        Some(write_marker)
+    };
     let db = RethEnv::new_database(reth_config, db_path)?;
     let task_manager = TaskManager::new("db-load-state");
 
@@ -1969,7 +1986,9 @@ fn restore_pack(
 
     // `open` refuses a datadir that already holds chain data, so this only lands in a fresh one.
     let restorer = SnapshotRestorer::open(reth_config, db, &task_manager)?;
-    before_writes()?;
+    if let Some(write_marker) = write_marker {
+        write_marker()?;
+    }
     restorer.import_chain_scaffold(&window, final_state)?;
     let root = restorer.import_state(&mut reader)?;
     // Reject a bundle the node could not resume from BEFORE declaring the import complete. The
@@ -4749,6 +4768,48 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("state import failed"), "it restored past the pack: {msg}");
         assert!(!pack.exists(), "the rerun removed the stopped run's pack");
+    }
+
+    /// `db load-state` writes its marker before it creates the execution database when the datadir
+    /// holds no chain data, so a stop while the database is created or genesis written leaves the
+    /// marker; with `marker_first` unset (chain data was there before) the marker goes in only once
+    /// the database is open and found at genesis.
+    #[test]
+    fn load_state_writes_its_marker_before_the_execution_database() {
+        use clap::Parser as _;
+        use std::sync::Arc;
+        use tn_config::TelcoinDirs as _;
+        let signers = test_signers(34, 4);
+        let bundle = tempfile::tempdir().expect("bundle");
+        write_verifiable_bundle(bundle.path(), &signers, 2);
+        for marker_first in [true, false] {
+            let datadir = load_state_datadir(&signers);
+            let datadir_path = datadir.path().to_path_buf();
+            let tn_config =
+                super::NamedChain::Adiri.load_config(&datadir_path, super::SHORT_VERSION).unwrap();
+            let reth_config = super::RethConfig::new(
+                super::RethCommand::parse_from(["telcoin-network"]),
+                None,
+                &datadir_path,
+                false,
+                Arc::new(tn_config.chain_spec()),
+            );
+            let db_path = datadir_path.reth_db_path();
+            let db_at_marker = std::cell::Cell::new(None);
+            let err = super::restore_pack(
+                &reth_config,
+                db_path.clone(),
+                bundle.path(),
+                marker_first,
+                || {
+                    db_at_marker.set(Some(db_path.exists()));
+                    Ok(())
+                },
+            )
+            .expect_err("the test bundle's state root does not match");
+            assert!(format!("{err:#}").contains("state root"), "{err:#}");
+            assert_eq!(db_at_marker.get(), Some(!marker_first), "marker_first={marker_first}");
+        }
     }
 
     /// `--verify-only` makes the refusals the restore makes before its first write: the rerun's of
