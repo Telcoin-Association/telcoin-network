@@ -1,7 +1,7 @@
 //! An epoch whose record the whole network leaves uncertified (issue #1850).
 //!
 //! Four validators run as processes with 20-second epochs. Validators 1 and 2 withhold their own
-//! vote for the record of epoch [`K`] in its first two rounds (the test hook
+//! vote for the record of epoch [`K`] in its first rounds (the test hook
 //! `TN_TEST_WITHHOLD_EPOCH_VOTE`), so that record keeps two of the three votes it needs on every
 //! node, while the records after it are certified by their own vote rounds. Two observers show
 //! what a node outside those rounds can collect: the own-record observer runs through the close of
@@ -9,9 +9,10 @@
 //! its own uncertified record of [`K`]; the fresh observer starts on an empty datadir after the
 //! close of `K + 2` and holds no record of [`K`].
 //!
-//! The two tests share one driver and differ in the record switch every node runs: none (the
-//! collector walks past an epoch it holds as its own uncertified record, and only then) and
-//! `epoch_record_recertify` (the close of `K + 2` re-votes [`K`] and certifies it).
+//! The two tests share one driver and differ in how many rounds the withholding validators keep
+//! their vote off: every round the test's closes start (the collector walks past an epoch it
+//! holds as its own uncertified record, and only then) or the first two (the close of `K + 2`
+//! re-votes [`K`] and certifies it).
 
 use super::{
     common::{
@@ -19,8 +20,8 @@ use super::{
         node_log_lines, scrape_metric_value, scrape_metrics, start_validator_with_overrides,
     },
     fleet::{
-        all_validators, assert_epoch_records, assert_switches, expected_switches, log_str_field,
-        node_epoch, wait_for_epoch_on_all, Fleet, Load, PASSPHRASE,
+        assert_epoch_records, assert_switches, expected_switches, log_str_field, node_epoch,
+        wait_for_epoch_on_all, Fleet, Load, PASSPHRASE,
     },
 };
 use alloy::providers::{Provider as _, ProviderBuilder};
@@ -50,10 +51,17 @@ const WITHHOLD_EPOCH_ENV: &str = "TN_TEST_WITHHOLD_EPOCH_VOTE";
 /// The test hook's count of withheld rounds.
 const WITHHOLD_ROUNDS_ENV: &str = "TN_TEST_WITHHOLD_EPOCH_VOTE_ROUNDS";
 
-/// The rounds [`WITHHOLDING`] withhold: the original round at the close of [`K`] and the
-/// failsafe at the close of `K + 1`. With one round the failsafe would certify the record a close
-/// later on every build.
+/// The rounds [`WITHHOLDING`] withhold in [`Arm::Recertify`]: the original round at the close of
+/// [`K`] and the failsafe at the close of `K + 1`. With one round the failsafe would certify the
+/// record a close later on every build.
 const WITHHOLD_ROUNDS: u32 = 2;
+
+/// The rounds [`WITHHOLDING`] withhold in [`Arm::Walk`]: more than the test's closes start for
+/// [`K`]. A validator signs for [`K`] in the original round, the failsafe, one re-certify pick at
+/// each close from `K + 2` while [`K`] is inside the pick's 16-epoch lookback, and each round a
+/// peer's re-vote starts after its own round for [`K`] ended; the test ends a few closes after
+/// `K + 2`.
+const WALK_WITHHOLD_ROUNDS: u32 = 64;
 
 /// The instance of the own-record observer. [`start_validator_with_overrides`] names a node's
 /// datadir `validator-<instance + 1>`; the observers' keys are not in the committee.
@@ -114,12 +122,12 @@ const RESOURCE_NOT_FOUND: i64 = -32001;
 /// The counter of re-certify rounds by `result`.
 const RECERTIFY_ROUNDS: &str = "tn_node_epoch_record_recertify_rounds_total";
 
-/// The record switches of one test.
+/// The withheld rounds of one test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
-    /// The plain node: the collector walks past its own uncertified record.
+    /// Every round for [`K`] is withheld: the collector walks past its own uncertified record.
     Walk,
-    /// `epoch_record_recertify` on.
+    /// The first two rounds are withheld: the close of `K + 2` re-votes [`K`] and certifies it.
     Recertify,
 }
 
@@ -132,25 +140,21 @@ impl Arm {
         }
     }
 
-    /// The `parameters.yaml` entries every node gets.
-    fn switches(self) -> &'static [(&'static str, &'static str)] {
+    /// The rounds [`WITHHOLDING`] withhold.
+    fn withhold_rounds(self) -> u32 {
         match self {
-            Self::Walk => &[],
-            Self::Recertify => &[("epoch_record_recertify", "true")],
+            Self::Walk => WALK_WITHHOLD_ROUNDS,
+            Self::Recertify => WITHHOLD_ROUNDS,
         }
     }
 
-    /// The arm's switches on every node and the withhold hook on [`WITHHOLDING`].
+    /// The withhold hook on [`WITHHOLDING`].
     fn overrides(self) -> FleetOverrides {
-        let fleet =
-            self.switches().iter().fold(FleetOverrides::default(), |fleet, (key, value)| {
-                fleet.parameter(all_nodes(), *key, *value)
-            });
         let withholding = WITHHOLDING.map(datadir);
-        fleet.env(withholding.clone(), WITHHOLD_EPOCH_ENV, K.to_string()).env(
+        FleetOverrides::default().env(withholding.clone(), WITHHOLD_EPOCH_ENV, K.to_string()).env(
             withholding,
             WITHHOLD_ROUNDS_ENV,
-            WITHHOLD_ROUNDS.to_string(),
+            self.withhold_rounds().to_string(),
         )
     }
 }
@@ -158,11 +162,6 @@ impl Arm {
 /// The datadir name [`start_validator_with_overrides`] gives `instance`.
 fn datadir(instance: usize) -> String {
     format!("validator-{}", instance + 1)
-}
-
-/// The datadir names of the four validators and the two observers.
-fn all_nodes() -> impl Iterator<Item = String> {
-    all_validators().chain([OWN_OBSERVER, FRESH_OBSERVER].map(datadir))
 }
 
 /// A collector walks past an epoch it holds as its own uncertified record, and a collector
@@ -182,7 +181,7 @@ fn test_uncertified_epoch_walked_past() -> eyre::Result<()> {
     run_arm(Arm::Walk)
 }
 
-/// With `epoch_record_recertify` on every node, the close of `K + 2` re-votes the
+/// The close of `K + 2` re-votes the
 /// record of [`K`], which the hook no longer withholds, and certifies it.
 ///
 /// Shortly after the close of `K + 2` every validator serves the same certified records of epochs
@@ -290,7 +289,7 @@ impl Observers {
         let test = fleet.test.clone();
         let mut timeline = Vec::new();
         network_advancing(&fleet.urls)?;
-        let expected = expected_switches(arm.switches())?;
+        let expected = expected_switches(&[])?;
         for node in 0..4 {
             assert_switches(&test, node, 0, &expected)?;
         }
@@ -435,20 +434,31 @@ impl Observers {
             .collect::<Vec<_>>();
         let observers_alive = [(OWN_OBSERVER, 1), (FRESH_OBSERVER, 0)];
 
-        // the hook withholds exactly the first two rounds on the withholding validators
+        // the hook withholds the first rounds for K on the withholding validators: the first two,
+        // or in the walk every round the closes started (never fewer than two, never all it holds)
         for &(node, run) in &runs {
             let lines = log_lines(test, node, run, WITHHOLD_LOG, &[])?;
             let rounds =
                 lines.iter().map(|line| (log_field(line, "epoch"), log_field(line, "round")));
             let rounds = rounds.collect::<Vec<_>>();
-            let expected: Vec<(Option<u64>, Option<u64>)> =
-                if WITHHOLDING.contains(&node) && run == 0 {
-                    (1..=WITHHOLD_ROUNDS)
-                        .map(|round| (Some(u64::from(K)), Some(u64::from(round))))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            let withheld = match arm {
+                Arm::Walk => {
+                    let started = u32::try_from(rounds.len())?;
+                    eyre::ensure!(
+                        started < WALK_WITHHOLD_ROUNDS,
+                        "node {node} run {run} withheld every round the hook holds"
+                    );
+                    started.max(WITHHOLD_ROUNDS)
+                }
+                Arm::Recertify => WITHHOLD_ROUNDS,
+            };
+            let expected: Vec<(Option<u64>, Option<u64>)> = if WITHHOLDING.contains(&node)
+                && run == 0
+            {
+                (1..=withheld).map(|round| (Some(u64::from(K)), Some(u64::from(round)))).collect()
+            } else {
+                Vec::new()
+            };
             eyre::ensure!(
                 rounds == expected,
                 "node {node} run {run} withheld rounds {rounds:?}, expected {expected:?}"
@@ -592,10 +602,37 @@ impl Observers {
                     .push(format!("re-certify round on validators {picked:?}, rounds {rounds:?}"));
             }
         }
-        if arm != Arm::Recertify {
+        if arm == Arm::Walk {
+            // every validator re-votes K at the closes after K + 1, and none of those rounds
+            // certifies it: the withholding validators keep their votes off in all of them
             for node in 0..4 {
-                fleet.assert_no_log(node, 0, RECERTIFY_LOG)?;
+                let lines = log_lines(test, node, 0, RECERTIFY_LOG, &[])?;
+                eyre::ensure!(
+                    !lines.is_empty()
+                        && lines.iter().all(|line| log_line_matches(
+                            line,
+                            RECERTIFY_LOG,
+                            &[format!("epoch={K}")]
+                        )),
+                    "validator {node} re-certify picks {lines:?}, expected epoch {K} only"
+                );
+                let certified = labelled_counter(
+                    &fleet.metrics[node],
+                    RECERTIFY_ROUNDS,
+                    "result=\"certified\"",
+                )?;
+                eyre::ensure!(
+                    certified == 0.0,
+                    "validator {node} counted {certified} certified re-certify rounds"
+                );
             }
+            let short = |node: usize| {
+                labelled_counter(&fleet.metrics[node], RECERTIFY_ROUNDS, "result=\"short\"")
+            };
+            poll(Duration::from_secs(90), "a short re-certify round", || {
+                let counted = (0..4).map(short).collect::<eyre::Result<Vec<_>>>()?;
+                Ok(counted.iter().any(|&c| c >= 1.0))
+            })?;
         }
 
         // the certified-through gauge

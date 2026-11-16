@@ -415,32 +415,6 @@ pub struct Parameters {
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub quorum_exec_block_starved_rounds: u32,
 
-    /// Re-vote one older uncertified epoch record of this node's own at each epoch close and at
-    /// startup, and keep verified epoch-vote signatures across vote rounds.
-    ///
-    /// When on, the close-time failsafe re-votes the previous epoch's record as before plus one
-    /// older record this node holds uncertified within the last 16 epochs (picked round-robin by
-    /// the closing epoch), the startup re-arm does the same, and a vote round for a record is
-    /// seeded with the signatures earlier rounds for that record verified, so two rounds that each
-    /// fell short can add up to a quorum, and a round that ends short aggregates the kept
-    /// signatures once they reach a quorum. The vote is the same signed message as the original:
-    /// nothing new goes on the wire. Rounds for records older than the previous one leave the
-    /// `tn_node.epoch_record_signers` gauge to the rounds of the latest and the previous record
-    /// and label their missed votes `round="recertify"` in
-    /// `tn_node.epoch_record_missing_signers_total`; the outcome of this node's own picks is in
-    /// `tn_node.epoch_record_recertify_rounds_total`.
-    ///
-    /// A node whose own record of an older epoch differs from the network's certified one learns
-    /// it when the round for that record falls short and the round fetches the certificate from a
-    /// peer. It then stops, as it does when its record of the newest epoch or the one before
-    /// differs: the round logs at error a line ending in `we have forked!` and calls the node's
-    /// shutdown. A restart does not change the stored record, so a later pick of it stops the
-    /// node again until an operator acts. The default `false` keeps the previous behaviour: only
-    /// the previous epoch's record is re-voted, once, and every vote round starts empty. Issue
-    /// #1850.
-    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
-    pub epoch_record_recertify: bool,
-
     /// Keep vote requests queued on the voter's per-author lock from each waiting out the
     /// execution wait in turn.
     ///
@@ -593,7 +567,6 @@ impl Default for Parameters {
             // ---- runtime switches: begin ----
             quorum_exec_block: false,
             quorum_exec_block_starved_rounds: 0,
-            epoch_record_recertify: false,
             vote_queue_fix: false,
             digest_order_hold: false,
             // ---- runtime switches: end ----
@@ -797,7 +770,6 @@ runtime_switches! {
     // one entry per switch field, in the order the node lists them
     quorum_exec_block,
     quorum_exec_block_starved_rounds,
-    epoch_record_recertify,
     vote_queue_fix,
     digest_order_hold,
     // ---- runtime switches: end ----

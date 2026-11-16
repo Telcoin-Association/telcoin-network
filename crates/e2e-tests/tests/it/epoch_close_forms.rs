@@ -203,10 +203,10 @@ const REVOTE_LOG: &str = "re-publishing epoch record vote for epoch";
 const QUORUM_LOG: &str = "epoch record quorum";
 
 /// The info line, with field `epoch`, of a vote round that stored the certificate from the votes
-/// earlier rounds for the record kept (`epoch_record_recertify`).
+/// earlier rounds for the record kept.
 const KEPT_LOG: &str = "epoch record certified from kept votes";
 
-/// The info line, with field `epoch`, of a re-certify pick (`epoch_record_recertify`): at the close
+/// The info line, with field `epoch`, of a re-certify pick: at the close
 /// of epoch N a node re-votes one of its uncertified records of epochs N - 16 to N - 2.
 const RECERTIFY_LOG: &str = "epoch record re-certify round";
 
@@ -1058,7 +1058,7 @@ struct CertifiedAt {
 
 /// How the missed record was certified, from every run of every node.
 ///
-/// With `epoch_record_recertify` on, the fast members keep their votes from the failed first round,
+/// The fast members keep their votes from the failed first round,
 /// so a round that a released member's vote starts can reach a quorum before the next close; the
 /// close of the next epoch re-votes a record still uncertified through the previous-record failsafe
 /// on every member. Required: a vote round on some node formed the certificate ([`QUORUM_LOG`] or
