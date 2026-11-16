@@ -88,12 +88,12 @@
 //! and pin the totals by class and the dup table's cursor calls, so a class whose share moved
 //! fails there. A test's scripts have a shape ([`Scripts`]):
 //! the narrow one above, or the multi-leaf one of `random_scripts_match_mdbx_multi_leaf` (and
-//! `_heavy`), seeded with [`MULTI_LEAF_ROWS`] rows under one dup key and as many header keys, the
-//! drawn keys and slots spread over them and the dup values in the wide encoding ([`WIDE`]), so
-//! the cursor calls run inside multi-leaf nested and composite trees. Every run also counts the
-//! dup table's cursor calls run and skipped apart, and fails if the skipped reach a fifth in a
-//! heavy run or a quarter in a default one, whose 32 scripts spread the share wide
-//! ([`DUP_SKIP_LIMIT_DEFAULT`]).
+//! `_heavy`), seeded with [`MULTI_LEAF_ROWS`] rows under one dup key, two under a later one and as
+//! many header keys as the first holds rows, the drawn keys and slots spread over them and the dup
+//! values in the wide encoding ([`WIDE`]), so the cursor calls run inside multi-leaf nested and
+//! composite trees. Every run also counts the dup table's cursor calls run and skipped apart, and
+//! fails if the skipped reach a fifth in a heavy run or a quarter in a default one, whose 32
+//! scripts spread the share wide ([`DUP_SKIP_LIMIT_DEFAULT`]).
 
 use super::{
     adapter::create_mdbx_db, dup::second_value_refused, mdbx_port::create_test_db_with, Form,
@@ -741,11 +741,17 @@ const SEED: [Op; 10] = [
 /// (8-byte keys, 32-byte values) to take several leaves at 4 KiB pages.
 const MULTI_LEAF_ROWS: u8 = 250;
 
-/// Puts [`MULTI_LEAF_ROWS`] rows under dup key 1 (slots 0 up), as many header keys (spread,
-/// [`Tb::row`]) and two bytecodes, and commits: the scripts of [`Scripts::MultiLeaf`] then run
-/// their cursor writes and moves inside multi-leaf nested trees and composite trees.
+/// Puts [`MULTI_LEAF_ROWS`] rows under dup key 1 (slots 0 up), two under dup key 3, as many
+/// header keys (spread, [`Tb::row`]) and two bytecodes, and commits: the scripts of
+/// [`Scripts::MultiLeaf`] then run their cursor writes and moves inside multi-leaf nested trees
+/// and composite trees. Key 3's rows give the table a key after the big one, so a seek or walk
+/// from keys 2 and 3 and a `next_no_dup` from key 1 land on a row, where they would run past the
+/// table's end and leave the cursor's relative calls skipped until it is placed again; two rows,
+/// so the key is no [`ONE_ROW_KEY`].
 fn multi_leaf_seed() -> Vec<Op> {
-    let slots = (0..MULTI_LEAF_ROWS).map(|s| Op::Put(Tb::S, K(1, s)));
+    let slots = (0..MULTI_LEAF_ROWS)
+        .map(|s| Op::Put(Tb::S, K(1, s)))
+        .chain([Op::Put(Tb::S, K(3, 0)), Op::Put(Tb::S, K(3, 1))]);
     let headers = (0..MULTI_LEAF_ROWS).map(|n| Op::Put(Tb::H, K(n / 16, n % 16)));
     let codes = [Op::Put(Tb::B, K(1, 0)), Op::Put(Tb::B, K(3, 0)), Op::Commit];
     slots.chain(headers).chain(codes).collect()
@@ -1958,10 +1964,10 @@ const HEAVY_TOTALS: Totals = Totals {
 
 /// [`random_scripts_skip_counts_are_pinned_at_seed_1_multi_leaf`]'s totals.
 const MULTI_LEAF_TOTALS: Totals = Totals {
-    ran: 17_374,
-    skips: [20, 0, 17, 1, 0, 8, 0, 2, 0],
-    dup_cursor_ran: 336,
-    dup_cursor_skipped: 37,
+    ran: 17_447,
+    skips: [14, 0, 15, 1, 0, 7, 0, 2, 0],
+    dup_cursor_ran: 345,
+    dup_cursor_skipped: 28,
 };
 
 /// Random scripts of transaction and cursor calls on three tables (one dup-sort, one with

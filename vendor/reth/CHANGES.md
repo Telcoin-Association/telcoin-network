@@ -1175,6 +1175,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `delete_segment`, no segment deletion, no static-file check. reth-db-common suite; tn-reth's
   layout and format-freeze tests. *Upstream*: n/a (upstream commits).
 
+- **TN-0207** — Backport 7d1fda9d0: an HTTP and WS server sharing one port keeps one stop handle.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc-builder/src/lib.rs` (`RpcServerConfig::start` stores the shared
+  server's handle as `http` only; test `test_stop_rpc_servers`). Applied cleanly with
+  `vendor.py pick`.
+  *Why*: on a shared port `RpcServerHandle` held the same `ServerHandle` as `http` and `ws`, so
+  `stop` sent the stop twice. When the server had already shut down after the first send (it
+  drops every receiver), the second returned `AlreadyStoppedError`. TN never calls `stop` (its
+  RPC servers end when the handle is dropped), so only tests saw it: TN-0016's
+  `test_ws_upgrade_origin_allowlist` failed 12 runs in 20 with every core busy. No node behaviour
+  changes: dropping the one remaining handle stops the server as dropping both did, and the
+  handle's addresses and clients are unchanged. *Tests*: with every core busy,
+  `test_ws_upgrade_origin_allowlist` and `test_stop_rpc_servers` pass 20 runs in 20 (12 of 20
+  failed with the fix reverted); reth-rpc-builder suite. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
