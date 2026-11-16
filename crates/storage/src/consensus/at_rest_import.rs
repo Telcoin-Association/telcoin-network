@@ -116,11 +116,15 @@ pub enum EpochImportError {
     Source(String),
     /// The copy failed the import's verification, or the import failed; nothing was installed.
     Import(ConsensusChainError),
-    /// The copy verified, but its install as `epoch-N` failed, possibly part way (see the
-    /// message): the node's next start settles what it left (`recover_incomplete_installs`).
+    /// The copy verified, but its install as `epoch-N` failed, most often changing nothing, else
+    /// part way (see the message): the node's next start settles what it left
+    /// (`recover_incomplete_installs`), and so does a rerun.
     Install {
         /// The epoch asked for.
         epoch: Epoch,
+        /// Whether a pack was in place (as `epoch-N` or an interrupted install's aside), which
+        /// the install moves aside: without one, it leaves no `epoch-N.replaced`.
+        had_pack: bool,
         /// Why the install failed.
         error: ConsensusChainError,
     },
@@ -150,9 +154,10 @@ impl Display for EpochImportError {
             ),
             Self::Source(why) => write!(f, "{why}"),
             Self::Import(e) => write!(f, "the copy did not import, and nothing was installed: {e}"),
-            Self::Install { epoch, error } => write!(
+            Self::Install { epoch, had_pack: true, error } => write!(
                 f,
-                "the copy verified, but its install did not complete ({error}). It may have \
+                "the copy verified, but its install did not complete ({error}). Most often \
+                 nothing changed: the pack that was there is still in place. It may also have \
                  stopped part way: `epoch-{epoch}` may already be the verified copy, with the pack \
                  it replaced at `epoch-{epoch}.replaced`, or `epoch-{epoch}` may be missing, with \
                  that pack at `epoch-{epoch}.replaced`. The node's next start settles either \
@@ -160,6 +165,13 @@ impl Display for EpochImportError {
                  puts the aside back), and so does a rerun of this import, which puts an \
                  interrupted install back first and finds nothing to import once the copy is in \
                  place"
+            ),
+            Self::Install { epoch, had_pack: false, error } => write!(
+                f,
+                "the copy verified, but its install did not complete ({error}). Most often \
+                 nothing changed: there is still no `epoch-{epoch}`; or `epoch-{epoch}` may \
+                 already be the verified copy. A rerun of this import settles it: it installs \
+                 the copy, or finds nothing to import once the copy is in place"
             ),
         }
     }
@@ -255,7 +267,11 @@ impl ConsensusChain {
                 epoch,
                 &path.join(format!("epoch-{epoch}")),
             )
-            .map_err(|error| EpochImportError::Install { epoch, error })?;
+            .map_err(|error| EpochImportError::Install {
+                epoch,
+                had_pack: replaces != EpochPackState::Missing,
+                error,
+            })?;
         }
         drop(import_path);
         Ok(EpochImport { epoch, replaces, bytes: len, installed: install })
@@ -1082,8 +1098,9 @@ mod test {
     }
 
     /// An install that fails after the copy verified is reported as an install failure, naming
-    /// what it may have left and that the node's next start settles it, never as a copy that
-    /// changed nothing; a rerun then installs the copy.
+    /// first the commonest state it leaves (nothing changed), then what it may have left part
+    /// way and that the node's next start settles it, and naming an aside only when a pack was
+    /// in place to move aside; never as a copy that changed nothing. A rerun installs the copy.
     #[tokio::test]
     async fn import_epoch_at_rest_reports_a_failed_install_as_one() {
         let tmp = TempDir::new().unwrap();
@@ -1092,24 +1109,44 @@ mod test {
         let copy = tmp.path().join("copy");
         copy_dir(&base.join("epoch-1"), &copy);
         flip_middle_byte(&base.join("epoch-1").join(DATA_NAME));
+        let damaged = tree(&base.join("epoch-1"));
+        let import = || {
+            ConsensusChain::import_epoch_at_rest(
+                &base,
+                1,
+                &copy,
+                true,
+                TIMEOUT,
+                IMPORT_MIN_FREE_BYTES,
+            )
+        };
         // the install runs on this (current-thread) test's thread
         crate::consensus_pack::FAIL_NEXT_INSTALL.with(|fail| fail.set(true));
-        let err = ConsensusChain::import_epoch_at_rest(
-            &base,
-            1,
-            &copy,
-            true,
-            TIMEOUT,
-            IMPORT_MIN_FREE_BYTES,
-        )
-        .await
-        .unwrap_err();
+        let err = import().await.unwrap_err();
         assert!(matches!(err, EpochImportError::Install { epoch: 1, .. }), "{err}");
         let text = err.to_string();
-        for named in ["recover_incomplete_installs", "`epoch-1.replaced`", "part way"] {
+        for named in
+            ["nothing changed", "recover_incomplete_installs", "`epoch-1.replaced`", "part way"]
+        {
             assert!(text.contains(named), "{named}: {text}");
         }
         assert!(!text.contains("nothing was installed"), "{text}");
+        // the failed rename put the old pack back: nothing changed
+        assert!(!base.join("epoch-1.replaced").exists());
+        assert_eq!(tree(&base.join("epoch-1")), damaged, "the old pack is in place");
+
+        // a missing pack: nothing is ever moved aside
+        let aside = tmp.path().join("aside");
+        std::fs::rename(base.join("epoch-1"), &aside).unwrap();
+        crate::consensus_pack::FAIL_NEXT_INSTALL.with(|fail| fail.set(true));
+        let err = import().await.unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, EpochImportError::Install { epoch: 1, .. }), "{text}");
+        assert!(text.contains("nothing changed"), "{text}");
+        assert!(!text.contains("epoch-1.replaced"), "{text}");
+        assert!(!base.join("epoch-1").exists() && !base.join("epoch-1.replaced").exists());
+        std::fs::rename(&aside, base.join("epoch-1")).unwrap();
+
         let done = ConsensusChain::import_epoch_at_rest(
             &base,
             1,
