@@ -7821,8 +7821,9 @@ async fn vote_path_timing_line_carries_superseding_request() -> eyre::Result<()>
     let unexecuted = BlockNumHash::new(parent.number() + 1, BlockHash::random());
     let author = committee.last_authority();
     let peer = *author.authority().protocol_key();
-    let gap = Duration::from_millis(300);
-    assert!(VOTE_EXECUTION_WAIT > gap * 2, "the newer request arrives well inside the wait");
+    // a short gap keeps the newer request far inside the wait on a loaded machine
+    let gap = Duration::from_millis(50);
+    assert!(VOTE_EXECUTION_WAIT > gap * 10, "the newer request arrives well inside the wait");
 
     // round 2 names a block that never executes and waits; round 3 arrives `gap` later naming an
     // executed block, so round 2 is refused as superseded once its wait ends
@@ -7848,10 +7849,9 @@ async fn vote_path_timing_line_carries_superseding_request() -> eyre::Result<()>
         after >= gap_ms && after <= line_field(&superseded, "total_ms"),
         "round 3 arrived `gap` after round 2 and before its answer: {superseded}"
     );
-    assert!(
-        superseded.find(" exec_deficit_open=") < superseded.find(" superseded_by_round="),
-        "the new fields come last: {superseded}"
-    );
+    let deficit_at = superseded.find(" exec_deficit_open=").expect("the deficit field");
+    let superseded_at = superseded.find(" superseded_by_round=").expect("the superseded field");
+    assert!(deficit_at < superseded_at, "the new fields follow the deficit: {superseded}");
     let answered = timing_line(3);
     assert!(!answered.contains(" outcome=\"superseded\" "), "{answered}");
     assert!(answered.contains(" superseded_by_round=0 superseded_after_ms=0"), "{answered}");
