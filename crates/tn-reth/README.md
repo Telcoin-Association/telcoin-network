@@ -1054,9 +1054,9 @@ CHANGES.md TN-0200..0203.
     checked against this node's certified record of epoch N and every earlier output by its
     parent links, and only a verified, sealed copy is renamed into place; without `--force` it only
     verifies. The copy must lie outside `consensus-db/epochs/`. It needs the records of epochs N-1
-    and N (the second certified) and refuses the epoch the node resumes, and epoch 0, whose sealed
-    pack is put back from this node's backup as a plain copy (then `db validate --epoch 0`). A
-    whole `consensus-db/` from an older backup lacks the packs of the epochs since it was taken,
+    and N (the second certified; for epoch 0, certified record 0 and the genesis committee) and
+    refuses the epoch the node resumes. A whole `consensus-db/` from an older backup lacks the
+    packs of the epochs since it was taken,
     so it fixes the gap only with the execution database restored from the same stop or rebuilt,
     and a validator restored that way stays stopped until the network has closed the epoch it was
     last in (its later votes are not in the backup). The node cannot

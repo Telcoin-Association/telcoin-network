@@ -152,9 +152,11 @@ enum DbSubcommand {
     /// which checks its last output against this node's certified record of epoch N and every
     /// earlier one by its parent links, and it is installed only once verified, sealed and
     /// read back, renamed into place as the node installs an import. It replaces a missing
-    /// pack, a damaged one, or an interrupted install whose copy is damaged. It refuses epoch
-    /// 0, the epoch the node resumes and any later one (and a datadir with no latest-consensus
-    /// hint, whose resume epoch is unknown), an epoch whose certified record (or
+    /// pack, a damaged one, or an interrupted install whose copy is damaged. Epoch 0's copy is
+    /// checked against certified record 0 and the genesis committee (the datadir's
+    /// `genesis/committee.yaml`), which the node opens epoch 0 with. It refuses the epoch
+    /// the node resumes and any later one (and a datadir with no latest-consensus hint, whose
+    /// resume epoch is unknown), an epoch whose certified record (or
     /// the record before it) this node lacks, a copy inside the epochs directory (put it
     /// elsewhere: the import and the node remove directories there), and a pack in place that
     /// validates and ends with the epoch's certified final output. The node MUST be stopped: it
@@ -1291,6 +1293,9 @@ impl DbImportEpochArgs {
         // The install replaces files a running node reads: refuse while a node holds the datadir,
         // and hold it so a node cannot start mid-import; released when this returns.
         let _pid_lock = PidLock::acquire(&datadir)?;
+        // Epoch 0's pack chains to the stand-in the node opens epoch 0 with, built from the
+        // genesis committee; no other epoch reads it.
+        let genesis = (self.epoch == 0).then(|| load_genesis_committee(&datadir)).transpose()?;
         let runtime =
             tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
         let import = runtime
@@ -1301,6 +1306,7 @@ impl DbImportEpochArgs {
                 self.force,
                 STREAM_IMPORT_TIMEOUT,
                 self.min_free(),
+                genesis.as_ref(),
             ))
             .map_err(|e| eyre!("epoch {}: {e}", self.epoch))?;
         if import.installed {
@@ -4606,9 +4612,9 @@ mod tests {
     }
 
     /// `db import-epoch` refuses while a node holds the datadir, before reading anything; with
-    /// the lock free it refuses epoch 0 (verified against the pre-genesis descriptor, which no
-    /// copy carries), a datadir with no epochs directory, and one with no latest-consensus hint
-    /// (whose resume epoch is unknown), and writes nothing.
+    /// the lock free it refuses a datadir with no epochs directory, epoch 0 without the genesis
+    /// committee it is verified against, and a datadir with no latest-consensus hint (whose
+    /// resume epoch is unknown), and writes nothing.
     #[cfg(unix)]
     #[test]
     fn db_import_epoch_refuses_a_running_node_and_what_it_cannot_verify() {
@@ -4631,8 +4637,8 @@ mod tests {
         assert!(err.to_string().contains("another telcoin process"), "{err}");
         drop(held);
         let before = tree_listing(&epochs);
-        let err = import(0).execute(datadir.clone()).expect_err("epoch 0");
-        assert!(format!("{err:#}").contains("epoch 0 cannot be imported"), "{err:#}");
+        let err = import(0).execute(datadir.clone()).expect_err("no genesis committee");
+        assert!(format!("{err:#}").contains("failed to load genesis committee"), "{err:#}");
         let err = import(1).execute(datadir.clone()).expect_err("no resume epoch to judge by");
         assert!(format!("{err:#}").contains("no readable latest-consensus hint"), "{err:#}");
         assert_eq!(tree_listing(&epochs), before, "a refusal wrote nothing");

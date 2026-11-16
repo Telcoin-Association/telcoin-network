@@ -524,13 +524,15 @@ log up to its last complete output (`wal_consistent_end`; a sealed log ends with
 no peer serves) goes through the peer import's own staged path (`ConsensusChain::import_sealed`, the
 `import-N` directory, the checked seal and its read-back) against the local records of epochs N-1
 and N, read from their logs without opening the records DB (N certified, N chaining to N-1; a log
-an unclean stop left unsealed is read up to its torn tail, as the node's open recovers it), and
+an unclean stop left unsealed is read up to its torn tail, as the node's open recovers it; for epoch
+0, record 0, naming no parent, and the stand-in record the node opens epoch 0 with,
+`ConsensusChain::epoch_zero_previous`, from the genesis committee the command loads), and
 only a verified copy is installed (`install_imported_epoch_dir`, rename-aside, which also puts back
 an interrupted install's aside first). It opens no `ConsensusChain`: an open writes (the live
 epoch's append open, `recover_incomplete_installs`, the sweep), and `stream_import`'s idempotency
 guard keeps a pack that still serves its final output, however damaged the rest of its log. It
-refuses epoch 0, the epoch the latest-consensus hint resumes and later ones (and, with no hint, every
-epoch: the epoch the start resumes is then unknown), a copy inside the epochs directory (whose directories the import and the node's start remove or replace), and a pack
+refuses the epoch the latest-consensus hint resumes and later ones (and, with no hint, every epoch:
+the epoch the start resumes is then unknown), a copy inside the epochs directory (whose directories the import and the node's start remove or replace), and a pack
 in place (or an interrupted install's aside) that validates and ends with the epoch's certified
 final output (`pack_damage`: a v2 pack must also be sealed; a legacy v0 or v1 pack, which predates
 the sentinel, is judged by the dry run of its migration to v2, as the node reads it); a dry run (no
