@@ -202,9 +202,13 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// out-of-order re-queue counter (issue #1807). Observability only.
     lane_seqs: LaneSequences,
     /// The highest own round a commit notice named in this proposer's life. Handling that notice
-    /// takes every tracked header at or below it out of [`Self::proposed_headers`], so a header
-    /// tracked there afterwards was put back by a re-send (the max-delay tick, or the restart
-    /// re-propose) and its digests are counted as `stale_resend`, never as out of order.
+    /// takes every tracked header at or below it out of [`Self::proposed_headers`], and that is
+    /// the only place it rises; a proposal result at or below it is not tracked again (the
+    /// guard in `Self::handle_proposal_result`). Every tracked header therefore lies above it,
+    /// a re-queue never meets a header tracked again after its own commit, and the
+    /// `stale_resend` reason of `tn_primary_requeued_order_unknown_total` stays 0. It starts
+    /// at 0 after a restart, so a committed header the restarted proposer re-sends from the
+    /// store is tracked, and its digests count as `unknown_seq` when they are re-queued.
     committed_own_round: Round,
     /// The `tn_primary_requeued_out_of_order_total{cause}` counters, resolved once per epoch.
     requeued_out_of_order: RequeuedOutOfOrderHandles,
@@ -959,8 +963,10 @@ impl<DB: Database> Proposer<DB> {
         // a re-queued digest's wait since it was last queued restarts here; its first receipt
         // comes back from `proposed_first_received`
         let requeued_at = Instant::now();
-        // a header tracked at or below an own round an earlier notice settled was re-sent after it
-        // left; its digests keep no sequence and are counted apart
+        // a header tracked at or below an own round an earlier notice settled would be a re-send
+        // tracked again after it left, its digests without a sequence and counted apart as
+        // `stale_resend`. Every tracked header lies above `committed_own_round` (see its doc), so
+        // `resent` is false here and `stale_resend` stays 0
         let settled_round = self.committed_own_round;
         let mut stale_resend = 0;
 
@@ -1046,7 +1052,8 @@ impl<DB: Database> Proposer<DB> {
     fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
         let mut requeued = BTreeMap::new();
         // see `process_committed_headers`: a header tracked again after an own commit settled its
-        // round keeps no sequence
+        // round would keep no sequence; a tracked header lies above `committed_own_round`, so
+        // `resent` is false here
         let resent = round <= self.committed_own_round;
         let stale_resend = match self.proposed_headers.get(&round) {
             Some(header) if round < self.round && header.digest() == digest => {
@@ -1111,8 +1118,11 @@ impl<DB: Database> Proposer<DB> {
     /// those that return behind a newer digest of their worker count in
     /// `tn_primary_requeued_out_of_order_total{cause}` and in the line's `out_of_order`, those
     /// without a known sequence in `tn_primary_requeued_order_unknown_total{reason}`.
-    /// `stale_resend` digests came from headers tracked again by a re-send after an own commit
-    /// settled their round; their callers gave them no sequence.
+    /// `stale_resend` digests would come from headers tracked again by a re-send after an own
+    /// commit settled their round, which the callers give no sequence. No such header is tracked
+    /// (see `Self::committed_own_round`), so the callers pass 0 and the `stale_resend` reason stays
+    /// 0; the digests of a committed header that a restarted proposer re-sent from the store have
+    /// no sequence either and count as `unknown_seq`.
     fn prepend_requeued(
         &mut self,
         mut requeued: BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
@@ -1154,6 +1164,8 @@ impl<DB: Database> Proposer<DB> {
         let total = |digests: usize| u64::try_from(digests).unwrap_or(u64::MAX);
         self.digests_requeued.counter(cause).increment(total(count));
         self.requeued_out_of_order.counter(cause).increment(total(order.out_of_order));
+        // every tracked header lies above `committed_own_round`, so `stale_resend` is 0 and every
+        // digest without a sequence counts as `unknown_seq`
         self.requeued_order_unknown
             .counter(RequeueOrderUnknown::UnknownSeq)
             .increment(total(order.unknown.saturating_sub(stale_resend)));
@@ -1406,17 +1418,19 @@ impl<DB: Database> Proposer<DB> {
         // reschedule intervals
         self.min_delay_interval.reset_after(self.calc_min_delay());
         self.max_delay_interval.reset_after(self.calc_max_delay());
-        // with the order hold on, a header at or below an own round a commit notice already
-        // settled is not tracked again. That notice took every tracked header at or below it out
-        // of `proposed_headers`, and the newest own header is the only one sent again, so this is
-        // a committed header: a re-send (the max-delay tick or the restart re-propose) that raced
-        // its notice, or a new header whose notice came before this result. Its digests leave the
-        // order bookkeeping as a committed header's do. Tracked again, it would hold its lanes
-        // behind every later header without an own parent until the next own commit at or above
-        // its round, and that commit would re-queue its committed digests (`stale_resend`).
+        // a header at or below an own round a commit notice already settled is not tracked again.
+        // That notice took every tracked header at or below it out of `proposed_headers`, and the
+        // newest own header is the only one sent again, so this is a committed header: a re-send
+        // (the max-delay tick or the restart re-propose) that raced its notice, or a new header
+        // whose notice came before this result. Its digests leave the order bookkeeping as a
+        // committed header's do. Tracked again, it would hold its lanes behind every later header
+        // without an own parent until the next own commit at or above its round, and that commit
+        // would re-queue its committed digests a second time. The insert below is the only one into
+        // `proposed_headers`, so every tracked header lies above `committed_own_round` and the
+        // `stale_resend` reason of `tn_primary_requeued_order_unknown_total` stays 0.
         // `committed_own_round` starts at 0 after a restart, so this guard does not catch the
         // max-delay re-send of a last own header that committed before the restart (see the order
-        // hold's module doc).
+        // hold's module doc); its digests count as `unknown_seq` when that commit re-queues them.
         if header.round() <= self.committed_own_round {
             header.payload().keys().for_each(|digest| {
                 self.proposed_first_received.remove(digest);

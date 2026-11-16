@@ -588,13 +588,17 @@ impl RequeuedOutOfOrderHandles {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RequeueOrderUnknown {
     /// The proposer holds no sequence for the digest: it rode a stored header re-sent after a
-    /// restart, which this proposer never drained, or its worker reported it twice and the other
-    /// copy took the sequence.
+    /// restart, which this proposer never drained (a header that committed before the restart
+    /// included), or its worker reported it twice and the other copy took the sequence.
     UnknownSeq,
     /// The digest's header was tracked again by a re-send after a commit notice at or above its
-    /// round had settled it: it committed and the max-delay tick re-sent it before the round moved
-    /// on, or a restart re-sent it from the store. Either way its digests have no place in the
-    /// queue's order, and a committed header's digests are re-queued a second time.
+    /// round had settled it; its digests would have no place in the queue's order, and a committed
+    /// header's digests would be re-queued a second time. The proposer does not track such a
+    /// header: a proposal result at or below its highest committed own round returns before the
+    /// header is tracked, and only the handling of a commit notice raises that round, after it
+    /// takes every tracked header at or below it out. This reason therefore stays 0. A committed
+    /// header that a restarted proposer re-sends from the store is tracked, because that round
+    /// starts at 0 after a restart, and its digests count as [`Self::UnknownSeq`].
     StaleResend,
 }
 
@@ -1064,7 +1068,7 @@ mod tests {
         assert_eq!(lock.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0.004]);
     }
 
-    // ---- bench7 voter-lock ----
+    // ---- the voter's per-author lock ----
 
     /// The vote path handles register one outcome counter per vote outcome, labelled with the
     /// outcome's `vote path timing` value, and count each finished request under its outcome.

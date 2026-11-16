@@ -43,8 +43,9 @@
 //! - I2: no re-queued digest is older, by its worker's sequence, than a digest of the same worker
 //!   in a tracked or committed header. The proposer checks it (a counter and a warning in
 //!   production, an assertion in tests); this module never sees sequences.
-//! - I3: a plan that holds no lane drains as the base does, byte for byte: the held-lane filter
-//!   takes no slot and does not move the drain's lane cursor.
+//! - I3: a plan that holds no lane drains the uniform rotation over every lane with digests (issue
+//!   #556), byte for byte: the held-lane filter takes no slot and does not move the drain's lane
+//!   cursor.
 //!
 //! # Why the hold is enough
 //!
@@ -87,15 +88,16 @@
 //! values (the round, the parents' authors and header digests, the tracked headers' digests and
 //! worker lanes) and has no I/O, clock or logging.
 //!
-//! The hold still changes when headers are built, through the proposer's trigger. Held digests
-//! stay queued, and the proposer's `enough_digests` trigger counts every queued digest, held ones
-//! included. A held backlog of at least `header_num_of_batches_threshold` digests therefore
-//! builds the next header as soon as its parents allow, without waiting for the min delay, and
-//! that header can carry none of the held digests. Under load the trigger fires as on the base,
-//! because the queue is above the threshold either way; at light load a held backlog builds a
-//! header earlier than the base would. A narrower trigger is not built and is a possible later
-//! change: leave held digests out of the count while the only blocker is the own header of the
-//! previous round, so that the node waits the base's min delay for that header's certificate.
+//! The hold still changes when headers are built, through the proposer's trigger. Held digests stay
+//! queued, and the proposer's `enough_digests` trigger counts every queued digest, held ones
+//! included. A held backlog of at least `header_num_of_batches_threshold` digests therefore builds
+//! the next header as soon as its parents allow, without waiting for the min delay, and that header
+//! can carry none of the held digests. Under load this changes nothing, because the queue is above
+//! the threshold with or without the held digests; at light load a held backlog builds a header
+//! earlier than the digests the drain can take would on their own. A narrower trigger is not built
+//! and is a possible later change: leave held digests out of the count while the only blocker is
+//! the own header of the previous round, so that the node waits the min delay for that header's
+//! certificate.
 //!
 //! # What releases a held lane
 //!
@@ -105,13 +107,13 @@
 //!
 //! - After a restart, the proposer's highest committed own round (`committed_own_round`) starts at
 //!   0, so the max-delay re-send can track the last own header again although it already committed.
-//!   The base does the same, and the next own commit at or above that header's round re-queues its
-//!   committed digests, which are proposed a second time. The hold only adds the wait: until that
-//!   commit, the header holds its lanes.
+//!   The next own commit at or above that header's round re-queues its committed digests, which are
+//!   proposed a second time. Until that commit, the header holds its lanes.
 //! - An own header that the certifier gives up on without sending the uncertified report (no quorum
 //!   after every vote request returned, a certificate-store read error, a full report channel)
 //!   stays tracked and holds its lanes until the next own commit at or above its round, which
-//!   re-queues it. On the base its digests wait just as long, while newer ones overtake them.
+//!   re-queues it. Its digests wait that long in any case, and the drain leaves the newer digests
+//!   of its lanes queued behind them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use tn_types::{AuthorityIdentifier, Certificate, Header, HeaderDigest, Round, WorkerId};
