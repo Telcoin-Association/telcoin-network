@@ -1,6 +1,9 @@
 //! Prometheus metrics for state sync (consensus catch-up).
 
-use reth_metrics::{metrics::Counter, Metrics};
+use reth_metrics::{
+    metrics::{Counter, Gauge},
+    Metrics,
+};
 use std::sync::LazyLock;
 
 /// Process-wide state-sync metrics.
@@ -12,7 +15,9 @@ pub(crate) static STATE_SYNC_METRICS: LazyLock<StateSyncMetrics> =
     LazyLock::new(StateSyncMetrics::default);
 
 /// Metrics for consensus catch-up and epoch pack retrieval.
-#[derive(Metrics)]
+///
+/// Cloning shares the registered handles: a clone writes the same series.
+#[derive(Metrics, Clone)]
 #[metrics(scope = "tn_state_sync")]
 pub(crate) struct StateSyncMetrics {
     /// Catch-up iterations that made no progress (consensus header cache miss).
@@ -32,6 +37,33 @@ pub(crate) struct StateSyncMetrics {
     /// empty-output stretch that queue is the loop's only throttle, so a steadily rising count
     /// means the subscriber is not draining catch-up output.
     pub(crate) output_send_stalls_total: Counter,
+    /// The highest epoch E such that this node holds a record and its certificate for every epoch
+    /// `0..=E`, or `-1` when epoch 0 has no certificate (a fresh node still holding the unsigned
+    /// genesis anchor). A certificate stored past a gap does not move it until the gap is filled.
+    /// Read from the epoch store by the record collector after each pass and by the startup sync.
+    pub(crate) epoch_records_certified_through: Gauge,
+    /// Epochs a record collection walked past: each epoch this node holds as its own uncertified
+    /// record that a pass skipped once a certified record after it was stored, counted when the
+    /// collection opens it as a gap. The startup sync and the record collector keep separate gap
+    /// sets, and both start empty after a restart, so one epoch can count more than once. Only
+    /// with `epoch_record_collect_past_uncertified` on.
+    pub(crate) epoch_record_gap_walks_total: Counter,
+    /// Walks that ended on the next epoch's record naming another parent: this node's own
+    /// uncertified record differs from the one the network built on, and the walk stops there.
+    /// Counted on every pass that meets it; any peer can send such a record, so this alone proves
+    /// nothing.
+    pub(crate) epoch_record_walk_parent_mismatches_total: Counter,
+    /// Certified records that validated against this node's record of the epoch before and differ
+    /// from the record this node stored for the same epoch. The certificate holds a super-quorum
+    /// of the record's own committee: the committee the record before it hands over to, or a
+    /// subset of that committee with at least four members and at least two thirds of its
+    /// members. The stop that follows reads each one as this node's execution having diverged
+    /// from the certified chain; the `epoch record conflict:` line logged with it names who
+    /// certified the other record, and how many members of which committee, so an operator can
+    /// check that reading. Each one stops the node right after it is counted here, and is
+    /// counted again in `tn_epoch.final_state_mismatches_total`
+    /// (`tn_epoch_final_state_mismatches_total` in Prometheus).
+    pub(crate) epoch_record_conflicts_total: Counter,
 }
 
 #[cfg(test)]
@@ -52,6 +84,7 @@ mod tests {
             metrics.catch_up_redrives_total.increment(1);
             metrics.stream_errors_total.increment(1);
             metrics.output_send_stalls_total.increment(1);
+            metrics.epoch_records_certified_through.set(-1.0);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -69,5 +102,7 @@ mod tests {
         find("tn_state_sync.catch_up_redrives_total");
         find("tn_state_sync.stream_errors_total");
         find("tn_state_sync.output_send_stalls_total");
+        let (_, _, _, value) = find("tn_state_sync.epoch_records_certified_through");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == -1.0), "got {value:?}");
     }
 }

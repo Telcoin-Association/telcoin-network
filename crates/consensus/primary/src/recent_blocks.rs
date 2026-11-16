@@ -2,8 +2,8 @@
 
 use std::collections::VecDeque;
 use tn_types::{
-    BlockNumHash, BlockNumber, CanonicalExecutionReader, ConsensusHeaderDigest, ConsensusNumHash,
-    Round, SealedHeader,
+    deconstruct_nonce, BlockNumHash, BlockNumber, CanonicalExecutionReader, ConsensusHeaderDigest,
+    ConsensusNumHash, Epoch, Round, SealedHeader,
 };
 
 /// Tracks 'num_blocks' most recently executed block hashes and numbers.
@@ -77,6 +77,43 @@ impl RecentBlocks {
     /// Return the hash and number of the last executed block.
     pub fn latest_execution_block(&self) -> SealedHeader {
         self.executed_blocks.back().cloned().unwrap_or_else(Default::default)
+    }
+
+    /// The newest executed block whose number is at or below `number`.
+    ///
+    /// `None` when the ring is empty or every entry is above `number`. The ring holds the final
+    /// block of each recent output, so this resolves a number to this node's own block at the end
+    /// of the newest output that had not passed it.
+    pub fn newest_at_or_below(&self, number: BlockNumber) -> Option<BlockNumHash> {
+        self.executed_blocks
+            .iter()
+            .rev()
+            .map(|block| block.num_hash())
+            .find(|block| block.number <= number)
+    }
+
+    /// The `k`-th newest executed block, counting the newest as `k = 0`.
+    ///
+    /// `k` counts ring entries (executed outputs that produced a block), not block numbers. A ring
+    /// holding `k` or fewer entries answers with its oldest entry, and an empty ring with `None`.
+    pub fn nth_newest(&self, k: usize) -> Option<BlockNumHash> {
+        let newest = self.executed_blocks.len().checked_sub(1)?;
+        self.executed_blocks.get(newest.saturating_sub(k)).map(|block| block.num_hash())
+    }
+
+    /// The newest executed block that belongs to an epoch before `epoch`.
+    ///
+    /// A block's epoch is the upper half of its header's `nonce`, which execution stamps from the
+    /// leader of the output that built it. The newest such entry is the block `epoch` opened on:
+    /// the previous epoch's closing block, which every node executes before it enters `epoch`.
+    /// `None` when the ring is empty or holds only blocks of `epoch` and later, which are all above
+    /// that opening block.
+    pub fn newest_before_epoch(&self, epoch: Epoch) -> Option<BlockNumHash> {
+        self.executed_blocks
+            .iter()
+            .rev()
+            .find(|block| deconstruct_nonce(u64::from(block.nonce)).0 < epoch)
+            .map(|block| block.num_hash())
     }
 
     /// Is `block` a recent block we have executed?
@@ -243,5 +280,88 @@ mod tests {
             recent.check_execution_block(BlockNumHash::new(10, older.hash())),
             Some(ExecutionCheck::NotYet)
         );
+    }
+
+    /// A ring of `capacity` holding one executed output per number in `numbers`, oldest first.
+    fn ring_of(capacity: usize, numbers: &[u64]) -> (RecentBlocks, Vec<BlockNumHash>) {
+        let mut recent = RecentBlocks::new(capacity);
+        let mut pushed = Vec::new();
+        for (i, number) in numbers.iter().enumerate() {
+            let block =
+                SealedHeader::seal_slow(ExecHeader { number: *number, ..Default::default() });
+            pushed.push(block.num_hash());
+            let round = u32::try_from(i).expect("small ring");
+            let output =
+                ConsensusNumHash::new(u64::from(round), ConsensusHeaderDigest::from([4u8; 32]));
+            recent.push_latest(round, output, Some(block));
+        }
+        (recent, pushed)
+    }
+
+    /// `newest_at_or_below` answers with the newest entry at or below a number: an exact hit, a
+    /// number between two entries, one above the tip and one below the oldest entry.
+    #[test]
+    fn newest_at_or_below_resolves_numbers_to_own_entries() {
+        let (empty, _) = ring_of(4, &[]);
+        assert_eq!(empty.newest_at_or_below(u64::MAX), None, "empty ring");
+
+        let (recent, blocks) = ring_of(8, &[10, 13, 16, 19]);
+        assert_eq!(recent.newest_at_or_below(13), Some(blocks[1]), "exact hit");
+        assert_eq!(recent.newest_at_or_below(15), Some(blocks[1]), "between two entries");
+        assert_eq!(recent.newest_at_or_below(u64::MAX), Some(blocks[3]), "above the tip");
+        assert_eq!(recent.newest_at_or_below(10), Some(blocks[0]), "the oldest entry");
+        assert_eq!(recent.newest_at_or_below(9), None, "below the oldest entry");
+    }
+
+    /// `nth_newest` counts entries back from the tip and stops at the oldest entry; after the ring
+    /// wraps, the oldest entry is the oldest one still held.
+    #[test]
+    fn nth_newest_counts_entries_and_stops_at_the_oldest() {
+        let (empty, _) = ring_of(4, &[]);
+        assert_eq!(empty.nth_newest(0), None, "empty ring");
+        assert_eq!(empty.nth_newest(8), None, "empty ring");
+
+        let (recent, blocks) = ring_of(8, &[10, 13, 16, 19]);
+        assert_eq!(recent.nth_newest(0), Some(blocks[3]), "the tip");
+        assert_eq!(recent.nth_newest(2), Some(blocks[1]), "entries, not block numbers");
+        assert_eq!(recent.nth_newest(3), Some(blocks[0]), "the oldest entry");
+        assert_eq!(recent.nth_newest(8), Some(blocks[0]), "a short ring stops at its oldest");
+
+        let (wrapped, blocks) = ring_of(3, &[10, 13, 16, 19, 22]);
+        assert_eq!(wrapped.nth_newest(1), Some(blocks[3]));
+        assert_eq!(wrapped.nth_newest(usize::MAX), Some(blocks[2]), "the oldest held entry");
+        assert_eq!(wrapped.newest_at_or_below(14), None, "13 left the ring");
+    }
+
+    // ---- bench7 quorum-exec-block ----
+
+    /// `newest_before_epoch` reads each entry's epoch from its nonce and answers with the newest
+    /// entry of an earlier epoch: the closing block of the epoch before, while the ring holds it.
+    #[test]
+    fn newest_before_epoch_finds_the_previous_epochs_closing_block() {
+        let mut recent = RecentBlocks::new(8);
+        let mut pushed = Vec::new();
+        // epoch 4 closes at block 16; epoch 5 executes blocks 19 and 22
+        for (round, (epoch, number)) in
+            [(4u64, 10u64), (4, 13), (4, 16), (5, 19), (5, 22)].into_iter().enumerate()
+        {
+            let round = u32::try_from(round).expect("small ring");
+            let nonce = (epoch << 32) | u64::from(round);
+            let block = SealedHeader::seal_slow(ExecHeader {
+                number,
+                nonce: nonce.into(),
+                ..Default::default()
+            });
+            pushed.push(block.num_hash());
+            let output =
+                ConsensusNumHash::new(u64::from(round), ConsensusHeaderDigest::from([5u8; 32]));
+            recent.push_latest(round, output, Some(block));
+        }
+
+        assert_eq!(recent.newest_before_epoch(5), Some(pushed[2]), "epoch 4's closing block");
+        assert_eq!(recent.newest_before_epoch(6), Some(pushed[4]), "the tip, of an earlier epoch");
+        assert_eq!(recent.newest_before_epoch(4), None, "nothing before epoch 4");
+        assert_eq!(recent.newest_before_epoch(0), None, "nothing before epoch 0");
+        assert_eq!(RecentBlocks::new(8).newest_before_epoch(5), None, "empty ring");
     }
 }

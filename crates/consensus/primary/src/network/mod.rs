@@ -2758,6 +2758,10 @@ impl PrimaryNetworkHandle {
     /// Request an epoch record and its certificate from a random peer, up to three times from
     /// three different peers.
     ///
+    /// On success it returns the record, its certificate and the BLS key of the peer that served
+    /// them: the identity the network resolved for the responding connection, used for logs only.
+    /// The caller validates the pair before it uses either.
+    ///
     /// The error tells a definitive answer apart from a failed exchange:
     /// - [`NetworkError::RPCError`]: at least one peer answered that it holds no certified record
     ///   for the request ([`PrimaryResponse::unavailable_epoch_record`]) and no peer returned one;
@@ -2771,7 +2775,7 @@ impl PrimaryNetworkHandle {
         &self,
         epoch: Option<Epoch>,
         hash: Option<EpochDigest>,
-    ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
+    ) -> NetworkResult<(EpochRecord, EpochCertificate, BlsPublicKey)> {
         let request = PrimaryRequest::EpochRecord { epoch, hash };
         let unavailable = PrimaryResponse::unavailable_epoch_record(epoch, hash);
         let mut answered = false;
@@ -2781,9 +2785,9 @@ impl PrimaryNetworkHandle {
             let res = self.handle.send_request_any(request.clone()).await?;
             match res.await {
                 Ok(Ok(NetworkResponseMessage {
-                    peer: _,
+                    peer,
                     result: PrimaryResponse::EpochRecord { record, certificate },
-                })) => return Ok((record, certificate)),
+                })) => return Ok((record, certificate, peer)),
                 Ok(Ok(NetworkResponseMessage { peer: _, result })) => {
                     answered |= result == unavailable;
                 }
@@ -3777,7 +3781,8 @@ where
         // The default budget is unbounded, so this only observes until an operator sets
         // `serve_budget.vote`. An enforcing vote class also caps each peer at
         // `MAX_PERMITS_PER_PEER`, so one committee peer cannot hold the whole pool while its
-        // requests wait on its author lock in `RequestHandler::vote`.
+        // requests wait in `RequestHandler::vote`: on its author lock, and with `vote_queue_fix`
+        // on also in the bounded wait for execution before that lock.
         if let Some(serve_permit) =
             self.network_handle.handle.serve_permits().try_acquire(ServiceClass::Vote, peer)
         {
