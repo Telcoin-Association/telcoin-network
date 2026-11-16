@@ -239,14 +239,14 @@ impl PrimaryMetrics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoteStage {
     /// The bounded wait for local execution to reach the header's latest execution block, taken
-    /// before the per-author lock when `vote_queue_fix` is on.
+    /// before the per-author lock.
     ///
     /// It runs before the vote timeout starts, so no vote timeout fires in it.
     PreLockWait,
     /// Header checks, the drift tier decision and the seed signature verify.
     Validate,
-    /// The wait for local execution to reach the header's latest execution block, or with
-    /// `vote_queue_fix` on the check of it without a wait.
+    /// The check, without a wait, that local execution has reached the header's latest execution
+    /// block.
     ExecWait,
     /// The missing-parent check, parent acceptance, the wait for the parents and their checks.
     Parents,

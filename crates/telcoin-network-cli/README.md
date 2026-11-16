@@ -651,7 +651,7 @@ The `parameters.yaml` file controls consensus timing and behavior. The node read
 | `max_header_num_of_batches`             | `10`     | Maximum batch digests per header                    |
 | `max_header_delay`                      | `2500ms` | Maximum wait time between header proposals          |
 | `min_header_delay`                      | `1000ms` | Minimum wait time; allows early header proposal     |
-| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + [`max_header_time_drift_tolerance`](#max_header_time_drift_tolerance-network-config) (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout (below 9 s with `vote_queue_fix` on) |
+| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + [`max_header_time_drift_tolerance`](#max_header_time_drift_tolerance-network-config) (rounded up to whole seconds pre-fork) and below 9 s: the 10 s libp2p request timeout less the voter's 1 s execution wait |
 | `gc_depth`                              | `50`     | Consensus rounds retained before garbage collection |
 | `sync_retry_delay`                      | `5s`     | Delay before retrying sync requests                 |
 | `sync_retry_nodes`                      | `3`      | Number of random committee nodes to query on retry  |
@@ -719,7 +719,7 @@ The only input to these checks that changes between epochs is whether the sub-se
 | `header_num_of_batches_threshold` from 1 to `max_header_num_of_batches`  | At 0 the proposer seals empty headers; above the maximum the two limits contradict each other                                                                                                        |
 | `min_header_delay` at most `max_header_delay`                            | The minimum is an early-proposal point inside the maximum's window; inverted, the maximum always expires first and the minimum never takes effect                                                   |
 | `vote_timeout` at least `max_header_delay` plus the voter's longest drift wait | A vote request must stay open for a full header cadence plus the time the voter may spend waiting out a future-dated header. The drift wait is `max_header_time_drift_tolerance` once the sub-second timestamp fork is active for the epoch, and the tolerance rounded up to whole seconds before it (1 s for the 250 ms default) |
-| `vote_timeout` below 10 s; below 9 s with `vote_queue_fix` on            | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires. With `vote_queue_fix` on, the voter waits up to 1 s for execution before it takes the author lock and starts `vote_timeout`, so that wait plus `vote_timeout` must stay below 10 s |
+| `vote_timeout` below 9 s                                                 | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires. The voter waits up to 1 s for execution before it takes the author lock and starts `vote_timeout`, so that wait plus `vote_timeout` must stay below 10 s |
 
 With `--chain adiri` or `--chain mainnet`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
 Neither preset sets `vote_timeout`, so it is 5 s.

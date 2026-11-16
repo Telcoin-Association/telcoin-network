@@ -5622,14 +5622,14 @@ fn header_on_unknown_worker(
 }
 
 /// A vote request whose header fails the stateless checks is refused at once, without the wait for
-/// execution, whether `vote_queue_fix` is `on` or not, and with the same fatal penalty. It still
-/// goes through the author lock and leaves the same entry there: a well-formed header of the same
-/// round is refused against it. With the switch on it also still sets its author's mark, so a
-/// lower round is refused as superseded; with it off that round is refused against the entry.
-async fn malformed_header_is_refused_without_the_wait(on: bool) -> eyre::Result<()> {
+/// execution, and with a fatal penalty. It still goes through the author lock and leaves the same
+/// entry there: a well-formed header of the same round is refused against it. It also still sets
+/// its author's mark, so a lower round is refused as superseded.
+#[tokio::test(start_paused = true)]
+async fn malformed_header_is_refused_without_the_wait() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), on).await;
+        create_vote_test_types(temp_dir.path()).await;
     let executed = BlockNumHash::new(parent.number(), parent.hash());
     let unexecuted = BlockNumHash::new(1, BlockHash::random());
     let author = committee.last_authority();
@@ -5646,7 +5646,7 @@ async fn malformed_header_is_refused_without_the_wait(on: bool) -> eyre::Result<
     assert_eq!(
         start.elapsed(),
         Duration::ZERO,
-        "a header that fails the stateless checks must not wait for execution (switch on: {on})"
+        "a header that fails the stateless checks must not wait for execution"
     );
     assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::UnkownWorkerId));
     assert_matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal), "the penalty stays");
@@ -5659,41 +5659,18 @@ async fn malformed_header_is_refused_without_the_wait(on: bool) -> eyre::Result<
             theirs: 3,
             ours: 3
         })),
-        "the refused header's entry must hold round 3 (switch on: {on})"
+        "the refused header's entry must hold round 3"
     );
 
     let lower = header_at(&committee, author, 2, executed);
     let res = handler.vote(peer, lower, Vec::new()).await;
-    if on {
-        assert_matches!(
-            res,
-            Err(PrimaryNetworkError::SupersededRequest { round: 2, newest_round: 3, .. }),
-            "the refused header still sets its author's mark"
-        );
-    } else {
-        assert_matches!(
-            res,
-            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
-                theirs: 2,
-                ours: 3
-            })),
-            "without the switch a lower round is refused against the entry"
-        );
-    }
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::SupersededRequest { round: 2, newest_round: 3, .. }),
+        "the refused header still sets its author's mark"
+    );
 
     Ok(())
-}
-
-/// [`malformed_header_is_refused_without_the_wait`] with `vote_queue_fix` on.
-#[tokio::test(start_paused = true)]
-async fn vote_queue_fix_on_refuses_malformed_header_without_the_wait() -> eyre::Result<()> {
-    malformed_header_is_refused_without_the_wait(true).await
-}
-
-/// [`malformed_header_is_refused_without_the_wait`] with `vote_queue_fix` off, as on main.
-#[tokio::test(start_paused = true)]
-async fn vote_queue_fix_off_refuses_malformed_header_without_the_wait() -> eyre::Result<()> {
-    malformed_header_is_refused_without_the_wait(false).await
 }
 
 // ---- bench7 voter-lock (continued) ----
@@ -5712,78 +5689,9 @@ fn header_at(
         .build()
 }
 
-/// Vote requests queued for one author whose block has not executed take that author's vote lock
-/// in turn, and each waits out the execution wait under it: the k-th request is answered k
-/// execution waits after they all arrived (#1804).
-///
-/// Two authors queue six requests each at the same time. One sends rounds 1 to 6 in order, the
-/// other the same round-1 header six times (retries piling up). In each queue the k-th answer comes
-/// k waits in, so a newer round waits behind every older one, and the two queues run side by side
-/// because the lock is per author. The sixth answer comes after the vote timeout: the time a
-/// request waits for the lock is not bounded by it. Every answer is the recoverable
-/// `ExecutionBehind`, which leaves the author's vote-cache entry as it was, so no request is
-/// refused early on the lock either.
-#[tokio::test(start_paused = true)]
-async fn vote_queued_requests_of_one_author_wait_in_turn() -> eyre::Result<()> {
-    let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path()).await;
-    let vote_timeout = Parameters::default().vote_timeout;
-    let unexecuted = BlockNumHash::new(1, BlockHash::random());
-    // the paused clock jumps from timer to timer, so each answer lands on its turn's tick
-    let slack = Duration::from_millis(10);
-
-    // each request records when it was answered, measured from when all of them were sent
-    let start = tokio::time::Instant::now();
-    let answered_in_turn = |headers: Vec<Header>, peer: BlsPublicKey| {
-        let handler = &handler;
-        futures::future::join_all(headers.into_iter().map(move |header| async move {
-            let res = handler.vote(peer, header, Vec::new()).await;
-            (res, start.elapsed())
-        }))
-    };
-
-    let rounds_author = committee.last_authority();
-    let rounds = (1..=6).map(|round| header_at(&committee, rounds_author, round, unexecuted));
-    let copies_author = committee.authority_fixture_by_idx(1).expect("a second authority");
-    let copies = vec![header_at(&committee, copies_author, 1, unexecuted); 6];
-    let (rounds, copies) = tokio::join!(
-        answered_in_turn(rounds.collect(), *rounds_author.authority().protocol_key()),
-        answered_in_turn(copies, *copies_author.authority().protocol_key()),
-    );
-
-    for (queue, results) in [("round", &rounds), ("copy", &copies)] {
-        for (turn, (res, at)) in (1..).zip(results) {
-            let due = VOTE_EXECUTION_WAIT * turn;
-            assert!(
-                *at >= due && *at < due + slack,
-                "{queue} {turn} waits under its author's lock behind {} earlier requests, so it is \
-                 due at {due:?}, answered at {at:?}",
-                turn - 1
-            );
-            assert_matches!(
-                res,
-                Err(PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind {
-                    header_block: 1,
-                    local_block: 0
-                })),
-                "{queue} {turn} is behind"
-            );
-        }
-        let (_, last) = results.last().expect("six requests");
-        assert!(
-            *last > vote_timeout,
-            "the last {queue} waits for the lock past the vote timeout {vote_timeout:?}, answered \
-             at {last:?}"
-        );
-    }
-
-    Ok(())
-}
-
-/// A handler for the first authority with [`Parameters::vote_queue_fix`] set to `on`.
-async fn create_test_types_vote_queue_fix(path: &Path, on: bool) -> TestTypes {
-    let params = Parameters { vote_queue_fix: on, ..Default::default() };
+/// A handler for the first authority with the default parameters.
+async fn create_vote_test_types(path: &Path) -> TestTypes {
+    let params = Parameters::default();
     create_test_types_with_params(path, Some(params)).await
 }
 
@@ -5843,14 +5751,12 @@ impl tracing::Subscriber for LinesAt {
 /// waiting again, so all five are refused `ExecutionBehind` at one second. Rounds 1 to 5 from
 /// another author, arriving in order while an earlier request holds that author's lock: after the
 /// shared wait the four older rounds are refused as superseded by round 5 with the lock still
-/// held, so by the check after the wait, and round 5 alone reaches the lock once it is free. With
-/// the switch off the same requests wait in turn
-/// (`vote_queued_requests_of_one_author_wait_in_turn`).
+/// held, so by the check after the wait, and round 5 alone reaches the lock once it is free.
 #[tokio::test(start_paused = true)]
-async fn vote_queue_fix_queued_requests_wait_once() -> eyre::Result<()> {
+async fn vote_queued_requests_wait_once() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+        create_vote_test_types(temp_dir.path()).await;
     let unexecuted = BlockNumHash::new(1, BlockHash::random());
     let behind = |res: &Result<PrimaryResponse, PrimaryNetworkError>| {
         matches!(
@@ -5927,10 +5833,10 @@ async fn vote_queue_fix_queued_requests_wait_once() -> eyre::Result<()> {
 /// retries it (seven sends) and reports it retryable, never the fatal `RPCError`. It is not written
 /// to the author's vote state: the newer header is still answered from its entry.
 #[tokio::test(start_paused = true)]
-async fn vote_queue_fix_stale_round_refused_at_once() -> eyre::Result<()> {
+async fn vote_stale_round_refused_at_once() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+        create_vote_test_types(temp_dir.path()).await;
     let executed = BlockNumHash::new(parent.number(), parent.hash());
     let unexecuted = BlockNumHash::new(1, BlockHash::random());
     let author = committee.last_authority();
@@ -5996,14 +5902,13 @@ async fn vote_queue_fix_stale_round_refused_at_once() -> eyre::Result<()> {
 
 /// Only a header inside the window `vote_inner` would vote on moves its author's mark: one round
 /// past the committed round plus `gc_depth` is refused as too new and leaves the mark alone, so a
-/// lower round reaches the author lock (refused there by the author's entry, as without the
-/// switch) instead of being refused as superseded. A header at the window's last round does move
-/// it.
+/// lower round reaches the author lock (refused there by the author's entry) instead
+/// of being refused as superseded. A header at the window's last round does move it.
 #[tokio::test(start_paused = true)]
-async fn vote_queue_fix_far_future_round_does_not_move_mark() -> eyre::Result<()> {
+async fn vote_far_future_round_does_not_move_mark() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+        create_vote_test_types(temp_dir.path()).await;
     let executed = BlockNumHash::new(parent.number(), parent.hash());
     let gc_depth = committee.first_authority().consensus_config().parameters().gc_depth;
 
@@ -6042,10 +5947,10 @@ async fn vote_queue_fix_far_future_round_does_not_move_mark() -> eyre::Result<()
 /// round-1 header still earns a vote after it. One that names another epoch's committee is outside
 /// the window, so it is refused without the wait before the author lock.
 #[tokio::test(start_paused = true)]
-async fn vote_queue_fix_unauthenticated_request_does_not_move_mark() -> eyre::Result<()> {
+async fn vote_unauthenticated_request_does_not_move_mark() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+        create_vote_test_types(temp_dir.path()).await;
     let executed = BlockNumHash::new(parent.number(), parent.hash());
     let author = committee.last_authority();
     let peer = *author.authority().protocol_key();
@@ -6093,7 +5998,7 @@ async fn vote_queue_fix_unauthenticated_request_does_not_move_mark() -> eyre::Re
 /// fork refusal, logged once for the request; a block below the restored-state floor is the
 /// existing `BelowRestoreFloor` refusal, also without a wait.
 #[tokio::test(start_paused = true)]
-async fn vote_queue_fix_checks_execution_under_lock_without_waiting() -> eyre::Result<()> {
+async fn vote_checks_execution_under_lock_without_waiting() -> eyre::Result<()> {
     /// A canonical database that answers `hash` at every height, or nothing, above an optional
     /// restored-state floor.
     struct Canonical(Option<BlockHash>, Option<u64>);
@@ -6112,7 +6017,7 @@ async fn vote_queue_fix_checks_execution_under_lock_without_waiting() -> eyre::R
     let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } = {
         // the bus registers its metrics with the recorder that is active while it is built
         let _local_recorder = metrics::set_default_local_recorder(&recorder);
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await
+        create_vote_test_types(temp_dir.path()).await
     };
     let lines = Arc::new(Mutex::new(Vec::new()));
     let _guard = tracing::subscriber::set_default(LinesAt {
@@ -6222,15 +6127,15 @@ async fn vote_queue_fix_checks_execution_under_lock_without_waiting() -> eyre::R
     Ok(())
 }
 
-/// The switch leaves the equivocation guards as they are: the same header is answered again with
+/// The equivocation guards hold: the same header is answered again with
 /// the vote cached for it under the author lock, a different header for the same round is refused
 /// `AlreadyVotedForLaterRound` under the lock (it passes the mark, which refuses only strictly
 /// older rounds), and a durable vote for the round refuses a different header `AlreadyVoted`.
 #[tokio::test(start_paused = true)]
-async fn vote_queue_fix_keeps_equivocation_refusals() -> eyre::Result<()> {
+async fn vote_keeps_equivocation_refusals() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+        create_vote_test_types(temp_dir.path()).await;
     let executed = BlockNumHash::new(parent.number(), parent.hash());
     let author = committee.last_authority();
     let peer = *author.authority().protocol_key();
@@ -6254,7 +6159,7 @@ async fn vote_queue_fix_keeps_equivocation_refusals() -> eyre::Result<()> {
     // a fresh handler (after a restart) with the vote durable on disk
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+        create_vote_test_types(temp_dir.path()).await;
     let author_id = committee.last_authority().id();
     let seeded = VoteInfo {
         epoch: committee.committee().epoch(),
@@ -6293,10 +6198,9 @@ fn line_field(line: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} is not a number in: {line}"))
 }
 
-/// The `vote path timing` line carries `prelock_wait_ms` with the switch on or off, so parsers see
-/// one shape: with it off the field is 0 and the execution wait shows in `exec_wait_ms`; with it
-/// on the wait shows in `prelock_wait_ms`, `exec_wait_ms` is 0, and the `prelock_wait` stage
-/// histogram records it. A superseded refusal is logged with `outcome="superseded"`.
+/// The `vote path timing` line carries the execution wait in `prelock_wait_ms`, `exec_wait_ms` is
+/// 0, and the `prelock_wait` stage histogram records it. A superseded refusal is logged with
+/// `outcome="superseded"`.
 ///
 /// The stage stamps read the wall clock, so this test runs on it: about two seconds.
 #[tokio::test]
@@ -6319,35 +6223,27 @@ async fn vote_path_timing_line_carries_prelock_wait() -> eyre::Result<()> {
     let unexecuted = BlockNumHash::new(1, BlockHash::random());
 
     let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), false).await;
-    let author = committee.last_authority();
-    let peer = *author.authority().protocol_key();
-    let _ = handler.vote(peer, header_at(&committee, author, 1, unexecuted), Vec::new()).await;
-    let off = timing_lines();
-    assert_eq!(off.len(), 1, "{off:?}");
-    assert!(off[0].contains(" outcome=\"behind\" prelock_wait_ms=0 lock_ms="), "{}", off[0]);
-    assert!(line_field(&off[0], "exec_wait_ms") >= wait_ms, "{}", off[0]);
-    lines.lock().clear();
-
-    let temp_dir = TempDir::new().unwrap();
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     let TestTypes { committee, handler, task_manager: _task_manager, .. } = {
         // the handler resolves its vote metric handles with the recorder active while it is built
         let _local_recorder = metrics::set_default_local_recorder(&recorder);
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await
+        create_vote_test_types(temp_dir.path()).await
     };
     let author = committee.last_authority();
     let peer = *author.authority().protocol_key();
     let _ = handler.vote(peer, header_at(&committee, author, 2, unexecuted), Vec::new()).await;
     let _ = handler.vote(peer, header_at(&committee, author, 1, unexecuted), Vec::new()).await;
-    let on = timing_lines();
-    assert_eq!(on.len(), 2, "{on:?}");
-    assert!(on[0].contains(" outcome=\"behind\" prelock_wait_ms="), "{}", on[0]);
-    assert!(line_field(&on[0], "prelock_wait_ms") >= wait_ms, "{}", on[0]);
-    assert_eq!(line_field(&on[0], "exec_wait_ms"), 0, "{}", on[0]);
-    assert!(on[1].contains(" outcome=\"superseded\" prelock_wait_ms=0 lock_ms=0 "), "{}", on[1]);
+    let found = timing_lines();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].contains(" outcome=\"behind\" prelock_wait_ms="), "{}", found[0]);
+    assert!(line_field(&found[0], "prelock_wait_ms") >= wait_ms, "{}", found[0]);
+    assert_eq!(line_field(&found[0], "exec_wait_ms"), 0, "{}", found[0]);
+    assert!(
+        found[1].contains(" outcome=\"superseded\" prelock_wait_ms=0 lock_ms=0 "),
+        "{}",
+        found[1]
+    );
     let prelock = snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
         (key.key().name() == "tn_primary.vote_stage_seconds"
             && key.key().labels().any(|l| l.key() == "stage" && l.value() == "prelock_wait"))
@@ -6371,11 +6267,11 @@ async fn vote_path_timing_line_carries_prelock_wait() -> eyre::Result<()> {
 /// superseded by round 3 instead of being evaluated, and round 3 is evaluated. Without the check
 /// on taking the lock, round 2 would be evaluated: it passed both checks before round 3 arrived.
 #[tokio::test]
-async fn vote_queue_fix_refuses_request_superseded_on_the_lock() -> eyre::Result<()> {
+async fn vote_refuses_request_superseded_on_the_lock() -> eyre::Result<()> {
     pin_subsecond_fork(true);
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+        create_vote_test_types(temp_dir.path()).await;
     let executed = BlockNumHash::new(parent.number(), parent.hash());
     let author = committee.last_authority();
     let peer = *author.authority().protocol_key();
@@ -6419,19 +6315,17 @@ async fn vote_queue_fix_refuses_request_superseded_on_the_lock() -> eyre::Result
     Ok(())
 }
 
-/// Repeats of headers this node voted for, around a newer request of their author, with
-/// `vote_queue_fix` set to `on`; returns nothing and asserts what both settings share.
+/// Repeats of headers this node voted for, around a newer request of their author.
 ///
 /// The author's round-1 and round-2 headers earn votes. Then the round-1 header is repeated, a
 /// round-2 repeat follows, the author's round-3 header is refused as behind (its block is not
 /// executed, so its decision keeps the round-2 entry), and the round-2 header is repeated once
-/// more. Neither setting signs again for any repeat: no vote is created after the first two, the
-/// author's cached vote stays the round-2 vote and the stored vote stays the round-2 header's. With
-/// the switch on, each repeat of an older header after a newer request is refused as superseded
-/// before the author lock; with it off, the round-1 repeat is refused under the lock and the
-/// round-2 repeat after round 3 gets the cached vote. A repeat of the newest voted header, before
-/// a newer request arrives, gets the cached vote either way.
-async fn repeats_of_voted_headers(on: bool) -> eyre::Result<()> {
+/// more. No repeat signs again: no vote is created after the first two, the author's cached vote
+/// stays the round-2 vote and the stored vote stays the round-2 header's. Each repeat of an older
+/// header after a newer request is refused as superseded before the author lock. A repeat of the
+/// newest voted header, before a newer request arrives, gets the cached vote.
+#[tokio::test(start_paused = true)]
+async fn vote_refuses_repeat_of_voted_header_after_newer_request() -> eyre::Result<()> {
     pin_subsecond_fork(true);
     let temp_dir = TempDir::new().unwrap();
     let recorder = DebuggingRecorder::new();
@@ -6439,7 +6333,7 @@ async fn repeats_of_voted_headers(on: bool) -> eyre::Result<()> {
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } = {
         // the handler resolves its vote metric handles with the recorder active while it is built
         let _local_recorder = metrics::set_default_local_recorder(&recorder);
-        create_test_types_vote_queue_fix(temp_dir.path(), on).await
+        create_vote_test_types(temp_dir.path()).await
     };
     let executed = BlockNumHash::new(parent.number(), parent.hash());
     let author = committee.last_authority();
@@ -6502,27 +6396,16 @@ async fn repeats_of_voted_headers(on: bool) -> eyre::Result<()> {
     unchanged("after the two votes").await;
 
     let repeat = handler.vote(peer, first.clone(), Vec::new()).await;
-    if on {
-        assert_matches!(
-            repeat,
-            Err(PrimaryNetworkError::SupersededRequest {
-                epoch: 0,
-                round: 1,
-                newest_epoch: 0,
-                newest_round: 2
-            }),
-            "an older voted header is superseded"
-        );
-    } else {
-        assert_matches!(
-            repeat,
-            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
-                theirs: 1,
-                ours: 2
-            })),
-            "an older voted header is refused under the lock"
-        );
-    }
+    assert_matches!(
+        repeat,
+        Err(PrimaryNetworkError::SupersededRequest {
+            epoch: 0,
+            round: 1,
+            newest_epoch: 0,
+            newest_round: 2
+        }),
+        "an older voted header is superseded"
+    );
     unchanged("after the round-1 repeat").await;
 
     let PrimaryResponse::Vote(cached) = handler.vote(peer, second.clone(), Vec::new()).await?
@@ -6538,43 +6421,18 @@ async fn repeats_of_voted_headers(on: bool) -> eyre::Result<()> {
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind { .. }))
     );
     let repeat = handler.vote(peer, second.clone(), Vec::new()).await;
-    if on {
-        assert_matches!(
-            repeat,
-            Err(PrimaryNetworkError::SupersededRequest { round: 2, newest_round: 3, .. }),
-            "the voted round-2 header is superseded by the round-3 request"
-        );
-    } else {
-        assert_matches!(
-            repeat,
-            Ok(PrimaryResponse::Vote(vote)) if vote.signature() == voted.signature(),
-            "the voted round-2 header is answered from the cache"
-        );
-    }
+    assert_matches!(
+        repeat,
+        Err(PrimaryNetworkError::SupersededRequest { round: 2, newest_round: 3, .. }),
+        "the voted round-2 header is superseded by the round-3 request"
+    );
     unchanged("after the round-3 request").await;
 
     Ok(())
 }
 
-/// With `vote_queue_fix` on, a repeat of an older voted header that arrives after a newer request
-/// of its author is refused as superseded instead of being answered from the cache: nothing is
-/// signed, the cached and stored votes stay the newest, and a repeat of the newest voted header is
-/// still answered from the cache (see [`repeats_of_voted_headers`]).
-#[tokio::test(start_paused = true)]
-async fn vote_queue_fix_refuses_repeat_of_voted_header_after_newer_request() -> eyre::Result<()> {
-    repeats_of_voted_headers(true).await
-}
-
-/// The switch-off twin of [`vote_queue_fix_refuses_repeat_of_voted_header_after_newer_request`]:
-/// the same sequence signs nothing either, and the round-2 repeat after the round-3 request gets
-/// the cached vote.
-#[tokio::test(start_paused = true)]
-async fn vote_queue_fix_off_answers_repeat_of_voted_header_from_cache() -> eyre::Result<()> {
-    repeats_of_voted_headers(false).await
-}
-
 /// A voter whose store holds half of the round 2 certificates and no round 1 certificate, as in
-/// the pending-parent vote tests of `primary_tests.rs`, with `vote_queue_fix` on.
+/// the pending-parent vote tests of `primary_tests.rs`.
 ///
 /// Every round 3 header from [`Self::header`] cites all round 2 certificates, so the voter asks
 /// its author for the other half. Those parents verify, but their own round 1 parents are
@@ -6602,7 +6460,7 @@ impl PendingParentVoter {
     const NUM_PARENTS: usize = 10;
 
     async fn new() -> Self {
-        let params = Parameters { vote_queue_fix: true, ..Default::default() };
+        let params = Parameters::default();
         let fixture = CommitteeFixture::builder(MemDatabase::default)
             .randomize_ports(true)
             .committee_size(NonZeroUsize::new(Self::NUM_PARENTS).expect("non-zero"))
@@ -6709,8 +6567,9 @@ impl PendingParentVoter {
     }
 }
 
-/// The scope the switch leaves (#1804): a request already being evaluated under the author lock
-/// keeps it for as long as it waits there, so a newer request of the same author waits behind it.
+/// What still waits under the author lock (#1804): a request already being evaluated under the
+/// author lock keeps it for as long as it waits there, so a newer request of the same author waits
+/// behind it.
 ///
 /// The author's round-3 request attached its missing parents, which are parked as pending, and
 /// waits for them under the lock until the vote timeout. Its round-4 request arrives right after:
@@ -6719,7 +6578,7 @@ impl PendingParentVoter {
 /// arrived. The mark does not cut the in-flight request short: it ends in `Timeout`, not
 /// superseded. A stale round-3 repeat that arrives meanwhile is still refused at once.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_queue_fix_newer_request_waits_for_pending_parent_wait() -> eyre::Result<()> {
+async fn vote_newer_request_waits_for_pending_parent_wait() -> eyre::Result<()> {
     let voter = PendingParentVoter::new().await;
     let vote_timeout = voter.fixture.first_authority().consensus_config().parameters().vote_timeout;
     let (peer, round_3) = voter.header(2, 3, 1);
@@ -6770,10 +6629,10 @@ async fn vote_queue_fix_newer_request_waits_for_pending_parent_wait() -> eyre::R
     Ok(())
 }
 
-/// With the switch on a request that attached a parent parked as pending still waits for it under
-/// the lock and votes once the parent is stored, as on the default path (#1842).
+/// A request that attached a parent parked as pending still waits for it under the lock and votes
+/// once the parent is stored (#1842).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_queue_fix_waits_for_pending_attached_parent() -> eyre::Result<()> {
+async fn vote_waits_for_pending_attached_parent() -> eyre::Result<()> {
     let voter = PendingParentVoter::new().await;
     let (peer, header) = voter.header(2, 3, 1);
     voter.ask_for_missing(peer, &header).await;
@@ -6789,12 +6648,12 @@ async fn vote_queue_fix_waits_for_pending_attached_parent() -> eyre::Result<()> 
     Ok(())
 }
 
-/// With the switch on a request dropped while it waits under the author lock leaves the author's
+/// A request dropped while it waits under the author lock leaves the author's
 /// entry as it found it (#1842): its `MissingParents` answer is still served, and a second header
 /// of the author for the same round is refused before it can record missing parents. The mark the
 /// dropped request moved is its own round, so neither later request is refused as superseded.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn vote_queue_fix_dropped_request_keeps_author_entry() -> eyre::Result<()> {
+async fn vote_dropped_request_keeps_author_entry() -> eyre::Result<()> {
     let voter = PendingParentVoter::new().await;
     let (peer, header) = voter.header(2, 3, 1);
     let (_, rival) = voter.header(2, 3, 2);
@@ -6820,14 +6679,14 @@ async fn vote_queue_fix_dropped_request_keeps_author_entry() -> eyre::Result<()>
     Ok(())
 }
 
-/// With the switch on a vote held only on disk is recast once (#1839): the first repeat signs it
+/// A vote held only on disk is recast once (#1839): the first repeat signs it
 /// again under the author lock and fills the cached vote, and the second is answered from the
 /// cache without a signature. Each signature logs one `Recast vote` line.
 #[tokio::test(start_paused = true)]
-async fn vote_queue_fix_recasts_a_stored_vote_once() -> eyre::Result<()> {
+async fn vote_recasts_a_stored_vote_once() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+        create_vote_test_types(temp_dir.path()).await;
     let author = committee.last_authority();
     let peer = *author.authority().protocol_key();
     let header = committee
@@ -6868,7 +6727,7 @@ async fn vote_queue_fix_recasts_a_stored_vote_once() -> eyre::Result<()> {
     Ok(())
 }
 
-/// What a requester's cancel does on the default path (switch off): it sends nothing the voter
+/// What a requester's cancel does: it sends nothing the voter
 /// can see, and the voter's request queued on the author lock runs to its answer.
 ///
 /// The certifier cancels an older header's vote requests by dropping their `request_vote`
@@ -7082,8 +6941,8 @@ fn old_block_epoch(block: &SealedHeader) -> Epoch {
     tn_types::deconstruct_nonce(u64::from(block.nonce)).0
 }
 
-/// A voter, the first authority of a committee at [`OLD_BLOCK_EPOCH`] with `vote_queue_fix` set to
-/// `on`, that executed [`OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS`] outputs of the epoch before and then
+/// A voter, the first authority of a committee at [`OLD_BLOCK_EPOCH`], that
+/// executed [`OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS`] outputs of the epoch before and then
 /// `epoch_outputs` of its own, each building blocks.
 ///
 /// The bus sizes its ring by `gc_depth`, as the node builds it, and each output's last block is
@@ -7092,12 +6951,11 @@ fn old_block_epoch(block: &SealedHeader) -> Epoch {
 /// no restored-state floor. The bus and the handler register their metrics with `recorder`.
 async fn old_block_voter(
     path: &Path,
-    on: bool,
     epoch_outputs: usize,
     recorder: &DebuggingRecorder,
 ) -> OldBlockVoter {
     let _local_recorder = metrics::set_default_local_recorder(recorder);
-    let params = Parameters { vote_queue_fix: on, ..Default::default() };
+    let params = Parameters::default();
     let committee = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .epoch(OLD_BLOCK_EPOCH)
@@ -7139,18 +6997,19 @@ async fn old_block_voter(
     OldBlockVoter { types, outputs, executed }
 }
 
-/// Case 1, with `vote_queue_fix` set to `on`: a header naming the block a proposer with
+/// Case 1: a header naming the block a proposer with
 /// `quorum_exec_block` names, [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] ring entries (outputs that built
 /// a block) below the tip of a voter in step with it, is voted for at once. The voter's database
 /// answers for no block here, so the vote rests on the ring alone.
 ///
 /// Catches: a voter that waits for, or refuses, an executed block below its tip, and a ring that
 /// no longer matches its older entries.
-async fn old_block_in_ring_is_voted_at_once(on: bool) -> eyre::Result<()> {
+#[tokio::test(start_paused = true)]
+async fn old_block_in_ring_is_voted_at_once() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+    let voter = old_block_voter(temp_dir.path(), OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
     voter.ring_only();
     let ring = voter.ring();
     let named = ring.nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES).expect("a full ring");
@@ -7165,41 +7024,30 @@ async fn old_block_in_ring_is_voted_at_once(on: bool) -> eyre::Result<()> {
     assert_matches!(
         answer,
         Ok(PrimaryResponse::Vote(_)),
-        "vote_queue_fix={on}: an executed block eight entries below the tip is voted for"
+        "an executed block eight entries below the tip is voted for"
     );
-    assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: an executed block is not waited for");
+    assert_eq!(took, Duration::ZERO, "an executed block is not waited for");
     assert_eq!(
         counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
         0,
-        "vote_queue_fix={on}: an executed block is not behind"
+        "an executed block is not behind"
     );
     Ok(())
 }
 
-/// [`old_block_in_ring_is_voted_at_once`] with `vote_queue_fix` off.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_votes_block_in_ring_at_once_switch_off() -> eyre::Result<()> {
-    old_block_in_ring_is_voted_at_once(false).await
-}
-
-/// [`old_block_in_ring_is_voted_at_once`] with `vote_queue_fix` on.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_votes_block_in_ring_at_once_switch_on() -> eyre::Result<()> {
-    old_block_in_ring_is_voted_at_once(true).await
-}
-
-/// Case 2, with `vote_queue_fix` set to `on`: a header naming an executed block of the voter's own
+/// Case 2: a header naming an executed block of the voter's own
 /// epoch that has left the ring is voted for at once. The block is the newest one evicted:
 /// `gc_depth` newer outputs have been pushed since. Below the tip the ring cannot decide a block it
 /// does not hold, so the canonical database confirms the number and the hash.
 ///
 /// Catches: a voter that reads a ring miss below its tip as a fork, or as a block it must wait for,
 /// while its database holds the block (the ring-only check of a bus without a database reader).
-async fn old_block_out_of_ring_is_voted_from_the_database(on: bool) -> eyre::Result<()> {
+#[tokio::test(start_paused = true)]
+async fn old_block_out_of_ring_is_voted_from_the_database() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+    let voter = old_block_voter(temp_dir.path(), OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
     let ring = voter.ring();
     assert_eq!(
         ring.block_capacity(),
@@ -7220,36 +7068,18 @@ async fn old_block_out_of_ring_is_voted_from_the_database(on: bool) -> eyre::Res
     assert_matches!(
         answer,
         Ok(PrimaryResponse::Vote(_)),
-        "vote_queue_fix={on}: an executed block the ring no longer holds is voted for"
+        "an executed block the ring no longer holds is voted for"
     );
-    assert_eq!(
-        took,
-        Duration::ZERO,
-        "vote_queue_fix={on}: a block the database confirms is not waited for"
-    );
+    assert_eq!(took, Duration::ZERO, "a block the database confirms is not waited for");
     assert_eq!(
         counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
         0,
-        "vote_queue_fix={on}: a block the database confirms is not behind"
+        "a block the database confirms is not behind"
     );
     Ok(())
 }
 
-/// [`old_block_out_of_ring_is_voted_from_the_database`] with `vote_queue_fix` off.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_votes_block_out_of_ring_from_database_switch_off(
-) -> eyre::Result<()> {
-    old_block_out_of_ring_is_voted_from_the_database(false).await
-}
-
-/// [`old_block_out_of_ring_is_voted_from_the_database`] with `vote_queue_fix` on.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_votes_block_out_of_ring_from_database_switch_on(
-) -> eyre::Result<()> {
-    old_block_out_of_ring_is_voted_from_the_database(true).await
-}
-
-/// Case 3, with `vote_queue_fix` set to `on`: a header naming an old block number with another hash
+/// Case 3: a header naming an old block number with another hash
 /// than the block the voter executed there is refused at once with `UnknownExecutionResult`
 /// (`unexpected execution result received`, logged once), never as `ExecutionBehind`, and stores no
 /// vote. Three headers: a made-up hash at the number of the quorum rule's block, eight ring entries
@@ -7260,7 +7090,8 @@ async fn quorum_exec_block_voter_votes_block_out_of_ring_from_database_switch_on
 /// Catches: a voter that accepts an unknown hash at an executed number, one that matches the hash
 /// alone, and one that reads the mismatch as "behind" (a retryable refusal the requester repeats
 /// until its vote timeout) or answers it after a wait.
-async fn old_number_with_another_hash_is_refused_as_a_fork(on: bool) -> eyre::Result<()> {
+#[tokio::test(start_paused = true)]
+async fn old_number_with_another_hash_is_refused_as_a_fork() -> eyre::Result<()> {
     let floor = QUORUM_EXEC_BLOCK_FLOOR_ENTRIES;
     let capacity = usize::try_from(Parameters::default().gc_depth)?;
     for (place, below_tip, hash_below_tip) in [
@@ -7271,7 +7102,7 @@ async fn old_number_with_another_hash_is_refused_as_a_fork(on: bool) -> eyre::Re
         let temp_dir = TempDir::new().unwrap();
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+        let voter = old_block_voter(temp_dir.path(), OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
         let ring = voter.ring();
         let executed = voter.below_tip(below_tip).num_hash();
         assert_eq!(ring.contains_execution_block(executed), below_tip < capacity, "{place}");
@@ -7296,46 +7127,32 @@ async fn old_number_with_another_hash_is_refused_as_a_fork(on: bool) -> eyre::Re
             answer,
             Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(block)))
                 if block == named,
-            "vote_queue_fix={on}: another hash at an executed number {place} is a fork refusal"
+            "another hash at an executed number {place} is a fork refusal"
         );
-        assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: a fork {place} is not waited for");
+        assert_eq!(took, Duration::ZERO, "a fork {place} is not waited for");
         assert_eq!(
             counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
             0,
-            "vote_queue_fix={on}: another hash at an executed number {place} is not behind"
+            "another hash at an executed number {place} is not behind"
         );
         let logged = lines.lock().clone();
         let forks = logged
             .iter()
             .filter(|line| line.starts_with("unexpected execution result received"))
             .count();
-        assert_eq!(forks, 1, "vote_queue_fix={on}: one fork line {place}: {logged:?}");
+        assert_eq!(forks, 1, "one fork line {place}: {logged:?}");
         let committee = &voter.types.committee;
         let vote_info = committee
             .first_authority()
             .consensus_config()
             .node_storage()
             .read_vote_info(&committee.last_authority().id())?;
-        assert!(vote_info.is_none(), "vote_queue_fix={on}: a refused header stores no vote");
+        assert!(vote_info.is_none(), "a refused header stores no vote");
     }
     Ok(())
 }
 
-/// [`old_number_with_another_hash_is_refused_as_a_fork`] with `vote_queue_fix` off.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_refuses_old_number_with_another_hash_switch_off(
-) -> eyre::Result<()> {
-    old_number_with_another_hash_is_refused_as_a_fork(false).await
-}
-
-/// [`old_number_with_another_hash_is_refused_as_a_fork`] with `vote_queue_fix` on.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_refuses_old_number_with_another_hash_switch_on() -> eyre::Result<()>
-{
-    old_number_with_another_hash_is_refused_as_a_fork(true).await
-}
-
-/// Case 4 in the ring, with `vote_queue_fix` set to `on`, as the voter answers today: a voter
+/// Case 4 in the ring, as the voter answers today: a voter
 /// [`OLD_BLOCK_EARLY_OUTPUTS`] outputs into its epoch votes at once for a header naming the
 /// previous epoch's closing block (the block the epoch opened on: the lowest block a proposer with
 /// `quorum_exec_block` names, as it skips parents that name a block below it) and, alike, for one
@@ -7343,14 +7160,15 @@ async fn quorum_exec_block_voter_refuses_old_number_with_another_hash_switch_on(
 /// before that block, in the previous epoch (the block the rule would name without that bound).
 /// The voter's database answers for no block here, so the ring alone decides both: it compares the
 /// number and the hash with what the voter executed, never the block's epoch.
-async fn previous_epoch_blocks_in_ring_are_voted_at_once(on: bool) -> eyre::Result<()> {
+#[tokio::test(start_paused = true)]
+async fn previous_epoch_blocks_in_ring_are_voted_at_once() -> eyre::Result<()> {
     for before_opening in [false, true] {
         let block =
             if before_opening { "a block before the opening block" } else { "the opening block" };
         let temp_dir = TempDir::new().unwrap();
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
+        let voter = old_block_voter(temp_dir.path(), OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
         voter.ring_only();
         let ring = voter.ring();
         let closing = &voter.outputs[OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS - 1];
@@ -7374,33 +7192,19 @@ async fn previous_epoch_blocks_in_ring_are_voted_at_once(on: bool) -> eyre::Resu
         assert_matches!(
             answer,
             Ok(PrimaryResponse::Vote(_)),
-            "vote_queue_fix={on}: {block} of the previous epoch is voted for"
+            "{block} of the previous epoch is voted for"
         );
-        assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: {block} is not waited for");
+        assert_eq!(took, Duration::ZERO, "{block} is not waited for");
         assert_eq!(
             counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
             0,
-            "vote_queue_fix={on}: {block} is not behind"
+            "{block} is not behind"
         );
     }
     Ok(())
 }
 
-/// [`previous_epoch_blocks_in_ring_are_voted_at_once`] with `vote_queue_fix` off.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_votes_previous_epoch_blocks_in_ring_switch_off() -> eyre::Result<()>
-{
-    previous_epoch_blocks_in_ring_are_voted_at_once(false).await
-}
-
-/// [`previous_epoch_blocks_in_ring_are_voted_at_once`] with `vote_queue_fix` on.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_votes_previous_epoch_blocks_in_ring_switch_on() -> eyre::Result<()>
-{
-    previous_epoch_blocks_in_ring_are_voted_at_once(true).await
-}
-
-/// Case 4 out of the ring, with `vote_queue_fix` set to `on`, as the voter answers today: a voter
+/// Case 4 out of the ring, as the voter answers today: a voter
 /// deep in its epoch, whose ring holds no block of the previous epoch any more, gets headers naming
 /// the previous epoch's closing block (the opening block) or the block of the output before it.
 /// - With every executed block in its database, it votes at once for the block before the opening
@@ -7408,7 +7212,8 @@ async fn quorum_exec_block_voter_votes_previous_epoch_blocks_in_ring_switch_on()
 /// - Restored from a snapshot at the opening block (the database holds nothing below it), it votes
 ///   at once for the opening block and refuses the block before it at once with
 ///   `BelowRestoreFloor`: final, without a penalty, not counted as behind, no vote stored.
-async fn previous_epoch_blocks_out_of_ring_are_answered_at_once(on: bool) -> eyre::Result<()> {
+#[tokio::test(start_paused = true)]
+async fn previous_epoch_blocks_out_of_ring_are_answered_at_once() -> eyre::Result<()> {
     for (case, restored, before_opening) in [
         ("before the opening block, full database", false, true),
         ("the opening block, restored there", true, false),
@@ -7417,7 +7222,7 @@ async fn previous_epoch_blocks_out_of_ring_are_answered_at_once(on: bool) -> eyr
         let temp_dir = TempDir::new().unwrap();
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+        let voter = old_block_voter(temp_dir.path(), OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
         let ring = voter.ring();
         let opening = voter.outputs[OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS - 1].num_hash();
         let before = &voter.outputs[OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS - 2];
@@ -7437,7 +7242,7 @@ async fn previous_epoch_blocks_out_of_ring_are_answered_at_once(on: bool) -> eyr
                     header_block,
                     floor,
                 })) if *header_block == named.number && *floor == opening.number,
-                "vote_queue_fix={on}: {case}: below the floor is the final refusal"
+                "{case}: below the floor is the final refusal"
             );
             let err = answer.expect_err("refused");
             assert!(Option::<Penalty>::from(&err).is_none(), "{case}: no penalty for the author");
@@ -7447,51 +7252,30 @@ async fn previous_epoch_blocks_out_of_ring_are_answered_at_once(on: bool) -> eyr
                 .consensus_config()
                 .node_storage()
                 .read_vote_info(&committee.last_authority().id())?;
-            assert!(vote_info.is_none(), "vote_queue_fix={on}: {case}: no vote stored");
+            assert!(vote_info.is_none(), "{case}: no vote stored");
         } else {
-            assert_matches!(
-                answer,
-                Ok(PrimaryResponse::Vote(_)),
-                "vote_queue_fix={on}: {case}: voted for"
-            );
+            assert_matches!(answer, Ok(PrimaryResponse::Vote(_)), "{case}: voted for");
         }
-        assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: {case}: not waited for");
-        assert_eq!(
-            counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
-            0,
-            "vote_queue_fix={on}: {case}: not behind"
-        );
+        assert_eq!(took, Duration::ZERO, "{case}: not waited for");
+        assert_eq!(counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER), 0, "{case}: not behind");
     }
     Ok(())
 }
 
-/// [`previous_epoch_blocks_out_of_ring_are_answered_at_once`] with `vote_queue_fix` off.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_answers_previous_epoch_blocks_out_of_ring_switch_off(
-) -> eyre::Result<()> {
-    previous_epoch_blocks_out_of_ring_are_answered_at_once(false).await
-}
-
-/// [`previous_epoch_blocks_out_of_ring_are_answered_at_once`] with `vote_queue_fix` on.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_answers_previous_epoch_blocks_out_of_ring_switch_on(
-) -> eyre::Result<()> {
-    previous_epoch_blocks_out_of_ring_are_answered_at_once(true).await
-}
-
-/// Case 5, the control, with `vote_queue_fix` set to `on`: a header naming a block above the
+/// Case 5, the control: a header naming a block above the
 /// voter's tip is waited for. When the next output executes half-way through the execution wait
 /// the vote is given then; when nothing executes the voter refuses with `ExecutionBehind` (counted)
-/// once [`VOTE_EXECUTION_WAIT`] has passed. `test_vote_inner_timeout` pins the same with the switch
-/// off on a voter at block 0.
-async fn block_above_the_tip_is_waited_for(on: bool) -> eyre::Result<()> {
+/// once [`VOTE_EXECUTION_WAIT`] has passed. `test_vote_inner_timeout` pins the same
+/// on a voter at block 0.
+#[tokio::test(start_paused = true)]
+async fn block_above_the_tip_is_waited_for() -> eyre::Result<()> {
     let half = VOTE_EXECUTION_WAIT / 2;
 
     // the next output executes within the wait
     let temp_dir = TempDir::new().unwrap();
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
+    let voter = old_block_voter(temp_dir.path(), OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
     let output = u64::try_from(voter.outputs.len())? + 1;
     let (round, blocks) = old_block_output(output, OLD_BLOCK_EPOCH, &voter.types.parent);
     let next = blocks.last().expect("an output builds blocks").clone();
@@ -7506,16 +7290,16 @@ async fn block_above_the_tip_is_waited_for(on: bool) -> eyre::Result<()> {
     assert_matches!(
         answer,
         Ok(PrimaryResponse::Vote(_)),
-        "vote_queue_fix={on}: a block executed within the wait is voted for"
+        "a block executed within the wait is voted for"
     );
     assert!(
         took >= half && took < VOTE_EXECUTION_WAIT,
-        "vote_queue_fix={on}: the vote waits for the block, took {took:?}"
+        "the vote waits for the block, took {took:?}"
     );
     assert_eq!(
         counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
         0,
-        "vote_queue_fix={on}: a block executed within the wait is not behind"
+        "a block executed within the wait is not behind"
     );
     execute.await?;
 
@@ -7523,7 +7307,7 @@ async fn block_above_the_tip_is_waited_for(on: bool) -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
+    let voter = old_block_voter(temp_dir.path(), OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
     let tip = voter.types.parent.num_hash();
     let named =
         BlockNumHash::new(tip.number + OLD_BLOCK_BLOCKS_PER_OUTPUT, BlockHash::repeat_byte(0xcd));
@@ -7534,33 +7318,21 @@ async fn block_above_the_tip_is_waited_for(on: bool) -> eyre::Result<()> {
             header_block,
             local_block
         })) if header_block == named.number && local_block == tip.number,
-        "vote_queue_fix={on}: a block that never executes is behind"
+        "a block that never executes is behind"
     );
     assert!(
         took >= VOTE_EXECUTION_WAIT && took < VOTE_EXECUTION_WAIT * 2,
-        "vote_queue_fix={on}: the refusal comes after one execution wait, took {took:?}"
+        "the refusal comes after one execution wait, took {took:?}"
     );
     assert_eq!(
         counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
         1,
-        "vote_queue_fix={on}: the behind refusal is counted"
+        "the behind refusal is counted"
     );
     Ok(())
 }
 
-/// [`block_above_the_tip_is_waited_for`] with `vote_queue_fix` off.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_waits_for_block_above_tip_switch_off() -> eyre::Result<()> {
-    block_above_the_tip_is_waited_for(false).await
-}
-
-/// [`block_above_the_tip_is_waited_for`] with `vote_queue_fix` on.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_waits_for_block_above_tip_switch_on() -> eyre::Result<()> {
-    block_above_the_tip_is_waited_for(true).await
-}
-
-/// Case 6, with `vote_queue_fix` set to `on`: one author's execution block steps back. The quorum
+/// Case 6: one author's execution block steps back. The quorum
 /// rule is the first proposer behaviour that names a lower block than the author's previous header
 /// and its parents did. The author's round-1 header names the voter's tip and is voted for; all
 /// four round-1 headers, each naming the tip, are certified; the author's round-2 header, built on
@@ -7569,13 +7341,14 @@ async fn quorum_exec_block_voter_waits_for_block_above_tip_switch_on() -> eyre::
 ///
 /// Catches: a voter that requires an author's execution block to rise from header to header, or to
 /// reach the blocks its parents named.
-async fn author_stepping_back_is_voted_at_once(on: bool) -> eyre::Result<()> {
+#[tokio::test(start_paused = true)]
+async fn author_stepping_back_is_voted_at_once() -> eyre::Result<()> {
     // the round-2 header's timestamp is checked against its parents' in milliseconds
     pin_subsecond_fork(true);
     let temp_dir = TempDir::new().unwrap();
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+    let voter = old_block_voter(temp_dir.path(), OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
     let committee = &voter.types.committee;
     let committee_obj = committee.committee();
     let author = committee.last_authority();
@@ -7608,7 +7381,7 @@ async fn author_stepping_back_is_voted_at_once(on: bool) -> eyre::Result<()> {
     assert_matches!(
         voter.types.handler.vote(peer, first, Vec::new()).await?,
         PrimaryResponse::Vote(_),
-        "vote_queue_fix={on}: the round-1 header naming the tip is voted for"
+        "the round-1 header naming the tip is voted for"
     );
     let certificates: Vec<_> =
         round_one.iter().map(|header| committee.certificate(header)).collect();
@@ -7626,25 +7399,13 @@ async fn author_stepping_back_is_voted_at_once(on: bool) -> eyre::Result<()> {
     assert_matches!(
         answer,
         Ok(PrimaryResponse::Vote(_)),
-        "vote_queue_fix={on}: a round-2 header naming a lower block than round 1 is voted for"
+        "a round-2 header naming a lower block than round 1 is voted for"
     );
-    assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: the lower block is not waited for");
+    assert_eq!(took, Duration::ZERO, "the lower block is not waited for");
     assert_eq!(
         counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
         0,
-        "vote_queue_fix={on}: the lower block is not behind"
+        "the lower block is not behind"
     );
     Ok(())
-}
-
-/// [`author_stepping_back_is_voted_at_once`] with `vote_queue_fix` off.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_votes_author_stepping_back_switch_off() -> eyre::Result<()> {
-    author_stepping_back_is_voted_at_once(false).await
-}
-
-/// [`author_stepping_back_is_voted_at_once`] with `vote_queue_fix` on.
-#[tokio::test(start_paused = true)]
-async fn quorum_exec_block_voter_votes_author_stepping_back_switch_on() -> eyre::Result<()> {
-    author_stepping_back_is_voted_at_once(true).await
 }

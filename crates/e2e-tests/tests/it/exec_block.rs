@@ -45,11 +45,11 @@ const REFUSED_BEHIND: &str = "tn_primary_votes_refused_execution_behind_total";
 /// One arm of [`test_fast_executor_is_certified`]: the switches every node gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecArm {
-    /// Every switch off: the base's proposer and voter.
+    /// Every switch off: the base's proposer.
     Control,
-    /// `quorum_exec_block` with `quorum_exec_block_starved_rounds: 4` and `vote_queue_fix`.
+    /// `quorum_exec_block` with `quorum_exec_block_starved_rounds: 4`.
     Adaptive,
-    /// `quorum_exec_block` with `quorum_exec_block_starved_rounds: 0` and `vote_queue_fix`.
+    /// `quorum_exec_block` with `quorum_exec_block_starved_rounds: 0`.
     Always,
 }
 
@@ -67,16 +67,12 @@ impl ExecArm {
     fn switches(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Control => &[],
-            Self::Adaptive => &[
-                ("quorum_exec_block", "true"),
-                ("quorum_exec_block_starved_rounds", "4"),
-                ("vote_queue_fix", "true"),
-            ],
-            Self::Always => &[
-                ("quorum_exec_block", "true"),
-                ("quorum_exec_block_starved_rounds", "0"),
-                ("vote_queue_fix", "true"),
-            ],
+            Self::Adaptive => {
+                &[("quorum_exec_block", "true"), ("quorum_exec_block_starved_rounds", "4")]
+            }
+            Self::Always => {
+                &[("quorum_exec_block", "true"), ("quorum_exec_block_starved_rounds", "0")]
+            }
         }
     }
 
@@ -138,12 +134,12 @@ const MIN_WINDOW_HEADERS: usize = 20;
 ///   round without it, so the fast node certifies at most [`MAX_CONTROL_SHARE`] of its own headers
 ///   while the slow nodes certify at least [`MIN_CERTIFIED_SHARE`]. A control that does not starve
 ///   fails the test: without it the other arms prove nothing;
-/// - `quorum_exec_block` + `quorum_exec_block_starved_rounds: 4` + `vote_queue_fix`: the fast node
-///   certifies at least [`MIN_ADAPTIVE_SHARE`] of its headers and more than in the control (the
-///   gain measured 0.20 to 0.30), at least [`MIN_STARVED_SHARE`] of its headers built under the
-///   quorum rule certify, its `header proposed` lines show both `exec_policy=tip` (the returns to
-///   its own tip) and `exec_policy=starved` (the windows a cancelled tip header opens), and the
-///   slow nodes certify at least [`MIN_CERTIFIED_SHARE`];
+/// - `quorum_exec_block` + `quorum_exec_block_starved_rounds: 4`: the fast node certifies at least
+///   [`MIN_ADAPTIVE_SHARE`] of its headers and more than in the control (the gain measured 0.20 to
+///   0.30), at least [`MIN_STARVED_SHARE`] of its headers built under the quorum rule certify, its
+///   `header proposed` lines show both `exec_policy=tip` (the returns to its own tip) and
+///   `exec_policy=starved` (the windows a cancelled tip header opens), and the slow nodes certify
+///   at least [`MIN_CERTIFIED_SHARE`];
 /// - `quorum_exec_block_starved_rounds: 0` (`always`): every node certifies at least
 ///   [`MIN_CERTIFIED_SHARE`], every fast-node header is `exec_policy=always`, and at least
 ///   [`MIN_FLOOR_SHARE`] of its headers in the second half of the window are `exec_basis=floor`.

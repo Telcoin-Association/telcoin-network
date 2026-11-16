@@ -208,8 +208,7 @@ pub(crate) struct RequestHandler<DB> {
     /// in the same branch, so this keeps the warning to once per author per round. Only headers
     /// whose author passed committee validation get that far, so every key is a committee member.
     deferred_vote_warned: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
-    /// The newest `(epoch, round)` of a vote request received from each author. Read and written
-    /// only with `vote_queue_fix` on.
+    /// The newest `(epoch, round)` of a vote request received from each author.
     ///
     /// A request of the same epoch and a lower round is refused as superseded before the
     /// per-author lock, or once it takes it. An entry moves only for a request whose peer is its
@@ -1043,40 +1042,38 @@ where
             self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
             return Err(HeaderError::NotActiveCvv.into());
         }
-        if self.consensus_config.parameters().vote_queue_fix {
-            // a request queued behind the author lock waits out the execution wait under it, one
-            // request after another. wait here instead, side by side with the author's other
-            // requests, and refuse the ones a newer request supersedes. a header outside the
-            // window on arrival neither moves the mark nor waits: `vote_inner` refuses it before
-            // its execution check, unless the committed round moved it inside the window while
-            // it queued on the lock, when it is checked without a wait (a recoverable
-            // `ExecutionBehind` if its block is not executed yet). a header that fails the
-            // stateless checks of `Header::validate` skips the wait too: `vote_inner` refuses it
-            // before its execution check whatever its block, so it goes straight to the author
-            // lock, where it is refused with the same error and penalty and leaves the same entry
-            // as after the wait (only a newer request of its author arriving during the wait it no
-            // longer makes would have turned that into `SupersededRequest`). the window already
-            // keeps a round-0 header and one of another epoch from waiting. every other check of
-            // `vote_inner` (the attached parents, the drift tier, the seed signature) stays under
-            // the lock, so a header that fails only one of those still waits
-            let in_window = self.in_vote_window(&header);
-            self.refuse_superseded_request(&header, in_window)?;
-            if in_window && header.validate(self.consensus_config.committee()).is_ok() {
-                timing.enter(VoteStage::PreLockWait);
-                let waited = timeout(
-                    VOTE_EXECUTION_WAIT,
-                    self.consensus_bus.wait_for_execution(header.latest_execution_block()),
-                )
-                .await;
-                timing.close_at(Instant::now());
-                // every other outcome is decided again by `vote_inner`, which checks execution
-                // under the lock without a wait and so without a watch to find closed
-                if matches!(waited, Ok(Err(ExecutionCheckError::Closed))) {
-                    return Err(HeaderError::ClosedWatchChannel.into());
-                }
-                // a newer request from the author may have arrived during the wait
-                self.refuse_superseded_request(&header, false)?;
+        // a request queued behind the author lock waits out the execution wait under it, one
+        // request after another. wait here instead, side by side with the author's other
+        // requests, and refuse the ones a newer request supersedes. a header outside the
+        // window on arrival neither moves the mark nor waits: `vote_inner` refuses it before
+        // its execution check, unless the committed round moved it inside the window while
+        // it queued on the lock, when it is checked without a wait (a recoverable
+        // `ExecutionBehind` if its block is not executed yet). a header that fails the
+        // stateless checks of `Header::validate` skips the wait too: `vote_inner` refuses it
+        // before its execution check whatever its block, so it goes straight to the author
+        // lock, where it is refused with the same error and penalty and leaves the same entry
+        // as after the wait (only a newer request of its author arriving during the wait it no
+        // longer makes would have turned that into `SupersededRequest`). the window already
+        // keeps a round-0 header and one of another epoch from waiting. every other check of
+        // `vote_inner` (the attached parents, the drift tier, the seed signature) stays under
+        // the lock, so a header that fails only one of those still waits
+        let in_window = self.in_vote_window(&header);
+        self.refuse_superseded_request(&header, in_window)?;
+        if in_window && header.validate(self.consensus_config.committee()).is_ok() {
+            timing.enter(VoteStage::PreLockWait);
+            let waited = timeout(
+                VOTE_EXECUTION_WAIT,
+                self.consensus_bus.wait_for_execution(header.latest_execution_block()),
+            )
+            .await;
+            timing.close_at(Instant::now());
+            // every other outcome is decided again by `vote_inner`, which checks execution
+            // under the lock without a wait and so without a watch to find closed
+            if matches!(waited, Ok(Err(ExecutionCheckError::Closed))) {
+                return Err(HeaderError::ClosedWatchChannel.into());
             }
+            // a newer request from the author may have arrived during the wait
+            self.refuse_superseded_request(&header, false)?;
         }
         // We have already verified committee membership with the peer check but this will double
         // check. Each committee member has it's own lock so different authorities can be
@@ -1135,13 +1132,11 @@ where
                 }
                 return Ok(PrimaryResponse::Vote(vote));
             }
-            if self.consensus_config.parameters().vote_queue_fix {
-                // a newer request from the author may have arrived while this one queued on the
-                // lock: refuse it before any decision below, leaving the entry untouched. it comes
-                // after the two answers above, which hand back a vote already cast for this header
-                // and sign nothing new for an older one
-                self.refuse_superseded_request(&header, false)?;
-            }
+            // a newer request from the author may have arrived while this one queued on the
+            // lock: refuse it before any decision below, leaving the entry untouched. it comes
+            // after the two answers above, which hand back a vote already cast for this header
+            // and sign nothing new for an older one
+            self.refuse_superseded_request(&header, false)?;
             // put back below when this request ends without a decision on the header
             let previous_vote = auth_last_vote.clone();
             if let Some((last_epoch, last_round, last_digest, last_response)) =
@@ -1363,7 +1358,7 @@ where
     ///
     /// Only a request of the newest one's epoch and a strictly lower round is refused, so a retry
     /// of the same header and the resend that carries missing parents pass, and a header of
-    /// another epoch is never refused here and gets the answer it gets with the switch off. The
+    /// another epoch is never refused here and gets the answer the later checks give it. The
     /// mark refuses any lower round of its author without checking the header, so a malformed
     /// header below the mark (a round-0 one, say) is answered `SupersededRequest` without the
     /// penalty its own check would bring; only the author's own requests get that far. The caller
@@ -1538,9 +1533,9 @@ where
         // the header and the local clock. a tier-2 answer is uncached and carries no penalty, so
         // an author can make this node repeat it at will, with the same header or with a new one
         // for the same round; decided here, each repeat costs no signature verify, no execution
-        // wait (with `vote_queue_fix` on, it has already paid the bounded wait before the author
-        // lock) and no parent reads. a lead within the tolerance is waited out after the parent
-        // checks instead, because the time they take uses up part of it
+        // wait (it has already paid the bounded wait before the author lock) and no parent reads.
+        // a lead within the tolerance is waited out after the parent checks instead, because the
+        // time they take uses up part of it
         if let HeaderLead::Deferred(reason) = self.check_header_lead(&header, subsecond_active)? {
             return Ok(PrimaryResponse::RecoverableError(reason));
         }
@@ -1584,25 +1579,16 @@ where
         timing.enter(VoteStage::ExecWait);
         let header_block = header.latest_execution_block();
         // `None` is a voter behind on execution
-        let execution = if self.consensus_config.parameters().vote_queue_fix {
-            // `vote_request` already waited before the author lock: check without waiting again,
-            // so requests queued on the lock are not held a second time each. a block not readable
-            // from the canonical database at or below the tip is behind, never a fork
-            match self.consensus_bus.check_execution_block(header_block) {
-                ExecutionCheck::Match => Some(Ok(())),
-                ExecutionCheck::Fork => Some(Err(ExecutionCheckError::Fork)),
-                ExecutionCheck::BelowFloor { floor } => {
-                    Some(Err(ExecutionCheckError::BelowFloor { floor }))
-                }
-                ExecutionCheck::NotYet | ExecutionCheck::Unconfirmed => None,
+        // `vote_request` already waited before the author lock: check without waiting again,
+        // so requests queued on the lock are not held a second time each. a block not readable
+        // from the canonical database at or below the tip is behind, never a fork
+        let execution = match self.consensus_bus.check_execution_block(header_block) {
+            ExecutionCheck::Match => Some(Ok(())),
+            ExecutionCheck::Fork => Some(Err(ExecutionCheckError::Fork)),
+            ExecutionCheck::BelowFloor { floor } => {
+                Some(Err(ExecutionCheckError::BelowFloor { floor }))
             }
-        } else {
-            tokio::time::timeout(
-                VOTE_EXECUTION_WAIT,
-                self.consensus_bus.wait_for_execution(header_block),
-            )
-            .await
-            .ok()
+            ExecutionCheck::NotYet | ExecutionCheck::Unconfirmed => None,
         };
         match execution {
             Some(Ok(())) => {}
@@ -2461,8 +2447,7 @@ pub(crate) enum VoteOutcome {
     /// validator, or its execution did not reach the header's block within the voter's execution
     /// wait.
     Behind,
-    /// A recoverable refusal because a newer request from the same author had arrived
-    /// (`vote_queue_fix` on).
+    /// A recoverable refusal because a newer request from the same author had arrived.
     Superseded,
     /// The request or its header failed a check, or a cached refusal was returned.
     Rejected,

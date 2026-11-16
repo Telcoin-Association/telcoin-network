@@ -27,10 +27,9 @@
 //!
 //! A permit is held for the whole task. For `vote` that is all of the primary's request handler:
 //! the wait for the author's vote lock, behind an earlier vote request of the same peer, every wait
-//! under that lock, and, with the primary's `vote_queue_fix` switch on, the bounded wait for
-//! execution that runs before the lock. The per-peer share bounds how many of one peer's vote
-//! tasks wait at once: with the switch off, all but the one holding the lock wait for it; with it
-//! on, all of them can wait for execution at the same time.
+//! under that lock, and the bounded wait for execution that runs before the lock. The per-peer
+//! share bounds how many of one peer's vote tasks wait at once: all of them can wait for
+//! execution at the same time.
 //!
 //! Every series carries the `network` and `class` labels only, so the cardinality is the six
 //! classes per swarm. The pools register all six classes at construction, so `gossip` and
