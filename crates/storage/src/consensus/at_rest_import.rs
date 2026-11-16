@@ -24,8 +24,8 @@ use tokio::io::AsyncReadExt as _;
 use super::{ConsensusChain, ConsensusChainError};
 use crate::{
     consensus_pack::{
-        legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, ConsensusPack,
-        PackError, DATA_NAME, SENTINEL_MIN_VERSION,
+        legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, PackError, DATA_NAME,
+        SENTINEL_MIN_VERSION,
     },
     epoch_records::{EpochRecordDb, CERTS_NAME, RECORDS_NAME},
     pack_validate::{classify_physical_corruption, validate_pack_file, Verdict},
@@ -91,8 +91,13 @@ pub struct EpochImport {
 pub enum EpochImportError {
     /// Epoch 0's pack is verified against the pre-genesis descriptor, which no copy carries.
     EpochZero,
+    /// No latest-consensus hint (neither `consensus_slot1` nor `consensus_slot2`), so the epoch
+    /// the node resumes is unknown: its start would open epoch 0 and then the epoch execution
+    /// reached, and the newest `epoch-N` need not be either.
+    NoResumeHint,
     /// Not a past epoch: `resume` is the epoch the node opens for append when it starts (the
-    /// latest-consensus hint, else the newest `epoch-N`), and its pack is the node's to write.
+    /// latest-consensus hint, [`ConsensusChain::resume_epoch`]), and its pack is the node's to
+    /// write.
     NotPast {
         /// The epoch asked for.
         epoch: Epoch,
@@ -137,6 +142,12 @@ impl Display for EpochImportError {
                 f,
                 "epoch 0 cannot be imported: its pack is verified against the pre-genesis \
                  descriptor, which a copy does not carry; restore `epoch-0` from a backup"
+            ),
+            Self::NoResumeHint => write!(
+                f,
+                "no readable latest-consensus hint (`consensus_slot1`, `consensus_slot2`), so the \
+                 epoch the node resumes is unknown: start the node once, or restore the slot \
+                 files from the same stop as the packs, then rerun"
             ),
             Self::NotPast { epoch, resume } => write!(
                 f,
@@ -187,8 +198,9 @@ impl ConsensusChain {
     ///
     /// Refuses, before anything is written: a copy inside `base_path`, whose directories the
     /// import and the node's start remove ([`EpochImportError::Source`]); epoch 0
-    /// ([`EpochImportError::EpochZero`]); an
-    /// epoch the node does not only read ([`EpochImportError::NotPast`]); local records that
+    /// ([`EpochImportError::EpochZero`]); a datadir with no latest-consensus hint, whose resume
+    /// epoch is unknown ([`EpochImportError::NoResumeHint`]); an epoch the node does not only read,
+    /// the one the hint names or a later one ([`EpochImportError::NotPast`]); local records that
     /// lack the record of `epoch`, its certificate, or the record of `epoch - 1` it chains to
     /// ([`EpochImportError::Records`]); and a pack in place that validates and ends with the
     /// epoch's certified final output, as `epoch-N` or as an interrupted install's
@@ -217,14 +229,11 @@ impl ConsensusChain {
         if epoch == 0 {
             return Err(EpochImportError::EpochZero);
         }
-        let resume = Self::resume_epoch(base_path).or_else(|| {
-            ConsensusPack::epoch_dirs(base_path).ok().and_then(|epochs| epochs.last().copied())
-        });
-        match resume {
-            Some(resume) if epoch < resume => {}
-            resume => {
-                return Err(EpochImportError::NotPast { epoch, resume: resume.unwrap_or_default() })
-            }
+        let Some(resume) = Self::resume_epoch(base_path) else {
+            return Err(EpochImportError::NoResumeHint);
+        };
+        if epoch >= resume {
+            return Err(EpochImportError::NotPast { epoch, resume });
         }
         let (record, previous) = local_records(base_path, epoch)?;
         let replaces = pack_in_place(base_path, &record, &previous)?;
@@ -821,6 +830,35 @@ mod test {
         std::fs::remove_file(base.join(crate::epoch_records::RECORDS_NAME)).unwrap();
         let err = import(1, copy.clone()).await.unwrap_err();
         assert!(matches!(err, EpochImportError::Records(_)), "{err}");
+    }
+
+    /// Without the latest-consensus hint the epoch the node resumes is unknown (its start would
+    /// open epoch 0, then the epoch execution reached), so the import refuses rather than take
+    /// the newest `epoch-N` for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_epoch_at_rest_refuses_without_the_latest_consensus_hint() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("epochs");
+        closed_epochs(&base).await;
+        let copy = tmp.path().join("copy");
+        std::fs::rename(base.join("epoch-1"), &copy).unwrap();
+        for slot in ["consensus_slot1", "consensus_slot2"] {
+            std::fs::remove_file(base.join(slot)).unwrap();
+        }
+        let before = tree(&base);
+        let err = ConsensusChain::import_epoch_at_rest(
+            &base,
+            1,
+            &copy,
+            true,
+            TIMEOUT,
+            IMPORT_MIN_FREE_BYTES,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, EpochImportError::NoResumeHint), "{err}");
+        assert!(err.to_string().contains("no readable latest-consensus hint"), "{err}");
+        assert_eq!(tree(&base), before, "the refusal wrote nothing");
     }
 
     /// The local records must hold the epoch, certified, and the epoch before it, linked.

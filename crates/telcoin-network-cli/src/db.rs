@@ -153,7 +153,8 @@ enum DbSubcommand {
     /// earlier one by its parent links, and it is installed only once verified, sealed and
     /// read back, renamed into place as the node installs an import. It replaces a missing
     /// pack, a damaged one, or an interrupted install whose copy is damaged. It refuses epoch
-    /// 0, the epoch the node resumes and any later one, an epoch whose certified record (or
+    /// 0, the epoch the node resumes and any later one (and a datadir with no latest-consensus
+    /// hint, whose resume epoch is unknown), an epoch whose certified record (or
     /// the record before it) this node lacks, a copy inside the epochs directory (put it
     /// elsewhere: the import and the node remove directories there), and a pack in place that
     /// validates and ends with the epoch's certified final output. The node MUST be stopped: it
@@ -4606,7 +4607,8 @@ mod tests {
 
     /// `db import-epoch` refuses while a node holds the datadir, before reading anything; with
     /// the lock free it refuses epoch 0 (verified against the pre-genesis descriptor, which no
-    /// copy carries) and a datadir with no epochs directory, and writes nothing.
+    /// copy carries), a datadir with no epochs directory, and one with no latest-consensus hint
+    /// (whose resume epoch is unknown), and writes nothing.
     #[cfg(unix)]
     #[test]
     fn db_import_epoch_refuses_a_running_node_and_what_it_cannot_verify() {
@@ -4631,8 +4633,8 @@ mod tests {
         let before = tree_listing(&epochs);
         let err = import(0).execute(datadir.clone()).expect_err("epoch 0");
         assert!(format!("{err:#}").contains("epoch 0 cannot be imported"), "{err:#}");
-        let err = import(1).execute(datadir.clone()).expect_err("nothing to verify against");
-        assert!(format!("{err:#}").contains("not a past epoch"), "{err:#}");
+        let err = import(1).execute(datadir.clone()).expect_err("no resume epoch to judge by");
+        assert!(format!("{err:#}").contains("no readable latest-consensus hint"), "{err:#}");
         assert_eq!(tree_listing(&epochs), before, "a refusal wrote nothing");
     }
 }

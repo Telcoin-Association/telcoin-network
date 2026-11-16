@@ -529,8 +529,8 @@ only a verified copy is installed (`install_imported_epoch_dir`, rename-aside, w
 an interrupted install's aside first). It opens no `ConsensusChain`: an open writes (the live
 epoch's append open, `recover_incomplete_installs`, the sweep), and `stream_import`'s idempotency
 guard keeps a pack that still serves its final output, however damaged the rest of its log. It
-refuses epoch 0, the epoch the latest-consensus hint resumes and later ones, a copy inside the
-epochs directory (whose directories the import and the node's start remove or replace), and a pack
+refuses epoch 0, the epoch the latest-consensus hint resumes and later ones (and, with no hint, every
+epoch: the epoch the start resumes is then unknown), a copy inside the epochs directory (whose directories the import and the node's start remove or replace), and a pack
 in place (or an interrupted install's aside) that validates and ends with the epoch's certified
 final output (`pack_damage`: a v2 pack must also be sealed; a legacy v0 or v1 pack, which predates
 the sentinel, is judged by the dry run of its migration to v2, as the node reads it); a dry run (no
