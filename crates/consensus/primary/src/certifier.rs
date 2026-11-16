@@ -1084,7 +1084,9 @@ fn final_answer_kind(error: &DagError) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::duration_ms;
+    use super::{
+        duration_ms, final_answer_kind, retry_answer_kind, DagError, NetworkError, RpcFailure,
+    };
     use std::time::Duration;
 
     /// Sub-millisecond remainders round down and a duration past `u64::MAX` milliseconds
@@ -1096,5 +1098,38 @@ mod tests {
         assert_eq!(duration_ms(Duration::from_micros(1_999)), 1);
         assert_eq!(duration_ms(Duration::from_secs(10)), 10_000);
         assert_eq!(duration_ms(Duration::MAX), u64::MAX);
+    }
+
+    /// Each failed exchange that a vote request retries maps to its outcome code.
+    #[test]
+    fn retry_answer_kind_names_each_code() {
+        let table = [
+            (NetworkError::RPCRetryable("not yet".into()), "deferred"),
+            (NetworkError::Timeout, "timeout"),
+            (NetworkError::Outbound(RpcFailure::Timeout), "timeout"),
+            (NetworkError::Outbound(RpcFailure::DialFailure), "network"),
+        ];
+        for (error, kind) in table {
+            assert_eq!(retry_answer_kind(&error), kind, "{error}");
+        }
+    }
+
+    /// Each error that ends a vote request without a vote maps to its outcome code, and a request
+    /// canceled because its proposal ended lists nothing.
+    #[test]
+    fn final_answer_kind_names_each_code() {
+        let table = [
+            (DagError::Canceled, None),
+            (DagError::NetworkError("refused".into()), Some("refused")),
+            (DagError::ProposedHeaderMissingCertificates, Some("parents_unavailable")),
+            (DagError::UnexpectedVote(tn_types::HeaderDigest::default()), Some("invalid_vote")),
+            (DagError::InvalidEpoch { expected: 1, received: 2 }, Some("invalid_vote")),
+            (DagError::InvalidRound { expected: 1, received: 2 }, Some("invalid_vote")),
+            (DagError::UnknownAuthority("unknown".into()), Some("invalid_vote")),
+            (DagError::InvalidSignature, Some("other")),
+        ];
+        for (error, kind) in table {
+            assert_eq!(final_answer_kind(&error), kind, "{error}");
+        }
     }
 }
