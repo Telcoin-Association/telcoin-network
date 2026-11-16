@@ -38,7 +38,7 @@ use tn_types::{
     forks::{seed_signature_active, subsecond_timestamp_active},
     now_ms, AuthorityIdentifier, BlockHash, BlockNumHash, BlockNumber, Certificate, Committee,
     Database, Epoch, EpochDigest, EpochSeedMessage, Hash as _, Header, HeaderDigest, Noticer,
-    Round, TaskManager, TaskSpawner, TnReceiver, TnSender, VotingPower, WorkerId,
+    Round, TaskManager, TaskSpawner, TimestampMs, TnReceiver, TnSender, VotingPower, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -224,6 +224,11 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// The `tn_primary_headers_held_total` and `tn_primary_digests_held` handles, resolved once
     /// per epoch.
     order_hold_metrics: OrderHoldHandles,
+    /// The tracked own headers that held a lane under the order hold, keyed by round, for the
+    /// `order hold released` line. A header enters the first time a plan names it a blocker and
+    /// leaves when its round leaves [`Self::proposed_headers`]. Always empty with the
+    /// `digest_order_hold` switch off. Observability only.
+    held_blockers: BTreeMap<Round, HeldBlocker>,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -280,6 +285,66 @@ struct HoldReport {
     /// Tracked older own headers with digests that the parents do not prove to be ancestors of
     /// the header: [`HoldPlan::blockers`].
     blockers: usize,
+}
+
+/// A tracked own header that held lanes under the order hold: what its `order hold released` line
+/// reports when it leaves the tracked set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldBlocker {
+    /// The workers named in the header's payload: the lanes it held.
+    lanes: BTreeSet<WorkerId>,
+    /// When the header was built: its `created_at_ms`.
+    created_at_ms: TimestampMs,
+}
+
+impl HeldBlocker {
+    /// The digests queued in the lanes this header held that none of `others` holds: the digests
+    /// its release frees, as far as the blockers known so far tell. The next plan can still hold a
+    /// lane again behind a newer blocker.
+    fn freed_digests<'a, T>(
+        &self,
+        others: impl Iterator<Item = &'a HeldBlocker> + Clone,
+        queues: &BTreeMap<WorkerId, VecDeque<T>>,
+    ) -> usize {
+        self.lanes
+            .iter()
+            .filter(|lane| !others.clone().any(|other| other.lanes.contains(lane)))
+            .filter_map(|lane| queues.get(lane))
+            .map(VecDeque::len)
+            .sum()
+    }
+
+    /// Milliseconds from the header's creation to `now`; zero if the wall clock stepped back.
+    fn waited_ms(&self, now: TimestampMs) -> u64 {
+        now.as_millis().saturating_sub(self.created_at_ms.as_millis())
+    }
+}
+
+/// Why a header that held a lane under the order hold left the tracked set: the `cause` field of
+/// the `order hold released` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldReleaseCause {
+    /// The certifier reported the header uncertified, and its digests were re-queued.
+    Cancel,
+    /// A commit notice named the header: it committed.
+    Commit,
+    /// A commit notice named a higher own round but not this header, and its digests were
+    /// re-queued.
+    RequeueOnCommit,
+    /// The epoch's proposer stopped with the header still tracked.
+    EpochEnd,
+}
+
+impl HoldReleaseCause {
+    /// The `cause` value of the line.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Commit => "commit",
+            Self::RequeueOnCommit => "requeue_on_commit",
+            Self::EpochEnd => "epoch_end",
+        }
+    }
 }
 
 impl ProposalTrigger {
@@ -428,6 +493,7 @@ impl<DB: Database> Proposer<DB> {
             requeued_order_unknown: RequeuedOrderUnknownHandles::new(),
             order_hold: config.parameters().digest_order_hold.then(OwnChainOrder::default),
             order_hold_metrics: OrderHoldHandles::new(),
+            held_blockers: BTreeMap::new(),
             exec_block_floor,
         }
     }
@@ -995,6 +1061,7 @@ impl<DB: Database> Proposer<DB> {
                         self.lane_seqs.committed(digest);
                     });
                     self.forget_held(round);
+                    self.release_held(round, HoldReleaseCause::Commit);
                 }
                 None => warn!(
                     "own committed header not found at round {round}, probably because of restarts."
@@ -1061,6 +1128,7 @@ impl<DB: Database> Proposer<DB> {
             retransmit_rounds.iter().for_each(|round| {
                 self.proposed_headers.remove(round);
                 self.forget_held(*round);
+                self.release_held(*round, HoldReleaseCause::RequeueOnCommit);
             });
 
             warn!(
@@ -1148,6 +1216,8 @@ impl<DB: Database> Proposer<DB> {
         self.proposed_headers.remove(&round);
         self.forget_held(round);
         self.prepend_requeued(requeued, round, RequeueCause::Canceled, stale_resend);
+        // after the re-queue, so the line's `digests` counts the canceled header's own digests
+        self.release_held(round, HoldReleaseCause::Cancel);
     }
 
     /// Tell the order hold, when the `digest_order_hold` switch is on, that the own header at
@@ -1165,6 +1235,50 @@ impl<DB: Database> Proposer<DB> {
         if let Some(order) = self.order_hold.as_mut() {
             order.record_resent(round);
         }
+    }
+
+    /// Log `order hold released` if the own header at `round`, which just left
+    /// [`Self::proposed_headers`] for `cause`, held a lane under the order hold. Called after the
+    /// removal and after any re-queue of the header's digests, so `digests` counts those too.
+    fn release_held(&mut self, round: Round, cause: HoldReleaseCause) {
+        if let Some(blocker) = self.held_blockers.remove(&round) {
+            self.log_hold_released(round, &blocker, self.held_blockers.values(), cause);
+        }
+    }
+
+    /// Log `order hold released` for every header still holding a lane when the proposer stops:
+    /// they leave the tracked set with the epoch's proposer. Oldest first, so a lane two of them
+    /// hold is counted free at the newer one. It leaves the map as it is: [`Self::log_stopped`],
+    /// its only caller, runs once, as the proposer's run loop returns.
+    fn log_held_at_stop(&self) {
+        for (round, blocker) in &self.held_blockers {
+            let newer = self
+                .held_blockers
+                .range((std::ops::Bound::Excluded(*round), std::ops::Bound::Unbounded))
+                .map(|(_, other)| other);
+            self.log_hold_released(*round, blocker, newer, HoldReleaseCause::EpochEnd);
+        }
+    }
+
+    /// Write one `order hold released` line for `blocker`, the own header at `round`, which left
+    /// the tracked set for `cause` while `others` still hold their lanes.
+    fn log_hold_released<'a>(
+        &self,
+        round: Round,
+        blocker: &HeldBlocker,
+        others: impl Iterator<Item = &'a HeldBlocker> + Clone,
+        cause: HoldReleaseCause,
+    ) {
+        info!(
+            target: "consensus::metrics",
+            epoch = self.committee.epoch(),
+            round,
+            lanes = blocker.lanes.len(),
+            digests = blocker.freed_digests(others, &self.digests),
+            waited_ms = blocker.waited_ms(now_ms()),
+            cause = cause.as_str(),
+            "order hold released"
+        );
     }
 
     /// Prepend `requeued`, the batch digests of own headers that will not be committed (oldest
@@ -1324,6 +1438,16 @@ impl<DB: Database> Proposer<DB> {
             self.order_hold_metrics.headers_held.increment(1);
         }
         self.order_hold_metrics.digests_held.set(held as f64);
+        // a blocker is noted the first time a plan names it; its release line is written when its
+        // round leaves the tracked set
+        for round in &plan.blockers {
+            if let Some(header) = self.proposed_headers.get(round) {
+                self.held_blockers.entry(*round).or_insert_with(|| HeldBlocker {
+                    lanes: header.payload().values().copied().collect(),
+                    created_at_ms: header.created_at_ms(),
+                });
+            }
+        }
         let hold = HoldReport {
             own_parent: plan.own_parent,
             held,
@@ -1623,6 +1747,7 @@ impl<DB: Database> Proposer<DB> {
             in_flight_digests,
             "proposer stopped"
         );
+        self.log_held_at_stop();
         // the held digests leave with the proposer, for the orphan re-pool
         if self.order_hold.is_some() {
             self.order_hold_metrics.digests_held.set(0.0);

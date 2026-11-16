@@ -4744,3 +4744,159 @@ async fn test_header_proposed_reports_bench8_fields() {
         }
     }
 }
+
+// ---- bench8 order-hold-released ----
+
+/// The `round`, `lanes`, `digests` and `cause` of an `order hold released` line.
+fn released_fields(line: &crate::log_capture::CapturedEvent) -> (u64, u64, u64, String) {
+    let number = |name: &str| line.u64_field(name).unwrap_or(u64::MAX);
+    let cause = line.field("cause").unwrap_or_default().trim_matches('"').to_string();
+    (number("round"), number("lanes"), number("digests"), cause)
+}
+
+/// `order hold released` on issue #1807's canceled case: round 2 holds worker 0 behind round 1,
+/// and the cancel report for round 1 releases it, with the canceled digests 1 and 2 back in the
+/// lane beside the held digest 3. Round 3 holds nothing, so the stop logs no second line. With the
+/// switch off nothing is tracked and nothing is logged.
+///
+/// Catches: a line per digest or per lane, `digests` counted before the re-queue, a line for a
+/// header that never held a lane, fields out of order, and a line with the switch off.
+#[tokio::test]
+async fn test_order_hold_released_on_cancel() {
+    use crate::log_capture::LogCapture;
+
+    for on in [false, true] {
+        let capture = LogCapture::new("consensus::metrics");
+        let _capture_guard = tracing::subscriber::set_default(capture.clone());
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let fixture = hold_fixture(on);
+        let task_manager = TaskManager::default();
+        let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
+
+        report_fixed(&mut proposer, 0, &[1, 2]);
+        let h1 = propose_and_track(&mut proposer).await;
+        report_fixed(&mut proposer, 0, &[3]);
+        report_fixed(&mut proposer, 1, &[101]);
+        let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, None)).await;
+        proposer.process_uncertified_header(h1.round(), h1.digest());
+        build_on(&mut proposer, hold_parents(&fixture, 2, Some(&h2))).await;
+        proposer.log_stopped();
+
+        let lines = capture.events("order hold released");
+        if !on {
+            assert!(lines.is_empty(), "the switch off tracks nothing");
+            assert!(proposer.held_blockers.is_empty());
+            continue;
+        }
+        assert_eq!(lines.len(), 1, "one line for the one blocker, none at the stop");
+        let line = &lines[0];
+        let names: Vec<&str> = line.fields.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["epoch", "round", "lanes", "digests", "waited_ms", "cause"]);
+        assert_eq!(line.u64_field("epoch"), Some(u64::from(fixture.committee().epoch())));
+        assert_eq!(released_fields(line), (1, 1, 3, "cancel".to_string()));
+        assert!(line.u64_field("waited_ms").is_some_and(|ms| ms < 60_000));
+    }
+}
+
+/// `order hold released` when a commit notice settles the blocker, as in
+/// `test_order_hold_releases_the_lane_when_the_notice_settles_the_blocker`: naming round 1 commits
+/// it with digest 2 left in the lane; naming only round 2 re-queues round 1, whose digest 1
+/// returns beside digest 2. A late cancel report and the stop add nothing. A third case stops the
+/// proposer while round 1 still holds: the line says `epoch_end`.
+///
+/// Catches: a wrong cause, a line for the committed round 2 that never held a lane, a second line
+/// for a header already released, and a header left out at the stop.
+#[tokio::test]
+async fn test_order_hold_released_on_commit_requeue_and_stop() {
+    use crate::log_capture::LogCapture;
+
+    for named in [Some(1), Some(2), None] {
+        let capture = LogCapture::new("consensus::metrics");
+        let _capture_guard = tracing::subscriber::set_default(capture.clone());
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let fixture = hold_fixture(true);
+        let task_manager = TaskManager::default();
+        let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
+
+        report_fixed(&mut proposer, 0, &[1]);
+        let h1 = propose_and_track(&mut proposer).await;
+        report_fixed(&mut proposer, 0, &[2]);
+        let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, None)).await;
+        assert!(h2.payload().is_empty(), "named {named:?}: round 2 holds worker 0");
+        match named {
+            Some(round) => {
+                proposer.process_committed_headers(4, vec![round]);
+                proposer.process_uncertified_header(h1.round(), h1.digest());
+                proposer.log_stopped();
+            }
+            None => proposer.log_stopped(),
+        }
+
+        let lines = capture.events("order hold released");
+        assert_eq!(lines.len(), 1, "named {named:?}");
+        let expected = match named {
+            Some(1) => (1, 1, 1, "commit"),
+            Some(_) => (1, 1, 2, "requeue_on_commit"),
+            None => (1, 1, 1, "epoch_end"),
+        };
+        let (round, lanes, digests, cause) = released_fields(&lines[0]);
+        assert_eq!((round, lanes, digests, cause.as_str()), expected, "named {named:?}");
+    }
+}
+
+/// [`HeldBlocker`]'s derived fields: `waited_ms` runs from the header's creation and is zero when
+/// the clock stepped back; `digests` counts only the lanes no other blocker still holds.
+///
+/// Catches: a lane counted free while a newer blocker holds it, and a wrapping subtraction.
+#[test]
+fn test_held_blocker_release_fields() {
+    let blocker = HeldBlocker {
+        lanes: BTreeSet::from([0, 1]),
+        created_at_ms: TimestampMs::from_millis(1_000),
+    };
+    assert_eq!(blocker.waited_ms(TimestampMs::from_millis(1_250)), 250);
+    assert_eq!(blocker.waited_ms(TimestampMs::from_millis(900)), 0);
+
+    let other =
+        HeldBlocker { lanes: BTreeSet::from([1]), created_at_ms: TimestampMs::from_millis(1_100) };
+    let queues: BTreeMap<WorkerId, VecDeque<u8>> =
+        BTreeMap::from([(0, VecDeque::from([1, 2])), (1, VecDeque::from([3, 4, 5]))]);
+    assert_eq!(blocker.freed_digests([&other].into_iter(), &queues), 2, "lane 1 stays held");
+    assert_eq!(blocker.freed_digests(std::iter::empty(), &queues), 5);
+}
+
+/// `order hold released` at the stop when two blockers share a lane: rounds 1 and 2 both carry
+/// worker 0 (round 2 cites round 1), and round 3, built without its own parent, holds worker 0
+/// behind both, with digest 3 queued. The stop logs round 1 first with nothing freed, since round
+/// 2 still holds the lane, then round 2 with digest 3.
+///
+/// Catches: a shared lane counted free twice, or at the older blocker, and lines out of round
+/// order.
+#[tokio::test]
+async fn test_order_hold_released_at_stop_counts_a_shared_lane_once() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let fixture = hold_fixture(true);
+    let task_manager = TaskManager::default();
+    let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
+
+    report_fixed(&mut proposer, 0, &[1]);
+    let h1 = propose_and_track(&mut proposer).await;
+    report_fixed(&mut proposer, 0, &[2]);
+    let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, Some(&h1))).await;
+    assert_eq!(payload_entries(&h2), [(fixed_digest(2), 0)], "round 2 extends the own chain");
+    report_fixed(&mut proposer, 0, &[3]);
+    let h3 = build_on(&mut proposer, hold_parents(&fixture, 2, None)).await;
+    assert!(h3.payload().is_empty(), "round 3 holds worker 0 behind rounds 1 and 2");
+    proposer.log_stopped();
+
+    let lines: Vec<_> = capture.events("order hold released").iter().map(released_fields).collect();
+    assert_eq!(
+        lines,
+        [(1, 1, 0, "epoch_end".to_string()), (2, 1, 1, "epoch_end".to_string())],
+        "the shared lane is free only at the newer blocker"
+    );
+}
