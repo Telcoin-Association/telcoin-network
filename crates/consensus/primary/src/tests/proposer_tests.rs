@@ -1623,12 +1623,16 @@ fn requeued_totals(snapshotter: &metrics_util::debugging::Snapshotter) -> [Optio
 }
 
 /// The certifier's report that an own header was cancelled puts that header's digests at the front
-/// of the queue, so the next header carries them ahead of newer digests: the header after the one
-/// that cancelled it, not the one after the next own commit. The re-queue logs one `digests resent`
-/// line with `cause=canceled` and counts the digests under that cause.
+/// of their worker's lane, so the next header carries them ahead of newer digests of that worker:
+/// the header after the one that cancelled it, not the one after the next own commit. The header
+/// that cancelled it was built while the older header was pending and does not cite it, so the
+/// order hold kept every digest of that worker out of it; the report releases the lane. The
+/// re-queue logs one `digests resent` line with `cause=canceled` and counts the digests under that
+/// cause.
 ///
-/// Catches: a proposer that does not subscribe to the report or ignores it, digests appended
-/// behind newer ones, a missing or misattributed `cause`, and a per-digest line.
+/// Catches: a proposer that does not subscribe to the report or ignores it, a newer digest of the
+/// worker drained while the older header is pending, digests appended behind newer ones, a lane
+/// left held after the report, a missing or misattributed `cause`, and a per-digest line.
 #[tokio::test(start_paused = true)]
 async fn test_canceled_header_digests_ride_the_next_header() {
     use crate::log_capture::LogCapture;
@@ -1647,11 +1651,12 @@ async fn test_canceled_header_digests_ride_the_next_header() {
     let (cb, mut rx_headers, canceled) =
         spawn_with_first_header(&fixture, &task_manager, &recorder, &[d1, d2]).await;
 
-    // round 2 cancels round 1's vote collection in the certifier
+    // round 2 cancels round 1's vote collection in the certifier; it does not cite round 1, which
+    // is still pending, so it carries nothing of worker 0 and d3 stays queued
     send_digest(&cb, d3).await;
     cb.parents().send((parents_at(&fixture, 1, epoch, all), 1)).await.expect("parents sent");
     let newer = next_header_at(&mut rx_headers, 2).await;
-    assert_eq!(payload_digests(&newer), [d3]);
+    assert!(payload_digests(&newer).is_empty(), "worker 0 is held while round 1 is pending");
 
     // the certifier's report, then a digest that arrives after it
     cb.uncertified_own_headers()
@@ -1668,7 +1673,11 @@ async fn test_canceled_header_digests_ride_the_next_header() {
 
     cb.parents().send((parents_at(&fixture, 2, epoch, all), 2)).await.expect("parents sent");
     let next = next_header_at(&mut rx_headers, 3).await;
-    assert_eq!(payload_digests(&next), [d1, d2, d4], "re-queued digests ride ahead of newer ones");
+    assert_eq!(
+        payload_digests(&next),
+        [d1, d2, d3, d4],
+        "the lane is released and the re-queued digests ride ahead of the held and the newest one"
+    );
 
     let lines = capture.events("digests resent");
     assert_eq!(lines.len(), 1, "one line per re-queue");
@@ -2663,7 +2672,7 @@ fn order_proposer(
 async fn test_lane_sequence_survives_requeues() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let (_fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
+    let (fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
     let author = proposer.authority_id.clone();
     let d = fixed_digest;
 
@@ -2672,9 +2681,12 @@ async fn test_lane_sequence_survives_requeues() {
     assert_eq!(lane_entries(&proposer, 0), [(d(1), Some(0)), (d(2), Some(1)), (d(3), Some(2))]);
     assert_eq!(lane_entries(&proposer, 1), [(d(101), Some(0))], "each worker counts from zero");
 
+    // rounds 2 and 3 each cite the previous own header, so the order hold keeps no lane back; the
+    // cancel report and the commit notice below are forced (no certifier reports a certified
+    // header, and a commit of round 3 orders round 2 with it), which the numbers do not depend on
     let h1 = propose_and_track(&mut proposer).await;
     report_fixed(&mut proposer, 0, &[4]);
-    let h2 = propose_and_track(&mut proposer).await;
+    let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, Some(&h1))).await;
     assert_eq!(payload_digests(&h2), [d(4)]);
 
     // a cancel re-queue keeps the numbers
@@ -2683,7 +2695,7 @@ async fn test_lane_sequence_survives_requeues() {
     assert_eq!(lane_entries(&proposer, 1), [(d(101), Some(0))]);
 
     // a commit re-queue keeps them too: round 3 commits and round 2 died behind it
-    let h3 = propose_and_track(&mut proposer).await;
+    let h3 = build_on(&mut proposer, hold_parents(&fixture, 2, Some(&h2))).await;
     assert_eq!(h3.payload().len(), 4);
     proposer.process_committed_headers(h3.round() + 2, vec![h3.round()]);
     assert_eq!(lane_entries(&proposer, 0), [(d(4), Some(3))]);
@@ -2720,7 +2732,7 @@ async fn test_requeues_that_keep_lane_order_count_nothing() {
     let _capture_guard = tracing::subscriber::set_default(capture.clone());
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let (_fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
+    let (fixture, _task_manager, _rx_headers, mut proposer) = order_proposer(&recorder);
     let d = fixed_digest;
 
     // only worker 1 drains after round 1: worker 0's digests come back with nothing newer out
@@ -2731,19 +2743,22 @@ async fn test_requeues_that_keep_lane_order_count_nothing() {
     proposer.process_uncertified_header(h1.round(), h1.digest());
     assert_eq!(lane_entries(&proposer, 0), [(d(1), Some(0)), (d(2), Some(1))]);
 
-    // rounds 3 and 4 carry 1, 2 and 3; round 5 commits, so both die and return together
+    // rounds 3 and 4 carry 1, 2 and 3 (round 4 cites round 3, so worker 0 is not held); round 5
+    // cites neither, and its commit skips both, so both die and return together
     let h3 = propose_and_track(&mut proposer).await;
     report_fixed(&mut proposer, 0, &[3]);
-    let h4 = propose_and_track(&mut proposer).await;
+    let h4 = build_on(&mut proposer, hold_parents(&fixture, 3, Some(&h3))).await;
     assert_eq!((payload_digests(&h3), payload_digests(&h4)), (vec![d(1), d(2)], vec![d(3)]));
     let h5 = propose_and_track(&mut proposer).await;
     proposer.process_committed_headers(h5.round() + 2, vec![h5.round()]);
     assert_eq!(lane_entries(&proposer, 0), [(d(1), Some(0)), (d(2), Some(1)), (d(3), Some(2))]);
 
-    // rounds 6 and 7 split them again, and round 7 is canceled before round 6
+    // rounds 6 and 7 split them again, and round 7 is canceled before round 6; under the order
+    // hold only an own-chain link lets two headers of one worker be out at once, so round 7 cites
+    // round 6 and the two reports are forced (no certifier reports a certified header)
     proposer.max_header_num_of_batches = 3;
     let h6 = propose_and_track(&mut proposer).await;
-    let h7 = propose_and_track(&mut proposer).await;
+    let h7 = build_on(&mut proposer, hold_parents(&fixture, 6, Some(&h6))).await;
     propose_and_track(&mut proposer).await;
     assert_eq!(
         (payload_digests(&h6), payload_digests(&h7)),
@@ -2832,13 +2847,15 @@ async fn test_proposer_stopped_reports_what_it_leaves() {
     let cb = ConsensusBus::new();
     let _rx_headers = cb.subscribe_headers();
 
-    // two tracked headers with three digests, one header in flight with one, two digests queued
+    // two tracked headers with three digests, one header in flight with one, two digests queued;
+    // each header cites the previous own header, so the order hold keeps nothing back
     let mut proposer = proposer_on(&config, &committee, &cb, &task_manager);
     report_fixed(&mut proposer, 0, &[1, 2]);
-    propose_and_track(&mut proposer).await;
+    let h1 = propose_and_track(&mut proposer).await;
     report_fixed(&mut proposer, 1, &[101]);
-    propose_and_track(&mut proposer).await;
+    let h2 = build_on(&mut proposer, hold_parents(&fixture, 1, Some(&h1))).await;
     report_fixed(&mut proposer, 0, &[3]);
+    proposer.last_parents = hold_parents(&fixture, 2, Some(&h2));
     proposer
         .propose_next_header(ProposeReason::MinDelay)
         .expect("proposal spawned")

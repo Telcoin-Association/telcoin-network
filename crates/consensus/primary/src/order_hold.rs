@@ -43,8 +43,8 @@
 //! - I2: no re-queued digest is older, by its worker's sequence, than a digest of the same worker
 //!   in a tracked or committed header. The proposer checks it (a counter and a warning in
 //!   production, an assertion in tests); this module never sees sequences.
-//! - I3: with the hold switched off, the drain is the base's, byte for byte. The proposer does not
-//!   consult this module then.
+//! - I3: a plan that holds no lane drains as the base does, byte for byte: the held-lane filter
+//!   takes no slot and does not move the drain's lane cursor.
 //!
 //! # Why the hold is enough
 //!
@@ -91,12 +91,11 @@
 //! stay queued, and the proposer's `enough_digests` trigger counts every queued digest, held ones
 //! included. A held backlog of at least `header_num_of_batches_threshold` digests therefore
 //! builds the next header as soon as its parents allow, without waiting for the min delay, and
-//! that header can carry none of the held digests. With the switch off, timing is the base's.
-//! With it on, under load the trigger fires as on the base, because the queue is above the
-//! threshold either way; at light load a held backlog builds a header earlier than the base
-//! would. A narrower trigger is not built and is a possible later change: leave held digests out
-//! of the count while the only blocker is the own header of the previous round, so that the node
-//! waits the base's min delay for that header's certificate.
+//! that header can carry none of the held digests. Under load the trigger fires as on the base,
+//! because the queue is above the threshold either way; at light load a held backlog builds a
+//! header earlier than the base would. A narrower trigger is not built and is a possible later
+//! change: leave held digests out of the count while the only blocker is the own header of the
+//! previous round, so that the node waits the base's min delay for that header's certificate.
 //!
 //! # What releases a held lane
 //!
