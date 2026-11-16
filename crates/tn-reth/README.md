@@ -597,7 +597,8 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   checks stat each name with `symlink_metadata` (a symbolic link counts as present, dangling or
   not), so a stat error fails the open. The MDBX build's error names the
   directory and both engines; the operator runs the default build or starts from a fresh datadir
-  (or `db load-state`). The MDBX build also refuses a migrated `db/` whose `tn-lmdb.dat` is
+  (or `db load-state`; a validator then stays stopped until the network has closed the last epoch
+  it took part in). The MDBX build also refuses a migrated `db/` whose `tn-lmdb.dat` is
   missing (the marker `db/mdbx-migrated` alone), saying to restore the file and run a build
   without `mdbx`, rather than create a new database in its place. It warns of a stopped migration's temp
   directory (`db/tn-lmdb-migrating/`, a partial copy beside an unchanged MDBX database), naming it
@@ -793,12 +794,13 @@ one of reth's: its rows are not copied (reth does not read them either).
   | `mdbx.dat` beside `tn-lmdb.dat` and the emptied `db/tn-lmdb-migrating/`, differing in length or MDBX transaction id from the record `db/tn-lmdb-migrating/mdbx-source` | an MDBX build (an older binary) wrote MDBX between the migration's commit point and its version file; removing `mdbx.dat` would roll those writes back | both files are kept. When the error says MDBX is at a later transaction than the migration copied, the MDBX build advanced it with the static files: remove `db/tn-lmdb.dat` and `db/tn-lmdb-migrating/`, then start this build again, which migrates `mdbx.dat` from the start. Otherwise (`mdbx.dat` may be one an MDBX build created anew, pruning the static files down to it) rebuild as above. Do not start an older release on the datadir |
   | an unfinished migration (the emptied `db/tn-lmdb-migrating/` beside `tn-lmdb.dat`) whose `tn-lmdb.dat` this build cannot open, say in another tn-lmdb format version | a stopped migration of an older build | nothing is changed. With `mdbx.dat` still there: remove `db/tn-lmdb.dat` and `db/tn-lmdb-migrating/`, then start again, which migrates MDBX from the start. Without it: rebuild as above |
   | an unfinished migration whose `mdbx.dat` another process has open (`MDBX_BUSY`, "another process has the MDBX database open") | two datadirs name one `db/`, and an MDBX build runs on the other | both files are kept: stop that process, then start again |
-  | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`) |
+  | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`; a validator then stays stopped until the network has closed the last epoch it took part in) |
   | an MDBX database whose `storage_settings` row or TN layout marker says v2, does not parse, or names an unknown format version (`refuse_non_v1_source`) | the migration changes the engine, never the layout, and no TN build writes v2 on MDBX | MDBX is unchanged: resolve by hand |
 
 - **No rollback:** once `mdbx.dat` is removed there is no way back to MDBX. The MDBX build of this
   tree refuses a `db/` holding `tn-lmdb.dat`, or the marker without it (saying to restore the file
-  and run a tn-lmdb build), so going back means a fresh datadir (or `db load-state`). A release
+  and run a tn-lmdb build), so going back means a fresh datadir (or `db load-state`; a validator
+  then stays stopped until the network has closed the last epoch it took part in). A release
   from before the backend guard has no such refusal; what stops it is the version file: it
   refuses `db/database.version` (1002, the tn-lmdb version) before it opens anything, so `db/` and
   `static_files/` are left as they were and the tn-lmdb build still runs on them. Do not edit or
@@ -947,7 +949,9 @@ as its index in the consensus batch its block executed ("Transactions stored by 
   configuration`). Not caught: a data, offsets or `.csoff` file of another file of the segment with
   the same length (every change-set file starts at row 0), or another file's longer data and
   offsets under a segment's latest file, which startup cuts to the `.conf`; they read as this
-  file's values with no error. Copy or restore whole datadirs, never single static files.
+  file's values with no error. Copy or restore whole datadirs, never single static files (a
+  validator restored that way stays stopped until the network has closed the epoch it was last
+  in).
   **Operator response:** the file is damaged on this node only (disk or memory fault,
   or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
   wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start

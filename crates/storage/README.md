@@ -259,7 +259,8 @@ fetches a past epoch's pack again, so each report of data loss ends with the rec
 (`pack_validate::lost_pack_remedy`): put back the epoch's directory from a backup taken after that epoch
 closed or another node's sealed copy, verified by `db import-epoch` (a sealed past pack never changes; a
 whole `consensus-db` from an older backup lacks the later packs), or
-start the node over (crates/tn-reth/README.md, "Transactions stored by position"), and never delete the
+start the node over (crates/tn-reth/README.md, "Transactions stored by position"; a validator then stays
+stopped until the network has closed the last epoch it took part in), and never delete the
 `epoch-N` directory, which a datadir storing transactions by position needs at every start. Only the
 newest epoch's torn-empty meta or all-zero data file holds no output: the node creates (or
 re-initializes) that epoch again when it enters it. Its read-only recovery checks
