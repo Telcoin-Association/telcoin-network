@@ -14,14 +14,17 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
-use super::{export_retention::PublishOutcome, run_epoch::retry_provider_faults};
+use super::{
+    export_retention::PublishOutcome,
+    run_epoch::{check_output_continuity, retry_provider_faults, OutputContinuity},
+};
 use crate::{
     engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics, primary::PrimaryNode,
 };
 use eyre::{eyre, WrapErr as _};
 use std::{collections::BTreeSet, path::Path, time::Duration};
 use tn_config::TelcoinDirs;
-use tn_reth::{recover_raw_transaction, RethEnv};
+use tn_reth::{recover_raw_transaction, PoolError, PoolErrorKind, RethEnv};
 use tn_storage::{
     consensus_pack::DATA_NAME,
     tables::{
@@ -120,10 +123,164 @@ async fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
 /// Whether an orphaned batch can be removed from the durable recovery cache.
 #[derive(Debug, PartialEq, Eq)]
 enum OrphanBatchRecovery {
-    /// Forwarding accepted the batch, or an active pool considered every transaction.
-    Complete,
+    /// Forwarding accepted the batch, or an active pool considered every transaction. The counts
+    /// are what the pool did with the batch's transactions (all zero for a forwarded batch).
+    Complete(OrphanTxCounts),
     /// No active pool was available; retain the batch for the next recovery attempt.
     Retry,
+}
+
+/// What the orphan re-pool did with one transaction, the `result` label of
+/// `tn_node.orphan_txs_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrphanTxResult {
+    /// The pool accepted the transaction.
+    Repooled,
+    /// The bytes failed to decode, or the signer failed to recover.
+    Invalid,
+    /// The pool already held the transaction ([`PoolErrorKind::AlreadyImported`]): a retried
+    /// pass found what a cancelled one had pooled, or the transaction came back through RPC or a
+    /// peer. Harmless.
+    AlreadyPooled,
+    /// The executed state holds a higher nonce for the sender
+    /// ([`PoolErrorKind::InvalidTransaction`] whose error `is_nonce_too_low`): a transaction
+    /// with this sender and nonce has executed, this one or a replacement.
+    RefusedNonceTooLow,
+    /// Any other refusal: the pool's size or per-sender limits, a cheaper replacement of a
+    /// pooled transaction, another validation failure, or a failed state read during validation.
+    /// Only these can be a loss.
+    RefusedOther,
+}
+
+impl OrphanTxResult {
+    /// Every result, in label order, for touching every series of a finished batch.
+    const ALL: [Self; 5] = [
+        Self::Repooled,
+        Self::Invalid,
+        Self::AlreadyPooled,
+        Self::RefusedNonceTooLow,
+        Self::RefusedOther,
+    ];
+
+    /// Classify a pool refusal by its error kind.
+    ///
+    /// The match names every kind, so a new kind in a reth upgrade must be placed here by hand.
+    fn refused(error: &PoolError) -> Self {
+        match &error.kind {
+            PoolErrorKind::AlreadyImported => Self::AlreadyPooled,
+            PoolErrorKind::InvalidTransaction(invalid) if invalid.is_nonce_too_low() => {
+                Self::RefusedNonceTooLow
+            }
+            PoolErrorKind::InvalidTransaction(_)
+            | PoolErrorKind::ReplacementUnderpriced
+            | PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(_)
+            | PoolErrorKind::SpammerExceededCapacity(_)
+            | PoolErrorKind::DiscardedOnInsert
+            | PoolErrorKind::ExistingConflictingTransactionType(..)
+            | PoolErrorKind::Other(_) => Self::RefusedOther,
+        }
+    }
+
+    /// The static `result` label value.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Repooled => "repooled",
+            Self::Invalid => "invalid",
+            Self::AlreadyPooled => "already_pooled",
+            Self::RefusedNonceTooLow => "refused_nonce_too_low",
+            Self::RefusedOther => "refused_other",
+        }
+    }
+}
+
+/// Per-result transaction counts of the orphan re-pool, for one batch or a whole recovery pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OrphanTxCounts {
+    /// Transactions the pool accepted.
+    repooled: u64,
+    /// Transactions that failed to decode or to recover a signer.
+    invalid: u64,
+    /// Transactions the pool already held.
+    already_pooled: u64,
+    /// Transactions refused as nonce too low.
+    refused_nonce_too_low: u64,
+    /// Transactions refused for any other reason.
+    refused_other: u64,
+}
+
+impl OrphanTxCounts {
+    /// The count of one result.
+    const fn get(&self, result: OrphanTxResult) -> u64 {
+        match result {
+            OrphanTxResult::Repooled => self.repooled,
+            OrphanTxResult::Invalid => self.invalid,
+            OrphanTxResult::AlreadyPooled => self.already_pooled,
+            OrphanTxResult::RefusedNonceTooLow => self.refused_nonce_too_low,
+            OrphanTxResult::RefusedOther => self.refused_other,
+        }
+    }
+
+    /// Count one transaction's result.
+    fn note(mut self, result: OrphanTxResult) -> Self {
+        let count = match result {
+            OrphanTxResult::Repooled => &mut self.repooled,
+            OrphanTxResult::Invalid => &mut self.invalid,
+            OrphanTxResult::AlreadyPooled => &mut self.already_pooled,
+            OrphanTxResult::RefusedNonceTooLow => &mut self.refused_nonce_too_low,
+            OrphanTxResult::RefusedOther => &mut self.refused_other,
+        };
+        *count = count.saturating_add(1);
+        self
+    }
+
+    /// Add another batch's counts.
+    fn add(self, other: Self) -> Self {
+        Self {
+            repooled: self.repooled.saturating_add(other.repooled),
+            invalid: self.invalid.saturating_add(other.invalid),
+            already_pooled: self.already_pooled.saturating_add(other.already_pooled),
+            refused_nonce_too_low: self
+                .refused_nonce_too_low
+                .saturating_add(other.refused_nonce_too_low),
+            refused_other: self.refused_other.saturating_add(other.refused_other),
+        }
+    }
+
+    /// Add one batch's counts to `tn_node.orphan_txs_total`. Every `result` series is touched,
+    /// by 0 when the batch had none, so each exists once a batch has been re-pooled.
+    fn record(self) {
+        OrphanTxResult::ALL.into_iter().for_each(|result| {
+            metrics::counter!("tn_node.orphan_txs_total", "result" => result.label())
+                .increment(self.get(result));
+        });
+    }
+}
+
+/// The path that finished an orphaned batch, the `path` label of `tn_node.orphan_batches_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrphanBatchPath {
+    /// Re-pooled into the pool of the worker that built the batch.
+    OwnWorker,
+    /// Re-pooled into worker 0's pool, because the batch's worker is no longer active.
+    Worker0Fallback,
+    /// Disbursed through the batch's worker by a node that is not an active CVV.
+    NonValidator,
+}
+
+impl OrphanBatchPath {
+    /// The static `path` label value.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::OwnWorker => "own_worker",
+            Self::Worker0Fallback => "worker0_fallback",
+            Self::NonValidator => "non_validator",
+        }
+    }
+
+    /// Count one finished batch on `tn_node.orphan_batches_total`.
+    fn record(self) {
+        metrics::counter!("tn_node.orphan_batches_total", "path" => self.label()).increment(1);
+    }
 }
 
 /// Hand every transaction in `batch` back to an active worker's mempool.
@@ -131,6 +288,31 @@ enum OrphanBatchRecovery {
 /// Pools can outlive their workers, so only the current epoch's `active_workers` are eligible.
 /// A removed worker falls back to worker 0. Invalid or refused transactions are logged and
 /// discarded under the pool's normal validation rules; a missing pool leaves the batch cached.
+///
+/// Each transaction is counted once on `tn_node.orphan_txs_total{result}`, and the batch once
+/// on `tn_node.orphan_batches_total{path}`, when the whole batch has been handled. A cancelled
+/// batch counts nothing and is counted by the attempt that finishes it; the transactions the
+/// cancelled attempt already pooled are then counted as `already_pooled`. The batch is counted
+/// again when it stays cached after its counts were recorded: a crash before the cache removal
+/// is durable (the restarted node re-pools it into an empty pool), or a failed removal.
+///
+/// A refusal is classified by the pool's error kind ([`OrphanTxResult::refused`]):
+/// `already_pooled`, `refused_nonce_too_low` or `refused_other`. A nonce-too-low refusal could
+/// mean two things: the transaction, or another with the same sender and nonce, already
+/// executed, which is expected (a batch can be orphaned and its transactions still land); or a
+/// transaction that never executed was refused because the pool's view of the sender's nonce
+/// ran ahead of the executed state, which would be a loss. The counter alone cannot tell them
+/// apart; the fleet reads it against the generator's list of transactions that never landed.
+///
+/// On this pool the second case does not arise from the batch builder's update of the pool
+/// after each sealed batch (`update_canonical_state` with the batch's changed accounts,
+/// `crates/batch-builder/src/lib.rs` ≈ :673-678), because that update only moves the pool's
+/// per-sender record. Admission checks the nonce in the validator against `client.latest()`,
+/// the executed state (`vendor/reth/crates/transaction-pool/src/validate/eth.rs` ≈ :237, :549,
+/// :638-651), and the insert then overwrites the per-sender record with that executed nonce
+/// (`vendor/reth/crates/transaction-pool/src/pool/txpool.rs` ≈ :754-768). A
+/// `refused_nonce_too_low` transaction is therefore one whose sender and nonce have executed:
+/// this one or a replacement.
 async fn repool_batch_txns(
     pools: &[tn_reth::WorkerTxPool],
     active_workers: usize,
@@ -138,31 +320,45 @@ async fn repool_batch_txns(
 ) -> OrphanBatchRecovery {
     use futures::StreamExt as _;
     let worker_id = usize::from(batch.worker_id);
-    let pool = pools.get(worker_id).filter(|_| worker_id < active_workers).or_else(|| {
-        warn!(target: "epoch-manager", worker_id, active_workers, pools = pools.len(),
-            transactions = batch.transactions().len(),
-            "orphaned batch has no active worker pool; trying worker 0");
-        pools.first().filter(|_| active_workers > 0)
-    });
-    futures::future::OptionFuture::from(pool.map(|pool| async move {
-        futures::stream::iter(batch.transactions())
-            .filter_map(|tx_bytes| async move {
-                recover_raw_transaction(tx_bytes)
-                    .inspect_err(|error| {
+    let pool = pools
+        .get(worker_id)
+        .filter(|_| worker_id < active_workers)
+        .map(|pool| (pool, OrphanBatchPath::OwnWorker))
+        .or_else(|| {
+            warn!(target: "epoch-manager", worker_id, active_workers, pools = pools.len(),
+                transactions = batch.transactions().len(),
+                "orphaned batch has no active worker pool; trying worker 0");
+            pools
+                .first()
+                .filter(|_| active_workers > 0)
+                .map(|pool| (pool, OrphanBatchPath::Worker0Fallback))
+        });
+    futures::future::OptionFuture::from(pool.map(|(pool, path)| async move {
+        let counts = futures::stream::iter(batch.transactions())
+            .fold(OrphanTxCounts::default(), |counts, tx_bytes| async move {
+                let result = match recover_raw_transaction(tx_bytes) {
+                    Err(error) => {
                         debug!(target: "epoch-manager", worker_id, ?error,
                             "invalid orphaned transaction");
-                    })
-                    .ok()
-            })
-            .for_each(|recovered| async move {
-                let _ =
-                    pool.add_recovered_transaction_external(recovered).await.inspect_err(|error| {
-                        debug!(target: "epoch-manager", worker_id, ?error,
-                            "pool refused an orphaned transaction");
-                    });
+                        OrphanTxResult::Invalid
+                    }
+                    Ok(recovered) => {
+                        match pool.add_recovered_transaction_external(recovered).await {
+                            Ok(_) => OrphanTxResult::Repooled,
+                            Err(error) => {
+                                debug!(target: "epoch-manager", worker_id, ?error,
+                                    "pool refused an orphaned transaction");
+                                OrphanTxResult::refused(&error)
+                            }
+                        }
+                    }
+                };
+                counts.note(result)
             })
             .await;
-        OrphanBatchRecovery::Complete
+        counts.record();
+        path.record();
+        OrphanBatchRecovery::Complete(counts)
     }))
     .await
     .unwrap_or_else(|| {
@@ -189,24 +385,25 @@ where
 {
     use futures::{StreamExt as _, TryStreamExt as _};
     let batches = orphan_batches.len();
-    let (processed_batches, processed_transactions) = futures::stream::iter(orphan_batches)
+    let (processed_batches, processed_transactions, txs) = futures::stream::iter(orphan_batches)
         .map(Ok)
         .try_fold(
-            (0usize, 0usize),
-            |(processed_batches, processed_transactions), (digest, batch)| {
+            (0usize, 0usize, OrphanTxCounts::default()),
+            |(processed_batches, processed_transactions, txs), (digest, batch)| {
                 let transactions = batch.transactions().len();
                 let recovery = recover(digest, batch);
                 async move {
                     match recovery.await {
-                        OrphanBatchRecovery::Complete => {
+                        OrphanBatchRecovery::Complete(counts) => {
                             consensus_db.remove::<OurNodeBatchesCache>(&digest)?;
                             Ok::<_, eyre::Report>((
                                 processed_batches + 1,
                                 processed_transactions + transactions,
+                                txs.add(counts),
                             ))
                         }
                         OrphanBatchRecovery::Retry => {
-                            Ok((processed_batches, processed_transactions))
+                            Ok((processed_batches, processed_transactions, txs))
                         }
                     }
                 }
@@ -214,6 +411,10 @@ where
         )
         .await?;
     info!(target: "epoch-manager", batches, processed_batches, processed_transactions,
+        txs_repooled = txs.repooled, txs_invalid = txs.invalid,
+        txs_already_pooled = txs.already_pooled,
+        txs_refused_nonce_too_low = txs.refused_nonce_too_low,
+        txs_refused_other = txs.refused_other,
         "Finished processing orphaned batches");
     Ok(())
 }
@@ -275,7 +476,8 @@ where
                                 debug!(target: "epoch-manager", worker_id = batch.worker_id, ?error,
                                     "orphaned batch disbursal refused; re-pooling");
                             }).is_ok()) {
-                                OrphanBatchRecovery::Complete
+                                OrphanBatchPath::NonValidator.record();
+                                OrphanBatchRecovery::Complete(OrphanTxCounts::default())
                             } else {
                                 repool_batch_txns(pools, workers.len(), &batch).await
                             }
@@ -309,17 +511,74 @@ where
     /// sequence (`close_epoch`, then `write_epoch_record`) can commit the epoch's
     /// record.
     ///
-    /// A forwarding failure (the engine channel closed) also returns `None`: the
-    /// caller must not wait on execution of output the engine never received, and
-    /// the dead channel resurfaces as a hard error at the next forwarding attempt
-    /// after re-entry.
+    /// A forwarding failure (the engine channel closed before it accepted the
+    /// output) also returns `None`: the caller must not wait on execution of
+    /// output the engine never received, and the dead channel resurfaces as a hard
+    /// error at the next forwarding attempt after re-entry. A forwarded output is
+    /// one accepted into the engine channel; a receiver dropped in the instant
+    /// between `reserve` and the write loses it without an error, and the engine's
+    /// exit then ends the node (it is a critical task).
+    ///
+    /// Phase 1 applies the live forward's continuity rule
+    /// ([`check_output_continuity`]) to what it takes off the queue: an output
+    /// already forwarded is skipped, and one that does not directly follow the
+    /// last output forwarded to the engine is refused with an error that stops the
+    /// node, before the engine gets past the gap (on restart the replay forwards
+    /// the missing output from the consensus DB). No honest path reaches the
+    /// refusal: the subscriber queues outputs in order, and the live forward hands
+    /// over every output it takes (`wait_for_epoch_boundary` is cancel safe). It
+    /// is there so a regression stops a node cleanly instead of forking its
+    /// execution.
+    ///
+    /// No honest path reaches the skip either, for the same reasons. A skip logs
+    /// the output's number and digest with `path = "leftover_queue"` and counts in
+    /// `tn_node.leftover_outputs_skipped_total`: a count above zero says an output
+    /// was queued twice.
+    ///
+    /// The queue phase holds the output it took across `process_output`'s wait
+    /// for room. That is safe only while nothing in the epoch loop races this
+    /// drain (only the node's exit drops it, and the restart replay forwards the
+    /// output from the consensus pack): do not put the drain under a `select!`.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-    ) -> Option<ConsensusHeaderDigest> {
+    ) -> eyre::Result<Option<ConsensusHeaderDigest>> {
         // Phase 1: drain the consensus_output queue
         while let Ok(output) = consensus_output.try_recv() {
+            let last_forwarded = self.last_forwarded_consensus_number;
+            match check_output_continuity(last_forwarded, output.number()) {
+                OutputContinuity::Stale => {
+                    // none on an honest run (see the doc): a count says an output was queued twice
+                    metrics::counter!("tn_node.leftover_outputs_skipped_total").increment(1);
+                    warn!(
+                        target: "epoch-manager",
+                        number = output.number(),
+                        last_forwarded,
+                        digest = ?output.consensus_header_hash(),
+                        path = "leftover_queue",
+                        "skipping already-forwarded consensus output",
+                    );
+                    continue;
+                }
+                OutputContinuity::Gap => {
+                    metrics::counter!("tn_node.leftover_output_gaps_total").increment(1);
+                    error!(
+                        target: "epoch-manager",
+                        number = output.number(),
+                        last_forwarded,
+                        "leftover consensus output does not follow the last output forwarded to \
+                         the engine: stopping the node before the engine executes past the gap",
+                    );
+                    return Err(eyre!(
+                        "leftover consensus output gap: expected {} but received {} - stopping \
+                         the node; a restart replays the missing output from the consensus DB",
+                        last_forwarded + 1,
+                        output.number(),
+                    ));
+                }
+                OutputContinuity::Next => {}
+            }
             let result = if output.reaches_epoch_boundary(self.epoch_boundary) {
                 // stash the boundary header for the caller's close-and-write sequence
                 self.last_consensus_header = Some(output.clone().into());
@@ -332,10 +591,10 @@ where
             // block on forever in wait_for_consensus_execution
             if let Err(e) = self.process_output(to_engine, output).await {
                 error!(target: "epoch-manager", "error sending leftover consensus output to engine: {}", e);
-                return None;
+                return Ok(None);
             }
             if result.is_some() {
-                return result;
+                return Ok(result);
             }
         }
 
@@ -362,10 +621,10 @@ where
                         // the caller would block on forever in wait_for_consensus_execution
                         if let Err(e) = self.process_output(to_engine, output).await {
                             error!(target: "epoch-manager", number, "error sending leftover consensus output to engine: {}", e);
-                            return None;
+                            return Ok(None);
                         }
                         if result.is_some() {
-                            return result;
+                            return Ok(result);
                         }
                     }
                     Err(e) => {
@@ -376,7 +635,7 @@ where
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Persist the finalized [`EpochRecord`] for the just-completed epoch and
@@ -1831,10 +2090,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(
+        assert!(matches!(
             repool_batch_txns(&pools, active_workers, &batch).await,
-            OrphanBatchRecovery::Complete
-        );
+            OrphanBatchRecovery::Complete(_)
+        ));
         pools.iter().enumerate().for_each(|(index, pool)| {
             assert_eq!(pool.get(&hash).is_some(), index == expected_pool);
         });
@@ -1897,7 +2156,7 @@ mod tests {
         let mut recovery =
             Box::pin(recover_orphan_batches(&db, snapshot, |digest, _| async move {
                 if digest == completed {
-                    OrphanBatchRecovery::Complete
+                    OrphanBatchRecovery::Complete(OrphanTxCounts::default())
                 } else {
                     std::future::pending().await
                 }
@@ -1912,7 +2171,7 @@ mod tests {
         assert!(db.contains_key::<OurNodeBatchesCache>(&new_batch)?);
 
         recover_orphan_batches(&db, vec![(interrupted, batch)], |_, _| async {
-            OrphanBatchRecovery::Complete
+            OrphanBatchRecovery::Complete(OrphanTxCounts::default())
         })
         .await?;
         db.persist::<OurNodeBatchesCache>().await?;
@@ -3740,5 +3999,463 @@ mod tests {
         );
         assert!(manager.consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
         Ok(())
+    }
+
+    // ---- bench7 digest-order-hold ----
+
+    /// One temporary chain with two worker pools and three senders: `funded` has a balance,
+    /// `unfunded` has none, and `executed` starts at nonce 1, as if its nonce 0 had executed.
+    struct OrphanPools {
+        /// Keeps the chain's datadir alive.
+        _tmp: tempfile::TempDir,
+        /// Runs the pools' validation tasks.
+        _task_manager: TaskManager,
+        /// Keeps the chain's provider alive.
+        _env: RethEnv,
+        /// The chain the transactions are signed for.
+        chain: std::sync::Arc<RethChainSpec>,
+        /// Worker 0's and worker 1's pools.
+        pools: Vec<tn_reth::WorkerTxPool>,
+        /// A sender with a balance.
+        funded: TransactionFactory,
+        /// A sender without a balance.
+        unfunded: TransactionFactory,
+        /// A funded sender whose executed nonce is 1.
+        executed: TransactionFactory,
+    }
+
+    impl OrphanPools {
+        /// Build the chain, its pools and the three senders.
+        fn new() -> eyre::Result<Self> {
+            let tmp = tempfile::tempdir()?;
+            let task_manager = TaskManager::default();
+            let sender = |seed: u8| {
+                TransactionFactory::new_random_from_seed(&mut StdRng::from_seed([seed; 32]))
+            };
+            let (funded, unfunded, executed) = (sender(41), sender(42), sender(43));
+            let genesis = test_genesis().extend_accounts([
+                (funded.address(), GenesisAccount::default().with_balance(U256::MAX)),
+                (
+                    executed.address(),
+                    GenesisAccount::default().with_balance(U256::MAX).with_nonce(Some(1)),
+                ),
+            ]);
+            let chain: std::sync::Arc<RethChainSpec> = std::sync::Arc::new(genesis.into());
+            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &task_manager, None)?;
+            let pools = (0..2)
+                .map(|_| env.init_txn_pool(BaseFeeContainer::default()))
+                .collect::<eyre::Result<Vec<_>>>()?;
+            Ok(Self {
+                _tmp: tmp,
+                _task_manager: task_manager,
+                _env: env,
+                chain,
+                pools,
+                funded,
+                unfunded,
+                executed,
+            })
+        }
+    }
+
+    /// The next transaction of `sender`, encoded as a batch carries it.
+    fn orphan_tx(
+        chain: &std::sync::Arc<RethChainSpec>,
+        sender: &mut TransactionFactory,
+    ) -> Vec<u8> {
+        sender.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            u128::from(MIN_PROTOCOL_BASE_FEE),
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        )
+    }
+
+    /// A worker's batch of `transactions`.
+    fn orphan_batch(worker_id: WorkerId, transactions: Vec<Vec<u8>>) -> Batch {
+        Batch { worker_id, transactions, ..Default::default() }
+    }
+
+    /// A finished batch with these per-result counts.
+    fn finished(counts: OrphanTxCounts) -> OrphanBatchRecovery {
+        OrphanBatchRecovery::Complete(counts)
+    }
+
+    /// Every counter of `snapshotter`'s recorder, keyed by `name{key=value}`. A snapshot drains
+    /// the recorder's counters, so a test takes one and reads every count from it.
+    fn orphan_counters(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+    ) -> std::collections::BTreeMap<String, u64> {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(series, _, _, value)| match value {
+                DebugValue::Counter(n) => {
+                    let labels = series
+                        .key()
+                        .labels()
+                        .map(|l| format!("{}={}", l.key(), l.value()))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    Some((format!("{}{{{labels}}}", series.key().name()), n))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each transaction of a re-pooled batch is counted once by its result and each batch once
+    /// by its path: all re-pooled, an undecodable transaction, a refused executed nonce, a refusal
+    /// for another reason (a sender without funds), and a batch handled twice (already pooled).
+    #[tokio::test]
+    async fn orphan_repool_counts_each_transaction_by_result() -> eyre::Result<()> {
+        // the re-pool runs on this thread (current-thread runtime), so the local recorder sees it
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let mut fixture = OrphanPools::new()?;
+        let chain = fixture.chain.clone();
+        let all_valid = orphan_batch(
+            0,
+            vec![orphan_tx(&chain, &mut fixture.funded), orphan_tx(&chain, &mut fixture.funded)],
+        );
+        let undecodable = orphan_batch(
+            0,
+            vec![b"invalid transaction".to_vec(), orphan_tx(&chain, &mut fixture.funded)],
+        );
+        let executed_nonce = orphan_batch(0, vec![orphan_tx(&chain, &mut fixture.executed)]);
+        let unfunded = orphan_batch(0, vec![orphan_tx(&chain, &mut fixture.unfunded)]);
+        let pools = &fixture.pools;
+
+        assert_eq!(
+            repool_batch_txns(pools, 1, &all_valid).await,
+            finished(OrphanTxCounts { repooled: 2, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &undecodable).await,
+            finished(OrphanTxCounts { repooled: 1, invalid: 1, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &executed_nonce).await,
+            finished(OrphanTxCounts { refused_nonce_too_low: 1, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &unfunded).await,
+            finished(OrphanTxCounts { refused_other: 1, ..Default::default() })
+        );
+        // a pass cancelled after the re-pool and retried finds the transactions already pooled
+        assert_eq!(
+            repool_batch_txns(pools, 1, &all_valid).await,
+            finished(OrphanTxCounts { already_pooled: 2, ..Default::default() })
+        );
+
+        let counters = orphan_counters(&snapshotter);
+        let count = |series: &str| counters.get(series).copied();
+        assert_eq!(count("tn_node.orphan_txs_total{result=repooled}"), Some(3));
+        assert_eq!(count("tn_node.orphan_txs_total{result=invalid}"), Some(1));
+        assert_eq!(count("tn_node.orphan_txs_total{result=already_pooled}"), Some(2));
+        assert_eq!(count("tn_node.orphan_txs_total{result=refused_nonce_too_low}"), Some(1));
+        assert_eq!(count("tn_node.orphan_txs_total{result=refused_other}"), Some(1));
+        assert_eq!(count("tn_node.orphan_batches_total{path=own_worker}"), Some(5));
+        assert_eq!(count("tn_node.orphan_batches_total{path=worker0_fallback}"), None);
+        assert_eq!(count("tn_node.orphan_batches_total{path=non_validator}"), None);
+        Ok(())
+    }
+
+    /// A batch of a worker that is no longer active counts on the worker-0 fallback path, and a
+    /// batch retained for lack of any active pool counts nothing.
+    #[tokio::test]
+    async fn orphan_repool_counts_the_worker_zero_fallback() -> eyre::Result<()> {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let mut fixture = OrphanPools::new()?;
+        let chain = fixture.chain.clone();
+        let batch = orphan_batch(1, vec![orphan_tx(&chain, &mut fixture.funded)]);
+
+        assert_eq!(
+            repool_batch_txns(&fixture.pools, 1, &batch).await,
+            finished(OrphanTxCounts { repooled: 1, ..Default::default() })
+        );
+        assert_eq!(repool_batch_txns(&fixture.pools, 0, &batch).await, OrphanBatchRecovery::Retry);
+
+        let counters = orphan_counters(&snapshotter);
+        let count = |series: &str| counters.get(series).copied();
+        assert_eq!(count("tn_node.orphan_batches_total{path=worker0_fallback}"), Some(1));
+        assert_eq!(count("tn_node.orphan_batches_total{path=own_worker}"), None);
+        assert_eq!(count("tn_node.orphan_txs_total{result=repooled}"), Some(1));
+        // every result series is touched by a finished batch, at 0 when it had none
+        ["invalid", "already_pooled", "refused_nonce_too_low", "refused_other"].iter().for_each(
+            |result| {
+                assert_eq!(count(&format!("tn_node.orphan_txs_total{{result={result}}}")), Some(0));
+            },
+        );
+        Ok(())
+    }
+
+    /// Every pool error kind lands in exactly one refusal result. The nonce-too-low arm needs the
+    /// validator's own error, so the pool test above covers it with an executed nonce.
+    #[test]
+    fn orphan_refusal_classified_by_every_pool_error_kind() {
+        let refused =
+            |kind: PoolErrorKind| OrphanTxResult::refused(&PoolError::new(B256::ZERO, kind));
+        assert_eq!(refused(PoolErrorKind::AlreadyImported), OrphanTxResult::AlreadyPooled);
+        [
+            PoolErrorKind::ReplacementUnderpriced,
+            PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(1),
+            PoolErrorKind::SpammerExceededCapacity(Address::ZERO),
+            PoolErrorKind::DiscardedOnInsert,
+            PoolErrorKind::InvalidTransaction(
+                tn_reth::InvalidPoolTransactionError::ExceedsGasLimit(2, 1),
+            ),
+            PoolErrorKind::ExistingConflictingTransactionType(Address::ZERO, 3),
+            PoolErrorKind::Other("state read failed".into()),
+        ]
+        .into_iter()
+        .for_each(|kind| assert_eq!(refused(kind), OrphanTxResult::RefusedOther));
+    }
+
+    /// Captures the fields of every event, so a test can read a log line without a log backend.
+    #[derive(Default)]
+    struct LineCapture(std::sync::Mutex<Vec<std::collections::BTreeMap<&'static str, String>>>);
+
+    impl LineCapture {
+        /// The fields of the first captured event whose message is `message`.
+        fn line(&self, message: &str) -> Option<std::collections::BTreeMap<&'static str, String>> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .find(|fields| fields.get("message").is_some_and(|logged| logged == message))
+                .cloned()
+        }
+    }
+
+    impl tracing::Subscriber for LineCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = FieldCapture::default();
+            event.record(&mut fields);
+            self.0.lock().expect("capture lock").push(fields.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// One event's fields, by name, as their `Debug` text.
+    #[derive(Default)]
+    struct FieldCapture(std::collections::BTreeMap<&'static str, String>);
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name(), format!("{value:?}"));
+        }
+    }
+
+    /// The summary line keeps its message and fields and adds the pass's transaction counts; a
+    /// retained batch adds nothing to them.
+    #[tokio::test]
+    async fn orphan_recovery_summary_line_carries_the_counts() -> eyre::Result<()> {
+        let capture = std::sync::Arc::new(LineCapture::default());
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let mut fixture = OrphanPools::new()?;
+        let chain = fixture.chain.clone();
+        let tmp = tempfile::tempdir()?;
+        let db = tn_storage::open_db(tmp.path());
+        let mixed = orphan_batch(
+            0,
+            vec![
+                b"invalid transaction".to_vec(),
+                orphan_tx(&chain, &mut fixture.funded),
+                orphan_tx(&chain, &mut fixture.unfunded),
+            ],
+        );
+        let retained = orphan_batch(0, vec![orphan_tx(&chain, &mut fixture.funded)]);
+        let (mixed_digest, retained_digest) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        db.insert::<OurNodeBatchesCache>(&mixed_digest, &mixed)?;
+        db.insert::<OurNodeBatchesCache>(&retained_digest, &retained)?;
+        let pools = &fixture.pools;
+
+        recover_orphan_batches(
+            &db,
+            vec![(mixed_digest, mixed), (retained_digest, retained)],
+            |digest, batch| async move {
+                if digest == retained_digest {
+                    OrphanBatchRecovery::Retry
+                } else {
+                    repool_batch_txns(pools, 1, &batch).await
+                }
+            },
+        )
+        .await?;
+
+        let expected: std::collections::BTreeMap<&'static str, String> = [
+            ("message", "Finished processing orphaned batches"),
+            ("batches", "2"),
+            ("processed_batches", "1"),
+            ("processed_transactions", "3"),
+            ("txs_repooled", "1"),
+            ("txs_invalid", "1"),
+            ("txs_already_pooled", "0"),
+            ("txs_refused_nonce_too_low", "0"),
+            ("txs_refused_other", "1"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name, value.to_string()))
+        .collect();
+        assert_eq!(capture.line("Finished processing orphaned batches"), Some(expected));
+        assert!(!db.contains_key::<OurNodeBatchesCache>(&mixed_digest)?);
+        assert!(db.contains_key::<OurNodeBatchesCache>(&retained_digest)?);
+        Ok(())
+    }
+
+    // ---- bench7 epoch-loop-output-drop ----
+
+    /// Run the leftover drain on `queued` with `last_forwarded` as the last output the engine
+    /// got, an engine channel with room for all of them and no boundary in reach. Returns the
+    /// drain's result, the numbers the engine received and the last forwarded number after it.
+    async fn drain_after(
+        last_forwarded: u64,
+        queued: &[u64],
+    ) -> eyre::Result<(eyre::Result<Option<ConsensusHeaderDigest>>, Vec<u64>, u64)> {
+        let temp = tempfile::TempDir::with_prefix("leftover_continuity")?;
+        let (mut manager, _engine, _reth_env, _tasks, committee) =
+            super::super::run_epoch::tests::manager_with_engine_and_floor(&temp, None).await?;
+        manager.epoch_boundary = u64::MAX;
+        manager.last_forwarded_consensus_number = last_forwarded;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        for &number in queued {
+            queue_tx
+                .send(super::super::run_epoch::tests::member_output_at(&committee, number))
+                .await?;
+        }
+        let (to_engine, mut engine_rx) = mpsc::channel(8);
+        let drained =
+            manager.send_leftover_consensus_output_to_engine(&mut queue, &to_engine).await;
+        drop(to_engine);
+        let mut received = Vec::new();
+        while let Some(output) = engine_rx.recv().await {
+            received.push(output.number());
+        }
+        Ok((drained, received, manager.last_forwarded_consensus_number))
+    }
+
+    /// The queue phase refuses an output that does not follow the last one the engine got: the
+    /// node stops with both numbers named and the gap counted, and the engine gets nothing, so
+    /// it never executes past the gap. The output after the gap is not forwarded either.
+    #[test]
+    fn the_leftover_drain_stops_on_a_gap_before_the_engine_gets_past_it() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (drained, received, last_forwarded) =
+            metrics::with_local_recorder(&recorder, || rt.block_on(drain_after(1, &[3, 4])))
+                .expect("the drain runs");
+
+        let err = drained.expect_err("a gap stops the node");
+        assert!(format!("{err:#}").contains("expected 2 but received 3"), "{err:#}");
+        assert!(received.is_empty(), "the engine gets nothing past the gap: {received:?}");
+        assert_eq!(last_forwarded, 1);
+        let gaps = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.leftover_output_gaps_total")
+            .and_then(|(_, _, _, value)| match value {
+                DebugValue::Counter(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(gaps, Some(1));
+    }
+
+    /// The queue phase skips an output the engine already got, as the live forward does, and
+    /// forwards the one after it.
+    #[tokio::test]
+    async fn the_leftover_drain_skips_an_output_already_forwarded() -> eyre::Result<()> {
+        let (drained, received, last_forwarded) = drain_after(2, &[2, 3]).await?;
+        assert!(drained?.is_none(), "no boundary in reach");
+        assert_eq!(received, [3], "forwarded once, in order");
+        assert_eq!(last_forwarded, 3);
+        Ok(())
+    }
+
+    // ---- bench7 epoch-loop-output-drop: review follow-ups ----
+
+    /// The queue phase's skip names the output it skips (number and digest) and the phase that
+    /// skipped it, and counts once in `tn_node.leftover_outputs_skipped_total`.
+    #[test]
+    fn the_leftover_drain_logs_and_counts_an_output_it_skips() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let capture = std::sync::Arc::new(LineCapture::default());
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let drain = async {
+            let temp = tempfile::TempDir::with_prefix("leftover_skip")?;
+            let (mut manager, _engine, _reth_env, _tasks, committee) =
+                super::super::run_epoch::tests::manager_with_engine_and_floor(&temp, None).await?;
+            manager.epoch_boundary = u64::MAX;
+            manager.last_forwarded_consensus_number = 2;
+            let stale = super::super::run_epoch::tests::member_output_at(&committee, 2);
+            let next = super::super::run_epoch::tests::member_output_at(&committee, 3);
+            let (queue_tx, mut queue) = mpsc::channel(8);
+            queue_tx.send(stale.clone()).await?;
+            queue_tx.send(next).await?;
+            let (to_engine, mut engine_rx) = mpsc::channel(8);
+            let drained =
+                manager.send_leftover_consensus_output_to_engine(&mut queue, &to_engine).await?;
+            assert!(drained.is_none(), "no boundary in reach");
+            assert_eq!(engine_rx.try_recv()?.number(), 3, "the next output is forwarded");
+            assert!(engine_rx.try_recv().is_err(), "the skipped one is not");
+            eyre::Ok(stale.consensus_header_hash())
+        };
+        let digest =
+            metrics::with_local_recorder(&recorder, || rt.block_on(drain)).expect("the drain runs");
+
+        let line = capture
+            .line("skipping already-forwarded consensus output")
+            .expect("the skip is logged");
+        let field = |name: &str| line.get(name).map(|value| value.trim_matches('"').to_string());
+        assert_eq!(field("number").as_deref(), Some("2"));
+        assert_eq!(field("last_forwarded").as_deref(), Some("2"));
+        assert_eq!(field("digest"), Some(format!("{digest:?}")));
+        assert_eq!(field("path").as_deref(), Some("leftover_queue"));
+        let skipped = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.leftover_outputs_skipped_total")
+            .and_then(|(_, _, _, value)| match value {
+                DebugValue::Counter(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(skipped, Some(1));
     }
 }
