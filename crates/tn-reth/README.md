@@ -1245,7 +1245,8 @@ restored from a snapshot, which would refuse the rebuilt chain's old blocks if i
 and config stay, and so does reth's transaction-pool blob store (`blobstore/`), which holds pool
 state, not chain data. It refuses while a node holds the datadir or a process holds
 `db/tn-lmdb.dat` open, and is a dry run without `--force`. It refuses a `db/` or `static_files/`
-that is a mount point or on another filesystem, which a rename cannot move, before anything moves.
+on another filesystem, which a rename cannot move, before anything moves; a move that fails anyway
+(a bind mount from the datadir's own filesystem) moves back what the run had moved.
 One that is a link moves as a link: the next start creates a new one in the datadir, on the
 datadir's filesystem, and the command prints a warning naming the link. It prints the size of what
 it moves and the space free on the datadir's filesystem: the moved-aside database keeps its space

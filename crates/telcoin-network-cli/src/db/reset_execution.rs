@@ -13,7 +13,8 @@
 //! there ([`refuse_interrupted_reset`]): a start between two moves would open a datadir holding
 //! half an execution database. An empty one (a reset stopped before its first move, or undone by
 //! moving its entries back) holds none of it and blocks nothing. Running the command again finishes
-//! an interrupted reset into the same directory.
+//! an interrupted reset into the same directory. A move that fails (the rename of a bind mount,
+//! say) moves back what the run had moved, so a failed run leaves the datadir as it was.
 //!
 //! The rebuild re-executes every epoch from 0 from the node's own consensus packs, so the command
 //! refuses a datadir whose consensus database lacks the pack of an epoch the node cannot fetch
@@ -371,9 +372,11 @@ fn bytes_under(path: &Path) -> eyre::Result<u64> {
     Ok(total)
 }
 
-/// Refuse a move the reset's rename cannot make: an entry that is a mount point, or on another
-/// filesystem than the datadir (`rename(2)` fails there, `EBUSY` or `EXDEV`). Checked before
-/// anything moves.
+/// Refuse a move the reset's rename cannot make: an entry on another filesystem than the datadir
+/// (`rename(2)` fails there, `EXDEV` or, for the mount point of one, `EBUSY`). Checked before
+/// anything moves. It compares `st_dev`, so it catches another filesystem only: a bind mount from
+/// the datadir's own filesystem passes, its rename then fails with `EBUSY`, and the reset moves
+/// back what it had moved ([`move_back`]).
 #[cfg(unix)]
 fn refuse_other_filesystem(datadir: &Path, entry: &Path) -> eyre::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
@@ -538,24 +541,111 @@ pub(crate) fn reset_execution(
         // a new reset's name is the current second's, so a rerun a second later gets another one
         bail!("{} already exists: run the reset again in a second", plan.target.display());
     }
-    if plan.resumes.is_none() {
+    let created = plan.resumes.is_none();
+    if created {
         fs::create_dir(&staging)
             .wrap_err_with(|| format!("failed to create {}", staging.display()))?;
         sync_dir(datadir)?;
     }
+    // a failed move (a bind mount's rename fails with `EBUSY` though the filesystem check passed
+    // it) moves back what this run moved, so it leaves no half-moved reset behind
+    let mut moved = Vec::new();
     for entry in &plan.moves {
         let from = datadir.join(entry);
         let to = staging.join(entry);
-        fs::rename(&from, &to)
-            .wrap_err_with(|| format!("failed to move {} to {}", from.display(), to.display()))?;
-        sync_dir(&staging)?;
-        sync_dir(datadir)?;
+        if let Err(e) = move_entry(&from, &to) {
+            let failure = eyre!("failed to move {} to {}: {e}", from.display(), to.display());
+            return Err(move_back(datadir, &staging, created, &moved, failure));
+        }
+        moved.push(entry);
+        if let Err(failure) = sync_dir(&staging).and_then(|()| sync_dir(datadir)) {
+            return Err(move_back(datadir, &staging, created, &moved, failure));
+        }
     }
     fs::rename(&staging, &plan.target).wrap_err_with(|| {
         format!("failed to rename {} to {}", staging.display(), plan.target.display())
     })?;
     sync_dir(datadir)?;
     Ok(plan)
+}
+
+/// Undo this run's moves after `failure`: move each entry of `moved` back from `staging` into
+/// `datadir`, the last first, sync both, and remove `staging` when this run `created` it and
+/// moved everything back. Returns the error to report: `failure`, then what was moved back, or
+/// what could not be and is left for the operator.
+fn move_back(
+    datadir: &Path,
+    staging: &Path,
+    created: bool,
+    moved: &[&PathBuf],
+    failure: eyre::Report,
+) -> eyre::Report {
+    let mut stuck = Vec::new();
+    for entry in moved.iter().rev() {
+        if let Err(e) = fs::rename(staging.join(entry), datadir.join(entry)) {
+            stuck.push(format!("{} ({e})", entry.display()));
+        }
+    }
+    let mut notes = Vec::new();
+    if let Err(e) = sync_dir(staging) {
+        notes.push(format!("{e:#}"));
+    }
+    if created && stuck.is_empty() {
+        if let Err(e) = fs::remove_dir(staging) {
+            notes.push(format!(
+                "failed to remove {} ({e}), which is empty and blocks nothing",
+                staging.display()
+            ));
+        }
+    }
+    if let Err(e) = sync_dir(datadir) {
+        notes.push(format!("{e:#}"));
+    }
+    let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) };
+    let names = |entries: &[&PathBuf]| {
+        entries.iter().map(|e| e.display().to_string()).collect::<Vec<_>>().join(", ")
+    };
+    if !stuck.is_empty() {
+        return eyre!(
+            "{failure:#}. Moving back what it had moved failed too: {} stay in {}, and the node \
+             refuses this datadir until they are moved back into it by hand{notes}",
+            stuck.join(", "),
+            staging.display(),
+        );
+    }
+    let back = if moved.is_empty() {
+        String::new()
+    } else {
+        format!(" The reset moved {} back into the datadir:", names(moved))
+    };
+    if created {
+        eyre!("{failure:#}.{back} nothing moved{notes}")
+    } else {
+        eyre!(
+            "{failure:#}.{back} nothing else moved, and the unfinished reset {} holds what it held \
+             before this run{notes}",
+            staging.display(),
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: once this many more of the reset's moves on this thread have run, the next one
+    /// fails, as the rename of a bind mount from the datadir's own filesystem does (`EBUSY`).
+    static FAIL_MOVE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Rename `from` to `to`, one of the reset's moves. Tests inject its failure.
+fn move_entry(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(left) = FAIL_MOVE_AFTER.with(std::cell::Cell::get) {
+        FAIL_MOVE_AFTER.with(|fail| fail.set(left.checked_sub(1)));
+        if left == 0 {
+            return Err(std::io::Error::other("injected move failure"));
+        }
+    }
+    fs::rename(from, to)
 }
 
 /// The final name of the reset directory `staging` (`...partial` without its suffix).
@@ -1011,6 +1101,50 @@ mod tests {
         assert!(err.contains("another telcoin process"), "{err}");
         assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
         drop(held);
+    }
+
+    /// A move that fails after an earlier one moved (as the rename of a bind mount from the
+    /// datadir's own filesystem does, which the filesystem check passes) moves back what this run
+    /// moved and removes the staging directory it created: the datadir is as it was, no
+    /// unfinished reset blocks the node, and the error says so. A rerun finishing an unfinished
+    /// reset moves back only its own moves and keeps that reset's directory and what it held.
+    #[test]
+    fn a_failed_move_moves_the_entries_back() {
+        let dir = datadir();
+        let root = dir.path();
+        FAIL_MOVE_AFTER.with(|fail| fail.set(Some(1)));
+        let err = format!("{:#}", reset_execution(root, true, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("injected move failure"), "{err}");
+        assert!(err.contains("moved db back into the datadir"), "{err}");
+        assert!(err.contains("nothing moved"), "{err}");
+        assert_eq!(
+            names(root),
+            [
+                "consensus-db",
+                "db",
+                "node-keys",
+                "restored-state-floor",
+                "static_files",
+                "telcoin.pid"
+            ],
+            "db is back and no staging directory is left"
+        );
+        assert_eq!(fs::read(root.join("db/tn-lmdb.dat")).unwrap(), b"database");
+        refuse_interrupted_reset(root).unwrap();
+
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        fs::rename(root.join("db"), partial.join("db")).unwrap();
+        FAIL_MOVE_AFTER.with(|fail| fail.set(Some(1)));
+        let err = format!("{:#}", reset_execution(root, true, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("moved static_files back into the datadir"), "{err}");
+        assert!(err.contains(&partial.display().to_string()), "{err}");
+        assert_eq!(names(&partial), ["db"], "the unfinished reset holds what it held");
+        assert!(root.join("static_files").exists());
+        assert!(root.join("restored-state-floor").exists());
+
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
     }
 
     /// A reset stopped between two moves blocks a node's start, and a rerun finishes it into the
