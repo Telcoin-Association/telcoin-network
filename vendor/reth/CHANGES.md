@@ -3160,7 +3160,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   an operator who turned the limit off keeps unbounded scans. A lower default for
   `--rpc.max-blocks-per-filter` was not taken: TN's docs promise 100,000, it would refuse long
   ranges over quiet history that cost little, and it would still not bound a range of blocks that
-  each hold many receipts; the read bound follows the work instead. 50 reads per returnable log
+  each hold many receipts; the read bound follows the work instead, and since TN-0209 it counts
+  each block whose transactions the scan resolves from their consensus batch as 1,000 reads
+  more. 50 reads per returnable log
   leaves room for blocks whose blooms match a filter by chance. Queries within the bound return
   the same logs in the same order. Upstream reth has no such bound.
   *Can reach execution or storage*: no. RPC only: the count runs inside the log query after the
@@ -3413,3 +3415,41 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   took no permit; also the logs, a missing body index answered as the provider's error, and a
   cached block answered with every permit taken).
   *Upstream*: no; upstream has the same shape, where those reads are short.
+
+- **TN-0209** — A log range scan counts 1,000 reads for each block whose transactions it resolves
+  from their consensus batch. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`SCAN_READS_PER_RESOLVED_BLOCK`, the read count in
+  `get_logs_in_block_range_inner`; test `range_scan_counts_resolved_blocks`),
+  `crates/rpc/rpc-eth-types/src/tx_read_scope.rs` (`TxReadScope::kept`, counted by `keep`; test
+  `kept_counts_the_values_this_threads_scopes_keep`).
+  *Why*: on a datadir that stores transactions by batch position (TN-0201, TN-0202), matching a
+  block's logs on the provider path reads each matching transaction through TN's resolver, which
+  resolves the block's batch, once per block since TN-0204: from its decoded-batch cache, or with
+  a consensus-pack read, a decode and a digest check of the whole batch. TN-0193's read bound
+  counted receipts and logs only, so a block with one matching log counted two reads but could
+  cost a pack read, and one scan could resolve a batch for each block up to the 20,000-log
+  response limit while it held a blocking-IO permit and a pool thread. A block whose log matching
+  kept a batch in the thread's read scope now adds `SCAN_READS_PER_RESOLVED_BLOCK` (1,000) to the
+  scan's read count before the bound check, so under the default bound of 1,000,000 a scan
+  resolves at most 1,000 blocks, then ends with `QueryExceedsMaxReads` and TN-0193's retry range
+  (a single-block range is never refused). The scan reads `TxReadScope::kept`, this thread's count
+  of the values its scopes keep, before and after `append_matching_block_logs`; TN's resolver
+  keeps each batch it resolves in the scope (TN-0204), and only position rows reach it. The
+  matching runs on the scan's thread, with no await in it, in every mode: the cached mode passes a
+  block only when the RPC cache already holds it (no transaction is read then), and the parallel
+  range mode fetches only receipts on its other threads. A datadir that stores transactions
+  inline, a block the RPC cache holds and a provider without a resolver count as before. A batch
+  from the resolver's cache counts as one from a pack: the scan cannot tell them apart. The error
+  texts, the factor 50, the response limit, `eth_getFilterChanges`' cursor and logs by block hash
+  (TN-0208) are unchanged.
+  *Can reach execution or storage*: no. RPC only: the log query reads the count, and nothing on
+  the block execution or storage path reads the read scope's counter.
+  *Tests*: `range_scan_counts_resolved_blocks` (genesis and 300 blocks on a `BlockchainProvider`
+  in storage v2, each block with one transaction whose receipt has one matching log, scanned in
+  the range mode: stored by position, with a resolver that keeps each batch in the scope as TN's
+  does, a limit of 300 logs (15,000 reads) ends the scan at block 15 with the retry range 1-14,
+  after one resolve per block, and the retry range returns its 14 logs; stored inline, the same
+  scan returns all 300 logs and resolves nothing); `kept_counts_the_values_this_threads_scopes_keep`
+  (each keep in a scope counts, a replaced value and an inner scope's too; a keep outside a scope
+  and another thread's keeps do not); `range_scan_reads_are_bounded` and the other filter tests
+  unchanged. *Upstream*: no (TN's format).
