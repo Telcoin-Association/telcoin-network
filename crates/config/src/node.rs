@@ -381,6 +381,97 @@ pub struct Parameters {
     // "Parameters::switch_at_default")]`, whose type's default is the behaviour from before the
     // switch existed; every field here also gets its default in `Default for Parameters` and an
     // entry in `runtime_switches!`
+    /// Propose headers that name the execution block a quorum of parents has reached, not this
+    /// node's own newest block.
+    ///
+    /// When `true`, the proposer ranks its own tip and each same-epoch parent's latest execution
+    /// block by voting weight and names the highest block that holders of 2f+1 weight have
+    /// reached, capped at its own tip, never older than 8 entries back in its recent-blocks ring
+    /// (the floor), and never older than the block the epoch opened on.
+    /// Voters then rarely wait for, or refuse, a block they have not executed. The floor counts
+    /// ring entries, and a ring entry is an executed output that produced a block; an output
+    /// without transactions adds none, so the floor is not a bound in rounds or in time, and
+    /// under light traffic the named block can be old.
+    /// [`Self::quorum_exec_block_starved_rounds`] picks when the rule applies. The default `false`
+    /// keeps the previous behaviour: every header names this node's own newest executed block.
+    /// Issue #1804.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub quorum_exec_block: bool,
+    /// When the proposer applies the [`Self::quorum_exec_block`] rule. Only matters while that
+    /// switch is `true`.
+    ///
+    /// The default `0` applies the rule to every header, as first designed. A value `K` above
+    /// zero names this node's own execution tip by default and applies the rule only to the next
+    /// `K` headers this node builds after one of its headers was cancelled uncertified, doubling
+    /// `K` while that keeps happening; it returns to `K` once 64 own headers in a row that named
+    /// the tip have certified. The window counts headers built, not rounds, and the name is
+    /// historical: a proposer in step with its committee builds one header a round, but a lagging
+    /// one skips rounds, so a window of rounds could pass with no header built under the rule.
+    /// With the rule on every header, the blocks parents name are earlier picks of the same rule
+    /// rather than tips, so every proposer settles at the ring floor; `K` keeps tips in the
+    /// parents. A value above 128, the bound the doubling stops at, is lowered to 128,
+    /// and a value above zero while `quorum_exec_block` is off has no effect; the proposer logs a
+    /// warning for either at the start of each epoch. Issue #1804.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub quorum_exec_block_starved_rounds: u32,
+
+    /// Re-vote one older uncertified epoch record of this node's own at each epoch close and at
+    /// startup, and keep verified epoch-vote signatures across vote rounds.
+    ///
+    /// When on, the close-time failsafe re-votes the previous epoch's record as before plus one
+    /// older record this node holds uncertified within the last 16 epochs (picked round-robin by
+    /// the closing epoch), the startup re-arm does the same, and a vote round for a record is
+    /// seeded with the signatures earlier rounds for that record verified, so two rounds that each
+    /// fell short can add up to a quorum, and a round that ends short aggregates the kept
+    /// signatures once they reach a quorum. The vote is the same signed message as the original:
+    /// nothing new goes on the wire. Rounds for records older than the previous one leave the
+    /// `tn_node.epoch_record_signers` gauge to the rounds of the latest and the previous record
+    /// and label their missed votes `round="recertify"` in
+    /// `tn_node.epoch_record_missing_signers_total`; the outcome of this node's own picks is in
+    /// `tn_node.epoch_record_recertify_rounds_total`.
+    ///
+    /// A node whose own record of an older epoch differs from the network's certified one learns
+    /// it when the round for that record falls short and the round fetches the certificate from a
+    /// peer. It then stops, as it does when its record of the newest epoch or the one before
+    /// differs: the round logs at error a line ending in `we have forked!` and calls the node's
+    /// shutdown. A restart does not change the stored record, so a later pick of it stops the
+    /// node again until an operator acts. The default `false` keeps the previous behaviour: only
+    /// the previous epoch's record is re-voted, once, and every vote round starts empty. Issue
+    /// #1850.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub epoch_record_recertify: bool,
+
+    /// Let the epoch record collection walk past an epoch this node holds as its own uncertified
+    /// record.
+    ///
+    /// When a peer answers that it holds no certified record for an epoch this node closed and
+    /// stored itself without a certificate, the record collector and the startup sync go on to the
+    /// next epoch, anchored on this node's own record. Once a certified record after it is
+    /// stored, the skipped epoch is a gap (at most 16 at a time) that the record collector asks
+    /// for again until its certificate is stored: at most once per 5 s retry interval, after a
+    /// pass a peer answered, one record request (up to three peers in turn) per gap, the whole
+    /// retry cut off after 5 s or at shutdown. The record collector tries a walk that ended
+    /// before a certified record after it was stored again at most once per retry interval, not
+    /// on every pass; the startup sync walks on each of its passes. A node without its own
+    /// record of the epoch does not walk. The default `false` keeps the previous behaviour:
+    /// collection stops at the first epoch the network left uncertified, on every node and
+    /// across restarts. Issue #1850.
+    ///
+    /// The switch does not change what a conflict does. With the walk on, though, the collection
+    /// reaches epochs past an uncertified one, so it can meet, and stop on, a conflict there that
+    /// a node with the walk off never asks for. A peer's record that validates against
+    /// this node's record of the epoch before, but differs from the record this node stored for
+    /// the same epoch, stops the node with the walk on or off: in the record collector and its
+    /// gap retry it ends the collector, in the startup sync it fails startup, and it does so again
+    /// on every restart. The collection first logs a line starting with `epoch record conflict:`
+    /// that names the certificate's signers and the offered record, and counts the conflict in
+    /// `tn_state_sync.epoch_record_conflicts_total`; the stop then logs its own line and counts it
+    /// in `tn_epoch.final_state_mismatches_total`. Both are counters of the running process, and
+    /// the node stops right after it counts, so a scrape may never see either; the two log lines
+    /// are what remains of a conflict.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub epoch_record_collect_past_uncertified: bool,
+
     /// Keep vote requests queued on the voter's per-author lock from each waiting out the
     /// execution wait in turn.
     ///
@@ -402,6 +493,32 @@ pub struct Parameters {
     /// larger value, so the node refuses to start an epoch it can vote in with one.
     #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
     pub vote_queue_fix: bool,
+
+    /// Keep each worker lane's batch digests executing in the order the worker sealed them, by
+    /// holding a lane while an older own header that carries it is not a proven ancestor of the
+    /// next one.
+    ///
+    /// When `true`, the proposer leaves queued every digest of a worker named in a tracked older
+    /// own header with digests that the new header's parents do not prove to be on its own chain
+    /// (the own certificate of the previous round is missing, or the chain below it was already
+    /// unproven). The lane is released when that header commits, is canceled, or is re-queued by
+    /// an own commit, and at the epoch's end. What peers vote for does not change, but header
+    /// timing can: held digests still count toward `header_num_of_batches_threshold`, so a held
+    /// backlog of at least that many builds the next header without waiting for the min delay, and
+    /// that header can carry none of them. Under load the trigger fires as with the switch off,
+    /// because the queue is above the threshold either way; at light load a held backlog builds a
+    /// header earlier. The cost is latency on a held lane: its digests wait until the older header
+    /// is settled, usually one commit, and while the own chain stays broken the lane drains at
+    /// most one header's worth per own commit. A held digest keeps its slot in each peer's
+    /// bound of uncommitted stored batches per committee key (issue #1794) until it commits;
+    /// peers count each batch report they refuse at that bound on
+    /// `tn_worker.batch_reports_over_quota_total`, the sign that a held backlog reached the
+    /// bound. Nothing is held while the own chain is intact. A garbage-collection cut below
+    /// the leader can still reorder a lane; `tn_primary.requeued_out_of_order_total` counts
+    /// it. The default `false` keeps the previous behaviour: every header drains every lane,
+    /// and a re-queued older digest can execute after a newer one of its lane. Issue #1807.
+    #[serde(default, skip_serializing_if = "Parameters::switch_at_default")]
+    pub digest_order_hold: bool,
     // ---- runtime switches: end ----
 }
 
@@ -505,7 +622,12 @@ impl Default for Parameters {
                 Parameters::default_parallel_fetch_request_delay_interval(),
             allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
             // ---- runtime switches: begin ----
+            quorum_exec_block: false,
+            quorum_exec_block_starved_rounds: 0,
+            epoch_record_recertify: false,
+            epoch_record_collect_past_uncertified: false,
             vote_queue_fix: false,
+            digest_order_hold: false,
             // ---- runtime switches: end ----
         }
     }
@@ -705,7 +827,12 @@ macro_rules! runtime_switches {
 runtime_switches! {
     // ---- runtime switches: begin ----
     // one entry per switch field, in the order the node lists them
+    quorum_exec_block,
+    quorum_exec_block_starved_rounds,
+    epoch_record_recertify,
+    epoch_record_collect_past_uncertified,
     vote_queue_fix,
+    digest_order_hold,
     // ---- runtime switches: end ----
 }
 

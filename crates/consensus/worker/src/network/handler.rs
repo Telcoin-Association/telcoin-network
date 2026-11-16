@@ -73,7 +73,10 @@ pub(crate) const REJECTED_BATCH_DIGESTS_CAPACITY: NonZeroUsize =
 /// commit frees the entries of its batches. An entry that is older than the commit horizon ages
 /// out when its key is at the bound, so batches that are never committed (a seal that failed, a
 /// reporter restart, a failed eviction, a late store of a committed batch) do not lock an honest
-/// key out. One ledger is shared by all workers of the node, so the bound is one per key for the
+/// key out. The age-out also drops batches that can still commit: a digest that its author holds
+/// queued with no header yet, such as one held by the own-chain order hold (issue #1807), keeps
+/// its entry until it commits. Its header is still voted for, and execution fetches the deleted
+/// body again. One ledger is shared by all workers of the node, so the bound is one per key for the
 /// whole node. The reports and gossip prefetches of one key that are in flight at the same time
 /// can each pass the check before any of them is counted, so the stored batches of a key can
 /// pass the bound by at most that number.

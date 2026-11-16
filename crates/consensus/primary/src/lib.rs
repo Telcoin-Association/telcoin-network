@@ -10,6 +10,7 @@ pub mod consensus;
 mod error;
 mod metrics;
 pub mod network;
+mod order_hold;
 mod primary;
 mod proposer;
 mod state_sync;

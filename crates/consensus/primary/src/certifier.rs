@@ -16,9 +16,10 @@ use tn_storage::{tables::ProposedCertificates, CertificateStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
+    test_hooks::{OwnCertDelay, OwnCertDelayStage},
     AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Epoch, Header,
     HeaderDigest, Noticer, Notifier, Round, TaskError, TaskManager, TaskResult, TaskSpawner,
-    TnReceiver, TnSender, Vote,
+    TnReceiver, TnSender, TrySendError, TrySendOutcome, Vote,
 };
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, enabled, error, info, instrument, warn};
@@ -75,6 +76,10 @@ pub(crate) struct Certifier<DB> {
     /// The consensus channels: reports own headers that a newer own header cancelled to the
     /// proposer (see [`Self::report_canceled`]).
     consensus_bus: ConsensusBus,
+    /// The test hook that holds back this node's own certificates
+    /// ([`tn_types::test_hooks::own_cert_delay`]), read once when the certifier is spawned.
+    /// Always `None` in a build without `tn-types/test-utils`.
+    own_cert_delay: Option<OwnCertDelay>,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -133,6 +138,7 @@ impl<DB: Database> Certifier<DB> {
                 in_flight: Arc::default(),
                 metrics,
                 consensus_bus,
+                own_cert_delay: tn_types::test_hooks::own_cert_delay(),
             }
             .run(rx_headers)
             .await;
@@ -514,6 +520,20 @@ impl<DB: Database> Certifier<DB> {
         self.metrics.certificates_formed_total.increment(1);
         self.metrics.certificate_form_duration_seconds.record(proposal_start.elapsed());
 
+        // test hook, `before_store`: hold the formed certificate before it is returned to be
+        // stored. a newer own header that arrives meanwhile cancels the proposal as it would
+        // during vote collection, so the header is never certified and is reported uncertified.
+        // the formed counters above then count a certificate that is never stored
+        if let Some(hold) = self.own_cert_hold(OwnCertDelayStage::BeforeStore, header.round()) {
+            tokio::select! {
+                _ = tokio::time::sleep(hold) => {}
+                _ = &cancel_proposal => {
+                    debug!(target: "primary::certifier", "new proposal received during the own certificate hold - aborting proposal...");
+                    return Err(DagError::Canceled);
+                }
+            }
+        }
+
         Ok(certificate)
     }
 
@@ -716,6 +736,20 @@ impl<DB: Database> Certifier<DB> {
                                 TaskError::from_message(e.to_string())
                             })?;
 
+                        // test hook, `after_store`: the certificate is stored and durable; hold it
+                        // back from this node's DAG (the parents of its next header) and from
+                        // gossip. this arm runs after the select and without the proposal lock, so
+                        // a newer own header neither cancels the hold nor waits for it. a shutdown
+                        // ends the hold with nothing externalized, as a crash here would: the
+                        // record is durable and the startup republish covers it
+                        if let Some(hold) = self.own_cert_hold(OwnCertDelayStage::AfterStore, header_round) {
+                            let shutdown = self.config.shutdown().subscribe();
+                            tokio::select! {
+                                _ = tokio::time::sleep(hold) => {}
+                                _ = &shutdown => return Ok(()),
+                            }
+                        }
+
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
@@ -760,7 +794,7 @@ impl<DB: Database> Certifier<DB> {
     }
 
     /// Report that the own header at `round` of `epoch` with `digest` will never be certified: a
-    /// newer own header cancelled its proposal before a certificate formed.
+    /// newer own header cancelled its proposal before a certificate was stored.
     ///
     /// Logs the `header uncertified` line with `reason=canceled`, and tells the proposer so it
     /// can move the header's batch digests to its next header: only the author can aggregate the
@@ -773,13 +807,23 @@ impl<DB: Database> Certifier<DB> {
     ///
     /// Called only where `new_proposal` ends the proposal of a header without a stored certificate,
     /// never where a proposal ends without a certificate: the identical header re-sent on the
-    /// max-delay tick may still be certified then. A shutdown also fires `new_proposal`; nothing
-    /// is logged or reported once it has.
+    /// max-delay tick may still be certified then. A shutdown also fires `new_proposal`; once it
+    /// has, the `header uncertified` line is not written and the report is dropped.
     ///
-    /// Never waits: a full queue drops the report with a debug line, and the digests then wait for
-    /// the proposer's next own commit, which re-queues every uncommitted header below it.
+    /// Never waits. A report that does not reach the proposer is dropped with the debug line
+    /// `uncertified own header report dropped` and counted in
+    /// `tn_primary.uncertified_report_dropped_total{reason}`, and the digests then wait for the
+    /// proposer's next own commit, which re-queues every uncommitted header below it, or, at an
+    /// epoch's end, for the orphan re-pool. The reasons are:
+    /// - `shutdown`: the shutdown guard above. A proposal in flight at an epoch's end lands here,
+    ///   so a count of about one per epoch is expected;
+    /// - `full`: the queue holds [`crate::consensus_bus::UNCERTIFIED_OWN_HEADERS_CHANNEL_CAPACITY`]
+    ///   reports the proposer has not read;
+    /// - `unsubscribed`: no proposer is subscribed to the queue (its task has ended, or never
+    ///   started), or the channel closed. Plain `try_send` reports this case as a success.
     fn report_canceled(&self, round: Round, epoch: Epoch, digest: HeaderDigest) {
         if self.config.shutdown().is_notified() {
+            Self::report_dropped(round, digest, "shutdown");
             return;
         }
         info!(
@@ -789,15 +833,49 @@ impl<DB: Database> Certifier<DB> {
             reason = "canceled",
             "header uncertified"
         );
-        if let Err(e) = self.consensus_bus.uncertified_own_headers().try_send((round, digest)) {
-            debug!(
-                target: "primary::certifier",
-                round,
-                %digest,
-                %e,
-                "uncertified own header report dropped"
-            );
+        let dropped =
+            match self.consensus_bus.uncertified_own_headers().try_send_outcome((round, digest)) {
+                Ok(TrySendOutcome::Queued) => None,
+                Ok(TrySendOutcome::Unsubscribed | TrySendOutcome::OverBudget) => {
+                    Some("unsubscribed")
+                }
+                Err(TrySendError::Full(_)) => Some("full"),
+                // a closed channel has lost its receiver, as an unsubscribed one has none
+                Err(TrySendError::Closed(_) | TrySendError::Broadcast(_)) => Some("unsubscribed"),
+            };
+        if let Some(reason) = dropped {
+            Self::report_dropped(round, digest, reason);
         }
+    }
+
+    /// Log and count an uncertified own header report that [`Self::report_canceled`] dropped for
+    /// `reason`, one of the static reasons its doc lists.
+    fn report_dropped(round: Round, digest: HeaderDigest, reason: &'static str) {
+        debug!(
+            target: "primary::certifier",
+            round,
+            %digest,
+            reason,
+            "uncertified own header report dropped"
+        );
+        metrics::counter!("tn_primary.uncertified_report_dropped_total", "reason" => reason)
+            .increment(1);
+    }
+
+    /// How long the test hook holds the own certificate of the header at `round` at `stage`, or
+    /// `None` when it does not (always, unless the hook is set).
+    ///
+    /// Logs one line per hold, so a node log shows which own certificates were held.
+    fn own_cert_hold(&self, stage: OwnCertDelayStage, round: Round) -> Option<Duration> {
+        let hold = self.own_cert_delay?.delay_for(stage, round)?;
+        info!(
+            target: "primary::certifier",
+            round,
+            stage = stage.as_str(),
+            hold_ms = duration_ms(hold),
+            "test hook: holding own certificate"
+        );
+        Some(hold)
     }
 
     /// Execute the main certification task.  Will run until shutdown is signalled.

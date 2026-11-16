@@ -6935,3 +6935,716 @@ async fn vote_request_cancelled_by_requester_still_runs_on_the_voter() -> eyre::
 
     Ok(())
 }
+
+// ---- bench7 quorum-exec-block: the voter's answers to an old execution block ----
+
+use crate::{proposer::QUORUM_EXEC_BLOCK_FLOOR_ENTRIES, ExecutionCheck};
+
+/// The epoch of the old-block voter's committee. The voter's execution crossed into it from the
+/// epoch before, so a header can name a block of either.
+const OLD_BLOCK_EPOCH: Epoch = 1;
+
+/// The outputs the old-block voter executed in the epoch before [`OLD_BLOCK_EPOCH`].
+const OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS: usize = 10;
+
+/// The outputs a voter deep in [`OLD_BLOCK_EPOCH`] has executed in it: twice the default
+/// `gc_depth`, the ring's capacity, so blocks of this epoch have left the ring.
+const OLD_BLOCK_DEEP_OUTPUTS: usize = 100;
+
+/// The outputs a voter early in [`OLD_BLOCK_EPOCH`] has executed in it: fewer than
+/// [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`], so the ring entry that far below its tip belongs to the
+/// epoch before.
+const OLD_BLOCK_EARLY_OUTPUTS: usize = 3;
+
+/// The blocks each output builds, one per batch. The ring keeps only the last block of each output;
+/// the canonical database holds them all.
+const OLD_BLOCK_BLOCKS_PER_OUTPUT: u64 = 2;
+
+/// The counter of vote requests refused as `ExecutionBehind`.
+const OLD_BLOCK_BEHIND_COUNTER: &str = "tn_primary.votes_refused_execution_behind_total";
+
+/// The old-block voter's canonical execution database: the executed blocks it holds, by number,
+/// and its restored-state floor.
+struct OldBlockCanonical {
+    /// The blocks the database holds.
+    blocks: BTreeMap<u64, BlockHash>,
+    /// The restored-state floor of a datadir restored from a snapshot.
+    floor: Option<u64>,
+}
+
+impl tn_types::CanonicalExecutionReader for OldBlockCanonical {
+    fn canonical_execution_hash(&self, number: u64) -> Option<BlockHash> {
+        self.blocks.get(&number).copied()
+    }
+
+    fn restored_state_floor(&self) -> Option<u64> {
+        self.floor
+    }
+}
+
+/// A voter that executed outputs across the start of [`OLD_BLOCK_EPOCH`] (see
+/// [`old_block_voter`]), and what it executed.
+struct OldBlockVoter {
+    /// The voter's committee, handler and bus; `parent` is the executed tip.
+    types: TestTypes,
+    /// The last block of each executed output, oldest first: one ring entry each.
+    outputs: Vec<SealedHeader>,
+    /// Every executed block, by number.
+    executed: BTreeMap<u64, BlockHash>,
+}
+
+impl OldBlockVoter {
+    /// A copy of the voter's ring.
+    fn ring(&self) -> RecentBlocks {
+        self.types.consensus_bus.recent_blocks().borrow().clone()
+    }
+
+    /// The last block of the output `entries` ring entries below the executed tip.
+    fn below_tip(&self, entries: usize) -> &SealedHeader {
+        &self.outputs[self.outputs.len() - 1 - entries]
+    }
+
+    /// Replace the canonical database with one that answers for no block, so only the ring can
+    /// confirm a block. A database miss at or below the tip is `Unconfirmed`, which the voter waits
+    /// out and then refuses as `ExecutionBehind`.
+    fn ring_only(&self) {
+        let canonical = OldBlockCanonical { blocks: BTreeMap::new(), floor: None };
+        self.types.consensus_bus.set_canonical_reader(Arc::new(canonical));
+    }
+
+    /// Replace the canonical database with one restored from a snapshot at block `floor`: it holds
+    /// the executed blocks from `floor` up and nothing below.
+    fn restored_at(&self, floor: u64) {
+        let blocks = self.executed.range(floor..).map(|(number, hash)| (*number, *hash)).collect();
+        let canonical = OldBlockCanonical { blocks, floor: Some(floor) };
+        self.types.consensus_bus.set_canonical_reader(Arc::new(canonical));
+    }
+
+    /// Ask the voter for a vote on a round-1 header of the committee's last authority that names
+    /// `block`. Returns the answer and the time it took on the test clock.
+    async fn ask(
+        &self,
+        block: BlockNumHash,
+    ) -> (Result<PrimaryResponse, PrimaryNetworkError>, Duration) {
+        let committee = &self.types.committee;
+        let header = committee
+            .header_builder_last_authority()
+            .latest_execution_block(block)
+            .created_at(1)
+            .build();
+        let peer = *committee.last_authority().authority().protocol_key();
+        let start = tokio::time::Instant::now();
+        let answer = self.types.handler.vote(peer, header, Vec::new()).await;
+        (answer, start.elapsed())
+    }
+}
+
+/// The leader round of output `output` (`2 * output`) and the blocks it builds on top of `parent`,
+/// oldest first. Each block carries the nonce execution stamps on it: `epoch` in the upper half,
+/// the leader round in the lower.
+fn old_block_output(
+    output: u64,
+    epoch: Epoch,
+    parent: &SealedHeader,
+) -> (Round, Vec<SealedHeader>) {
+    let round = Round::try_from(2 * output).expect("a small round");
+    let nonce = (u64::from(epoch) << 32) | u64::from(round);
+    let mut parent_hash = parent.hash();
+    let blocks = (1..=OLD_BLOCK_BLOCKS_PER_OUTPUT)
+        .map(|offset| {
+            let block = SealedHeader::seal_slow(ExecHeader {
+                number: parent.number() + offset,
+                parent_hash,
+                nonce: nonce.into(),
+                ..Default::default()
+            });
+            parent_hash = block.hash();
+            block
+        })
+        .collect();
+    (round, blocks)
+}
+
+/// Push the last block of output `output` onto `bus`'s ring, as the node's engine-update task does
+/// once the output is executed.
+fn old_block_push(bus: &ConsensusBusApp, output: u64, round: Round, block: SealedHeader) {
+    bus.recent_blocks().send_modify(|ring| {
+        ring.push_latest(
+            round,
+            ConsensusNumHash::new(output, ConsensusHeaderDigest::default()),
+            Some(block),
+        )
+    });
+}
+
+/// The epoch execution stamped on `block`.
+fn old_block_epoch(block: &SealedHeader) -> Epoch {
+    tn_types::deconstruct_nonce(u64::from(block.nonce)).0
+}
+
+/// A voter, the first authority of a committee at [`OLD_BLOCK_EPOCH`] with `vote_queue_fix` set to
+/// `on`, that executed [`OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS`] outputs of the epoch before and then
+/// `epoch_outputs` of its own, each building blocks.
+///
+/// The bus sizes its ring by `gc_depth`, as the node builds it, and each output's last block is
+/// pushed onto the ring the way the node's engine-update task pushes it, so the oldest entries
+/// leave the ring as they do on a node. The canonical database holds every executed block and has
+/// no restored-state floor. The bus and the handler register their metrics with `recorder`.
+async fn old_block_voter(
+    path: &Path,
+    on: bool,
+    epoch_outputs: usize,
+    recorder: &DebuggingRecorder,
+) -> OldBlockVoter {
+    let _local_recorder = metrics::set_default_local_recorder(recorder);
+    let params = Parameters { vote_queue_fix: on, ..Default::default() };
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .epoch(OLD_BLOCK_EPOCH)
+        .with_consensus_parameters(params)
+        .build();
+    let config = committee.first_authority().consensus_config();
+    // the node sizes the ring by `gc_depth` (`ConsensusBusApp::new_with_recent_blocks`)
+    let cb = ConsensusBus::new_with_args(config.parameters().gc_depth);
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    let mut tip = SealedHeader::seal_slow(ExecHeader::default());
+    let mut executed = BTreeMap::from([(tip.number(), tip.hash())]);
+    let mut outputs = Vec::new();
+    for (output, index) in (1u64..).zip(0..OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS + epoch_outputs) {
+        let epoch = if index < OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS {
+            OLD_BLOCK_EPOCH - 1
+        } else {
+            OLD_BLOCK_EPOCH
+        };
+        let (round, blocks) = old_block_output(output, epoch, &tip);
+        executed.extend(blocks.iter().map(|block| (block.number(), block.hash())));
+        tip = blocks.last().expect("an output builds blocks").clone();
+        old_block_push(cb.app(), output, round, tip.clone());
+        outputs.push(tip.clone());
+    }
+    let canonical = OldBlockCanonical { blocks: executed.clone(), floor: None };
+    cb.app().set_canonical_reader(Arc::new(canonical));
+    assert_eq!(cb.app().latest_execution_block_num_hash(), tip.num_hash(), "the executed tip");
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler =
+        RequestHandler::new(config.clone(), consensus_bus.clone(), synchronizer, consensus_chain);
+    let types = TestTypes { committee, handler, parent: tip, consensus_bus, task_manager };
+    OldBlockVoter { types, outputs, executed }
+}
+
+/// Case 1, with `vote_queue_fix` set to `on`: a header naming the block a proposer with
+/// `quorum_exec_block` names, [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] ring entries (outputs that built
+/// a block) below the tip of a voter in step with it, is voted for at once. The voter's database
+/// answers for no block here, so the vote rests on the ring alone.
+///
+/// Catches: a voter that waits for, or refuses, an executed block below its tip, and a ring that
+/// no longer matches its older entries.
+async fn old_block_in_ring_is_voted_at_once(on: bool) -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+    voter.ring_only();
+    let ring = voter.ring();
+    let named = ring.nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES).expect("a full ring");
+    assert_eq!(
+        named,
+        voter.below_tip(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES).num_hash(),
+        "the quorum rule's block is eight ring entries below the tip"
+    );
+    assert_eq!(ring.check_execution_block(named), Some(ExecutionCheck::Match), "the ring holds it");
+
+    let (answer, took) = voter.ask(named).await;
+    assert_matches!(
+        answer,
+        Ok(PrimaryResponse::Vote(_)),
+        "vote_queue_fix={on}: an executed block eight entries below the tip is voted for"
+    );
+    assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: an executed block is not waited for");
+    assert_eq!(
+        counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
+        0,
+        "vote_queue_fix={on}: an executed block is not behind"
+    );
+    Ok(())
+}
+
+/// [`old_block_in_ring_is_voted_at_once`] with `vote_queue_fix` off.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_block_in_ring_at_once_switch_off() -> eyre::Result<()> {
+    old_block_in_ring_is_voted_at_once(false).await
+}
+
+/// [`old_block_in_ring_is_voted_at_once`] with `vote_queue_fix` on.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_block_in_ring_at_once_switch_on() -> eyre::Result<()> {
+    old_block_in_ring_is_voted_at_once(true).await
+}
+
+/// Case 2, with `vote_queue_fix` set to `on`: a header naming an executed block of the voter's own
+/// epoch that has left the ring is voted for at once. The block is the newest one evicted:
+/// `gc_depth` newer outputs have been pushed since. Below the tip the ring cannot decide a block it
+/// does not hold, so the canonical database confirms the number and the hash.
+///
+/// Catches: a voter that reads a ring miss below its tip as a fork, or as a block it must wait for,
+/// while its database holds the block (the ring-only check of a bus without a database reader).
+async fn old_block_out_of_ring_is_voted_from_the_database(on: bool) -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+    let ring = voter.ring();
+    assert_eq!(
+        ring.block_capacity(),
+        u64::from(Parameters::default().gc_depth),
+        "the ring holds `gc_depth` entries"
+    );
+    let evicted = voter.below_tip(usize::try_from(ring.block_capacity())?);
+    let named = evicted.num_hash();
+    assert_eq!(old_block_epoch(evicted), OLD_BLOCK_EPOCH, "a block of the voter's own epoch");
+    assert!(!ring.contains_execution_block(named), "the block has left the ring");
+    assert_eq!(
+        ring.check_execution_block(named),
+        None,
+        "below the tip, the ring leaves a block it does not hold to the canonical database"
+    );
+
+    let (answer, took) = voter.ask(named).await;
+    assert_matches!(
+        answer,
+        Ok(PrimaryResponse::Vote(_)),
+        "vote_queue_fix={on}: an executed block the ring no longer holds is voted for"
+    );
+    assert_eq!(
+        took,
+        Duration::ZERO,
+        "vote_queue_fix={on}: a block the database confirms is not waited for"
+    );
+    assert_eq!(
+        counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
+        0,
+        "vote_queue_fix={on}: a block the database confirms is not behind"
+    );
+    Ok(())
+}
+
+/// [`old_block_out_of_ring_is_voted_from_the_database`] with `vote_queue_fix` off.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_block_out_of_ring_from_database_switch_off(
+) -> eyre::Result<()> {
+    old_block_out_of_ring_is_voted_from_the_database(false).await
+}
+
+/// [`old_block_out_of_ring_is_voted_from_the_database`] with `vote_queue_fix` on.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_block_out_of_ring_from_database_switch_on(
+) -> eyre::Result<()> {
+    old_block_out_of_ring_is_voted_from_the_database(true).await
+}
+
+/// Case 3, with `vote_queue_fix` set to `on`: a header naming an old block number with another hash
+/// than the block the voter executed there is refused at once with `UnknownExecutionResult`
+/// (`unexpected execution result received`, logged once), never as `ExecutionBehind`, and stores no
+/// vote. Three headers: a made-up hash at the number of the quorum rule's block, eight ring entries
+/// below the tip and still in the ring; a made-up hash at the number of a block that has left the
+/// ring; and, at the quorum rule's number, the hash of the block one ring entry older, which the
+/// voter did execute but at another number.
+///
+/// Catches: a voter that accepts an unknown hash at an executed number, one that matches the hash
+/// alone, and one that reads the mismatch as "behind" (a retryable refusal the requester repeats
+/// until its vote timeout) or answers it after a wait.
+async fn old_number_with_another_hash_is_refused_as_a_fork(on: bool) -> eyre::Result<()> {
+    let floor = QUORUM_EXEC_BLOCK_FLOOR_ENTRIES;
+    let capacity = usize::try_from(Parameters::default().gc_depth)?;
+    for (place, below_tip, hash_below_tip) in [
+        ("in the ring", floor, None),
+        ("out of the ring", capacity, None),
+        ("with another executed block's hash", floor, Some(floor + 1)),
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+        let ring = voter.ring();
+        let executed = voter.below_tip(below_tip).num_hash();
+        assert_eq!(ring.contains_execution_block(executed), below_tip < capacity, "{place}");
+        let hash = hash_below_tip
+            .map_or(BlockHash::repeat_byte(0xab), |entries| voter.below_tip(entries).hash());
+        let named = BlockNumHash::new(executed.number, hash);
+        assert_ne!(named, executed, "the voter executed another block at that number");
+        assert_eq!(
+            ring.check_execution_block(named),
+            None,
+            "below the tip, the ring leaves a block it does not hold to the canonical database"
+        );
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(LinesAt {
+            target: "primary",
+            level: tracing::Level::ERROR,
+            lines: lines.clone(),
+        });
+
+        let (answer, took) = voter.ask(named).await;
+        assert_matches!(
+            answer,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(block)))
+                if block == named,
+            "vote_queue_fix={on}: another hash at an executed number {place} is a fork refusal"
+        );
+        assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: a fork {place} is not waited for");
+        assert_eq!(
+            counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
+            0,
+            "vote_queue_fix={on}: another hash at an executed number {place} is not behind"
+        );
+        let logged = lines.lock().clone();
+        let forks = logged
+            .iter()
+            .filter(|line| line.starts_with("unexpected execution result received"))
+            .count();
+        assert_eq!(forks, 1, "vote_queue_fix={on}: one fork line {place}: {logged:?}");
+        let committee = &voter.types.committee;
+        let vote_info = committee
+            .first_authority()
+            .consensus_config()
+            .node_storage()
+            .read_vote_info(&committee.last_authority().id())?;
+        assert!(vote_info.is_none(), "vote_queue_fix={on}: a refused header stores no vote");
+    }
+    Ok(())
+}
+
+/// [`old_number_with_another_hash_is_refused_as_a_fork`] with `vote_queue_fix` off.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_refuses_old_number_with_another_hash_switch_off(
+) -> eyre::Result<()> {
+    old_number_with_another_hash_is_refused_as_a_fork(false).await
+}
+
+/// [`old_number_with_another_hash_is_refused_as_a_fork`] with `vote_queue_fix` on.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_refuses_old_number_with_another_hash_switch_on() -> eyre::Result<()>
+{
+    old_number_with_another_hash_is_refused_as_a_fork(true).await
+}
+
+/// Case 4 in the ring, with `vote_queue_fix` set to `on`, as the voter answers today: a voter
+/// [`OLD_BLOCK_EARLY_OUTPUTS`] outputs into its epoch votes at once for a header naming the
+/// previous epoch's closing block (the block the epoch opened on: the lowest block a proposer with
+/// `quorum_exec_block` names, as it skips parents that name a block below it) and, alike, for one
+/// naming the block [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] ring entries below its tip, which lies
+/// before that block, in the previous epoch (the block the rule would name without that bound).
+/// The voter's database answers for no block here, so the ring alone decides both: it compares the
+/// number and the hash with what the voter executed, never the block's epoch.
+async fn previous_epoch_blocks_in_ring_are_voted_at_once(on: bool) -> eyre::Result<()> {
+    for before_opening in [false, true] {
+        let block =
+            if before_opening { "a block before the opening block" } else { "the opening block" };
+        let temp_dir = TempDir::new().unwrap();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
+        voter.ring_only();
+        let ring = voter.ring();
+        let closing = &voter.outputs[OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS - 1];
+        assert_eq!(old_block_epoch(closing), OLD_BLOCK_EPOCH - 1, "the previous epoch's block");
+        assert_eq!(
+            old_block_epoch(&voter.outputs[OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS]),
+            OLD_BLOCK_EPOCH,
+            "the next output is the voter's epoch"
+        );
+        let opening = ring.newest_before_epoch(OLD_BLOCK_EPOCH).expect("the ring holds it");
+        assert_eq!(opening, closing.num_hash(), "the epoch opened on the previous closing block");
+        let unbounded = ring.nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES).expect("a long ring");
+        assert!(
+            unbounded.number < opening.number,
+            "eight ring entries below the tip lies before the opening block"
+        );
+        let named = if before_opening { unbounded } else { opening };
+        assert_eq!(ring.check_execution_block(named), Some(ExecutionCheck::Match), "{block}");
+
+        let (answer, took) = voter.ask(named).await;
+        assert_matches!(
+            answer,
+            Ok(PrimaryResponse::Vote(_)),
+            "vote_queue_fix={on}: {block} of the previous epoch is voted for"
+        );
+        assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: {block} is not waited for");
+        assert_eq!(
+            counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
+            0,
+            "vote_queue_fix={on}: {block} is not behind"
+        );
+    }
+    Ok(())
+}
+
+/// [`previous_epoch_blocks_in_ring_are_voted_at_once`] with `vote_queue_fix` off.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_previous_epoch_blocks_in_ring_switch_off() -> eyre::Result<()>
+{
+    previous_epoch_blocks_in_ring_are_voted_at_once(false).await
+}
+
+/// [`previous_epoch_blocks_in_ring_are_voted_at_once`] with `vote_queue_fix` on.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_previous_epoch_blocks_in_ring_switch_on() -> eyre::Result<()>
+{
+    previous_epoch_blocks_in_ring_are_voted_at_once(true).await
+}
+
+/// Case 4 out of the ring, with `vote_queue_fix` set to `on`, as the voter answers today: a voter
+/// deep in its epoch, whose ring holds no block of the previous epoch any more, gets headers naming
+/// the previous epoch's closing block (the opening block) or the block of the output before it.
+/// - With every executed block in its database, it votes at once for the block before the opening
+///   block.
+/// - Restored from a snapshot at the opening block (the database holds nothing below it), it votes
+///   at once for the opening block and refuses the block before it at once with
+///   `BelowRestoreFloor`: final, without a penalty, not counted as behind, no vote stored.
+async fn previous_epoch_blocks_out_of_ring_are_answered_at_once(on: bool) -> eyre::Result<()> {
+    for (case, restored, before_opening) in [
+        ("before the opening block, full database", false, true),
+        ("the opening block, restored there", true, false),
+        ("before the opening block, restored at the opening block", true, true),
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+        let ring = voter.ring();
+        let opening = voter.outputs[OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS - 1].num_hash();
+        let before = &voter.outputs[OLD_BLOCK_PREVIOUS_EPOCH_OUTPUTS - 2];
+        assert_eq!(old_block_epoch(before), OLD_BLOCK_EPOCH - 1, "the previous epoch's block");
+        assert_eq!(ring.newest_before_epoch(OLD_BLOCK_EPOCH), None, "no such block in the ring");
+        if restored {
+            voter.restored_at(opening.number);
+        }
+        let named = if before_opening { before.num_hash() } else { opening };
+        assert_eq!(ring.check_execution_block(named), None, "{case}: the database decides it");
+
+        let (answer, took) = voter.ask(named).await;
+        if restored && before_opening {
+            assert_matches!(
+                &answer,
+                Err(PrimaryNetworkError::InvalidHeader(HeaderError::BelowRestoreFloor {
+                    header_block,
+                    floor,
+                })) if *header_block == named.number && *floor == opening.number,
+                "vote_queue_fix={on}: {case}: below the floor is the final refusal"
+            );
+            let err = answer.expect_err("refused");
+            assert!(Option::<Penalty>::from(&err).is_none(), "{case}: no penalty for the author");
+            let committee = &voter.types.committee;
+            let vote_info = committee
+                .first_authority()
+                .consensus_config()
+                .node_storage()
+                .read_vote_info(&committee.last_authority().id())?;
+            assert!(vote_info.is_none(), "vote_queue_fix={on}: {case}: no vote stored");
+        } else {
+            assert_matches!(
+                answer,
+                Ok(PrimaryResponse::Vote(_)),
+                "vote_queue_fix={on}: {case}: voted for"
+            );
+        }
+        assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: {case}: not waited for");
+        assert_eq!(
+            counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
+            0,
+            "vote_queue_fix={on}: {case}: not behind"
+        );
+    }
+    Ok(())
+}
+
+/// [`previous_epoch_blocks_out_of_ring_are_answered_at_once`] with `vote_queue_fix` off.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_answers_previous_epoch_blocks_out_of_ring_switch_off(
+) -> eyre::Result<()> {
+    previous_epoch_blocks_out_of_ring_are_answered_at_once(false).await
+}
+
+/// [`previous_epoch_blocks_out_of_ring_are_answered_at_once`] with `vote_queue_fix` on.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_answers_previous_epoch_blocks_out_of_ring_switch_on(
+) -> eyre::Result<()> {
+    previous_epoch_blocks_out_of_ring_are_answered_at_once(true).await
+}
+
+/// Case 5, the control, with `vote_queue_fix` set to `on`: a header naming a block above the
+/// voter's tip is waited for. When the next output executes half-way through the execution wait
+/// the vote is given then; when nothing executes the voter refuses with `ExecutionBehind` (counted)
+/// once [`VOTE_EXECUTION_WAIT`] has passed. `test_vote_inner_timeout` pins the same with the switch
+/// off on a voter at block 0.
+async fn block_above_the_tip_is_waited_for(on: bool) -> eyre::Result<()> {
+    let half = VOTE_EXECUTION_WAIT / 2;
+
+    // the next output executes within the wait
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
+    let output = u64::try_from(voter.outputs.len())? + 1;
+    let (round, blocks) = old_block_output(output, OLD_BLOCK_EPOCH, &voter.types.parent);
+    let next = blocks.last().expect("an output builds blocks").clone();
+    let named = next.num_hash();
+    assert_eq!(voter.types.consensus_bus.check_execution_block(named), ExecutionCheck::NotYet);
+    let bus = voter.types.consensus_bus.clone();
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(half).await;
+        old_block_push(&bus, output, round, next);
+    });
+    let (answer, took) = voter.ask(named).await;
+    assert_matches!(
+        answer,
+        Ok(PrimaryResponse::Vote(_)),
+        "vote_queue_fix={on}: a block executed within the wait is voted for"
+    );
+    assert!(
+        took >= half && took < VOTE_EXECUTION_WAIT,
+        "vote_queue_fix={on}: the vote waits for the block, took {took:?}"
+    );
+    assert_eq!(
+        counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
+        0,
+        "vote_queue_fix={on}: a block executed within the wait is not behind"
+    );
+    execute.await?;
+
+    // nothing executes
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_EARLY_OUTPUTS, &recorder).await;
+    let tip = voter.types.parent.num_hash();
+    let named =
+        BlockNumHash::new(tip.number + OLD_BLOCK_BLOCKS_PER_OUTPUT, BlockHash::repeat_byte(0xcd));
+    let (answer, took) = voter.ask(named).await;
+    assert_matches!(
+        answer,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind {
+            header_block,
+            local_block
+        })) if header_block == named.number && local_block == tip.number,
+        "vote_queue_fix={on}: a block that never executes is behind"
+    );
+    assert!(
+        took >= VOTE_EXECUTION_WAIT && took < VOTE_EXECUTION_WAIT * 2,
+        "vote_queue_fix={on}: the refusal comes after one execution wait, took {took:?}"
+    );
+    assert_eq!(
+        counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
+        1,
+        "vote_queue_fix={on}: the behind refusal is counted"
+    );
+    Ok(())
+}
+
+/// [`block_above_the_tip_is_waited_for`] with `vote_queue_fix` off.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_waits_for_block_above_tip_switch_off() -> eyre::Result<()> {
+    block_above_the_tip_is_waited_for(false).await
+}
+
+/// [`block_above_the_tip_is_waited_for`] with `vote_queue_fix` on.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_waits_for_block_above_tip_switch_on() -> eyre::Result<()> {
+    block_above_the_tip_is_waited_for(true).await
+}
+
+/// Case 6, with `vote_queue_fix` set to `on`: one author's execution block steps back. The quorum
+/// rule is the first proposer behaviour that names a lower block than the author's previous header
+/// and its parents did. The author's round-1 header names the voter's tip and is voted for; all
+/// four round-1 headers, each naming the tip, are certified; the author's round-2 header, built on
+/// them, names the block [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] ring entries below the tip and is
+/// voted for at once too.
+///
+/// Catches: a voter that requires an author's execution block to rise from header to header, or to
+/// reach the blocks its parents named.
+async fn author_stepping_back_is_voted_at_once(on: bool) -> eyre::Result<()> {
+    // the round-2 header's timestamp is checked against its parents' in milliseconds
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let voter = old_block_voter(temp_dir.path(), on, OLD_BLOCK_DEEP_OUTPUTS, &recorder).await;
+    let committee = &voter.types.committee;
+    let committee_obj = committee.committee();
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let tip = voter.types.parent.num_hash();
+    let named = voter.ring().nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES).expect("a full ring");
+    assert!(named.number < tip.number, "the round-2 block is below the round-1 block");
+
+    // round-1 headers a minute in the past, so a round-2 header built on them earns a vote
+    let oldest = TimestampMs::from_parts(now() - 60, 500);
+    let created_at: Vec<_> =
+        committee.authorities().zip(0..).map(|(_, i)| oldest.saturating_add_millis(i)).collect();
+    let newest_parent = *created_at.last().expect("4 authorities in fixture");
+    let round_one: Vec<_> = committee
+        .authorities()
+        .zip(&created_at)
+        .map(|(authority, created_at)| {
+            authority
+                .header_builder_at_round(&committee_obj, 1)
+                .latest_execution_block(tip)
+                .created_at_ms(*created_at)
+                .build()
+        })
+        .collect();
+    let first = round_one
+        .iter()
+        .find(|header| *header.author() == author.id())
+        .expect("the author's round-1 header")
+        .clone();
+    assert_matches!(
+        voter.types.handler.vote(peer, first, Vec::new()).await?,
+        PrimaryResponse::Vote(_),
+        "vote_queue_fix={on}: the round-1 header naming the tip is voted for"
+    );
+    let certificates: Vec<_> =
+        round_one.iter().map(|header| committee.certificate(header)).collect();
+    committee.first_authority().consensus_config().node_storage().write_all(certificates.iter())?;
+
+    let second = author
+        .header_builder_at_round(&committee_obj, 2)
+        .parents(certificates.iter().map(|certificate| certificate.digest()).collect())
+        .latest_execution_block(named)
+        .created_at_ms(newest_parent.saturating_add_millis(1))
+        .build();
+    let start = tokio::time::Instant::now();
+    let answer = voter.types.handler.vote(peer, second, Vec::new()).await;
+    let took = start.elapsed();
+    assert_matches!(
+        answer,
+        Ok(PrimaryResponse::Vote(_)),
+        "vote_queue_fix={on}: a round-2 header naming a lower block than round 1 is voted for"
+    );
+    assert_eq!(took, Duration::ZERO, "vote_queue_fix={on}: the lower block is not waited for");
+    assert_eq!(
+        counter_value(&snapshotter, OLD_BLOCK_BEHIND_COUNTER),
+        0,
+        "vote_queue_fix={on}: the lower block is not behind"
+    );
+    Ok(())
+}
+
+/// [`author_stepping_back_is_voted_at_once`] with `vote_queue_fix` off.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_author_stepping_back_switch_off() -> eyre::Result<()> {
+    author_stepping_back_is_voted_at_once(false).await
+}
+
+/// [`author_stepping_back_is_voted_at_once`] with `vote_queue_fix` on.
+#[tokio::test(start_paused = true)]
+async fn quorum_exec_block_voter_votes_author_stepping_back_switch_on() -> eyre::Result<()> {
+    author_stepping_back_is_voted_at_once(true).await
+}
