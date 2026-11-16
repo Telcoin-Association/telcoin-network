@@ -1366,11 +1366,12 @@ pub struct DbLoadStateArgs {
     /// set, else the system's: `/tmp` on Linux; an empty `TMPDIR` or one inside the datadir is
     /// refused), which needs the pack's size plus the node's import floor (one default growth
     /// step of the execution database plus a margin) free there, since a running node may
-    /// share that filesystem: it refuses to start without that room, the import stops before
-    /// free space drops below the floor, and the directory is removed afterwards. On many
-    /// Linux hosts `/tmp` is a RAM-backed tmpfs or a small root partition: set `TMPDIR` to a
-    /// directory on a disk with room. The state data's own records are read only by the
-    /// restore itself.
+    /// share that filesystem: it refuses to start without that room, and the import stops
+    /// before free space drops below the floor. The directory, printed to stderr, is removed
+    /// on every normal exit; a killed run leaves `$TMPDIR/tn-load-state-verify-*` to remove by
+    /// hand. On many Linux hosts `/tmp` is a RAM-backed tmpfs or a small root partition: set
+    /// `TMPDIR` to a directory on a disk with room. The state data's own records are read only
+    /// by the restore itself.
     ///
     /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
     /// is used, as a restore would), never written. It takes no datadir lock, so it can vet a
@@ -2136,7 +2137,8 @@ fn verify_only_lock_warning(datadir: &impl TelcoinDirs) -> Option<String> {
 /// `db load-state --verify-only`'s check of the bundle's consensus pack: the restore's own import
 /// ([`import_bundle_consensus`]) of `bundle_consensus` against the last two of the verified
 /// `records`, run in a new staging directory under `staging_root` (the temp directory, `$TMPDIR`
-/// when set, outside the datadir), which is removed whatever the outcome. A running node may share
+/// when set, outside the datadir), which is removed on every normal exit; a killed run leaves
+/// `$TMPDIR/tn-load-state-verify-*`, which is why its path is printed. A running node may share
 /// that filesystem, so the check keeps the node's own import floor there
 /// ([`verify_only_import_floor`]): it refuses to start without room for the pack plus the floor,
 /// and the import stops before free space drops below the floor. A failure names where it staged
@@ -2171,6 +2173,12 @@ fn verify_bundle_consensus(
                 staging_root.display()
             )
         })?;
+    // no signal handler removes it, so say where it is
+    eprintln!(
+        "checking the consensus pack in {} (removed when this run ends; a killed run leaves it to \
+         remove by hand)",
+        staging.path().display()
+    );
     // The runtime is dropped, and with it every blocking task the import ran, before the staging
     // directory is removed.
     let checked = tokio::runtime::Builder::new_multi_thread()

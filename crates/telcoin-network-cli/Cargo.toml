@@ -59,7 +59,8 @@ bs58 = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 # `db load-state --verify-only` imports the bundle's consensus pack into a staging directory
-# under the system temp directory, removed on every exit path
+# under the system temp directory, removed on every normal exit (a killed run leaves
+# `$TMPDIR/tn-load-state-verify-*`)
 tempfile = { workspace = true }
 url = { workspace = true }
 zeroize = { workspace = true }
