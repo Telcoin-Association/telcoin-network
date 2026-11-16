@@ -8,7 +8,7 @@
 //! (10^9 fixed-point precision) keeps results identical on every node — a consensus
 //! requirement, since the penalty changes account balances.
 
-use tracing::debug;
+use tracing::trace;
 
 /// Minimum gas limit threshold (10x minimum transaction cost)
 const MIN_GAS_LIMIT_THRESHOLD: u64 = 210_000;
@@ -65,7 +65,7 @@ pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
 
     // no penalty if usage is above threshold
     if usage_ratio_scaled >= THRESHOLD {
-        debug!(target: "engine", ?gas_limit, ?gas_used, ?usage_ratio_scaled, threshold=?THRESHOLD, "usage within acceptable range");
+        trace!(target: "engine::evm", ?gas_limit, ?gas_used, ?usage_ratio_scaled, threshold=?THRESHOLD, "usage within acceptable range");
         return 0;
     }
 
@@ -79,8 +79,8 @@ pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
 
     // this is safe: max value is ~6×10^23, well below u128 max
     let penalty = (inefficiency_squared * unused_gas) / THRESHOLD_SQUARED;
-    debug!(
-        target: "engine",
+    trace!(
+        target: "engine::evm",
         ?gas_limit,
         ?gas_used,
         ?penalty,

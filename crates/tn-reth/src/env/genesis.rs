@@ -57,13 +57,13 @@ use std::{path::Path, sync::Arc};
 
 use alloy::{hex, sol_types::SolConstructor as _};
 use eyre::OptionExt as _;
-use reth::{
-    args::{DatabaseArgs, DatadirArgs, RpcServerArgs},
-    dirs::MaybePlatformPath,
-};
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_evm::{ConfigureEvm as _, Evm as _, EvmFactory as _};
-use reth_node_builder::NodeConfig;
+use reth_node_core::{
+    args::{DatadirArgs, RpcServerArgs},
+    dirs::MaybePlatformPath,
+    node_config::NodeConfig,
+};
 use reth_revm::{
     cached::CachedReads,
     context::result::{ExecutionResult, ResultAndState},
@@ -82,13 +82,110 @@ use tn_types::{
 };
 use tracing::debug;
 
+use super::database;
 use crate::{
     init_reth_defaults,
     system_calls::{
         ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, PRECOMPILE_GENESIS_BYTECODE,
     },
-    RethConfig, RethEnv, BLS_G1_PRECOMPILE_ADDRESS,
+    DatadirFormat, RethConfig, RethEnv, StorageLayout, TxBodies, TxForwardConfig,
+    BLS_G1_PRECOMPILE_ADDRESS,
 };
+
+/// The environment variable that picks the storage layout of a new temp chain datadir in a test
+/// build: `v1` or `v2`. Unset, temp chains get [`StorageLayout::for_new_datadirs`].
+///
+/// Test-only: it is read only when tn-reth is built for tests (`cfg(test)` or the `test-utils`
+/// feature, which no release graph enables), and only by the temp chain constructors
+/// ([`RethEnv::new_for_temp_chain`] and the seams built on it), never by [`RethConfig::new`] or
+/// [`RethConfig::from_node_config`], which the node and `db load-state` open their datadirs with.
+/// `./etc/ci-lanes.sh test-default` sets it to `v1` for a second run of tn-reth's and tn-engine's
+/// suites, so the tests on temp chains run layout v1 on tn-lmdb (every migrated testnet datadir)
+/// too. Tests that open a datadir as the node does (`test_utils::load::open_production_env`) stay
+/// on v2 under it; those that need v1 name it (`open_production_env_with_layout`).
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) const TEST_NEW_DATADIR_LAYOUT_VAR: &str = "TN_TEST_NEW_DATADIR_LAYOUT";
+
+/// The layout a new temp chain datadir gets: the one [`TEST_NEW_DATADIR_LAYOUT_VAR`] names in a
+/// test build, else [`StorageLayout::for_new_datadirs`]. A value other than `v1` or `v2` is an
+/// error, so a mistyped lane fails instead of running the default.
+pub(crate) fn temp_chain_new_datadir_layout() -> eyre::Result<StorageLayout> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(layout) = test_layout_override(std::env::var(TEST_NEW_DATADIR_LAYOUT_VAR))? {
+        return Ok(layout);
+    }
+    Ok(StorageLayout::for_new_datadirs())
+}
+
+/// The environment variable that picks where a new temp chain datadir keeps its transactions in
+/// a test build: `inline` or `pointers`. Unset, temp chains ask for
+/// [`TxBodies::for_new_datadirs`] (pointers on the tn-lmdb build; a v1 datadir stores them inline
+/// whatever is asked).
+///
+/// Test-only, read as [`TEST_NEW_DATADIR_LAYOUT_VAR`] is: only by the temp chain constructors. A
+/// temp chain asked for pointers reads batches from the process-wide [`crate::MemoryBatches`],
+/// which every persist that stores a batch's transactions by position fills, in place of the
+/// consensus packs a node attaches.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) const TEST_NEW_DATADIR_TX_BODIES_VAR: &str = "TN_TEST_TX_BODIES";
+
+/// Where a new temp chain datadir is asked to keep its transactions: what
+/// [`TEST_NEW_DATADIR_TX_BODIES_VAR`] names in a test build, else
+/// [`TxBodies::for_new_datadirs`]. A value other than `inline` or `pointers` is an error.
+pub(crate) fn temp_chain_new_datadir_tx_bodies() -> eyre::Result<TxBodies> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(tx_bodies) = test_tx_bodies_override(std::env::var(TEST_NEW_DATADIR_TX_BODIES_VAR))?
+    {
+        return Ok(tx_bodies);
+    }
+    Ok(TxBodies::for_new_datadirs())
+}
+
+/// What a read of [`TEST_NEW_DATADIR_TX_BODIES_VAR`] names: `None` when it is unset.
+#[cfg(any(test, feature = "test-utils"))]
+fn test_tx_bodies_override(
+    value: Result<String, std::env::VarError>,
+) -> eyre::Result<Option<TxBodies>> {
+    match value {
+        Ok(value) => match value.as_str() {
+            "inline" => Ok(Some(TxBodies::Inline)),
+            "pointers" => Ok(Some(TxBodies::Pointers)),
+            _ => eyre::bail!(
+                "{TEST_NEW_DATADIR_TX_BODIES_VAR}={value:?}: expected `inline` or `pointers`, or \
+                 unset"
+            ),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => eyre::bail!("{TEST_NEW_DATADIR_TX_BODIES_VAR}: {e}"),
+    }
+}
+
+/// The format a new temp chain datadir is asked for: [`temp_chain_new_datadir_layout`] and
+/// [`temp_chain_new_datadir_tx_bodies`].
+pub(crate) fn temp_chain_new_datadir_format() -> eyre::Result<DatadirFormat> {
+    Ok(DatadirFormat {
+        layout: temp_chain_new_datadir_layout()?,
+        tx_bodies: temp_chain_new_datadir_tx_bodies()?,
+    })
+}
+
+/// The layout a read of [`TEST_NEW_DATADIR_LAYOUT_VAR`] names: `None` when it is unset.
+#[cfg(any(test, feature = "test-utils"))]
+fn test_layout_override(
+    value: Result<String, std::env::VarError>,
+) -> eyre::Result<Option<StorageLayout>> {
+    match value {
+        Ok(value) => match value.as_str() {
+            "v1" => Ok(Some(StorageLayout::V1)),
+            "v2" => Ok(Some(StorageLayout::V2)),
+            _ => eyre::bail!(
+                "{TEST_NEW_DATADIR_LAYOUT_VAR}={value:?}: expected `v1` or `v2`, or unset"
+            ),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => eyre::bail!("{TEST_NEW_DATADIR_LAYOUT_VAR}: {e}"),
+    }
+}
 
 impl RethEnv {
     /// Create a new temp RethEnv using a specified chain spec.
@@ -137,16 +234,92 @@ impl RethEnv {
         rewards: Option<GasAccumulator>,
         rpc: RpcServerArgs,
     ) -> eyre::Result<Self> {
-        /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
-        /// environment; `cargo test` runs a test binary as threads in ONE process, so N
-        /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
-        /// env-open with ENOMEM ("Cannot allocate memory (12)"). A temp chain never holds a
-        /// full node's history, so a small ceiling is safe and lets many envs coexist.
-        const TEMP_CHAIN_DB_MAX_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
-        /// Grow the temp DB file in small increments so throwaway DBs stay tiny on disk
-        /// (reth pairs its 8 TB default with a 4 GiB step; mirror reth's `test()` 4 MiB step).
-        const TEMP_CHAIN_DB_GROWTH_STEP: usize = 4 * 1024 * 1024; // 4 MiB
+        Self::new_for_temp_chain_with_tx_forward(
+            chain,
+            db_path,
+            task_manager,
+            rewards,
+            rpc,
+            TxForwardConfig::default(),
+        )
+    }
 
+    /// Create a new temp RethEnv with explicit RPC server args and `--forward-txs` settings.
+    ///
+    /// Test seam for the forwarding handler: [`Self::new_for_temp_chain_with_rpc_args`] with the
+    /// forwarding settings a parsed command would carry beside the reth args.
+    pub(crate) fn new_for_temp_chain_with_tx_forward<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        rewards: Option<GasAccumulator>,
+        rpc: RpcServerArgs,
+        tx_forward: TxForwardConfig,
+    ) -> eyre::Result<Self> {
+        Self::open_temp_chain(
+            chain,
+            db_path,
+            task_manager,
+            rewards,
+            rpc,
+            tx_forward,
+            temp_chain_new_datadir_format()?,
+        )
+    }
+
+    /// Create a new temp RethEnv whose datadir, when new, gets storage layout `layout`.
+    ///
+    /// Test seam for the layout guard (`env::layout`): [`Self::new_for_temp_chain`] with the
+    /// layout for new datadirs chosen.
+    #[cfg(test)]
+    pub(crate) fn new_for_temp_chain_with_layout<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        layout: StorageLayout,
+    ) -> eyre::Result<Self> {
+        let tx_bodies = temp_chain_new_datadir_tx_bodies()?;
+        Self::new_for_temp_chain_with_format(
+            chain,
+            db_path,
+            task_manager,
+            DatadirFormat { layout, tx_bodies },
+        )
+    }
+
+    /// Create a new temp RethEnv whose datadir, when new, is asked for `format`.
+    ///
+    /// Test seam for the format guard (`env::layout`) and the transaction resolver
+    /// (`env::tx_bodies`): [`Self::new_for_temp_chain`] with the format for new datadirs chosen.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_temp_chain_with_format<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        format: DatadirFormat,
+    ) -> eyre::Result<Self> {
+        init_reth_defaults();
+        Self::open_temp_chain(
+            chain,
+            db_path,
+            task_manager,
+            None,
+            RpcServerArgs { ipcdisable: true, ..Default::default() },
+            TxForwardConfig::default(),
+            format,
+        )
+    }
+
+    /// The temp chain constructors' shared body: the config, the database, then the env.
+    fn open_temp_chain<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        rewards: Option<GasAccumulator>,
+        rpc: RpcServerArgs,
+        tx_forward: TxForwardConfig,
+        format: DatadirFormat,
+    ) -> eyre::Result<Self> {
         // `NodeConfig::default` reads reth's process-wide pool and RPC-server defaults through
         // the args types' `Default` impls, which lock them. Seed first so a temp chain built
         // before any command is parsed does not fix reth's own values (per-sender slots 16,
@@ -163,17 +336,20 @@ impl RethEnv {
                 pprof_dumps_path: None,
             },
             chain,
-            // Bound the MDBX geometry for throwaway temp chains (see const docs).
-            db: DatabaseArgs {
-                max_size: Some(TEMP_CHAIN_DB_MAX_SIZE),
-                growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
-                ..Default::default()
-            },
+            // Bound the database's address space for throwaway temp chains.
+            db: database::temp_chain_db_args(),
             // Injected as given: `new_for_temp_chain` passes `ipcdisable: true` (issue #1165).
             rpc,
             ..NodeConfig::default()
         };
-        let reth_config = RethConfig(node_config);
+        let reth_config = RethConfig::from_node_config(node_config)
+            .with_new_datadir_layout(format.layout)
+            .with_new_datadir_tx_bodies(format.tx_bodies);
+        // a test build's temp chain asked for pointers reads batches from memory, having no packs
+        #[cfg(any(test, feature = "test-utils"))]
+        let reth_config = reth_config.with_memory_batches(format.tx_bodies == TxBodies::Pointers);
+        let mut reth_config = reth_config;
+        reth_config.1 = tx_forward;
         let database = Self::new_database(&reth_config, db_path)?;
         Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())
     }
@@ -499,6 +675,21 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tn_types::{generate_proof_of_possession_bls_for_test, BlsKeypair, NodeP2pInfo};
 
+    /// The temp chains' layout override names v1 or v2, is absent when unset, and refuses
+    /// anything else, so a mistyped lane fails rather than runs the default layout.
+    #[test]
+    fn the_test_layout_override_reads_v1_v2_or_nothing() {
+        use std::env::VarError;
+        let read = |value: &str| test_layout_override(Ok(value.to_string()));
+        assert_eq!(read("v1").expect("v1"), Some(StorageLayout::V1));
+        assert_eq!(read("v2").expect("v2"), Some(StorageLayout::V2));
+        assert_eq!(test_layout_override(Err(VarError::NotPresent)).expect("unset"), None);
+        for bad in ["", "V1", "1", "v3"] {
+            let err = read(bad).expect_err(bad).to_string();
+            assert!(err.contains(TEST_NEW_DATADIR_LAYOUT_VAR), "{bad:?}: {err}");
+        }
+    }
+
     /// Regression: a `WorkerConfigs` constructor revert must FAIL genesis creation.
     ///
     /// Strategy 2 exceeds the contract's `MAX_STRATEGY` (= 1), so the constructor reverts
@@ -678,7 +869,7 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::new("Archive Mode Test Task Manager");
-        let mut config = RethConfig(NodeConfig {
+        let mut config = RethConfig::from_node_config(NodeConfig {
             datadir: DatadirArgs {
                 datadir: MaybePlatformPath::from(tmp_dir.path().to_path_buf()),
                 static_files_path: None,

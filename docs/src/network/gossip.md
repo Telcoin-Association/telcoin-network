@@ -110,6 +110,40 @@ If an operator lowered it, that node would ban honest peers forwarding legitimat
 The bound is enforced symmetrically.
 A node refuses to publish a message larger than the limit rather than emitting one its peers must reject, so on the first hop the originator is never the victim of its own ban.
 
+## Frame limits
+
+Every gossip message is signed, and gossipsub verifies one signature for each message in a received frame.
+That work runs before the duplicate cache and before the `MAX_GOSSIP_MESSAGE_SIZE` check, so the node sets explicit frame limits that the codec applies first, on the raw bytes, before it decodes the frame or verifies a signature.
+A frame that breaks a limit closes the stream, and none of its messages are delivered.
+
+- **Frame size: 24,579 bytes.** One honest frame is at most 16,387 bytes: one 12,000-byte payload plus a 512-byte bound on its envelope, or one 16 KiB control field plus its length prefix.
+  The node's own `IHAVE` gossip fits in that control field because of the cap on message ids per `IHAVE` below.
+  The codec reads in 8 KiB chunks and checks the size of its whole read buffer, not of one frame, so the limit adds one read chunk.
+  Without that slack, two maximum frames sent back to back can close an honest stream.
+  The 16,387-byte bound covers the frames an author sends and the frames a node forwards, because the node rejects the one unsigned field that a forwarder could grow (see the `key` item below).
+- **Publish entries per frame: 8.** An honest peer sends one message per frame.
+  The library default of 500 would let one frame force 500 signature checks.
+  This is a per-frame bound, not a rate bound.
+- **Control bytes per frame: 16 KiB.** This equals the library default, set explicitly so that an upgrade cannot change it.
+- **Message ids per `IHAVE` sent: 198.** Each heartbeat, gossipsub sends one `IHAVE` per topic to subscribed peers outside the mesh, except explicit peers.
+  The `IHAVE` lists the validated message ids of the last three heartbeats, and gossipsub puts no byte cap on it.
+  A message id is 71 bytes today, so on a 15-byte topic an `IHAVE` of 225 ids passes the 16 KiB control limit, and the receiver closes the stream.
+  The library default allows 5000 ids.
+  The node caps the ids per `IHAVE` at 198, which fits the limit with an 80-byte id on a 64-byte topic.
+  Above the cap, each peer gets a different random subset of the ids, so gossip coverage drops but the stream stays open.
+  The same setting caps the ids that the node requests from one peer with `IWANT` in one heartbeat.
+  The cap changes only the frames that the node sends, so peers on other versions need no change.
+- **Unsigned `key` field: rejected.** The author signs `from`, `data`, `seqno` and `topic`, but not `key`.
+  A node forwards a message as it received it, so without this check a peer could add bytes in `key` to a valid message, and every honest node would forward the larger copy.
+  An ed25519 author never sends `key`, because its public key is inlined in its peer id, so the node drops every message that carries `key` (issue #1699).
+  This check drops the message only, and the stream stays open.
+  It runs before the duplicate cache, so a later clean copy of the same message is accepted.
+  The node does not penalize the peer, because a node on an older release forwards such a message without fault.
+
+No topic has its own size limit, because `MAX_GOSSIP_MESSAGE_SIZE` applies to every topic.
+The limits and the order in which the library applies them are recorded at `gossipsub_config`, with the resolved library versions.
+A dependency upgrade must re-check both.
+
 ## Penalty attribution
 
 Rejection never propagates the message.
@@ -118,22 +152,66 @@ The reason for the rejection decides only which peer, if any, loses reputation.
 - **Oversized payload: the relayer's fault.**
   An honest node never originates an oversized message and, under strict validation, never forwards one, so delivering one is misbehavior by the peer that delivered it.
   The relaying peer takes a fatal penalty.
-- **Unauthorized author: the author's fault.**
-  A forwarder that relayed content authored by someone else is not accountable for that content.
-  The resolved author takes the fatal penalty and the relayer takes none.
+- **Unauthorized author: the author's fault, charged only on the author's own delivery.**
+  A forwarder that relayed content authored by someone else is not accountable for that content, so the relayer takes no penalty.
+  The resolved author takes the fatal penalty only when the frame arrived over the author's own connection, which is the one delivery that is the author's act.
+  A signed frame is static, and gossipsub remembers its id for only the 60 s duplicate-cache window, so any peer that received the frame while the author held a committee slot could deliver it again after the author left the previous, current and next window.
+  Charging the author for such a delivery would let any connected peer ban an ex-committee validator at will (GHSA-vw36-8f6c-vppp), so a frame delivered by a peer other than its author is dropped and no one is charged.
 
 If the accountable identity has not resolved — a peer can be connected and relaying before its node record arrives — the node skips the penalty entirely rather than charging whichever peer happens to be in hand.
-The same skip covers an anonymous message and the case where this node's committee view lags a neighbour's.
-Accepted messages carry both the relayer and the author onward, as optional identities, so a fault that only deep validation can surface is still charged to the author rather than the forwarder.
+The same skip covers an anonymous message, a frame delivered by a peer other than its author, and the case where this node's committee view lags a neighbour's.
+Messages that pass the network-layer checks carry both the relayer and the author onward, as optional identities, so a fault that only deep validation can surface is still charged to the author rather than the forwarder.
+A certificate whose aggregate signature fails is such a fault: the primary reports Reject and charges the author a fatal penalty.
+Every author these topics admit holds a committee slot, and the peer manager exempts committee keys from penalties, so the penalty is recorded with `outcome=exempt`.
+The cost the author pays is local: the primary ignores that author's gossip for 10 seconds after the strike, doubling with each further strike in the epoch up to 160 seconds (#1772).
+The primary strikes an author only for a fatal author fault on a frame that the author delivered itself.
+A forged frame that another peer relays is rejected and not forwarded, but it strikes no one, which is the rule the network layer applies for GHSA-vw36.
+A consensus result with a bad signature also strikes its author.
 
 ## Validation configuration
 
 Gossipsub runs with strict validation mode, manual message validation, and a one-second heartbeat interval.
-Manual validation is what allows the allowlist check to run before a message is re-propagated: the node reports accept or reject explicitly, and a rejected message is never forwarded.
+Manual validation is what allows the allowlist check and the primary's signature check to run before a message is re-propagated: the node reports accept, reject or ignore explicitly, and only an accepted message is forwarded.
 
 Gossipsub's own peer scoring is deliberately left disabled.
 The peer manager is the authoritative reputation system, and running gossipsub scoring alongside it would double-count the same misbehavior — once as a gossipsub score decay and again as a peer-manager penalty — with two sets of thresholds that could disagree about when to disconnect.
 Two gossipsub events do feed the peer manager directly: a peer that does not support gossipsub is fatally penalized, and a peer that persistently fails to keep up with the mesh takes a mild one.
+
+Keeping scoring off has two consequences inside the library.
+Upstream gossipsub removes an expired `IWANT` promise only from the scoring branch of its heartbeat, so a peer that advertises ids with `IHAVE` and never delivers would grow the promise map without bound.
+Upstream also skips an advertised id while any peer holds a pending promise for it, so one peer's unanswered promise, renewed with each `IHAVE` at no cost, would suppress the `IWANT` to every other advertiser of that id.
+The node therefore carries `patches/libp2p-gossipsub`, which expires promises on every heartbeat, applies the broken-promise penalty only while scoring is active, and skips an advertised id only when the advertising peer itself already holds a pending promise for it; `patches/libp2p-gossipsub/PATCH.md` records the patch and its retirement criteria.
+
+## Deferred validation (#1772)
+
+Gossipsub holds each message until the node reports a verdict.
+With a history length of 12 and a 1 second heartbeat, a held message stays reportable for about 12 seconds.
+A deferred verdict can land after the primary's epoch gap.
+In a gap the primary event queue holds the epoch votes (#1786) and the newest consensus result of each author, so this window covers the verdicts of the gossip held through the gap.
+Certificate gossip that arrives in a gap, and a consensus result that a newer result of its author replaces there, is shed, its ticket reports Ignore, and this node does not relay it.
+The author's flood publish and the committee dials still deliver it to the committee.
+The network layer admits a message first: it checks the size and that the author is an authorized publisher for the topic.
+An admitted message goes to the application with a validation ticket, and the network layer does not accept it yet.
+The primary verifies the signature before it reports a verdict, with at most 4 messages per peer in verification at once.
+The cap is keyed by the author, or by the relayer when the author has not resolved, and gossip with neither identity shares one bucket with the same cap.
+The primary reports Accept right after the signature check passes, and only then does gossipsub forward the message.
+A failed check reports Reject: a bad aggregate signature on a certificate, a bad signature on a consensus result or an epoch vote, a malformed payload, or a message on the wrong topic.
+The author of a rejected message is charged the penalty, which is fatal for a failed aggregate signature.
+Committee authors are exempt from peer-manager penalties, so a fatal author fault on a frame that the author delivered itself puts the author's gossip on a local cooldown instead: 10 seconds, doubling per strike up to 160 seconds, cleared at the epoch change.
+A consensus result with a bad signature also puts its author on the cooldown.
+A forged frame that another peer relays is rejected and not forwarded, but it strikes no one, which is the rule the network layer applies for GHSA-vw36.
+Gossip that the primary cannot verify, such as a certificate for an epoch with no known committee, reports Ignore.
+A certificate for an earlier epoch reports Ignore before any verification, is not forwarded and charges no one.
+Observers and ExEx get earlier-epoch certificates through epoch-pack sync.
+A certificate for the next epoch that fails against the provisional committee also reports Ignore.
+A certificate that this node already holds or verified recently, or one below its garbage-collection round, is recognized before the aggregate check, so a replayed certificate frame reports Ignore without a verification and is not forwarded.
+This known-certificate check applies to current-epoch certificates.
+Duplicate consensus results and epoch votes, stale consensus results and messages over the per-peer cap also report Ignore.
+Certificate gossip that arrives in the epoch gap, and a consensus result replaced there by a newer result of its author, also reports Ignore, and this node does not relay it.
+Ignore drops the message without a penalty.
+A ticket dropped without a verdict reports Ignore, so no message is forwarded by default.
+The verdict frees the verification slot, so downstream work on verified gossip is not bounded by the cap.
+The worker accepts batch gossip when it receives it, because its check fetches the batch over the network and can take longer than the validation window.
 
 ## Topic re-validation in the application layer
 
@@ -160,7 +238,7 @@ See [Network architecture](../architecture/network.md) for the node roles this g
 |----------|------|
 | Topic names | `crates/config/src/network.rs` (`LibP2pConfig` topic constructors) |
 | Message size limit | `crates/config/src/network.rs` (`MAX_GOSSIP_MESSAGE_SIZE`) |
-| Gossipsub configuration | `crates/network-libp2p/src/consensus.rs` (`ConsensusNetwork::new`) |
+| Gossipsub configuration, frame limits, the `IHAVE` id cap and `key` rejection | `crates/network-libp2p/src/gossip_config.rs` (`gossipsub_config`, `RejectGossipKey`), called from `ConsensusNetwork::new` |
 | Allowlist check and subscribe/unsubscribe | `crates/network-libp2p/src/consensus.rs` (`verify_gossip`, `NetworkCommand::Subscribe`) |
 | Penalty attribution | `crates/network-libp2p/src/consensus.rs` (`RejectReason::penalty`) |
 | Per-epoch subscription and allowlists | `crates/node/src/manager/node/start_epoch.rs` (`spawn_primary_network_for_epoch`, `spawn_worker_network_for_epoch`) |

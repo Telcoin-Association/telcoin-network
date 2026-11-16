@@ -5,7 +5,7 @@
 use crate::error::ExecutionError;
 use eyre::{eyre, OptionExt};
 use jsonrpsee::http_client::HttpClient;
-use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
+use std::{collections::BTreeSet, net::SocketAddr, ops::ControlFlow, sync::Arc};
 use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
@@ -41,7 +41,7 @@ pub(super) struct ExecutionNodeInner {
     /// Reth execution environment.
     pub(super) reth_env: RethEnv,
     /// Initialized execution components indexed by worker id.
-    /// Removed workers retain their pools with stopped RPC listeners until reactivation.
+    /// Removed workers retain their pools and listeners with transaction admission closed.
     pub(super) workers: Vec<WorkerComponents>,
 }
 
@@ -94,9 +94,9 @@ impl ExecutionNodeInner {
         Ok(())
     }
 
-    /// The worker's RPC, TX pool, and block builder
-    pub(super) async fn start_batch_builder(
-        &mut self,
+    /// Start the worker's batch builder for the epoch without mutating engine state.
+    pub(super) fn start_batch_builder(
+        &self,
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
         epoch_task_spawner: &TaskSpawner,
@@ -135,13 +135,15 @@ impl ExecutionNodeInner {
 
     /// Initialize the worker's transaction pool and public RPC.
     /// Peer tracking is attached separately when the worker enters an epoch.
-    /// Must call this function in accending worker_id order or will panic,
-    /// for instance call for worker id 0, then 1, etc.
+    /// Worker ids must be consecutive, starting at zero. Reject existing or skipped ids before
+    /// creating a pool or binding RPC listeners.
     ///
     /// The pool receives the shared [`BaseFeeContainer`] so canonical updates always charge
     /// the current epoch's fee (issue #1262). The RPC server keeps the [`WorkerBaseFee`]
     /// handle so `eth_feeHistory` resolves the worker's current fee on every quote, surviving
     /// worker-count changes (issue #1282).
+    /// Raw transaction admission reads the same live node mode as `tn_nodeMode`,
+    /// refusing inactive validators before their pools can retain submissions.
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
@@ -152,6 +154,11 @@ impl ExecutionNodeInner {
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
+        eyre::ensure!(
+            usize::from(worker_id) == self.workers.len(),
+            "cannot initialize worker {worker_id}: next uninitialized worker is {}",
+            self.workers.len()
+        );
         let transaction_pool = self.reth_env.init_txn_pool(base_fee.clone())?;
 
         let network = WorkerNetwork::new(
@@ -172,6 +179,7 @@ impl ExecutionNodeInner {
             transaction_pool.clone(),
             network.clone(),
             worker_base_fee,
+            tn_ext.node_mode_reader(),
             tn_ext.into_rpc(),
         )?;
 
@@ -181,11 +189,7 @@ impl ExecutionNodeInner {
         let rpc_handle = self.reth_env.start_rpc(&server, worker_id).await?;
 
         // take ownership of worker components
-        let components = WorkerComponents::new(rpc_handle, server, transaction_pool, network);
-        // Must call this function in accending worker_id order or will panic.
-        if worker_id as usize != self.workers.len() {
-            panic!("initialize_worker_components not called with sequencial worker ids!")
-        }
+        let components = WorkerComponents::new(rpc_handle, transaction_pool, network);
         self.workers.push(components);
         Ok(())
     }
@@ -325,7 +329,7 @@ impl ExecutionNodeInner {
         self.reth_env.clone()
     }
 
-    /// Return a running worker's RPC handle, or an error if absent or stopped.
+    /// Return an active worker's RPC handle, or an error if absent or inactive.
     pub(super) fn worker_rpc_handle(&self, worker_id: &WorkerId) -> eyre::Result<&RpcServerHandle> {
         self.workers
             .get(usize::from(*worker_id))
@@ -440,6 +444,19 @@ impl ExecutionNodeInner {
             .zip(epochs)
             .map(|(raw, &epoch)| decode_committee_keys(epoch, block_hash, raw))
             .collect()
+    }
+
+    /// Read the BLS keys of the committee-eligible validator pool (`PendingActivation`,
+    /// `Active` and `PendingExit`), pinned to `header`'s state.
+    ///
+    /// Best-effort, unlike the committee reads above: an undecodable key is skipped with a
+    /// warning rather than failing the read (see
+    /// [`RethEnv::committee_eligible_bls_keys_at_header`]).
+    pub(super) fn committee_eligible_keys_at_header(
+        &self,
+        header: &SealedHeader,
+    ) -> StateReadResult<BTreeSet<BlsPublicKey>> {
+        self.reth_env.committee_eligible_bls_keys_at_header(header)
     }
 }
 

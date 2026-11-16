@@ -40,7 +40,7 @@ exist and combine as **`live ∪ floor`**:
 | Source | Flag | Role | Notes |
 | --- | --- | --- | --- |
 | RPC committee | `--rpc-url` | live | `tn_getCurrentEpochInfo` + `tn_getCommitteeBlsPubkeys(epochId)` each cycle. Also yields the epoch boundary for scheduling. |
-| Committee file | `--committee-file` | floor | Authorities of a `committee.yaml`. Re-read every cycle; a file that stops parsing keeps the last good set. Also supplies bootstrap addresses when `--bootstrap` is unset. |
+| Committee file | `--committee-file` | floor | Authorities of a `committee.yaml`. Re-read every cycle; a file that stops parsing keeps the last good set. A file that lists bootstrap servers (a datadir genesis committee) also supplies bootstrap addresses when neither `--bootstrap` nor `--bootstrap-servers-file` is set; the bundled `chain-configs/*/committee.yaml` files list none. |
 | Static list | `--keys-file` | floor | YAML list of base58 or `0x`-hex keys. Every entry must parse (startup error otherwise). |
 
 > **`tn_getCommitteeBlsPubkeys` returns the COMMITTEE, not all validators.** A staked validator
@@ -76,8 +76,9 @@ syntax (`5s`, `2m`, `24h`).
 | `--metrics` | `NODE_RECORD_API_METRICS_ADDR` | (none) | Prometheus `/metrics` on a separate listener; unset disables. |
 | `--chain-id` | `NODE_RECORD_API_CHAIN_ID` | **required** | Chain whose worker DHT is read (`2017` for testnet). No default: a wrong value silently yields `NoPeerAnswered` / `InvalidRecords` for every key. |
 | `--worker-id` | `NODE_RECORD_API_WORKER_ID` | `0` | Which worker DHT to read. |
-| `--bootstrap` | `NODE_RECORD_API_BOOTSTRAP` | (from committee file) | Worker DHT bootstrap multiaddr with `/p2p/`; repeatable, comma-separated in the env. |
-| `--committee-file` | `NODE_RECORD_API_COMMITTEE_FILE` | (none) | `committee.yaml`: key floor + bootstrap addresses. |
+| `--bootstrap` | `NODE_RECORD_API_BOOTSTRAP` | (from the files below) | Worker DHT bootstrap multiaddr with `/p2p/`; repeatable, comma-separated in the env. |
+| `--bootstrap-servers-file` | `NODE_RECORD_API_BOOTSTRAP_SERVERS_FILE` | (none) | A chain's `bootstrap_servers.yaml`: bootstrap addresses when `--bootstrap` is unset. Read once at startup. |
+| `--committee-file` | `NODE_RECORD_API_COMMITTEE_FILE` | (none) | `committee.yaml`: key floor, plus bootstrap addresses if it lists bootstrap servers and neither flag above is set. |
 | `--keys-file` | `NODE_RECORD_API_KEYS_FILE` | (none) | YAML list of keys: static floor. |
 | `--rpc-url` | `NODE_RECORD_API_RPC_URL` | (none) | Node JSON-RPC (`http`/`https`): live committee + epoch scheduling. |
 | `--rpc-timeout` | `NODE_RECORD_API_RPC_TIMEOUT` | `10s` | Per-request deadline for those JSON-RPC calls. |
@@ -102,25 +103,27 @@ syntax (`5s`, `2m`, `24h`).
 | `--graceful-shutdown-timeout` | `NODE_RECORD_API_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--log-filter` | `NODE_RECORD_API_LOG_FILTER` | `info` | Tracing filter directive. |
 
-Startup validation: at least one bootstrap source (`--bootstrap` or `--committee-file`); at
+Startup validation: at least one bootstrap source (`--bootstrap`, `--bootstrap-servers-file`, or a
+`--committee-file` that lists bootstrap servers); at
 least one key source (`--rpc-url`, `--committee-file`, or `--keys-file`); every bootstrap address
 carries `/p2p/`; `--refresh-interval` > 0 and > `--query-timeout`; `--record-ttl` >
 `--refresh-interval`; `--max-connection-duration` >= `--header-read-timeout` +
 `--request-timeout` (or `0`); `--lookup-concurrency` and `--absent-cycles-before-evict` >= 1;
 `--rpc-url` is `http` or `https`. Each rule fails startup with the offending flag named.
 
-### Example: testnet from the committee file
+### Example: testnet from the chain-config files
 
 ```
 node-record-api \
   --chain-id 2017 \
   --committee-file chain-configs/testnet/committee.yaml \
+  --bootstrap-servers-file chain-configs/testnet/bootstrap_servers.yaml \
   --listen-addr 127.0.0.1:8080
 ```
 
-The committee file supplies both the key floor (its five authorities) and the worker-0 DHT
-bootstrap addresses (`udp/49594`). Add `--rpc-url https://rpc.example/` to track committee
-rotation live.
+The committee file supplies the key floor (its five authorities) and the bootstrap servers file
+the worker-0 DHT bootstrap addresses, the servers a `--chain adiri` node dials. Add
+`--rpc-url https://rpc.example/` to track committee rotation live.
 
 ## HTTP contract
 
@@ -211,14 +214,16 @@ runtime, non-root user). Build it from the repository root:
 docker build -f bin/node-record-api/Dockerfile -t telcoin-node-record-api:latest .
 ```
 
-Run it against testnet with the committee file from the repository:
+Run it against testnet with the chain-config files from the repository:
 
 ```
 docker run --rm -p 8080:8080 \
   -v "$PWD/chain-configs/testnet/committee.yaml:/etc/node-record-api/committee.yaml:ro" \
+  -v "$PWD/chain-configs/testnet/bootstrap_servers.yaml:/etc/node-record-api/bootstrap_servers.yaml:ro" \
   telcoin-node-record-api:latest \
   --chain-id 2017 \
-  --committee-file /etc/node-record-api/committee.yaml
+  --committee-file /etc/node-record-api/committee.yaml \
+  --bootstrap-servers-file /etc/node-record-api/bootstrap_servers.yaml
 
 curl -s 127.0.0.1:8080/readyz
 curl -s 127.0.0.1:8080/v1/rpcs

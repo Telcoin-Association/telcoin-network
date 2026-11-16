@@ -9,12 +9,22 @@ Requires Rust 1.94
 
 The Telcoin Network protocol client supports Linux and MacOS operating systems. For Windows users, use WSL to run a Linux environment in which the client compiles and runs properly.
 
+## Install
+
+Releases are signed git tags with a Linux x86_64 tarball and a `linux/amd64` container image published as `ghcr.io/telcoin-association/tn-mainnet:<tag>` for mainnet tags and as `ghcr.io/telcoin-association/tn-testnet:<tag>` for tags ending in `-adiri`, which are built with the `adiri` feature for the adiri testnet. Each release lists the tarball and the image digest in `SHA256SUMS`, and `SHA256SUMS.asc` carries a detached signature over that file from a maintainer's OpenPGP key held on a YubiKey. Follow [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) to download a release and check its signature and checksums before you run it. The check takes the maintainer keys from `.github/maintainer-gpg-keys/` on `main`, never from the release's tag, and has you compare their fingerprints with the table in `SECURITY.md` and with the maintainers' keys on GitHub.
+
+On macOS or any other platform, build from source as shown in the Quick Start below.
+
+Maintainers cutting a release follow [Releasing](https://docs.telcoin.network/maintainers/releasing.html).
+
 ## Quick Start
 
 Check out the repo and update the submodules:
 `make init-submodules` or `git submodule update --init --recursive`
 
 ### Run an observer against testnet
+
+On Linux x86_64 you can skip this build and run a signed release instead; [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) shows how to download and verify one.
 
 Build a release version of the node software with the `adiri` feature (required to join the
 adiri testnet — the node refuses the `--chain adiri` flag at startup without it):
@@ -27,6 +37,9 @@ This will use DATADIR for storage and set your "execution" address to 0x44444444
 
 Start your observer node:
 `target/release/telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+
+keytool writes 127.0.0.1 listeners when no `--external-*-addr` flag is given. Peers on other hosts cannot connect to them, and an observer needs none to: it dials the bootstrap peers from a socket bound to every interface, so it works outbound-only and a firewall can drop inbound UDP.
+[Transport](docs/src/network/transport.md#listener-addresses) describes the listener addresses.
 
 Make sure DATADIR matches the config command above and use the same password for reading the key.
 
@@ -41,7 +54,8 @@ observer. To take a validator out of consensus, exit it on chain.
 telcoin-network --datadir DATADIR --bls-passphrase-source ask \
   keytool generate validator \
   --address 0xYOUR_EXECUTION_ADDRESS \
-  --external-primary-addr /ip4/YOUR_IP/udp/PORT/quic-v1
+  --external-primary-addr /ip4/YOUR_IP/udp/49590/quic-v1 \
+  --external-worker-addrs /ip4/YOUR_IP/udp/49594/quic-v1
 ```
 
 This generates a BLS keypair, network keys, proof-of-possession, and a `node-info.yaml` file in `DATADIR`.
@@ -55,16 +69,18 @@ Restore worker key entries using the expected Base58 key printed in the startup 
 configure a separate listen address for each worker.
 
 - `--address` is the execution layer address that receives fees
-- `--external-primary-addr` should be set to the node's public IP and port
+- `--external-primary-addr` and `--external-worker-addrs` should be set to the node's public IP and the UDP ports it listens on (49590 and 49594 by convention; the node has no default P2P ports)
+- without them, key generation records `127.0.0.1` with random ports, which only works for local testing
 
 #### 2. Export staking arguments
 
 ```bash
-telcoin-network keytool export-staking-args --node-info DATADIR/node-info.yaml
+telcoin-network --bls-passphrase-source no-passphrase keytool export-staking-args --node-info DATADIR/node-info.yaml
 ```
 
 This reads the public `node-info.yaml` and outputs the BLS public key and proof-of-possession in the format required by `ConsensusRegistry.stake()`.
-No BLS private key or passphrase is needed.
+It never reads the BLS private key, but the binary still requires a passphrase source for every keytool command except `set-rpc`: with the default `env` source and no `TN_BLS_PASSPHRASE` it exits with "passphrase is required", so pass `--bls-passphrase-source no-passphrase`.
+`keytool` also writes log lines to stdout, so add the global `-q` flag when a script captures the `--json` or `--calldata` output.
 
 Output modes:
 
@@ -90,18 +106,19 @@ CONSENSUS_REGISTRY=0x07E17e17E17e17E17e17E17E17E17e17e17E17e1
 ```
 
 The `stake()` function is payable.
-Users must send the exact required stake amount as the transaction value.
-Query the current required stake amount:
+Users must send the exact stake amount of the current epoch's stake version as the transaction value.
+`getCurrentStakeConfig()` can return a version that only takes effect at the next epoch, so query the stake version, then that version's config:
 
 ```bash
-cast call $CONSENSUS_REGISTRY "getCurrentStakeConfig()(uint256,uint256,uint256,uint32)" --rpc-url RPC_URL
+STAKE_VERSION=$(cast call $CONSENSUS_REGISTRY "getCurrentStakeVersion()(uint8)" --rpc-url RPC_URL)
+cast call $CONSENSUS_REGISTRY "stakeConfig(uint8)(uint256,uint256,uint256,uint32)" $STAKE_VERSION --rpc-url RPC_URL
 ```
 
 The first value returned is `stakeAmount` (in wei). Use it as the `--value` in the stake transaction:
 
 ```bash
-CALLDATA=$(telcoin-network keytool export-staking-args --node-info DATADIR/node-info.yaml --calldata)
-cast send $CONSENSUS_REGISTRY $CALLDATA --value <STAKE_AMOUNT> --trezor --rpc-url RPC_URL
+CALLDATA=$(telcoin-network -q --bls-passphrase-source no-passphrase keytool export-staking-args --node-info DATADIR/node-info.yaml --calldata)
+cast send $CONSENSUS_REGISTRY "$CALLDATA" --value <STAKE_AMOUNT> --trezor --rpc-url RPC_URL
 ```
 
 Other signing options: `--ledger` for Ledger hardware wallets, `--interactive` to enter a private key securely at a prompt.
@@ -178,9 +195,9 @@ See [docs/src/gas-penalty.md](docs/src/gas-penalty.md) for the formula, examples
 Developer documentation lives in [`docs/`](docs/) and is built into a static site with [mdBook](https://rust-lang.github.io/mdBook/) 0.5.4.
 Markdown sources are in `docs/src/`, with `docs/src/SUMMARY.md` defining the sidebar.
 `docs/book.toml` is the book configuration and `docs/theme/` holds the site theme.
-CI publishes the book to GitHub Pages whenever a merge into `main` touches `docs/` or the docs workflow (`.github/workflows/docs.yaml`), and on every `v*` tag push.
-The site is versioned: `main` is served at the site root as **latest** (the default), and every `v*` tag that contains `docs/book.toml` is served under `/<tag>/`; readers switch versions with the picker in the book header.
-Intended site behaviors (version switching, sidebar, header, cursor) are pinned in [`docs/ux.md`](docs/ux.md) — update it in the same PR when a theme change intentionally alters one.
+CI publishes the book to GitHub Pages whenever a merge into `main` touches `docs/`, the docs workflow (`.github/workflows/docs.yaml`) or `CHANGELOG.md`, which the [Release notes](https://docs.telcoin.network/getting-started/release-notes.html) page includes.
+The site publishes only `main`; there are no per-release copies.
+Intended site behaviors (sidebar, header, cursor) are pinned in [`docs/ux.md`](docs/ux.md) — update it in the same PR when a theme change intentionally alters one.
 
 To preview locally, install mdBook with `cargo install mdbook --version 0.5.4 --locked`, then:
 

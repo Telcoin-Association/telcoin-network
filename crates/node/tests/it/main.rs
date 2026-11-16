@@ -21,7 +21,7 @@ use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
 use tn_node::{
     build_epoch_record, catchup_accumulator, read_base_fees_for_entered_epoch,
-    sync_num_workers_from_chain, EngineToPrimaryRpc,
+    sync_num_workers_from_chain, AdmissionSnapshotSource, EngineToPrimaryRpc,
 };
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
@@ -41,7 +41,8 @@ use tn_reth::{
     ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethEnv,
 };
 use tn_rpc::{
-    EngineToPrimary, RpcNodeInfo, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer as _,
+    ConsensusStorageError, EngineToPrimary, RpcAdmissionSnapshot, RpcNodeInfo,
+    TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer as _,
 };
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{
@@ -265,7 +266,7 @@ impl EngineToPrimary for NoopEngineToPrimary {
         &self,
         _epoch: Epoch,
         _digest: ConsensusHeaderDigest,
-    ) -> Option<ConsensusHeader> {
+    ) -> Result<Option<ConsensusHeader>, ConsensusStorageError> {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
 
@@ -276,10 +277,14 @@ impl EngineToPrimary for NoopEngineToPrimary {
     fn node_mode(&self) -> tn_types::NodeMode {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
+
+    async fn admission_snapshot(&self) -> Option<RpcAdmissionSnapshot> {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
 }
 
 /// `EngineToPrimaryRpc::consensus_header_by_digest` finds a stored header by (epoch, digest) and
-/// answers `None` for a digest the epoch never stored or an epoch whose pack this node lacks.
+/// answers `Ok(None)` for a digest the epoch never stored or an epoch whose pack this node lacks.
 #[tokio::test]
 async fn test_engine_to_primary_consensus_header_by_digest() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("test_consensus_header_by_digest")?;
@@ -316,17 +321,17 @@ async fn test_engine_to_primary_consensus_header_by_digest() -> eyre::Result<()>
 
     let found = rpc
         .consensus_header_by_digest(epoch, stored.digest())
-        .await
+        .await?
         .expect("stored header is found by its epoch and digest");
     assert_eq!(found.digest(), stored.digest());
     assert_eq!(found, stored);
 
     // the digest of the next header, which this chain has not stored
     let unknown = ConsensusHeader::digest_from_parts(stored.digest(), &stored.sub_dag, number + 1);
-    assert!(rpc.consensus_header_by_digest(epoch, unknown).await.is_none());
+    assert!(rpc.consensus_header_by_digest(epoch, unknown).await?.is_none());
 
     // a known digest routed to an epoch with no pack on disk is a miss, not a panic or a hit
-    assert!(rpc.consensus_header_by_digest(epoch + 5, stored.digest()).await.is_none());
+    assert!(rpc.consensus_header_by_digest(epoch + 5, stored.digest()).await?.is_none());
 
     Ok(())
 }
@@ -603,6 +608,7 @@ fn engine_to_primary_rpc(
             primary_external_address: Multiaddr::empty(),
             worker_external_address: Multiaddr::empty(),
         },
+        AdmissionSnapshotSource::default(),
     )
 }
 
@@ -657,10 +663,12 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
 }
 
 /// Independent workers keep separate RPC listeners and fees across epoch rollover and regrowth.
+/// Existing and skipped worker ids are rejected before construction, including while stopped.
 #[tokio::test]
 async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
     use futures::{StreamExt as _, TryStreamExt as _};
-    use tn_node::engine::{ExecutionNode, TnBuilder};
+    use jsonrpsee::core::client::ClientT as _;
+    use tn_node::engine::{ExecutionNode, TnBuilder, WorkerState};
     use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig};
 
     tn_reth::init_reth_defaults();
@@ -673,6 +681,7 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
             rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
             txpool: Default::default(),
             db: Default::default(),
+            db_gap_fill: None,
         },
         None,
         temp_dir.path(),
@@ -684,6 +693,31 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
         RethEnv::new(&node_config, &task_manager, reth_db.clone(), None, accumulator.clone())?;
     let builder = TnBuilder::new(node_config, config, reth_db);
     let engine = ExecutionNode::new(&builder, reth_env)?;
+    let assert_initialization_rejected = |worker_id, next_worker| {
+        let engine = &engine;
+        let accumulator = &accumulator;
+        async move {
+            let error = engine
+                .initialize_worker_components(
+                    worker_id,
+                    NoopEngineToPrimary,
+                    accumulator.base_fee(worker_id),
+                    accumulator.worker_base_fee(worker_id),
+                )
+                .await
+                .err()
+                .ok_or_else(|| eyre::eyre!("invalid worker initialization succeeded"))?;
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "cannot initialize worker {worker_id}: next uninitialized worker is {next_worker}"
+                ),
+            );
+            eyre::Ok(())
+        }
+    };
+    assert_initialization_rejected(1, 0).await?;
+    assert_eq!(engine.worker_state(1).await, WorkerState::Uninitialized);
     futures::stream::iter(0..2)
         .then(|worker_id| {
             let engine = &engine;
@@ -691,7 +725,8 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
             async move {
                 let fee = MIN_PROTOCOL_BASE_FEE + 1000 * (u64::from(worker_id) + 1);
                 accumulator.base_fee(worker_id).set_base_fee(fee);
-                assert!(!engine.is_worker_initialized(worker_id).await);
+                assert_eq!(engine.worker_state(worker_id).await, WorkerState::Uninitialized);
+                assert!(!engine.is_worker_running(worker_id).await);
                 engine
                     .initialize_worker_components(
                         worker_id,
@@ -700,7 +735,8 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
                         accumulator.worker_base_fee(worker_id),
                     )
                     .await?;
-                assert!(engine.is_worker_initialized(worker_id).await);
+                assert_eq!(engine.worker_state(worker_id).await, WorkerState::Running);
+                assert!(engine.is_worker_running(worker_id).await);
                 assert_eq!(
                     engine
                         .get_worker_transaction_pool(&worker_id)
@@ -714,6 +750,8 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
         })
         .try_collect::<()>()
         .await?;
+    assert_initialization_rejected(0, 2).await?;
+    assert_initialization_rejected(1, 2).await?;
 
     let pool_zero = engine.get_worker_transaction_pool(&0).await?;
     let pool_one = engine.get_worker_transaction_pool(&1).await?;
@@ -756,6 +794,39 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
         )
         .await
         .is_err());
+
+    let client = engine
+        .worker_http_client(&1)
+        .await?
+        .ok_or_else(|| eyre::eyre!("worker one HTTP client missing"))?;
+    let assert_worker_inactive = || async {
+        let inactive = client
+            .request::<serde_json::Value, _>("eth_sendRawTransaction", jsonrpsee::rpc_params!["0x"])
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("removed worker accepted an RPC submission"))?;
+        assert!(inactive.to_string().contains("worker is inactive"), "{inactive}");
+        eyre::Ok(())
+    };
+    engine.deactivate_workers_above(1).await;
+    assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
+    assert!(!engine.is_worker_running(1).await);
+    assert!(engine.is_worker_running(0).await);
+    assert_worker_inactive().await?;
+    assert_initialization_rejected(1, 2).await?;
+    assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
+    assert_worker_inactive().await?;
+    let restarted_fee = next_fee + 1;
+    engine.restart_worker_rpc(1, restarted_fee).await?;
+    assert_eq!(engine.worker_state(1).await, WorkerState::Running);
+    assert!(engine.is_worker_running(1).await);
+    assert_eq!(pool_one.block_info().pending_basefee, restarted_fee);
+    let restarted_rpc = engine
+        .worker_http_local_address(&1)
+        .await?
+        .ok_or_else(|| eyre::eyre!("restarted worker RPC listener missing"))?;
+    assert_eq!(restarted_rpc, rpc_one);
+    assert!(tokio::net::TcpStream::connect(restarted_rpc).await.is_ok());
     Ok(())
 }
 

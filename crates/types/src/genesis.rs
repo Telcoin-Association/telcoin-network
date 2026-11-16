@@ -11,7 +11,7 @@ use alloy::{
     primitives::{address, U256},
 };
 use reth_chainspec::ChainSpec;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// test genesis
 ///
@@ -27,7 +27,7 @@ pub fn test_genesis() -> Genesis {
 pub fn test_genesis_at(timestamp: u64) -> Genesis {
     let mut genesis = Genesis::default();
     set_genesis_defaults_at(&mut genesis, timestamp);
-    genesis.config.chain_id = 2017;
+    genesis.config.chain_id = ADIRI_CHAIN_ID;
     let default_factory_accounts = vec![
         (
             // Default transaction factory
@@ -53,9 +53,11 @@ pub fn test_genesis_at(timestamp: u64) -> Genesis {
         ),
     ];
     // use testnet pre-compiles
-    let precompiles: Genesis =
-        serde_yaml::from_str(TESTNET_GENESIS).expect("bad testnet genesis yaml data");
-    let genesis = genesis.extend_accounts(precompiles.alloc);
+    // parse the embedded yaml once per process: test fixtures call this hundreds of times
+    static PRECOMPILES: LazyLock<Genesis> = LazyLock::new(|| {
+        serde_yaml::from_str(TESTNET_GENESIS).expect("bad testnet genesis yaml data")
+    });
+    let genesis = genesis.extend_accounts(PRECOMPILES.alloc.clone());
     // overwrite any conflicting accounts with specified values
     genesis.extend_accounts(default_factory_accounts)
 }
@@ -111,6 +113,14 @@ fn _adiri_chain_spec_arc() -> Arc<ChainSpec> {
     Arc::new(_adiri_chain_spec())
 }
 
+/// Chain id of Telcoin Network mainnet (`0x2db`).
+///
+/// Devnet genesis files (`etc/genesis.sh`) use 487, so the chain id alone identifies mainnet.
+pub const MAINNET_CHAIN_ID: u64 = 731;
+
+/// Chain id of the adiri testnet (`0x7e1`), the only chain an `adiri` build starts on.
+pub const ADIRI_CHAIN_ID: u64 = 2017;
+
 // The raw strings for the testnet genesis and config.
 /// Static strig for adiri (testnet) genesis.
 ///
@@ -129,8 +139,30 @@ fn _adiri_chain_spec_arc() -> Arc<ChainSpec> {
 pub const TESTNET_GENESIS: &str = include_str!("../../../chain-configs/testnet/genesis.yaml");
 pub const TESTNET_COMMITTEE: &str = include_str!("../../../chain-configs/testnet/committee.yaml");
 pub const TESTNET_PARAMETERS: &str = include_str!("../../../chain-configs/testnet/parameters.yaml");
+/// The adiri (testnet) bootstrap servers: a YAML map of [`crate::BootstrapServer`] keyed by BLS
+/// public key, which a node started with `--chain adiri` dials to join the network.
+pub const TESTNET_BOOTSTRAP_SERVERS: &str =
+    include_str!("../../../chain-configs/testnet/bootstrap_servers.yaml");
 
 // The raw strings for the mainnet genesis and config.
 pub const MAINNET_GENESIS: &str = include_str!("../../../chain-configs/mainnet/genesis.yaml");
 pub const MAINNET_COMMITTEE: &str = include_str!("../../../chain-configs/mainnet/committee.yaml");
 pub const MAINNET_PARAMETERS: &str = include_str!("../../../chain-configs/mainnet/parameters.yaml");
+/// The mainnet bootstrap servers, in the shape of [`TESTNET_BOOTSTRAP_SERVERS`].
+pub const MAINNET_BOOTSTRAP_SERVERS: &str =
+    include_str!("../../../chain-configs/mainnet/bootstrap_servers.yaml");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chain id constants match the embedded mainnet and testnet genesis files.
+    #[test]
+    fn chain_id_constants_match_embedded_genesis() -> Result<(), serde_yaml::Error> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        let testnet: Genesis = serde_yaml::from_str(TESTNET_GENESIS)?;
+        assert_eq!(mainnet.config.chain_id, MAINNET_CHAIN_ID);
+        assert_eq!(testnet.config.chain_id, ADIRI_CHAIN_ID);
+        Ok(())
+    }
+}

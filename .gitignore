@@ -1,6 +1,8 @@
 # cargo
 debug/
 target/
+# ...but the debug RPC namespace docs are source
+!docs/src/rpc-methods/debug/
 
 # MacOS
 .DS_Store
@@ -27,3 +29,10 @@ test_logs/
 
 # mdBook build output
 docs/book/
+
+# reports written to the repo root by etc/storage-ab-bench.sh and etc/storage-baseline-bench.sh
+/storage-ab-*.txt
+/storage-baseline-*.txt
+
+# etc/reth-exec-bench.sh writes its reports to the repository root
+/reth-exec-*.txt

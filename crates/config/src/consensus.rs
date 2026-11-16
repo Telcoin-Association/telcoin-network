@@ -174,10 +174,11 @@ where
     /// `prior_epoch` carries the previous epoch's record digest and closing timestamp, or
     /// [`PriorEpoch::genesis`] for epoch 0 (see [`PriorEpoch`]).
     ///
-    /// Fails when the parameters violate their operational floors, or when `vote_timeout` is
-    /// shorter than `max_header_delay` plus the network config's
-    /// `max_header_time_drift_tolerance` (rounded up to whole seconds while the sub-second gate
-    /// is dormant for the epoch), or not below the libp2p request timeout.
+    /// Fails when the parameters violate their operational floors. It does not check the vote
+    /// window: every epoch the node enters builds its config here, including the historical
+    /// epochs a catching-up node only replays, and the window bounds only this node's own votes.
+    /// The epoch manager runs [`Self::validate_epoch_timing`] on the built config for an epoch
+    /// the node can still vote in.
     pub fn new_for_epoch(
         config: Config,
         node_storage: DB,
@@ -191,7 +192,6 @@ where
         // [`Parameters::validate_operational_floors`]); the shared test-facing constructor skips
         // them so DAG fixtures may use small `gc_depth` values.
         config.parameters.validate_operational_floors()?;
-        validate_epoch_timing(&config.parameters, network_config.sync_config(), committee.epoch())?;
 
         Self::new_with_committee(
             config,
@@ -264,6 +264,25 @@ where
             }),
             shutdown,
         })
+    }
+
+    /// Checks that `vote_timeout` covers the longest honest vote this node can cast in the
+    /// config's epoch.
+    ///
+    /// Fails when `vote_timeout` is shorter than `max_header_delay` plus the voter's longest drift
+    /// wait, does not exceed the voter's 1 s execution wait ([`VOTE_EXECUTION_WAIT`]), or is not
+    /// below the libp2p request timeout. The drift wait depends on the epoch's
+    /// fork regime: with sub-second timestamps active it is the network config's
+    /// `max_header_time_drift_tolerance`, and without them the voter compares whole seconds and
+    /// waits out the tolerance rounded up to whole seconds. The same parameters can therefore
+    /// pass for a post-fork epoch and fail for a pre-fork one. Also warns, without failing, when
+    /// `max_header_delay` is below one second in an epoch without sub-second timestamps.
+    ///
+    /// The window bounds this node's own votes, so the caller runs this check only for an epoch
+    /// the node can still vote in. An epoch its committee has already closed is replayed, never
+    /// voted in, and is entered without it.
+    pub fn validate_epoch_timing(&self) -> eyre::Result<()> {
+        validate_epoch_timing(self.parameters(), self.network_config().sync_config(), self.epoch())
     }
 
     /// Returns a reference to the shutdown notifier.
@@ -429,6 +448,16 @@ where
 /// that call site if it ever sets its own timeout.
 const LIBP2P_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The longest a voter waits for its own execution to reach the block a header was built on.
+///
+/// A voter only votes once the header's `latest_execution_block` is canonical locally, so it first
+/// waits for its execution to reach that block. A voter still behind when this wait runs out
+/// refuses the request as recoverable instead of holding it until `vote_timeout`, so the requester
+/// asks again soon and a voter only a second or two behind still votes on a retry.
+/// [`ConsensusConfig::validate_epoch_timing`] refuses a `vote_timeout` that does not exceed this
+/// wait.
+pub const VOTE_EXECUTION_WAIT: Duration = Duration::from_secs(1);
+
 /// Validate the consensus timing knobs that span [`Parameters`] and [`SyncConfig`] for the epoch
 /// about to run.
 ///
@@ -468,6 +497,10 @@ fn validate_epoch_timing(
 /// tolerance rounded up to whole seconds, so it can admit, and then wait out, a lead of that
 /// rounded-up length: 1 s at the 250 ms default.
 ///
+/// `vote_timeout` must also exceed [`VOTE_EXECUTION_WAIT`]. Its deadline is set before the wait
+/// starts, so at or below the wait the vote timeout fires while a voter behind on execution is
+/// still waiting, and the requester never sees the quick recoverable refusal that wait exists for.
+///
 /// The upper bound is [`LIBP2P_REQUEST_TIMEOUT`], exclusive: at or above it the transport cancels
 /// a slow vote before `vote_timeout` can fire. The transport also counts the time to read and
 /// dispatch the request, so a value just below the bound leaves little margin.
@@ -498,6 +531,15 @@ fn validate_vote_timeout(
         vote_window,
     );
     eyre::ensure!(
+        parameters.vote_timeout > VOTE_EXECUTION_WAIT,
+        "vote_timeout {:?} does not exceed the voter's execution wait VOTE_EXECUTION_WAIT {:?}, so \
+         a voter behind on execution would time out instead of refusing the vote as \
+         ExecutionBehind; raise vote_timeout above {:?}",
+        parameters.vote_timeout,
+        VOTE_EXECUTION_WAIT,
+        VOTE_EXECUTION_WAIT,
+    );
+    eyre::ensure!(
         parameters.vote_timeout < LIBP2P_REQUEST_TIMEOUT,
         "vote_timeout {:?} must stay below the libp2p request timeout {:?}, which otherwise \
          cancels a slow vote before vote_timeout fires; lower vote_timeout",
@@ -511,7 +553,7 @@ fn validate_vote_timeout(
 mod tests {
     use super::{
         validate_epoch_timing, validate_vote_timeout, ConsensusConfig, PriorEpoch,
-        LIBP2P_REQUEST_TIMEOUT,
+        LIBP2P_REQUEST_TIMEOUT, VOTE_EXECUTION_WAIT,
     };
     use crate::{Config, KeyConfig, NetworkConfig, Parameters, SyncConfig};
     use rand::{rngs::StdRng, SeedableRng as _};
@@ -742,6 +784,28 @@ mod tests {
         }
     }
 
+    /// A `vote_timeout` that covers the header window but does not exceed [`VOTE_EXECUTION_WAIT`]
+    /// is rejected, since the vote timeout would fire before a voter behind on execution refuses;
+    /// one just above the wait is accepted.
+    #[test]
+    fn vote_timeout_must_exceed_the_execution_wait() {
+        // a 750 ms header window, so only the execution wait can refuse these
+        let short_rounds = |vote_timeout| Parameters {
+            max_header_delay: Duration::from_millis(500),
+            vote_timeout,
+            ..Default::default()
+        };
+        for refused in [VOTE_EXECUTION_WAIT - Duration::from_millis(1), VOTE_EXECUTION_WAIT] {
+            let err = validate_vote_timeout(&short_rounds(refused), &tolerance_ms(250), true)
+                .expect_err("a vote_timeout not above the execution wait must be rejected");
+            assert!(err.to_string().contains("VOTE_EXECUTION_WAIT"), "{refused:?}: {err}");
+            assert!(err.to_string().contains("raise vote_timeout above 1s"), "{refused:?}: {err}");
+        }
+        let just_above = VOTE_EXECUTION_WAIT + Duration::from_millis(1);
+        validate_vote_timeout(&short_rounds(just_above), &tolerance_ms(250), true)
+            .expect("a vote_timeout above the execution wait must be accepted");
+    }
+
     /// An overflowing `max_header_delay + tolerance` must reject rather than panic, including
     /// when the tolerance is first rounded up to whole seconds.
     #[test]
@@ -776,6 +840,40 @@ mod tests {
     fn new_for_epoch_threads_prior_close() {
         let close: TimestampSec = 1_700_000_000;
         assert_eq!(config_for_epoch(1, Some(close)).prior_epoch_close(), Some(close));
+    }
+
+    /// Building an epoch's config does not judge the vote window: a node replaying an epoch its
+    /// committee already closed must be able to enter it. The window is checked on the built
+    /// config instead, which still rejects a short `vote_timeout` and names the knob.
+    #[test]
+    fn new_for_epoch_leaves_the_vote_window_to_validate_epoch_timing() {
+        let (committee, key_config) = committee_and_keys(1);
+        let mut config = Config::default_for_test();
+        // 2 s misses the window in both fork regimes (2.25 s with sub-second timestamps, 3 s
+        // without), so the outcome does not depend on the build's fork schedule
+        config.parameters = two_second_rounds(Duration::from_secs(2));
+        let short_vote_timeout = ConsensusConfig::new_for_epoch(
+            config,
+            NoStorage,
+            key_config,
+            committee,
+            NetworkConfig::default(),
+            vec![],
+            PriorEpoch { record: EpochDigest::default(), close: None },
+        )
+        .expect("new_for_epoch must build an epoch's config whatever its vote_timeout");
+
+        let err = short_vote_timeout
+            .validate_epoch_timing()
+            .expect_err("a vote_timeout below the vote window must fail the epoch timing check");
+        assert!(
+            err.to_string().contains("vote_timeout"),
+            "the error must name vote_timeout as the knob to raise: {err}"
+        );
+
+        config_for_epoch(1, None)
+            .validate_epoch_timing()
+            .expect("the default parameters must pass the epoch timing check");
     }
 
     /// Test-facing constructors never seed a floor; tests that need one build the config through

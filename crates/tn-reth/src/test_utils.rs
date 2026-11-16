@@ -19,6 +19,8 @@
 //! - Consensus/payload-execution helpers: `consensus_output_for_tests`, and
 //!   `execute_payload_and_update_canonical_chain`, which builds a block and commits it as the
 //!   canonical tip, standing in for the engine's payload builder.
+//! - [`load`]: shared code for the busy-node execution bench, such as [`load::CaptureRecorder`],
+//!   [`load::open_production_env`] and the database counters [`load::DbCounters`].
 //! - [`plant_finalized_marker`]: writes the finalized/safe database markers directly — a test-only
 //!   backdoor into storage state for reconstructing pre-fix crash layouts.
 
@@ -37,7 +39,10 @@ use alloy::{
     consensus::{
         SignableTransaction as _, TxEip2930, TxEip4844, TxEip4844Variant, TxEip7702, TxLegacy,
     },
-    eips::{eip7594::BlobTransactionSidecarVariant, eip7702::Authorization},
+    eips::{
+        eip7594::BlobTransactionSidecarVariant,
+        eip7702::{Authorization, SignedAuthorization},
+    },
     hex,
     primitives::{utils::parse_ether, ChainId},
     signers::{
@@ -48,8 +53,7 @@ use alloy::{
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm, Evm as _, EvmFactory as _};
-use reth_primitives::sign_message;
-use reth_primitives_traits::SignerRecoverable;
+use reth_primitives_traits::{crypto::secp256k1::sign_message, SignerRecoverable};
 use reth_provider::{
     CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
     DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory,
@@ -82,6 +86,8 @@ use tn_types::{
     ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::debug;
+pub mod load;
+
 // re-exports for tests
 pub use crate::evm::precompile_test_utils;
 pub use alloy::eips::{
@@ -326,6 +332,11 @@ impl TransactionFactory {
         // tag returned by libsecp's uncompressed pubkey serialization
         let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
         Address::from_slice(&hash[12..])
+    }
+
+    /// The nonce of the next transaction.
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
     }
 
     /// Change the nonce for the next transaction.
@@ -659,6 +670,28 @@ impl TransactionFactory {
         TransactionSigned::new_unhashed(transaction, signature)
     }
 
+    /// Sign `transaction`, built with [`Self::nonce`], with this factory's key, and advance the
+    /// nonce.
+    pub fn sign_transaction(&mut self, transaction: impl Into<Transaction>) -> TransactionSigned {
+        let transaction = transaction.into();
+        let signature = self.sign_hash(transaction.signature_hash());
+        self.inc_nonce();
+        TransactionSigned::new_unhashed(transaction, signature)
+    }
+
+    /// An EIP-7702 authorization signed with this factory's key: it delegates this factory's
+    /// account to `address`, and applies only while the account's nonce is `nonce`.
+    pub fn authorize(
+        &self,
+        chain_id: ChainId,
+        address: Address,
+        nonce: u64,
+    ) -> SignedAuthorization {
+        let authorization = Authorization { chain_id: U256::from(chain_id), address, nonce };
+        let signature = self.sign_hash(authorization.signature_hash());
+        authorization.into_signed(signature)
+    }
+
     /// Sign the transaction hash with the key in memory
     fn sign_hash(&self, hash: B256) -> EthSignature {
         let secret = B256::from_slice(&self.keypair.secret_bytes());
@@ -817,6 +850,12 @@ pub fn seeded_genesis_from_random_batches<'a>(
 
 /// Helper function to create a committee for tests from on-chain data.
 pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Result<Committee> {
+    committee_from_epoch_state(epoch_state)
+}
+
+/// The blocking form of [`create_committee_from_state`]: the committee of `epoch_state`, read from
+/// the `ConsensusRegistry`.
+pub fn committee_from_epoch_state(epoch_state: EpochState) -> eyre::Result<Committee> {
     // deconstruct epoch information
     let EpochState { epoch, validators, bls_pubkeys, .. } = epoch_state;
     let validators = validators

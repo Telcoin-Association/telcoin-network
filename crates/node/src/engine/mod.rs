@@ -11,9 +11,17 @@
 //! The methods in this module are thread-safe wrappers for the inner type that contains logic.
 
 use self::inner::ExecutionNodeInner;
+use crate::health::WorkerReadiness;
 use builder::ExecutionNodeBuilder;
-use std::{collections::BTreeMap, future::Future, net::SocketAddr, num::NonZeroUsize, sync::Arc};
-use tn_config::Config;
+use readiness::WorkerReadinessState;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    sync::Arc,
+};
+use tn_config::{Config, PidLock};
 use tn_exex::ExExInstallFn;
 use tn_reth::{
     error::StateReadResult, system_calls::EpochState, CanonStateNotificationStream, RethConfig,
@@ -24,13 +32,14 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
     repack_monitor::RepackMonitor,
     BatchSender, BatchValidation, BlsPublicKey, BootstrapServer, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
-    B256,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, NodeMode, Noticer, SealedHeader, TaskSpawner,
+    WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
 mod builder;
 mod inner;
+mod readiness;
 pub use tn_reth::worker::*;
 
 /// The struct used to build the execution nodes.
@@ -46,14 +55,14 @@ pub struct TnBuilder {
     ///
     /// The metrics will be served at the given interface and port.
     pub metrics: Option<SocketAddr>,
-    /// Optional TCP port to start healthcheck service.
-    /// If a port is provided, the healthcheck service will spawn. Otherwise, no healthcheck
-    /// service starts.
+    /// Optional healthcheck listener bind. `None` starts no listener.
     ///
-    /// IMPORTANT: only enable healthcheck if the endpoint is protected by a firewall. The
-    /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
-    /// var.
-    pub healthcheck: Option<u16>,
+    /// A bare port binds IPv4 loopback; an explicit socket address binds that interface (a
+    /// wildcard has to be written out). The liveness route responds unconditionally;
+    /// `/health/workers` reports transaction acceptance and `/health/network` reports cached
+    /// swarm reachability and established-peer counts, returning 503 while not-ready. Read from
+    /// `--healthcheck` / `HEALTHCHECK_TCP_PORT`. A bind failure fails node startup (#1689).
+    pub healthcheck: Option<crate::health::HealthcheckBind>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,
     /// Maximum completed export bundles to retain, or unlimited when absent.
@@ -74,8 +83,13 @@ pub struct TnBuilder {
     /// the given capacity.
     pub exex_fns: Vec<(String, usize, ExExInstallFn)>,
     /// Optional process-local bootstrap dial hints, taking precedence over the network config.
-    /// An explicitly empty map selects the genesis fallback.
+    /// An explicitly empty map selects the chain's default set (`Config::bootstrap_servers`, else
+    /// the genesis committee file's).
     bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+    /// The datadir lock, when the caller took it before opening the execution database (so a
+    /// second node is refused before it touches the live node's database). The node holds it for
+    /// its lifetime; see `launch_node`.
+    pid_lock: Option<PidLock>,
 }
 
 impl TnBuilder {
@@ -96,7 +110,20 @@ impl TnBuilder {
             reth_db,
             exex_fns: Vec::new(),
             bootstrap_peers: None,
+            pid_lock: None,
         }
+    }
+
+    /// Hand the node the datadir lock the caller already holds (taken before the execution
+    /// database was opened), instead of having the node take it itself.
+    pub fn with_pid_lock(mut self, pid_lock: PidLock) -> Self {
+        self.pid_lock = Some(pid_lock);
+        self
+    }
+
+    /// Take the datadir lock handed over with [`Self::with_pid_lock`], if any.
+    pub fn take_pid_lock(&mut self) -> Option<PidLock> {
+        self.pid_lock.take()
     }
 
     /// Set the maximum completed export bundles to retain, or leave retention unlimited.
@@ -185,16 +212,19 @@ impl std::fmt::Debug for TnBuilder {
 pub enum WorkerState {
     /// The worker has never been activated in this process.
     Uninitialized,
-    /// The pool is retained, but the worker's RPC listeners have been stopped.
+    /// The pool and listeners are retained, but transaction admission is closed.
     Stopped,
-    /// The worker's RPC listeners are running.
+    /// The worker's transaction admission is open.
     Running,
 }
 
 /// Wrapper for the inner execution node components.
 #[derive(Clone, Debug)]
 pub struct ExecutionNode {
+    /// Process-lifetime execution components, including initialized worker RPC servers.
     internal: Arc<RwLock<ExecutionNodeInner>>,
+    /// Current epoch membership and shutdown state for worker readiness probes.
+    worker_readiness: Arc<RwLock<WorkerReadinessState>>,
 }
 
 impl ExecutionNode {
@@ -202,7 +232,10 @@ impl ExecutionNode {
     pub fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> eyre::Result<Self> {
         let inner = ExecutionNodeBuilder::new(tn_builder, reth_env).build()?;
 
-        Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
+        Ok(ExecutionNode {
+            internal: Arc::new(RwLock::new(inner)),
+            worker_readiness: Arc::new(RwLock::new(WorkerReadinessState::default())),
+        })
     }
 
     /// Execution engine to produce blocks after consensus.
@@ -224,6 +257,9 @@ impl ExecutionNode {
     ///
     /// This method can run before startup synchronization. Call
     /// [`Self::respawn_worker_network_tasks`] separately when the worker enters an epoch.
+    /// Only call this for [`WorkerState::Uninitialized`], in consecutive worker id order.
+    /// Existing workers must use [`Self::restart_worker_rpc`] to reuse their components.
+    /// Invalid worker ids return an error before creating a pool or binding RPC listeners.
     ///
     /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
     /// live container so canonical updates always charge the current epoch's fee (issue
@@ -285,33 +321,36 @@ impl ExecutionNode {
         !self.internal.read().await.workers.is_empty()
     }
 
-    /// Stop RPC listeners for initialized workers outside the current committee.
+    /// Close transaction admission for initialized workers outside the current committee.
     ///
-    /// Their pools remain available for a later epoch that reactivates the worker ids.
+    /// Hand pending and parked transactions to worker 0, including late in-flight admissions.
+    /// Each removed worker spawns a relay that moves them off this lock, so epoch entry does not
+    /// wait on the retired pool's size. Retain empty pools for reactivation. Normal destination
+    /// validation and capacity apply.
     pub async fn deactivate_workers_above(&self, active_workers: usize) {
-        self.internal
-            .write()
-            .await
-            .workers
-            .iter_mut()
-            .skip(active_workers)
-            .for_each(WorkerComponents::deactivate);
+        let mut guard = self.internal.write().await;
+        let destination =
+            guard.workers.first().filter(|_| active_workers > 0).map(WorkerComponents::pool);
+        destination.into_iter().for_each(|destination| {
+            guard
+                .workers
+                .iter_mut()
+                .skip(active_workers)
+                .for_each(|worker| worker.deactivate(&destination));
+        });
     }
 
-    /// Refresh an initialized worker's fee and reopen its RPC listeners if stopped.
+    /// Refresh an initialized worker's fee and reopen admission on its retained RPC listeners.
     pub async fn restart_worker_rpc(&self, worker_id: WorkerId, base_fee: u64) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        let reth_env = guard.reth_env.clone();
         guard
             .workers
             .get_mut(usize::from(worker_id))
-            .ok_or_else(|| eyre::eyre!("cannot restart uninitialized worker {worker_id}"))?
-            .restart_rpc(&reth_env, worker_id, base_fee)
-            .await
-            .map_err(Into::into)
+            .map(|worker| worker.reactivate(base_fee))
+            .ok_or_else(|| eyre::eyre!("cannot restart uninitialized worker {worker_id}"))
     }
 
-    /// Return whether a worker needs initial construction, RPC restart, or task refresh.
+    /// Return whether a worker needs initial construction, reactivation, or task refresh.
     pub async fn worker_state(&self, worker_id: WorkerId) -> WorkerState {
         self.internal.read().await.workers.get(usize::from(worker_id)).map_or(
             WorkerState::Uninitialized,
@@ -329,11 +368,31 @@ impl ExecutionNode {
     ///
     /// Backs the `/health/workers` readiness endpoint. A retained pool alone does not make a
     /// removed worker ready to accept transactions.
-    pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
+    /// Use [`Self::worker_state`] to decide whether initial construction is needed: stopped
+    /// workers retain their components and must be restarted rather than initialized again.
+    pub async fn is_worker_running(&self, worker_id: WorkerId) -> bool {
         self.worker_state(worker_id).await == WorkerState::Running
     }
 
-    /// Batch maker
+    /// Set the current committee's worker range and shutdown signal before worker startup.
+    pub(crate) async fn start_worker_readiness_epoch(&self, workers: usize, shutdown: Noticer) {
+        self.worker_readiness.write().await.start_epoch(workers, shutdown);
+    }
+
+    /// Snapshot initialized workers and their current epoch's accepting state.
+    ///
+    /// Removed workers remain visible with a false accepting flag. Active workers accept only
+    /// after their RPC listeners bind, until consensus shuts down their epoch, and only while
+    /// the node's `mode` admits submissions (issue #1514).
+    pub(crate) async fn worker_readiness(&self, mode: NodeMode) -> Vec<WorkerReadiness> {
+        let engine = self.internal.read().await;
+        self.worker_readiness
+            .read()
+            .await
+            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()), mode)
+    }
+
+    /// Start the worker's batch builder for the epoch.
     pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
@@ -342,10 +401,8 @@ impl ExecutionNode {
         base_fee: u64,
         epoch: Epoch,
     ) -> eyre::Result<()> {
-        let mut guard = self.internal.write().await;
-        guard
-            .start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
-            .await
+        let guard = self.internal.read().await;
+        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
     }
 
     /// Batch validator
@@ -499,5 +556,22 @@ impl ExecutionNode {
     ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
         let guard = self.internal.read().await;
         guard.validators_for_epochs_at_block(epochs, block_hash)
+    }
+
+    /// Read the BLS keys of the committee-eligible validator pool (`PendingActivation`,
+    /// `Active` and `PendingExit`), pinned to `header`'s state.
+    ///
+    /// This is the pool the epoch-closing committee draw shuffles, read for peer tracking rather
+    /// than consensus. The read is best-effort: an undecodable key is skipped with a warning,
+    /// duplicates are removed, and registry or provider failures are returned classified so the
+    /// caller can log and skip. Like the committee reads above, it holds the engine read lock
+    /// while the registry calls run; the lock's writers are epoch-entry and epoch-close steps,
+    /// never block execution.
+    pub async fn committee_eligible_keys_at_header(
+        &self,
+        header: &SealedHeader,
+    ) -> StateReadResult<BTreeSet<BlsPublicKey>> {
+        let guard = self.internal.read().await;
+        guard.committee_eligible_keys_at_header(header)
     }
 }

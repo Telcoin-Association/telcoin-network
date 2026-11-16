@@ -1,5 +1,100 @@
 # E2E Tests
 
+## Captured SIGKILL recovery
+
+`make test-sigkill` runs two abrupt restarts under transaction traffic: one shortly before
+epoch close and one halfway through the epoch. Both keep the validator down across the
+boundary and require bounded catch-up, active CVV mode, matching execution hashes at
+catch-up, and the recovery transaction on both chains at the same height. Both nodes must
+then advance beyond that transaction, and their latest shared block hash must match.
+The kill primitive verifies SIGKILL (signal 9) directly.
+
+The defaults are 10-second epochs, a 2-second late-kill offset, at least 18 seconds down,
+and a 180-second recovery deadline, so each case takes about 60 to 75 seconds. To use fleet
+B's epoch duration and kill offset:
+
+```sh
+TN_SIGKILL_EPOCH_SECS=1200 \
+TN_SIGKILL_BEFORE_CLOSE_SECS=59 \
+TN_SIGKILL_DOWNTIME_SECS=300 \
+TN_SIGKILL_RECOVERY_SECS=1800 \
+make test-sigkill
+```
+
+For the before-close case, the 300-second downtime includes 59 seconds before close and
+approximately four minutes after close. The mid-epoch case stays down for at least 600
+seconds to cross the boundary. Restart waits for both the configured minimum downtime
+and a peer crossing the boundary. These tests use four local validators and modest
+transaction traffic. A passing run does not establish the cause of the larger fleet's
+historical freeze in
+[issue #1510](https://github.com/Telcoin-Association/telcoin-network/issues/1510).
+
+Both cases restart inside the second epoch after the killed one when
+`1.5 * epoch < downtime < 2 * epoch + before_close`, with the kill offset under half an epoch.
+The node then finds an epoch record newer than its local epoch, starts as `CvvInactive`, and
+rejoins through catch-up. The short-run defaults sit inside that window: the before-close
+restart lands 16 seconds after the killed epoch's close and the mid-epoch restart 13 seconds
+after it, both inside the 10 to 20 second span of the second epoch. Unit tests in
+`sigkill/timing.rs` check the defaults against the window. Fleet B restarts in the epoch
+right after the kill and starts as `CvvActive`; the window is logged, not enforced, so fleet
+settings still run.
+
+The `SIGKILL recovery` workflow runs one scenario and sync regime per matrix job, covering
+both scenarios in Durable and SafeNoSync by default. Manual inputs select timing and either
+sync regime. Each job has a six-hour limit and uses the dedicated `sigkill` nextest profile
+with a five-hour per-case watchdog. The ordinary e2e timeout remains 2160 seconds.
+
+Before starting nodes, each case rejects timings whose bounded waits need at least the
+18000-second watchdog budget. The conservative requirement is
+`9 * epoch + downtime + 3 * recovery + 300` seconds, including RPC startup and capture
+overhead. Fleet B settings
+with 1800-second recovery need 16800 seconds and fit this profile. At 1200/59/300, the
+healthy before-close restart is approximately 3841 seconds after genesis; the mid-epoch
+restart is approximately 3600 seconds after genesis. Use `make test-sigkill`, or pass
+`--profile sigkill` when invoking nextest directly with fleet timing.
+
+Each matrix job verifies that omitting the restart fails at the recovery timeout and that
+mutating the transaction or subsequent block comparison reports chain divergence. The
+nightly Durable lane also runs both cases.
+Download the run's `sigkill-recovery-*` artifact before its 15-day retention expires.
+
+Each case's `test_logs/sigkill_*` directory contains separate node stdout/stderr for each
+start, `kill.json`, `boundary.json`, `restart.json`, `samples.csv`, `agreement.jsonl`, metrics
+snapshots, and file inventories. Agreement records include the phase, height, and both
+hashes. The stdout filter enables `state-sync`, `consensus-chain`, and
+`tn::observer` debug messages. On a returned error, `retained-datadir.txt` names the local
+data directory. The crash guard sends SIGKILL and reaps every remaining node before
+retaining the directory, including failures before the crash or after restart. It never
+runs graceful shutdown handlers, preserving unsealed packs and in-flight import state
+at failure. Inventories continue past entries that disappear during sampling. Failed CI
+runs archive the directory under `validation-logs/failed-data`. Restart itself can sweep
+the original run-0 import directories; retained failure data describes the final run.
+
+For a fleet run, save the victim's Docker log and service journal before the kill and before
+teardown. Record the boundary block's timestamp and the actual remote kill/restart times.
+List `consensus-db/epochs` sizes and modification times every minute during the outage and
+recovery. Preserve these files even when the RPC remains alive and the node keeps one PID.
+The benchmark scripts and the collector live in `devnet-genesis` and
+`tn-transaction-generator`; their workload schedule and fleet telemetry remain necessary
+for reproducing the original load.
+
+An operator with access to the original Prometheus endpoint can preserve the historical
+window with the following read-only query. Adjust the node/network labels to the fleet's
+actual labels. An empty result is missing evidence, not proof of recovery.
+
+```sh
+: "${PROMETHEUS_URL:?Set the accessible Prometheus endpoint}"
+mkdir -p sigkill-prometheus
+for metric in tn_primary_round tn_primary_committed_round tn_epoch_current; do
+  curl --fail --silent --show-error --get "$PROMETHEUS_URL/api/v1/query_range" \
+    --data-urlencode "query=$metric{network=\"bench\"}" \
+    --data-urlencode 'start=2026-09-23T06:10:00Z' \
+    --data-urlencode 'end=2026-09-23T07:05:00Z' \
+    --data-urlencode 'step=15s' \
+    --output "sigkill-prometheus/$metric.json"
+done
+```
+
 ## Running the ignored e2e suite
 
 The heavy e2e tests (restart and epoch tests) are `#[ignore]`d and each needs the
@@ -32,6 +127,30 @@ follows the working directory, so a run from `crates/e2e-tests` would build into
 a stray package-local `target` tree.
 If `TN_BIN_PATH` is left unset the suite still runs; add `--no-capture` to watch the one-time build
 instead of waiting on a silent first test.
+
+`reth_db_migration::test_restart_migrates_reth_db_to_tn_lmdb` needs two binaries and skips (with a
+warning) in the run above. `make test-e2e-reth-migration` builds both and runs it: the committee
+starts on the MDBX binary (`TN_BIN_PATH_PREV`, built with the `mdbx` feature by
+`make build-e2e-bin-mdbx`), and each validator restarts on the default binary (`TN_BIN_PATH`, reth
+database on tn-lmdb), migrates its reth database and follows the chain. The target also sets
+`TN_E2E_TN_LMDB_BIN=1`, the marker that says `TN_BIN_PATH` is the tn-lmdb build.
+`make test-e2e-resync` uses the same two binaries.
+
+By default neither runs a real release as the previous one. Their MDBX binary is this tree built
+with the `mdbx` feature, which records the storage layout marker like the default build, so the
+marker recording of a pre-marker datadir, part of the upgrade from `v0.17.0-adiri`, is covered by
+a unit test only (`tn-reth`'s `env::layout::a_datadir_without_the_marker_is_v1_and_gets_it`), as
+is the consensus-database migration from MDBX that a node still on `v0.16.0-adiri` makes
+(`tn-storage`'s `test_migrate_from_mdbx_*`). `make test-e2e-resync TN_RESYNC_BIN_PREV=...` takes
+the real release instead (`make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri`; see the Makefile
+comment above `TN_RESYNC_BIN_PREV`): it peers with this release and writes no marker. Adiri itself
+upgrades all at once, not one validator at a time (the tn-reth README's "Upgrading a testnet
+node").
+
+The node binary of every other e2e target (`make build-e2e-bin`) runs its reth database on
+tn-lmdb, the default backend, so `make test-restarts`, `make test-epochs` and `make test-sigkill`
+are the crash and restart cycles for that engine. MDBX is the legacy backend, kept until testnet
+has resynced: no e2e target runs those suites on it.
 
 ## Test Log Output
 

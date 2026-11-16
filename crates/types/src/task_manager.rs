@@ -196,9 +196,17 @@ impl TaskSpawner {
                 }
             }
         });
-        if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, critical))
-        {
-            tracing::error!(target: "tn::tasks", "Failed to track spawned task {name}: {err}. The task is already spawned but untracked: it can never be joined or aborted, and only its shutdown notice can end it.");
+        match self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, critical)) {
+            Ok(()) => {}
+            // The manager has ended (dropped, which notifies its shutdown): the task subscribed to
+            // that notice above, so it ends at once and nothing is left to track. A spawn racing a
+            // node stop lands here.
+            Err(mpsc::error::TrySendError::Closed(_)) if self.local_shutdown.is_notified() => {
+                tracing::debug!(target: "tn::tasks", "task {name} spawned after its task manager ended; it ends at once");
+            }
+            Err(err) => {
+                tracing::error!(target: "tn::tasks", "Failed to track spawned task {name}: {err}. The task is already spawned but untracked: it can never be joined or aborted, and only its shutdown notice can end it.");
+            }
         }
     }
 
@@ -403,7 +411,42 @@ impl TaskManager {
     /// Will resolve once all tasks have shutdown or timeout is reached.
     /// Can be used after until_exit to split up the join.
     pub async fn wait_for_task_shutdown(&mut self) {
-        self.wait_for_task_shutdown_internal().await
+        let _ = self.wait_for_task_shutdown_internal().await;
+    }
+
+    /// Give the tasks up to `grace` to exit on their own (after their shutdown was signalled), so
+    /// each can run its graceful exit, and report whether all of them did. Unlike
+    /// [`Self::wait_for_task_shutdown`], tasks still running when the grace lapses are not
+    /// reported as a failure: the caller is expected to abort them next.
+    pub async fn wait_for_exit(&mut self, grace: Duration) -> bool {
+        self.join_tasks_within(grace).await.all_exited
+    }
+
+    /// Signal every task this manager spawned to exit, as dropping the manager does, and keep the
+    /// manager so [`Self::wait_for_exit`] can wait for them. Reth's blocking tasks
+    /// (`spawn_reth_task` on the blocking pool) end only on this notice: [`Self::abort`] cannot
+    /// stop a blocking task.
+    pub fn signal_shutdown(&self) {
+        self.local_shutdown.notify();
+    }
+
+    /// Stop and join every task once the shutdown the tasks follow has been notified.
+    ///
+    /// The tasks first get up to `grace` to exit on their own, so their graceful exits run. Then
+    /// the manager signals its own shutdown ([`Self::signal_shutdown`]), which ends the tasks
+    /// that follow only this manager (reth's tasks), and joins them for up to the join wait. Only
+    /// a task still running after both is logged as an error. The result says whether every task
+    /// exited and names the first critical task that failed as it stopped: a stop is where a task
+    /// that holds work (the engine's drain) finishes it, so its error is the stop's.
+    pub async fn shutdown_tasks(&mut self, grace: Duration) -> TasksStopped {
+        self.update_tasks();
+        let first = self.join_tasks_within(grace).await;
+        if first.all_exited {
+            return first;
+        }
+        self.signal_shutdown();
+        let rest = self.wait_for_task_shutdown_internal().await;
+        TasksStopped { all_exited: rest.all_exited, failed: first.failed.or(rest.failed) }
     }
 
     /// Abort all of our direct tasks (not sub task managers though).
@@ -465,8 +508,11 @@ impl TaskManager {
                                 continue;
                             }
                             tracing::info!(target: "tn::tasks", "{}: {} returned Ok, exiting", self.name, info.name);
-                            // Ok exit is fine if we are shutting down.
-                            if !rx_shutdown.noticed() {
+                            // Ok exit is fine if we are shutting down. Ask the notifier, not
+                            // `rx_shutdown`: `notify` sets its noticers one at a time, so a task
+                            // can see its own set and exit before `rx_shutdown`'s is, while
+                            // `is_notified` waits for `notify` to finish.
+                            if !shutdown.is_notified() {
                                 result = Err(TaskJoinError::CriticalExitOk(info.name));
                             }
                         }
@@ -475,10 +521,13 @@ impl TaskManager {
                             if !info.critical {
                                 continue;
                             }
-                            // Ok exit is fine if we are shutting down.
-                            if !rx_shutdown.noticed() {
+                            if !shutdown.is_notified() {
                                 tracing::error!(target: "tn::tasks", "{}: {} returned error {join_err}, exiting", self.name, info.name);
                                 result = Err(join_err);
+                            } else {
+                                // Already shutting down: the shutdown decides the exit, but the
+                                // error is still the task's, so it is logged.
+                                tracing::warn!(target: "tn::tasks", "{}: {} returned error {join_err} while shutting down", self.name, info.name);
                             }
                         }
                     }
@@ -492,13 +541,24 @@ impl TaskManager {
         result
     }
 
-    /// Attempt to wait for all the tasks to complete or timeout waiting on them.
-    async fn wait_for_task_shutdown_internal(&mut self) {
+    /// Attempt to wait for all the tasks to complete or timeout waiting on them. When some did
+    /// not, the ones still running are logged.
+    async fn wait_for_task_shutdown_internal(&mut self) -> TasksStopped {
         let task_name = self.name.clone();
         let join_wait = Duration::from_millis(self.join_wait_millis);
-        // wait some time for shutdown...
-        // 2 seconds for our tasks to end...
-        if tokio::time::timeout(join_wait, async move {
+        let stopped = self.join_tasks_within(join_wait).await;
+        if !stopped.all_exited {
+            let running: Vec<&str> =
+                self.tasks.iter().map(|task| task.info.name.as_str()).collect();
+            tracing::error!(target:"tn::tasks", ?running, "{}: All tasks NOT shutdown", task_name);
+        }
+        stopped
+    }
+
+    /// Join the tasks as they finish, logging each, for up to `wait`.
+    async fn join_tasks_within(&mut self, wait: Duration) -> TasksStopped {
+        let mut failed = None;
+        let all_exited = tokio::time::timeout(wait, async {
             tracing::debug!(target: "tn::tasks", "awaiting shutdown for task manager\n{self:?}");
             while let Some(res) = self.tasks.next().await {
                 match res {
@@ -527,17 +587,16 @@ impl TaskManager {
                             "{}: {} shutdown with error {err}",
                             self.name,
                             info.name,
-                        )
+                        );
+                        failed.get_or_insert(err);
                     }
                 }
             }
             tracing::info!(target: "tn::tasks", "{}: All tasks shutdown", self.name);
         })
         .await
-        .is_err()
-        {
-            tracing::error!(target:"tn::tasks", "{}: All tasks NOT shutdown", task_name);
-        }
+        .is_ok();
+        TasksStopped { all_exited, failed }
     }
 
     /// Implements the join logic for the manager.
@@ -547,7 +606,7 @@ impl TaskManager {
         do_exit: bool,
     ) -> Result<(), TaskJoinError> {
         let result = self.until_exit_internal(shutdown, do_exit).await;
-        self.wait_for_task_shutdown_internal().await;
+        let _ = self.wait_for_task_shutdown_internal().await;
         result
     }
 
@@ -625,6 +684,62 @@ impl reth_tasks::TaskSpawner for TaskSpawner {
     }
 }
 
+/// A reth [`reth_tasks::TaskSpawner`] over a [`TaskSpawner`] that spawns reth's critical tasks as
+/// non-critical TN tasks: tracked by the manager, ended by its shutdown signal, but never ending
+/// the node when they exit or panic. For reth code whose "critical" tasks only serve RPC (its eth
+/// state cache, fee-history task and transaction batcher): on reth's own `TokioTaskExecutor` they
+/// ran untracked, and a panic left the RPC cache dead with the node running; tracked, they
+/// release what they hold (the provider, so the database) when the node's tasks shut down, and
+/// a panic still only ends them. [`TaskSpawner::non_critical`] makes one.
+#[derive(Clone, Debug)]
+pub struct NonCriticalTaskSpawner(TaskSpawner);
+
+impl TaskSpawner {
+    /// A reth spawner on this manager whose critical tasks are tracked as non-critical
+    /// ([`NonCriticalTaskSpawner`]).
+    pub fn non_critical(&self) -> NonCriticalTaskSpawner {
+        NonCriticalTaskSpawner(self.clone())
+    }
+}
+
+impl reth_tasks::TaskSpawner for NonCriticalTaskSpawner {
+    fn spawn_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+        self.0.spawn_reth_task("reth-task", fut, false, false)
+    }
+
+    fn spawn_critical_task(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()> {
+        self.0.spawn_reth_task(name, fut, false, false)
+    }
+
+    fn spawn_blocking_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+        self.0.spawn_reth_task("reth-blocking-task", fut, false, true)
+    }
+
+    fn spawn_critical_blocking_task(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()> {
+        self.0.spawn_reth_task(name, fut, false, true)
+    }
+}
+
+/// How a manager's tasks stopped ([`TaskManager::shutdown_tasks`]).
+#[derive(Debug)]
+#[must_use = "a critical task that failed as it stopped is an error of the stop"]
+pub struct TasksStopped {
+    /// Every task ended within the waits.
+    pub all_exited: bool,
+    /// The first critical task that ended with an error (or panicked) as it stopped; each is also
+    /// logged. A task ended by the manager's own shutdown ends `Ok`, and a cancelled one is not
+    /// counted.
+    pub failed: Option<TaskJoinError>,
+}
+
 /// Indicate a non-normal exit on a a taskmanager join.
 #[derive(Debug, Error)]
 pub enum TaskJoinError {
@@ -638,7 +753,7 @@ pub enum TaskJoinError {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -678,6 +793,34 @@ mod test {
         async fn ping(&mut self, p: u32) -> eyre::Result<u32> {
             self.ping_tx.send(p).await?;
             self.pong_rx.recv().await.map_or_else(|| Err(eyre::eyre!("No Pong!")), Ok)
+        }
+    }
+
+    /// A critical task that exits because the shutdown was notified is a normal exit, even when it
+    /// exits while `notify` is still setting the other noticers (it sets them one at a time):
+    /// `until_task_ends` must not report it as an unexpected `CriticalExitOk`. The noticers between
+    /// the task's and the manager's own widen that window enough to hit it every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critical_exit_mid_notify_is_a_shutdown() {
+        for round in 0..10 {
+            let mut task_manager = TaskManager::default();
+            let shutdown = ShutdownNotifier::new();
+            let task_rx = shutdown.subscribe();
+            let _between: Vec<_> = (0..200_000).map(|_| shutdown.subscribe()).collect();
+            task_manager.spawn_critical_task("watcher", async move {
+                while !task_rx.noticed() {
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            });
+            let notifier = shutdown.clone();
+            let notify = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                notifier.notify();
+            });
+            let result = task_manager.until_task_ends(shutdown).await;
+            notify.join().unwrap();
+            assert!(result.is_ok(), "round {round}: {result:?}");
         }
     }
 
@@ -807,6 +950,35 @@ mod test {
         assert!(rspong_crit_block.ping(2).await.is_err());
     }
 
+    /// A reth "critical" task spawned through `TaskSpawner::non_critical` ends, or panics,
+    /// without ending the node: `join` keeps waiting, where the spawner's own reth critical
+    /// spawn reports the exit. Both are tracked: the manager's shutdown signal ends them.
+    #[tokio::test]
+    async fn non_critical_reth_tasks_never_end_the_node() {
+        use reth_tasks::TaskSpawner as RethTaskSpawner;
+        let mut task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner().non_critical();
+        spawner.spawn_critical_task("rpc cache", Box::pin(async { panic!("dead cache") }));
+        spawner.spawn_critical_task("fee history", Box::pin(async {}));
+        spawner.spawn_critical_blocking_task("batcher", Box::pin(async {}));
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            task_manager.join(ShutdownNotifier::default()),
+        )
+        .await;
+        assert!(waited.is_err(), "the node keeps running: {waited:?}");
+        task_manager.signal_shutdown();
+        assert!(task_manager.wait_for_exit(Duration::from_secs(5)).await, "tracked: they exit");
+
+        let mut task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        RethTaskSpawner::spawn_critical_task(&spawner, "rpc cache", Box::pin(async {}));
+        match task_manager.join(ShutdownNotifier::default()).await {
+            Err(TaskJoinError::CriticalExitOk(name)) => assert_eq!(name, "rpc cache"),
+            other => panic!("a reth critical task's exit ends the node: {other:?}"),
+        }
+    }
+
     /// Test that an error produced in a task makes it up to join.
     #[tokio::test]
     async fn test_task_manager_join() {
@@ -831,5 +1003,188 @@ mod test {
             Err(TaskJoinError::CriticalJoinError(_name, _err)) => panic!("wrong error"),
             Err(TaskJoinError::CriticalExitError(name, _err)) => assert!(name.eq("Crit 2")),
         }
+    }
+
+    /// `wait_for_exit` lets tasks that honour their shutdown signal finish on their own (their
+    /// graceful exit runs), returns as soon as they have, and reports a task that ignores the
+    /// signal by returning `false` after the grace, leaving it running for the caller to abort.
+    #[tokio::test]
+    async fn test_wait_for_exit_lets_tasks_finish_before_an_abort() {
+        let mut task_manager = TaskManager::default();
+        let shutdown = ShutdownNotifier::default();
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+        let rx_shutdown = shutdown.subscribe();
+        task_manager.spawn_task("graceful", async move {
+            rx_shutdown.await;
+            let _ = done_tx.send(()).await; // the graceful exit's own work
+            Ok(())
+        });
+        task_manager.update_tasks();
+        shutdown.notify();
+        let started = std::time::Instant::now();
+        assert!(task_manager.wait_for_exit(Duration::from_secs(5)).await, "the task exits");
+        assert!(started.elapsed() < Duration::from_secs(5), "returns once every task exited");
+        assert!(done_rx.try_recv().is_ok(), "the graceful exit ran");
+
+        let mut task_manager = TaskManager::default();
+        task_manager.spawn_task("stubborn", async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+        task_manager.update_tasks();
+        assert!(
+            !task_manager.wait_for_exit(Duration::from_millis(50)).await,
+            "a task that does not exit is reported"
+        );
+        task_manager.abort_all_tasks();
+        task_manager.wait_for_task_shutdown().await;
+    }
+
+    /// A reth blocking task outlives an abort and ends on `signal_shutdown`, which leaves the
+    /// manager in place so `wait_for_exit` sees it go and what it held is released.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_signal_shutdown_ends_reth_blocking_tasks() {
+        let mut task_manager = TaskManager::default();
+        let held = Arc::new(());
+        let task_held = held.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        reth_tasks::TaskSpawner::spawn_blocking_task(
+            &task_manager.get_spawner(),
+            Box::pin(async move {
+                let _held = task_held;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            }),
+        );
+        task_manager.update_tasks();
+        // a blocking task that has not started yet is cancelled by an abort; this one is running
+        started_rx.await.expect("the task starts");
+        task_manager.abort();
+        assert!(
+            !task_manager.wait_for_exit(Duration::from_millis(200)).await,
+            "an abort does not stop a blocking task"
+        );
+        task_manager.signal_shutdown();
+        assert!(task_manager.wait_for_exit(Duration::from_secs(5)).await, "the task exits");
+        assert_eq!(Arc::strong_count(&held), 1, "the task released what it held");
+    }
+
+    /// After the node's shutdown is notified, `shutdown_tasks` lets the tasks that follow it run
+    /// their graceful exits, then ends the tasks that follow only the manager (reth's, blocking
+    /// or not) and joins every one within the shutdown grace, as the node's clean stop needs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_tasks_ends_tasks_that_follow_only_the_manager() {
+        use reth_tasks::TaskSpawner as RethTaskSpawner;
+        let mut task_manager = TaskManager::default();
+        task_manager.set_join_wait(500);
+        let node_shutdown = ShutdownNotifier::default();
+        let rx_shutdown = node_shutdown.subscribe();
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+        task_manager.spawn_critical_task("follows the node shutdown", async move {
+            rx_shutdown.await;
+            // the graceful exit's own work
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = done_tx.send(()).await;
+            Ok(())
+        });
+        let spawner = task_manager.get_spawner();
+        RethTaskSpawner::spawn_critical_task(&spawner, "reth", Box::pin(std::future::pending()));
+        RethTaskSpawner::spawn_blocking_task(&spawner, Box::pin(std::future::pending()));
+
+        node_shutdown.notify();
+        let stopped = task_manager.shutdown_tasks(Duration::from_millis(300)).await;
+        assert!(stopped.all_exited, "every task exits within the grace and the join wait");
+        assert!(stopped.failed.is_none(), "a task the manager ends is no failure: {stopped:?}");
+        assert!(done_rx.try_recv().is_ok(), "the graceful exit ran");
+    }
+
+    /// A critical task whose graceful exit fails (the engine failing to persist what it drains)
+    /// is named in `shutdown_tasks`' result, so the node's stop can exit with it; a non-critical
+    /// task's failure is not.
+    #[tokio::test]
+    async fn shutdown_tasks_names_a_critical_task_that_failed_as_it_stopped() {
+        let mut task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::default();
+        let rx_drain = node_shutdown.subscribe();
+        task_manager.spawn_critical_task("drains on the node shutdown", async move {
+            rx_drain.await;
+            Err(TaskError::from_message("the drain could not persist"))
+        });
+        let rx_side = node_shutdown.subscribe();
+        task_manager.spawn_task("not critical", async move {
+            rx_side.await;
+            Err(TaskError::from_message("ignored"))
+        });
+
+        node_shutdown.notify();
+        let stopped = task_manager.shutdown_tasks(Duration::from_secs(5)).await;
+        assert!(stopped.all_exited);
+        let Some(TaskJoinError::CriticalExitError(name, err)) = stopped.failed else {
+            panic!("expected the draining task's error, got {:?}", stopped.failed);
+        };
+        assert_eq!(name, "drains on the node shutdown");
+        assert!(err.to_string().contains("the drain could not persist"), "{err}");
+    }
+
+    /// A task spawned through a spawner whose manager has ended (a spawn racing a node stop) ends
+    /// at once: the manager's drop notified its shutdown, which the task's select sees, so a
+    /// closed tracker there leaves nothing running and is not an error.
+    #[tokio::test]
+    async fn a_task_spawned_after_its_manager_ended_ends_at_once() {
+        let manager = TaskManager::new("ended");
+        let spawner = manager.get_spawner();
+        drop(manager);
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+        spawner.spawn_task("late", async move {
+            // never resolves on its own; only the shutdown notice ends the task, dropping
+            // `ended_tx`
+            let _ended = ended_tx;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(5), ended_rx)
+            .await
+            .expect("the late task ended on the manager's shutdown")
+            .expect_err("the task ended without finishing its future");
+    }
+
+    /// Regression: each spawn subscribes to the manager's shutdown notifier (a reth task three
+    /// times, a reth blocking task twice), and the notifier used to keep every Noticer until the
+    /// manager shut down. A node's manager lives as long as the node and reth spawns through it
+    /// for blocking RPC calls and subscriptions, so the list grew with RPC traffic: these 300
+    /// finished tasks left 600 entries. Finished tasks must leave no live Noticer behind, and the
+    /// list must stay bounded however many tasks have run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finished_tasks_release_their_shutdown_noticers() {
+        use crate::notifier::MIN_PRUNE_LEN;
+        use reth_tasks::TaskSpawner as RethTaskSpawner;
+        const N: usize = 100;
+        let manager = TaskManager::new("noticers");
+        let spawner = manager.get_spawner();
+        for _ in 0..N {
+            RethTaskSpawner::spawn_task(&spawner, Box::pin(async {})).await.expect("task joins");
+            RethTaskSpawner::spawn_blocking_task(&spawner, Box::pin(async {}))
+                .await
+                .expect("blocking task joins");
+            let (ran_tx, ran_rx) = tokio::sync::oneshot::channel();
+            manager.spawn_task("finished", async move {
+                let _ = ran_tx.send(());
+                Ok(())
+            });
+            ran_rx.await.expect("task ran");
+        }
+        // A reth join handle resolves when the task signals its end, which can be just before
+        // the task finishes and drops its Noticers, so give the last ones a moment.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while manager.local_shutdown.live_noticers() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.local_shutdown.live_noticers(), 0, "finished tasks left live noticers");
+        let registered = manager.local_shutdown.registered_len();
+        assert!(
+            registered <= MIN_PRUNE_LEN,
+            "{registered} entries left by {} finished tasks",
+            3 * N
+        );
     }
 }

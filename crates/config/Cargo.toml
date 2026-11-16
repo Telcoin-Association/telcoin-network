@@ -24,7 +24,7 @@ serde_json = { workspace = true }
 # Use reth directly to avoid circular deps.
 reth-chainspec = { workspace = true }
 humantime-serde = { workspace = true }
-libp2p = { workspace = true, features = ["request-response", "kad"] }
+libp2p = { workspace = true, features = ["request-response", "kad", "quic"] }
 backoff = { workspace = true }
 bs58 = { workspace = true }
 
@@ -39,13 +39,15 @@ aes = { version = "0.8.4", features = ["zeroize"] }
 pbkdf2 = "0.12.2"
 sha2 = "0.10.8"
 # Clears derived key material and decrypt buffers on drop.
-zeroize = "1.8.2"
+zeroize = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
 tempfile = { workspace = true }
-# Lets the key-permission tests run under a deliberately permissive umask, so they fail if the
-# writer ever regresses to relying on the ambient umask for restrictiveness.
+tn-types = { workspace = true, features = ["test-utils"] }
+
+# `umask` for the key-permission tests, which run under a deliberately permissive umask so they fail
+# if the writer ever regresses to relying on the ambient umask for restrictiveness.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 

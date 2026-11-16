@@ -4,12 +4,12 @@
 //! ([`DEFAULT_ROOT_DIR`]) and maps TN's per-chain datadir layout through the
 //! `tn_config::TelcoinDirs` impl on [`DataDirChainPath`]: `parameters.yaml`, `node-info.yaml`,
 //! `node-keys/`, `genesis/` (holding `committee.yaml` and `genesis.yaml`), `consensus-db/`
-//! (consensus storage), `db/` (reth MDBX), and `network-config`.
-use reth::{
+//! (consensus storage), `db/` (the reth execution database), and `network-config`.
+use reth_chainspec::Chain;
+use reth_node_core::{
     args::DatadirArgs,
     dirs::{ChainPath, MaybePlatformPath, PlatformPath, XdgPath},
 };
-use reth_chainspec::Chain;
 use std::{
     fmt::Debug,
     ops::Deref,
@@ -149,6 +149,10 @@ impl TelcoinDirs for DataDirChainPath {
     fn network_config_path(&self) -> PathBuf {
         self.0.as_ref().join("network-config")
     }
+
+    fn node_pid_path(&self) -> PathBuf {
+        self.0.as_ref().join("telcoin.pid")
+    }
 }
 
 /// Returns the path to the telcoin network data dir.
@@ -181,7 +185,7 @@ impl XdgPath for LogsDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth::dirs::MaybePlatformPath;
+    use reth_node_core::dirs::MaybePlatformPath;
     use std::str::FromStr;
 
     #[test]

@@ -3,34 +3,39 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
+        gossip_author_to_strike,
         message::{PrimaryGossip, PrimaryRPCError, PrimaryRequest, PrimaryResponse},
-        try_admit_epoch_record, try_admit_shed, MissingCertificatesRequest, PrimaryNetwork,
-        PrimaryNetworkHandle, RequestHandler, RequestVoteResult,
-        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS,
+        try_admit_epoch_record, try_admit_shed, GossipSlots, MissingCertificatesRequest,
+        PendingGossip, PrimaryNetwork, PrimaryNetworkHandle, PrimarySyncLedgers, ProbeWalk,
+        RequestHandler, RequestVoteResult, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS,
+        MAX_CONCURRENT_SHED_TASKS, MAX_CONSENSUS_CERTS, MAX_PENDING_GOSSIP_PER_PEER,
         MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use parking_lot::Mutex;
 use rand::{rngs::StdRng, SeedableRng};
 use roaring::RoaringBitmap;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use tn_config::{ConsensusConfig, KeyConfig, Parameters};
+use tn_config::{ConsensusConfig, KeyConfig, Parameters, VOTE_EXECUTION_WAIT};
 use tn_network_libp2p::{
     error::NetworkError,
     types::{
-        GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkResponseMessage,
-        NetworkResult,
+        GossipPayload, GossipValidation, GossipVerdict, IntoResponse as _, MessageId,
+        NetworkCommand, NetworkEvent, NetworkResponseMessage, NetworkResult,
     },
-    GossipMessage, Penalty, TopicHash,
+    GossipMessage, PeerId, Penalty, StreamError, TopicHash,
 };
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
@@ -517,17 +522,193 @@ async fn test_retrieve_consensus_output() {
         assert!(!bytes.is_empty(), "served output {number} bytes must not be empty");
     }
 
-    // A number we do not have is a benign miss: it errors and carries no penalty.
+    // A number past the local tip is a benign miss: it is reported unknown before any pack read
+    // and carries no penalty.
     let err =
         handler.consensus_output_bytes(999).await.expect_err("unknown consensus output must error");
-    assert_matches!(
-        err,
-        PrimaryNetworkError::ConsensusChainError(ConsensusChainError::PackError(
-            PackError::ConsensusNumberTooHigh
-        ))
-    );
+    assert_matches!(err, PrimaryNetworkError::UnknownConsensusOutput(999));
     let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
     assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
+}
+
+/// An output one to three positions past the local tip is reported unknown at once (issue #1646).
+///
+/// The serve holds a sync-stream permit, so it must not poll for the output to arrive. The clock
+/// is paused: any retry sleep would auto-advance it, so an unchanged clock proves that no retry
+/// timer ran.
+#[tokio::test(start_paused = true)]
+async fn test_consensus_output_past_tip_is_unknown_without_waiting() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let sub_dag = |number: u64| {
+        let cert = Certificate::default();
+        CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        )
+    };
+
+    // store outputs 1..=3 so the local tip is 3
+    handler.consensus_chain().write_subdag_for_test(1, sub_dag(1)).await;
+    handler.consensus_chain().write_subdag_for_test(2, sub_dag(2)).await;
+    handler.consensus_chain().write_subdag_for_test(3, sub_dag(3)).await;
+    assert_eq!(handler.consensus_chain().latest_consensus_number(), 3);
+
+    // each miss is unknown, carries no penalty, and runs no retry timer
+    macro_rules! assert_unknown_without_waiting {
+        ($number:expr) => {{
+            let start = tokio::time::Instant::now();
+            let err = handler
+                .consensus_output_bytes($number)
+                .await
+                .expect_err("an output past the local tip must be unknown");
+            assert_eq!(tokio::time::Instant::now(), start, "output {} must not wait", $number);
+            assert_matches!(err, PrimaryNetworkError::UnknownConsensusOutput(n) if n == $number);
+            let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+            assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
+        }};
+    }
+    assert_unknown_without_waiting!(4u64);
+    assert_unknown_without_waiting!(5u64);
+    assert_unknown_without_waiting!(6u64);
+
+    // the stored tip is still served
+    let bytes = handler.consensus_output_bytes(3).await.expect("stored tip output is served");
+    assert!(!bytes.is_empty(), "served tip output bytes must not be empty");
+}
+
+/// Save a minimal certificate for `record` (a valid BLS signature reused from a vote, empty signer
+/// bitmap). The epoch-record serve does not verify the certificate, so this makes the record
+/// available.
+async fn certify_epoch_record(
+    handler: &RequestHandler<MemDatabase>,
+    committee: &CommitteeFixture<MemDatabase>,
+    record: &EpochRecord,
+) {
+    let auth = committee.authorities().next().expect("committee has authorities");
+    let key_config = auth.consensus_config().key_config().clone();
+    let cert = EpochCertificate {
+        epoch_hash: record.digest(),
+        signature: record.sign_vote(&key_config).signature,
+        signed_authorities: RoaringBitmap::new(),
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_certificate(record.digest(), cert)
+        .await
+        .expect("store epoch certificate");
+}
+
+/// An epoch record without its certificate is reported unavailable at once, by number and by
+/// digest (issue #1646).
+///
+/// The serve holds an epoch-record permit, so it must not wait for the certificate. The old code
+/// waited 1.5 s before it reported the miss. The clock is real: the lookup runs on the epoch
+/// database thread, so a paused clock could advance to an unrelated timer.
+#[tokio::test]
+async fn test_uncertified_epoch_record_is_unavailable_without_waiting() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+
+    // each miss is unavailable, carries no penalty, and returns before the old wait
+    macro_rules! assert_unavailable_without_waiting {
+        ($epoch:expr, $hash:expr, $($expected:tt)+) => {{
+            let start = Instant::now();
+            let err = handler
+                .retrieve_epoch_record($epoch, $hash)
+                .await
+                .expect_err("an uncertified epoch record must be unavailable");
+            assert!(start.elapsed() < Duration::from_secs(1), "an uncertified record must not wait");
+            assert_matches!(err, $($expected)+);
+            let penalty: Option<Penalty> = (&err).into();
+            assert!(penalty.is_none(), "an unavailable epoch record must not penalize the peer");
+            // the reply on the wire is the one requesters recognise as a definitive answer
+            assert_eq!(
+                Err::<PrimaryResponse, _>(err).into_response(),
+                PrimaryResponse::unavailable_epoch_record($epoch, $hash),
+            );
+        }};
+    }
+    assert_unavailable_without_waiting!(Some(0), None, PrimaryNetworkError::UnavailableEpoch(0));
+    assert_unavailable_without_waiting!(
+        None,
+        Some(record.digest()),
+        PrimaryNetworkError::UnavailableEpochDigest(digest) if digest == record.digest()
+    );
+
+    // with its certificate saved, the record is served by number and by digest
+    certify_epoch_record(&handler, &committee, &record).await;
+    let by_number = handler.retrieve_epoch_record(Some(0), None).await;
+    let by_digest = handler.retrieve_epoch_record(None, Some(record.digest())).await;
+    [by_number, by_digest].into_iter().for_each(|response| {
+        assert_matches!(
+            response,
+            Ok(PrimaryResponse::EpochRecord { record: served, certificate })
+                if served.digest() == record.digest() && certificate.epoch_hash == record.digest()
+        );
+    });
+}
+
+/// A sync request for the output one past the local tip is shed with `Deny(Unavailable)` at once
+/// (issue #1646), so the requester retries another peer. The bytes are resolved as in
+/// `process_sync_consensus_output_stream`.
+#[tokio::test]
+async fn test_sync_consensus_output_past_tip_denies() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // store output 1 so the local tip is 1
+    let cert = Certificate::default();
+    let sub_dag = CommittedSubDag::new(
+        vec![cert.clone()],
+        cert,
+        1,
+        ReputationScores::new(&committee_obj),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    handler.consensus_chain().write_subdag_for_test(1, sub_dag).await;
+    assert_eq!(handler.consensus_chain().latest_consensus_number(), 1);
+
+    // the output at tip + 1 is unavailable, and the serve sheds it
+    let bytes = handler.consensus_output_bytes(2).await.ok();
+    assert!(bytes.is_none(), "the output past the local tip must be unavailable");
+    let mut out: Vec<u8> = Vec::new();
+    crate::network::sync_codec::send_sync_consensus_output_over_stream(
+        &mut out,
+        bytes,
+        Duration::from_secs(5),
+        BlsPublicKey::default(),
+        2,
+    )
+    .await
+    .expect("serving an unavailable output sheds cleanly without erroring");
+
+    // the first (and only) frame must be Deny(Unavailable)
+    let (mut dec, mut comp) = (Vec::new(), Vec::new());
+    let frame = tn_network_libp2p::read_frame::<_, tn_network_libp2p::PrimarySyncRequest>(
+        &mut futures::io::Cursor::new(out),
+        &mut dec,
+        &mut comp,
+        crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+    )
+    .await
+    .expect("read deny frame");
+    assert_matches!(
+        frame,
+        tn_network_libp2p::SyncFrame::Deny(tn_network_libp2p::DenyReason::Unavailable)
+    );
 }
 
 #[tokio::test]
@@ -931,7 +1112,7 @@ async fn test_primary_batch_gossip_topics() {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
 
-    let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
+    let gossip = PrimaryGossip::Certificate(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let goodish_msg =
@@ -940,7 +1121,7 @@ async fn test_primary_batch_gossip_topics() {
     // This will be rejected for other reasons, but make sure not for an invalid topic.
     assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
-    let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
+    let gossip = PrimaryGossip::Consensus(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -948,7 +1129,7 @@ async fn test_primary_batch_gossip_topics() {
 
     // EpochVote::default()'s all-zero public_key is not a committee member, so the committee gate
     // rejects it (before the signature verify); see GHSA-j2g4-553f-875r.
-    let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
+    let gossip = PrimaryGossip::EpochVote(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -956,7 +1137,7 @@ async fn test_primary_batch_gossip_topics() {
     // Not rejected for InvalidTopic — rejected for non-committee membership instead.
     assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
-    let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
+    let gossip = PrimaryGossip::Certificate(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -964,13 +1145,13 @@ async fn test_primary_batch_gossip_topics() {
     // This will be rejected for other reasons, but make sure it is for an invalid topic.
     assert!(matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
-    let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
+    let gossip = PrimaryGossip::Consensus(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
 
-    let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
+    let gossip = PrimaryGossip::EpochVote(Box::default());
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -986,11 +1167,12 @@ async fn test_primary_batch_gossip_topics() {
 // *before* paying the expensive BLS pairing verify, must drop a vote for an unknown epoch before
 // the verify, and must not turn a bad vote into a `Fatal` penalty charged to the honest relayer.
 
-/// Build a gossip message carrying `vote` on `epoch_vote_topic` for `chain_id`.
-fn epoch_vote_gossip(vote: EpochVote, chain_id: u64) -> GossipMessage {
+/// Build a gossip message from `source` carrying `vote` on `epoch_vote_topic` for `chain_id`. The
+/// swarm forwards only signed gossip, so the message has a source.
+fn epoch_vote_gossip(vote: EpochVote, chain_id: u64, source: PeerId) -> GossipMessage {
     let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(chain_id));
-    GossipMessage { source: None, data, sequence_number: None, topic }
+    GossipMessage { source: Some(source), data, sequence_number: None, topic }
 }
 
 /// Seed an uncertified epoch-0 [`EpochRecord`] (committee = the fixture's committee) into the
@@ -1033,7 +1215,7 @@ async fn test_epoch_vote_non_committee_rejected_before_verify() -> eyre::Result<
     let record = seed_uncertified_epoch0(&handler, &committee).await;
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
     let vote = EpochVote { epoch: 0, epoch_hash: record.digest(), ..Default::default() };
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
 
     assert_matches!(
         res,
@@ -1061,7 +1243,7 @@ async fn test_epoch_vote_unknown_epoch_dropped_before_verify() -> eyre::Result<(
     // Epoch 9999 has no stored record in the fixture, so `get_epoch_by_number` returns `None`.
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
     let vote = EpochVote { epoch: 9999, ..Default::default() };
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
 
     assert!(
         res.is_ok(),
@@ -1094,7 +1276,7 @@ async fn test_epoch_vote_valid_committee_member_forwarded() -> eyre::Result<()> 
     assert!(vote.check_signature(), "test vote must be validly signed");
 
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    handler.process_gossip(&epoch_vote_gossip(vote, 0)).await?;
+    handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await?;
 
     let received = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
@@ -1137,7 +1319,7 @@ async fn test_epoch_vote_committee_key_bad_sig_reaches_verify() -> eyre::Result<
         ..Default::default()
     };
 
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert_matches!(
         res,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)),
@@ -1169,7 +1351,7 @@ async fn test_epoch_vote_wrong_digest_rejected_before_verify() -> eyre::Result<(
     let vote = forked.sign_vote(&key_config);
 
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert_matches!(
         res,
         Err(PrimaryNetworkError::InvalidEpochVote(0, _, _)),
@@ -1215,7 +1397,7 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
     // The vote is otherwise valid (correct digest, real committee member) — it is dropped ONLY
     // because the epoch is already certified.
     let mut rx = consensus_bus.subscribe_new_epoch_votes();
-    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0, PeerId::random())).await;
     assert!(
         res.is_ok(),
         "a vote for an already-certified epoch must be dropped without error or penalty: {res:?}"
@@ -1229,9 +1411,10 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
 
 /// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
 /// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
-/// That channel is a `QueChannel::new_always_subscribed()`, so events that arrive while no
-/// `PrimaryNetwork` is running are queued (not dropped) and delivered to the next epoch's network.
-/// Stream commands and epoch-record voting depend on this; enforce it going forward.
+/// That channel is an always-subscribed `QueChannel` with a gap policy, so epoch-vote gossip with
+/// an author that arrives while no `PrimaryNetwork` is running is queued (not dropped) and
+/// delivered to the next epoch's network. Epoch-record voting depends on this; enforce it going
+/// forward.
 ///
 /// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
 /// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
@@ -1286,6 +1469,8 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     // receiver bound so any stray send cannot error.
     let (handle_tx, _handle_rx) = tokio::sync::mpsc::channel(10);
     let network_handle = PrimaryNetworkHandle::new_for_test(handle_tx);
+    // The node-scope sync ledgers, shared by the network of both epochs as the node shares them.
+    let sync_ledgers = PrimarySyncLedgers::new();
 
     // Observe forwarded epoch votes. `new_epoch_votes` is a plain `QueChannel`, so hold this one
     // subscription for the whole test (a second concurrent subscribe would panic).
@@ -1297,8 +1482,9 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let mut epoch_a = TaskManager::new("epoch-a");
     let spawner_a = epoch_a.get_spawner();
     PrimaryNetwork::new(
-        app.subscribe_primary_network_events(),
+        app.subscribe_primary_network_events(epoch0_record.epoch),
         network_handle.clone(),
+        sync_ledgers.clone(),
         config.clone(),
         app.clone(),
         state_sync.clone(),
@@ -1311,9 +1497,10 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let pubkey_a = vote_a.public_key;
     events_tx
         .send(NetworkEvent::Gossip(Box::new(GossipPayload {
-            message: epoch_vote_gossip(vote_a, chain_id),
+            message: epoch_vote_gossip(vote_a, chain_id, PeerId::random()),
             relayer: None,
             author: None,
+            validation: GossipValidation::detached(),
         })))
         .await
         .expect("inject epoch-A event");
@@ -1337,9 +1524,10 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let pubkey_gap = vote_gap.public_key;
     events_tx
         .send(NetworkEvent::Gossip(Box::new(GossipPayload {
-            message: epoch_vote_gossip(vote_gap, chain_id),
+            message: epoch_vote_gossip(vote_gap, chain_id, PeerId::random()),
             relayer: None,
             author: None,
+            validation: GossipValidation::detached(),
         })))
         .await
         .expect("inject gap event");
@@ -1354,9 +1542,12 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let spawner_b = epoch_b.get_spawner();
     // A non-panicking re-subscribe is itself proof epoch A's loop released the shared receiver
     // (`subscribe()` panics if a receiver is still checked out).
+    // Re-subscribe as the epoch manager does: the gap policy keeps the epoch-vote gossip sent in
+    // the gap.
     PrimaryNetwork::new(
-        app.subscribe_primary_network_events(),
+        app.subscribe_primary_network_events(epoch0_record.epoch.saturating_add(1)),
         network_handle.clone(),
+        sync_ledgers.clone(),
         config.clone(),
         app.clone(),
         state_sync.clone(),
@@ -1496,6 +1687,293 @@ async fn test_vote_recast_different_digest_fails_closed() -> eyre::Result<()> {
         res,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(_, _))),
         "recast with a different digest at the same round must fail closed"
+    );
+
+    Ok(())
+}
+
+/// Test setup for a vote this node cast before a restart: a header from the last authority and a
+/// durable vote info for it, with the in-memory `auth_last_vote` guard empty (fresh handler).
+fn seed_stored_vote(
+    committee: &CommitteeFixture<MemDatabase>,
+    parent: &SealedHeader,
+) -> eyre::Result<Header> {
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let stored = VoteInfo {
+        epoch: header.epoch(),
+        round: header.round(),
+        vote_digest: header.digest().into(),
+    };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&committee.last_authority().id(), &stored)?;
+    Ok(header)
+}
+
+/// A repeated vote request for a header this node voted for before a restart is recast under the
+/// author lock, and the recast vote stays in the author's guard. Later repeats are served from the
+/// guard, so a burst of copies of one header signs at most once (issue #1836).
+#[tokio::test]
+async fn test_vote_recast_fills_author_guard() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let header = seed_stored_vote(&committee, &parent)?;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let request_vote = || handler.vote(peer, header.clone(), vec![]);
+
+    assert!(
+        !handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a fresh handler holds the stored vote only on disk"
+    );
+    let first = request_vote().await;
+    assert_matches!(first, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "the recast vote must stay in the author's guard"
+    );
+
+    // from here on only memory can answer a repeat: a recast needs the stored digest to match
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+    let second = request_vote().await;
+    assert_matches!(second, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "serving the guarded vote must keep it in the guard for the next repeat"
+    );
+    let third = request_vote().await;
+    assert_matches!(third, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "serving the guarded vote must keep it in the guard for the next repeat"
+    );
+
+    Ok(())
+}
+
+/// The recast of a stored vote waits for the author lock, like every other vote request from that
+/// author, so parallel copies of one header queue on the lock instead of each signing at once
+/// (issue #1836).
+#[tokio::test]
+async fn test_vote_recast_waits_for_author_lock() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let header = seed_stored_vote(&committee, &parent)?;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let held = handler.lock_author_vote(&author_id).await;
+    assert!(held.is_some(), "every committee member has a vote lock");
+    let mut recast = std::pin::pin!(handler.vote(peer, header.clone(), vec![]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut recast).await.is_err(),
+        "the recast must not answer while another request from the author holds its lock"
+    );
+
+    drop(held);
+    let res = recast.await;
+    assert_matches!(res, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+
+    Ok(())
+}
+
+/// Write `vote_digest` as this node's stored vote for the author of `header` at the header's epoch
+/// and round.
+///
+/// With a digest other than the header's, a repeat of a header this node voted for can only be
+/// answered from memory: a recast needs the stored digest to match, and a new evaluation refuses a
+/// second digest for the round.
+fn store_vote_digest(
+    committee: &CommitteeFixture<MemDatabase>,
+    header: &Header,
+    vote_digest: VoteDigest,
+) -> eyre::Result<()> {
+    let stored = VoteInfo { epoch: header.epoch(), round: header.round(), vote_digest };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(header.author(), &stored)?;
+    Ok(())
+}
+
+/// A header from the last authority at round 1 whose execution block the test handler knows, so
+/// a vote request for it completes.
+fn votable_header(
+    committee: &CommitteeFixture<MemDatabase>,
+    parent: &SealedHeader,
+    created_at: u64,
+) -> Header {
+    committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(created_at)
+        .build()
+}
+
+/// A recast vote is answered from memory after the same author's headers for the same round and
+/// for an older round were refused in between. Each refusal keeps the decision entry but used to
+/// drop the vote cached in it, so every second request signed again (issue #1836).
+#[tokio::test]
+async fn test_vote_cached_across_stale_headers() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let author_id = author.id();
+    let peer = *author.authority().protocol_key();
+    // whole seconds, so the digests differ with or without sub-second timestamps
+    let header_at = |round, created_at| {
+        author.header_builder_at_round(&committee.committee(), round).created_at(created_at).build()
+    };
+
+    // a vote this node cast for the round-2 header before a restart
+    let header = header_at(2, 2);
+    store_vote_digest(&committee, &header, header.digest().into())?;
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the stored vote must be recast, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    for (stale, what) in [(header_at(2, 3), "same round"), (header_at(1, 1), "older round")] {
+        let res = handler.vote(peer, stale, vec![]).await;
+        assert_matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+            "a different header for the {what} must still be refused"
+        );
+        assert!(
+            handler.author_guard_holds_vote(&author_id, header.digest()).await,
+            "refusing a header for the {what} must keep the cached vote"
+        );
+    }
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A vote is answered from memory after the same author's header that fails validation, with no
+/// penalty and no retry, was refused in between. The refusal replaces the decision entry, which
+/// used to hold the only cached copy of the vote (issue #1836).
+#[tokio::test]
+async fn test_vote_cached_across_refused_header() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author_id = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let header = votable_header(&committee, &parent, 1);
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the first request must get a vote, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    // two epochs ahead: not stale, and not the recoverable next-epoch race
+    let refused = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .epoch(2)
+        .build();
+    let err = handler.vote(peer, refused, vec![]).await.expect_err("an epoch-2 header is invalid");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { .. }));
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal carries no penalty");
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a refused header from the same author must keep the cached vote"
+    );
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A vote is answered from memory after a request from the same author was dropped while it was
+/// evaluated, as the network layer drops it when the requester cancels (issue #1836). The decision
+/// entry is put back before the evaluation awaits, and the vote is kept apart from it, so each
+/// covers the other here.
+#[tokio::test]
+async fn test_vote_cached_across_dropped_request() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let author_id = author.id();
+    let peer = *author.authority().protocol_key();
+
+    let header = votable_header(&committee, &parent, 1);
+    let vote = match handler.vote(peer, header.clone(), vec![]).await {
+        Ok(PrimaryResponse::Vote(vote)) => vote,
+        other => panic!("the first request must get a vote, got {other:?}"),
+    };
+    store_vote_digest(&committee, &header, VoteDigest::default())?;
+
+    // a newer header waiting for an execution block that never comes; polled once, then dropped
+    let waiting = author
+        .header_builder_at_round(&committee.committee(), 2)
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .build();
+    assert!(
+        handler.vote(peer, waiting, vec![]).now_or_never().is_none(),
+        "the newer header's request must be waiting when it is dropped"
+    );
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "a dropped request from the same author must keep the cached vote"
+    );
+
+    let repeat = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+
+    Ok(())
+}
+
+/// A recast leaves a decision on a newer header of the author in place, so a different header for
+/// that newer slot is still refused early once the older header's vote was recast.
+#[tokio::test]
+async fn test_vote_recast_keeps_newer_decision() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let header = votable_header(&committee, &parent, 1);
+    store_vote_digest(&committee, &header, header.digest().into())?;
+    let epoch_two = |created_at| {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(created_at)
+            .epoch(2)
+            .build()
+    };
+
+    let newer = handler.vote(peer, epoch_two(1), vec![]).await;
+    assert_matches!(
+        newer,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { .. }))
+    );
+    let recast = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(recast, Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == header.digest());
+
+    let sibling = handler.vote(peer, epoch_two(2), vec![]).await;
+    assert_matches!(
+        sibling,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "the recast must not move the author's decision entry back to the older header"
     );
 
     Ok(())
@@ -1849,54 +2327,123 @@ async fn test_vote_per_authority_lock_concurrent_same_header() -> eyre::Result<(
     Ok(())
 }
 
-/// When `vote_inner` blocks longer than [`Parameters::vote_timeout`], `vote()` must return
-/// `PrimaryNetworkError::Timeout` once that timeout elapses.
+/// A voter whose execution has not reached the header's block refuses the vote as
+/// `ExecutionBehind` once [`VOTE_EXECUTION_WAIT`] passes, well inside the 5 s default
+/// [`Parameters::vote_timeout`], and a block that executes within the wait lets the vote proceed.
 ///
-/// `vote_timeout` is the voter-side limit on evaluating one vote request, including every wait for
-/// execution, parents, batches, or a future-dated header's lead. To force a reliable block the
-/// header's `latest_execution_block` is at block number 1 while the test environment only has
-/// block 0, so `wait_for_execution` suspends on the watch channel. The paused clock jumps from
-/// timer to timer, so the virtual time the call takes pins the configured timeout rather than the
-/// 5 s default or any other header-cadence setting.
+/// To force a reliable block the header's `latest_execution_block` is at block number 1 while the
+/// test environment only has block 0, so `wait_for_execution` suspends on the watch channel. The
+/// paused clock jumps from timer to timer, so the virtual time the call takes pins the execution
+/// wait rather than the vote timeout or any header-cadence setting.
 ///
-/// The timeout is recoverable: it carries no penalty and answers the requester with a
-/// `RecoverableError`, so the proposer asks again instead of giving up on this voter.
+/// The refusal is recoverable: it carries no penalty and answers the requester with a
+/// `RecoverableError`, so the proposer asks again instead of giving up on this voter. It also
+/// leaves the author's vote-cache entry as it was, so a header from the same author for the same
+/// round still earns a vote once block 1 executes within the wait. A block that executes within
+/// the wait at the header's height but with another hash still fails the fork check
+/// (`UnknownExecutionResult`) and stores no vote.
 #[tokio::test(start_paused = true)]
 async fn test_vote_inner_timeout() -> eyre::Result<()> {
-    let vote_timeout = Duration::from_millis(10);
     let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types_with_vote_timeout(temp_dir.path(), vote_timeout).await;
-
-    // Block number 1 will never be executed in this test; vote_inner blocks in
-    // wait_for_execution until the outer timeout fires.
-    let future_block = BlockNumHash::new(1, BlockHash::random());
-    let header = committee
-        .header_builder_last_authority()
-        .latest_execution_block(future_block)
-        .created_at(1)
-        .build();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let vote_timeout = Parameters::default().vote_timeout;
+    assert!(VOTE_EXECUTION_WAIT < vote_timeout, "the execution wait must end first");
     let peer = *committee.last_authority().authority().protocol_key();
+    let builder = || committee.header_builder_last_authority().created_at(1);
 
+    // block 1 has not executed, so vote_inner waits for it until the execution wait runs out
+    let header =
+        builder().latest_execution_block(BlockNumHash::new(1, BlockHash::random())).build();
     let start = tokio::time::Instant::now();
     let err = handler
         .vote(peer, header, vec![])
         .await
-        .expect_err("a vote request that never finishes evaluating must time out");
+        .expect_err("a voter behind on execution must refuse the vote");
     let waited = start.elapsed();
 
-    assert_matches!(err, PrimaryNetworkError::Timeout(_), "expected Timeout error");
-    assert!(
-        waited >= vote_timeout && waited < vote_timeout * 2,
-        "the vote must time out after the configured vote_timeout {vote_timeout:?}, waited \
-         {waited:?}"
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind {
+            header_block: 1,
+            local_block: 0
+        }),
+        "expected ExecutionBehind error"
     );
-    assert!(Option::<Penalty>::from(&err).is_none(), "a vote timeout must not penalize the author");
+    assert!(
+        waited >= VOTE_EXECUTION_WAIT && waited < VOTE_EXECUTION_WAIT * 2,
+        "the voter must refuse after the execution wait {VOTE_EXECUTION_WAIT:?}, not the vote \
+         timeout {vote_timeout:?}, waited {waited:?}"
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
     assert_matches!(
         PrimaryResponse::into_error_ref(&err),
         PrimaryResponse::RecoverableError(_),
-        "a vote timeout must answer the requester with a retryable response"
+        "the refusal must answer the requester with a retryable response"
     );
+
+    // block 1 executes half-way through the wait: the vote proceeds
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = builder().latest_execution_block(BlockNumHash::new(1, block.hash())).build();
+    let half = VOTE_EXECUTION_WAIT / 2;
+    let executed = consensus_bus.clone();
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(half).await;
+        executed.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+    let start = tokio::time::Instant::now();
+    assert_matches!(
+        handler.vote(peer, header, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a block executed within the wait must let the vote proceed"
+    );
+    assert!(start.elapsed() >= half, "the vote must have waited for block 1");
+    execute.await?;
+
+    // block 2 executes within the wait with another hash than the header's: the fork check refuses
+    let other = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let forked = SealedHeader::seal_slow(ExecHeader {
+        number: 2,
+        parent_hash: BlockHash::random(),
+        ..Default::default()
+    });
+    let header = other
+        .header_builder(&committee.committee())
+        .created_at(1)
+        .latest_execution_block(BlockNumHash::new(2, BlockHash::random()))
+        .build();
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(half).await;
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                2,
+                ConsensusNumHash::new(2, ConsensusHeaderDigest::default()),
+                Some(forked),
+            )
+        });
+    });
+    assert_matches!(
+        handler.vote(*other.authority().protocol_key(), header, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(_))),
+        "a block of another hash at the header's height must fail the fork check"
+    );
+    execute.await?;
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&other.id())?;
+    assert!(vote_info.is_none(), "a failed fork check must store no vote");
 
     Ok(())
 }
@@ -2479,12 +3026,12 @@ async fn test_request_vote_persistent_tier_two_lead_is_retryable() -> eyre::Resu
 }
 
 /// A header further ahead of the local clock than the drift tolerance plus the vote timeout is
-/// rejected for good: `InvalidTimestamp`, a severe penalty, and a verdict cached for its digest.
+/// rejected for good: `InvalidTimestamp`, no score penalty, and a verdict cached for its digest.
 ///
 /// The repeat request is answered from the cache with the already-converted response; a fresh
 /// evaluation would return the error itself instead.
 #[tokio::test]
-async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
+async fn test_vote_tier_three_lead_is_cached_without_penalty() -> eyre::Result<()> {
     pin_subsecond_fork(true);
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
@@ -2509,10 +3056,9 @@ async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
         PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
             if *created == created_at
     );
-    assert_matches!(
-        Option::<Penalty>::from(&err),
-        Some(Penalty::Severe),
-        "a header beyond the vote window must cost the author a severe penalty"
+    assert!(
+        Option::<Penalty>::from(&err).is_none(),
+        "clock skew must reject the header without scoring its author"
     );
 
     let repeat = handler.vote(peer, header, vec![]).await?;
@@ -2522,6 +3068,121 @@ async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
         "the repeat request must be answered from the cached verdict"
     );
     assert_matches!(repeat, PrimaryResponse::Error(_), "the cached verdict must be permanent");
+
+    Ok(())
+}
+
+/// A tier-two header is deferred before the voter checks its seed signature, so a header the voter
+/// will not vote on yet costs it no BLS verify.
+///
+/// The header leads the local clock by the drift tolerance plus half the vote timeout and carries
+/// a seed signature over another epoch's seed message, which the seed check refuses with
+/// `InvalidSeedSignature` (see `test_vote_rejects_invalid_seed_signature`). The drift tier needs
+/// only the header and the clock, so the voter decides it first and answers `RecoverableError`.
+/// The deferral counter moving by one shows the answer is the tier-two one. The answer also leaves
+/// the author's vote-cache entry as it was, so a valid header from the same author for the same
+/// round still earns a vote. Had the seed check run first, its cached error would refuse that
+/// header as `AlreadyVotedForLaterRound`.
+#[tokio::test]
+async fn test_vote_tier_two_lead_is_deferred_before_seed_signature_check() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    let (tolerance, vote_timeout) = drift_limits(&committee);
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let builder = || {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+    };
+
+    // the middle of tier two, so the lead is still in it when the request arrives
+    let lead = tolerance + vote_timeout / 2;
+    let ahead = builder()
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+        .seed_signature(author.seed_signature(42, 1))
+        .build();
+    assert_matches!(
+        handler.vote(peer, ahead, vec![]).await,
+        Ok(PrimaryResponse::RecoverableError(_)),
+        "a tier-two header must be deferred before its seed signature is checked"
+    );
+    let deferrals = snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.votes_deferred_future_header_total").then_some(value)
+    });
+    assert_matches!(
+        deferrals,
+        Some(DebugValue::Counter(1)),
+        "the recoverable answer must be the tier-two deferral"
+    );
+
+    let legit = builder().created_at(1).build();
+    assert_matches!(
+        handler.vote(peer, legit, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "the deferral must leave the author free to earn a vote in the same round"
+    );
+
+    Ok(())
+}
+
+/// A tier-three header is rejected before the voter waits for its execution block.
+///
+/// The header leads the local clock by more than the drift tolerance plus the vote timeout and
+/// names execution block 1, which this node has not reached (the fixture stops at block 0). The
+/// execution wait would suspend on that block until the vote timeout fired and end the request as
+/// a `Timeout`, which carries no penalty (see `test_vote_inner_timeout`). The drift tier is decided
+/// first instead: the answer is `InvalidTimestamp`, without scoring clock skew. The paused clock
+/// moves only while every task waits, so a call that never waits takes no virtual time.
+#[tokio::test(start_paused = true)]
+async fn test_vote_tier_three_lead_is_rejected_before_execution_wait() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let (tolerance, vote_timeout) = drift_limits(&committee);
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let unexecuted = BlockNumHash::new(1, BlockHash::random());
+    // anti-vacuity: the execution wait would suspend on this block rather than fail at once
+    assert!(
+        consensus_bus.latest_execution_block_num_hash().number < unexecuted.number,
+        "the voter must not have executed the header's block yet"
+    );
+    let lead = tolerance + vote_timeout + Duration::from_secs(1);
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(unexecuted)
+        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+        .build();
+    let created_at = header.created_at_ms();
+
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(peer, header, vec![])
+        .await
+        .expect_err("a header beyond the vote window must be rejected");
+    let waited = start.elapsed();
+
+    assert_matches!(
+        &err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
+            if *created == created_at,
+        "the drift tier must reject the header before the execution wait; the request ended \
+         after {waited:?}"
+    );
+    assert_eq!(waited, Duration::ZERO, "the voter must not wait for the header's execution block");
+    assert!(
+        Option::<Penalty>::from(&err).is_none(),
+        "clock skew must reject the header without scoring its author"
+    );
 
     Ok(())
 }
@@ -2686,10 +3347,14 @@ async fn test_sync_partial_epoch_pack_over_stream() {
         assert_matches!(ack, tn_network_libp2p::SyncFrame::Ack);
 
         let mut reassembled = Vec::new();
-        crate::network::sync_codec::sync_pack_reader(cursor)
-            .read_to_end(&mut reassembled)
-            .await
-            .expect("reassemble partial pack data frames");
+        crate::network::sync_codec::sync_pack_reader(
+            cursor,
+            crate::network::sync_codec::SyncRateBound::Floor,
+            crate::network::sync_codec::SyncServeMeter::default(),
+        )
+        .read_to_end(&mut reassembled)
+        .await
+        .expect("reassemble partial pack data frames");
         reassembled
     }
 
@@ -2791,8 +3456,9 @@ fn test_epoch_record_admission_enforces_per_peer_cap() {
 
 /// `EpochRecord` request-response admission must cap the concurrent serve count across all peers
 /// at [`MAX_CONCURRENT_EPOCH_RECORD_REQUESTS`] and free the budget when serves end
-/// (GHSA-vc2r-9cp2-w74j). This bounds the global task-spawn and, since a permit is held for the
-/// serve's lifetime, the total in-flight certificate-wait budget as well.
+/// (GHSA-vc2r-9cp2-w74j). This bounds the global task-spawn. A permit is held for the serve's
+/// lifetime, which is only the lookup and the response (an uncertified record is answered as
+/// unavailable at once, without a wait).
 #[test]
 fn test_epoch_record_admission_enforces_global_cap() {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
@@ -2826,6 +3492,68 @@ fn test_epoch_record_admission_enforces_global_cap() {
     assert!(
         try_admit_epoch_record(&semaphore, &peers, extra).is_some(),
         "dropping in-flight serves must free global concurrency"
+    );
+}
+
+/// Uncertified epoch-record serves release their admission permits at once (issue #1646).
+///
+/// Every global permit is held by a serve that answers an uncertified record, and a further peer
+/// is shed while they are held. When the serves end, the global budget and the per-peer counts
+/// are free again, and a certified record is served under a new permit. The per-peer cap is
+/// covered by `test_epoch_record_admission_enforces_per_peer_cap`.
+#[tokio::test]
+async fn test_epoch_record_permits_release_after_unavailable_serves() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut rng = StdRng::seed_from_u64(3);
+
+    // one serve per distinct peer holds every global permit
+    let peer_pool: Vec<_> = (0..MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)
+        .map(|_| *BlsKeypair::generate(&mut rng).public())
+        .collect();
+    let held: Vec<_> = peer_pool
+        .iter()
+        .map(|peer| {
+            try_admit_epoch_record(&semaphore, &peers, *peer)
+                .expect("a global permit must be available while the budget is not exhausted")
+        })
+        .collect();
+
+    // a further peer is shed while every permit is held
+    let extra = *BlsKeypair::generate(&mut rng).public();
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, extra).is_none(),
+        "a fresh peer must be shed while every epoch-record permit is held"
+    );
+
+    // each held serve answers the uncertified record as unavailable, without a wait
+    let start = Instant::now();
+    let served = futures::future::join_all(
+        held.iter().map(|_permit| handler.retrieve_epoch_record(Some(0), None)),
+    )
+    .await;
+    assert!(start.elapsed() < Duration::from_secs(1), "uncertified serves must not wait");
+    served.into_iter().for_each(|response| {
+        assert_matches!(response, Err(PrimaryNetworkError::UnavailableEpoch(0)));
+    });
+
+    // ending the serves frees the global budget and every per-peer count
+    drop(held);
+    assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_EPOCH_RECORD_REQUESTS);
+    assert!(peers.lock().is_empty(), "ended serves must leave no per-peer count");
+
+    // a new serve is admitted, and a certified record is served under its permit
+    certify_epoch_record(&handler, &committee, &record).await;
+    let _permit = try_admit_epoch_record(&semaphore, &peers, extra)
+        .expect("a freed budget must admit a new serve");
+    assert_matches!(
+        handler.retrieve_epoch_record(Some(0), None).await,
+        Ok(PrimaryResponse::EpochRecord { record: served, .. })
+            if served.digest() == record.digest()
     );
 }
 
@@ -2917,6 +3645,158 @@ async fn test_consensus_result_publishes_on_quorum() -> eyre::Result<()> {
         consensus_bus.published_consensus_num_hash(),
         (epoch, number, hash),
         "result must be published once a quorum of distinct signers is reached",
+    );
+    Ok(())
+}
+
+/// Feed a quorum (`1/3 + 1`) of distinct fixture signers of one consensus result through the
+/// handler, in committee order.
+async fn gossip_consensus_result_quorum(
+    handler: &RequestHandler<MemDatabase>,
+    committee: &CommitteeFixture<MemDatabase>,
+    epoch: Epoch,
+    round: Round,
+    number: u64,
+    hash: ConsensusHeaderDigest,
+) -> eyre::Result<()> {
+    let quorum = committee.committee().size() / 3 + 1;
+    futures::stream::iter(committee.authorities().take(quorum))
+        .then(|auth| async move {
+            handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, number, hash)).await
+        })
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
+}
+
+/// Signers of a consensus result must come from the previous, current or next committee, the
+/// window the gossip layer authorises publishers from. A stored committee for an older epoch is
+/// retired: a quorum of its keys claiming that epoch must not publish (issue #1771). The old
+/// resolver read the epoch-0 record, verified the signatures and pinned the watch at `(0, 10)`.
+#[tokio::test]
+async fn test_consensus_result_rejects_signers_outside_committee_window() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    // An observer follows the tip through the watch and never enters catch-up mode here.
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+    // The retired committee: the fixture keys, stored as the epoch-0 record.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 0, 1, 10, hash).await?;
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a quorum of a retired committee must not publish a consensus result",
+    );
+    Ok(())
+}
+
+/// A result for the previous epoch is accepted from that epoch's committee, but the certified
+/// epoch record bounds its number: `final_consensus.number` is the last output of the epoch, so a
+/// result numbered past it is dropped before the signature check and never pins the watch
+/// (issue #1771). Without the bound the first batch publishes `(1, 7)` and the real `(1, 5)` is
+/// then dropped as old, so the final assertion fails.
+#[tokio::test]
+async fn test_consensus_result_previous_epoch_bounded_by_certified_record() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+
+    // Epoch records are stored in order from epoch 0.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    // The certified record of epoch 1: the fixture committee, closed at consensus number 5.
+    let final_hash = ConsensusHeaderDigest::from(B256::random());
+    let record = EpochRecord {
+        epoch: 1,
+        committee: committee.committee().bls_keys().into_iter().collect(),
+        final_consensus: ConsensusNumHash::new(5, final_hash),
+        ..Default::default()
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_record(record.clone())
+        .await
+        .expect("seed epoch-1 record");
+    certify_epoch_record(&handler, &committee, &record).await;
+
+    // A quorum signs a number past the epoch's certified final consensus.
+    let past_hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 7, past_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a result numbered past the certified epoch record must not publish",
+    );
+
+    // The same quorum signs the epoch's real final output.
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 5, final_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (1, 5, final_hash),
+        "a result at the certified final consensus of the previous epoch must publish",
+    );
+    Ok(())
+}
+
+/// A result for the previous epoch is dropped while that epoch's record has no certificate
+/// (issue #1796). After a boundary the node stores its own closed record uncertified until the
+/// epoch votes complete, and in that window the #1771 bound was `None`: f+1 signers of the previous
+/// committee could pin the watch to any number. Now the result is dropped before the signature
+/// check and the record collector is asked for the certificate. Without the fix the first batch
+/// publishes `(1, u64::MAX)`, so the first assertion fails and the real `(1, 5)` is dropped as old.
+#[tokio::test]
+async fn test_consensus_result_previous_epoch_dropped_without_certified_record() -> eyre::Result<()>
+{
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 2).await;
+    consensus_bus.node_mode().send_replace(NodeMode::Observer);
+
+    // Epoch records are stored in order from epoch 0.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
+    // The node's own closed record of epoch 1, stored without a certificate.
+    let final_hash = ConsensusHeaderDigest::from(B256::random());
+    let record = EpochRecord {
+        epoch: 1,
+        committee: committee.committee().bls_keys().into_iter().collect(),
+        final_consensus: ConsensusNumHash::new(5, final_hash),
+        ..Default::default()
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_record(record.clone())
+        .await
+        .expect("seed epoch-1 record");
+
+    // A quorum of the epoch-1 committee signs a far-future number while the record is uncertified.
+    let far_hash = ConsensusHeaderDigest::from(B256::random());
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, u64::MAX, far_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "a previous-epoch result must not publish while the epoch record is uncertified",
+    );
+    assert!(
+        *consensus_bus.requested_missing_epoch().borrow() >= 1,
+        "the dropped result must ask the record collector for the previous epoch",
+    );
+
+    // Once the certificate is stored the certified bound applies and the real final output
+    // publishes.
+    certify_epoch_record(&handler, &committee, &record).await;
+    gossip_consensus_result_quorum(&handler, &committee, 1, 1, 5, final_hash).await?;
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (1, 5, final_hash),
+        "the previous epoch's final output publishes once its record is certified",
     );
     Ok(())
 }
@@ -3086,7 +3966,7 @@ async fn test_consensus_certs_publisher_flood_cannot_evict_honest_tally() -> eyr
     let (epoch, round) = (0u32, 1u32);
     let quorum = committee.committee().size() / 3 + 1;
     let authorities: Vec<_> = committee.authorities().collect();
-    assert!(authorities.len() >= quorum + 1, "need a flooder plus a distinct honest quorum");
+    assert!(authorities.len() > quorum, "need a flooder plus a distinct honest quorum");
 
     let hash_real = ConsensusHeaderDigest::from(B256::random());
     for auth in authorities.iter().skip(1).take(quorum) {
@@ -3191,17 +4071,11 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
     // never evicted. Under a fixed cap this same flood would evict it and number 2 would stall.
     let hash_real = ConsensusHeaderDigest::from(B256::random());
     for h in f..(f + quorum) {
-        for b in 0..f {
+        for authority in authorities.iter().take(f) {
             for _ in 0..MAX_TALLIES_PER_SIGNER_PER_NUMBER {
                 let flood = ConsensusHeaderDigest::from(B256::random());
                 handler
-                    .process_gossip(&signed_consensus_gossip(
-                        authorities[b],
-                        epoch,
-                        round,
-                        1,
-                        flood,
-                    ))
+                    .process_gossip(&signed_consensus_gossip(authority, epoch, round, 1, flood))
                     .await?;
             }
         }
@@ -3222,6 +4096,1430 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
     );
     assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
 
+    Ok(())
+}
+
+/// `order_probe_peers` shuffles candidates and moves peers that already failed a probe for
+/// THIS epoch to the back, so a Byzantine/drip peer fixed in stable `HashMap` order can no longer
+/// starve every retry. A failure recorded for a DIFFERENT epoch does not de-prioritise a peer.
+#[test]
+fn test_order_probe_peers_deprioritises_this_epoch_failures() {
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peers: Vec<BlsPublicKey> =
+        (0..5).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+
+    // peers[0], peers[1] failed THIS epoch (7); peers[2] failed a DIFFERENT epoch (6, ignored).
+    let failed: HashSet<(BlsPublicKey, Epoch)> =
+        [(peers[0], 7), (peers[1], 7), (peers[2], 6)].into_iter().collect();
+
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &failed,
+        &HashMap::new(),
+        7,
+        None,
+        false,
+        &mut rng,
+    );
+
+    // Same set, no drops.
+    assert_eq!(
+        ordered.iter().copied().collect::<BTreeSet<_>>(),
+        peers.iter().copied().collect::<BTreeSet<_>>(),
+        "ordering must be a permutation of the input"
+    );
+    // The two this-epoch-failed peers occupy exactly the last two slots (order within a group is
+    // shuffled, so compare as a set).
+    let tail: BTreeSet<BlsPublicKey> = ordered[3..].iter().copied().collect();
+    assert_eq!(
+        tail,
+        [peers[0], peers[1]].into_iter().collect::<BTreeSet<_>>(),
+        "peers that failed this epoch must be probed last"
+    );
+    // peers[2] (failed a different epoch) is NOT de-prioritised — it is among the first three.
+    assert!(
+        ordered[..3].contains(&peers[2]),
+        "a failure recorded for another epoch must not de-prioritise the peer"
+    );
+}
+
+/// The context of an ordinary walk that starts now on `handle`: it reads the preference slot's
+/// current generation, so its serve records (#1787).
+fn current_walk(handle: &PrimaryNetworkHandle) -> ProbeWalk {
+    ProbeWalk { generation: handle.last_sync_server.lock().generation, explore: false }
+}
+
+/// Stand in for the swarm behind a [`PrimaryNetworkHandle`] in the sync probe tests.
+///
+/// The spawned task answers `ConnectedPeers` with `peers` and fails every `OpenStream`: a peer in
+/// `unsupported` gets `UpgradeFailed` (it does not speak the sync protocol), every other peer gets
+/// `Timeout` (a transient failure). Each opened peer is recorded in order. Any other command
+/// panics, which closes the command channel and fails the probe.
+fn spawn_scripted_swarm(
+    peers: Vec<BlsPublicKey>,
+    unsupported: HashSet<BlsPublicKey>,
+) -> (PrimaryNetworkHandle, Arc<Mutex<Vec<BlsPublicKey>>>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    let handle = PrimaryNetworkHandle::new_for_test(tx);
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&opened);
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            match command {
+                NetworkCommand::ConnectedPeers { reply } => {
+                    // the prober awaits this reply, so the send cannot fail
+                    let _ = reply.send(peers.clone());
+                }
+                NetworkCommand::OpenStream { peer, reply } => {
+                    recorder.lock().push(peer);
+                    let error = if unsupported.contains(&peer) {
+                        StreamError::UpgradeFailed
+                    } else {
+                        StreamError::Timeout
+                    };
+                    let _ = reply.send(Err(NetworkError::Stream(error)));
+                }
+                other => panic!("unexpected command from a sync probe: {other:?}"),
+            }
+        }
+    });
+    (handle, opened)
+}
+
+/// Sixteen connected peers and a consensus chain holding a fresh epoch-0 pack.
+///
+/// Returns the temp dir so the chain's files outlive the test body.
+async fn sync_probe_peers_and_chain() -> (Vec<BlsPublicKey>, ConsensusChain, TempDir) {
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peers = (0..16).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let temp_dir = TempDir::new().unwrap();
+    let chain = ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+        .await
+        .unwrap();
+    (peers, chain, temp_dir)
+}
+
+/// One full-pack fetch walks every connected peer before it gives up, so a single server among
+/// many peers is always reached, and the peers that failed are probed again on the next call.
+#[tokio::test]
+async fn test_request_epoch_pack_probes_every_eligible_peer() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+    let all: BTreeSet<BlsPublicKey> = peers.iter().copied().collect();
+    let record = EpochRecord::default();
+
+    for call in 1..=2 {
+        let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+        assert!(result.await.is_err(), "no peer serves, so call {call} must fail");
+        let opens = std::mem::take(&mut *opened.lock());
+        assert_eq!(opens.len(), 16, "call {call} must open one stream to every peer");
+        assert_eq!(
+            opens.into_iter().collect::<BTreeSet<_>>(),
+            all,
+            "call {call} must probe each connected peer once"
+        );
+    }
+}
+
+/// One consensus-output fetch walks every connected peer before it gives up.
+#[tokio::test]
+async fn test_request_consensus_output_probes_every_eligible_peer() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+
+    let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
+    assert!(result.is_err(), "no peer serves, so the fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the fetch must open one stream to every peer");
+    assert_eq!(
+        opens.into_iter().collect::<BTreeSet<_>>(),
+        peers.into_iter().collect::<BTreeSet<_>>(),
+        "the fetch must probe each connected peer once"
+    );
+}
+
+/// A full-pack fetch caches the peers that do not speak the sync protocol as unsyncable and the
+/// next call walks only the peers that do, still without a cap.
+#[tokio::test]
+async fn test_request_epoch_pack_skips_cached_unsyncable_peers() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let unsupported: HashSet<BlsPublicKey> = peers[..4].iter().copied().collect();
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
+    let record = EpochRecord::default();
+
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the first call must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the first call must open one stream to every peer");
+
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the second call must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 12, "the second call must skip the four cached unsyncable peers");
+    assert_eq!(
+        opens.into_iter().collect::<BTreeSet<_>>(),
+        peers[4..].iter().copied().collect::<BTreeSet<_>>(),
+        "the second call must probe exactly the sync-capable peers"
+    );
+}
+
+/// `order_probe_peers` puts the last peer that served first while it is fresh, first among the
+/// failed peers once it has failed this epoch, and ignores a preferred key that is not connected.
+#[test]
+fn test_order_probe_peers_puts_last_server_first() {
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peers: Vec<BlsPublicKey> =
+        (0..6).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+    let none_failed: HashSet<(BlsPublicKey, Epoch)> = HashSet::new();
+
+    // whichever peer served last, it is probed first while it has not failed this epoch
+    for &preferred in &peers {
+        let ordered = crate::network::order_probe_peers(
+            peers.clone(),
+            &none_failed,
+            &HashMap::new(),
+            7,
+            Some(preferred),
+            false,
+            &mut rng,
+        );
+        assert_eq!(ordered[0], preferred, "a fresh preferred peer must be probed first");
+    }
+
+    // the preferred peer and one other both failed epoch 7: both sit behind the four fresh peers,
+    // the preferred one first
+    let failed: HashSet<(BlsPublicKey, Epoch)> =
+        [(peers[0], 7), (peers[1], 7)].into_iter().collect();
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &failed,
+        &HashMap::new(),
+        7,
+        Some(peers[0]),
+        false,
+        &mut rng,
+    );
+    assert_eq!(ordered[4], peers[0], "a failed preferred peer must lead the failed group");
+    assert_eq!(ordered[5], peers[1], "the other failed peer must be probed last");
+
+    // a failure recorded for another epoch does not cost the preference
+    let stale: HashSet<(BlsPublicKey, Epoch)> = [(peers[0], 6)].into_iter().collect();
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &stale,
+        &HashMap::new(),
+        7,
+        Some(peers[0]),
+        false,
+        &mut rng,
+    );
+    assert_eq!(ordered[0], peers[0], "a failure in another epoch must not demote the peer");
+
+    // a preferred key that is not connected changes nothing: same rng state, same order as `None`
+    let stranger = *BlsKeypair::generate(&mut rng).public();
+    let with_stranger = crate::network::order_probe_peers(
+        peers.clone(),
+        &none_failed,
+        &HashMap::new(),
+        7,
+        Some(stranger),
+        false,
+        &mut rng.clone(),
+    );
+    let without = crate::network::order_probe_peers(
+        peers.clone(),
+        &none_failed,
+        &HashMap::new(),
+        7,
+        None,
+        false,
+        &mut rng,
+    );
+    assert_eq!(with_stranger, without, "an unconnected preferred key must not reorder peers");
+    assert_eq!(
+        with_stranger.into_iter().collect::<BTreeSet<_>>(),
+        peers.into_iter().collect::<BTreeSet<_>>(),
+        "ordering must be a permutation of the input"
+    );
+}
+
+/// Both probe loops open the last peer that served first, a preferred peer that does not serve
+/// its probe loses the preference (`forget_sync_server`), and a preferred peer that already
+/// failed this epoch is opened after every fresh peer.
+#[tokio::test]
+async fn test_probe_loops_open_last_server_first() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let record = EpochRecord::default();
+
+    // four peers refuse the protocol (`Unsupported`) and the rest time out (`Failed`); the
+    // preferred peer is among the failed ones, so it loses the preference
+    let unsupported: HashSet<_> = peers[..4].iter().copied().collect();
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
+    handle.record_sync_served(peers[9], 0, current_walk(&handle));
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
+    assert_eq!(opens[0], peers[9], "the pack fetch must open the last server first");
+    assert_eq!(
+        handle.last_sync_server.lock().peer,
+        None,
+        "a preferred peer that failed its probe must lose the preference"
+    );
+
+    // the four unsupported peers are now cached unsyncable and skipped; every other peer failed
+    // epoch 0 above. Serving again restores the preference (and clears the peer's failure), so
+    // the preferred peer leads that group until it fails once more
+    handle.record_sync_served(peers[9], 0, current_walk(&handle));
+    let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
+    assert!(result.is_err(), "no peer serves, so the output fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 12, "the output fetch must skip the peers cached unsyncable");
+    assert_eq!(opens[0], peers[9], "the output fetch must open the last server first");
+    assert_eq!(
+        handle.last_sync_server.lock().peer,
+        None,
+        "a preferred peer that failed its probe must lose the preference"
+    );
+
+    // a preferred peer that already failed this epoch goes behind every fresh peer
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+    handle.record_sync_served(peers[9], 0, current_walk(&handle));
+    handle.epoch_sync_failed.lock().insert((peers[9], 0));
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
+    assert_eq!(opens.last(), Some(&peers[9]), "a failed preferred peer must be opened last");
+    assert_eq!(handle.last_sync_server.lock().peer, None, "and it loses the preference as well");
+}
+
+/// `clear_sync_capability` empties the per-epoch caches and also drops the last peer that
+/// served, so a peer preferred in one epoch gets no head start in the next (#1787). Serving
+/// clears only the `(peer, epoch)` slow mark it was recorded for.
+#[test]
+fn test_clear_sync_capability_drops_last_server() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let handle = PrimaryNetworkHandle::new_for_test(tx);
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peer = *BlsKeypair::generate(&mut rng).public();
+    let other = *BlsKeypair::generate(&mut rng).public();
+
+    handle.epoch_sync_failed.lock().insert((peer, 2));
+    handle.epoch_sync_failed.lock().insert((peer, 3));
+    handle.epoch_sync_failed.lock().insert((other, 3));
+    handle.record_sync_served(peer, 3, current_walk(&handle));
+    assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
+    assert!(
+        !handle.epoch_sync_failed.lock().contains(&(peer, 3)),
+        "serving must clear the peer's failure for this epoch"
+    );
+    assert!(
+        handle.epoch_sync_failed.lock().contains(&(peer, 2)),
+        "serving in one epoch must not clear the peer's failure for another epoch"
+    );
+    assert!(
+        handle.epoch_sync_failed.lock().contains(&(other, 3)),
+        "serving must not clear another peer's failure"
+    );
+    assert_eq!(handle.last_sync_server.lock().peer, Some(peer), "serving must set the preference");
+
+    handle.clear_sync_capability();
+    assert!(handle.sync_capability.lock().is_empty(), "capability cache must be cleared");
+    assert!(handle.epoch_sync_failed.lock().is_empty(), "failure set must be cleared");
+    assert_eq!(handle.last_sync_server.lock().peer, None, "the preference must be dropped");
+}
+
+/// `import_fault_is_peer_caused` admits ONLY faults attributable solely to
+/// the peer's streamed bytes (which then carry the severity `consensus_chain_error_to_penalty`
+/// assigns), and excludes every local/ambiguous error so an honest peer is never banned for this
+/// node's own storage/IO failure.
+#[test]
+fn test_import_fault_is_peer_caused_whitelist() {
+    use tn_network_libp2p::Penalty;
+    let peer_caused =
+        |e: ConsensusChainError| PrimaryNetworkHandle::import_fault_is_peer_caused(&e);
+    let cc = ConsensusChainError::PackError;
+
+    // Peer-caused stream faults -> penalised (and the severity is the mapper's).
+    assert!(peer_caused(cc(PackError::InvalidConsensusChain)));
+    assert!(peer_caused(cc(PackError::InvalidConsensusNumber(2, 1))));
+    assert!(peer_caused(cc(PackError::EmptySubDag)));
+    assert!(peer_caused(cc(PackError::BatchTooLarge { size: 2, max: 1 })));
+    assert!(peer_caused(cc(PackError::OutputTooLarge { size: 2, max: 1 })));
+    assert!(peer_caused(cc(PackError::TooManyBatches(9))));
+    assert!(peer_caused(cc(PackError::MissingBatch)));
+    // A record out of place / not what the header declares, or one that fails its CRC/decode, is
+    // the sender's bytes: charged at Medium (an honest peer's at-rest pack damage looks the
+    // same).
+    assert!(peer_caused(cc(PackError::UnexpectedRecord("batch before header".into()))));
+    assert!(peer_caused(cc(PackError::UndecodableRecord("crc failed".into()))));
+    for error in [
+        PackError::UnexpectedRecord("batch before header".into()),
+        PackError::UndecodableRecord("crc failed".into()),
+    ] {
+        assert!(matches!(
+            PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(error)),
+            Some(Penalty::Medium)
+        ));
+    }
+    // Severity check: the whitelisted OOM/wedge faults are Severe.
+    assert!(matches!(
+        PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(PackError::BatchTooLarge {
+            size: 2,
+            max: 1
+        })),
+        Some(Penalty::Severe)
+    ));
+
+    // An import whose stream stores under its progress bound is the sender's (Mild: the cut also
+    // marks the peer for the epoch).
+    let stalled =
+        || PackError::ImportStalled { written: 0, window: std::time::Duration::from_secs(300) };
+    assert!(peer_caused(cc(stalled())));
+    assert!(matches!(
+        PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(stalled())),
+        Some(Penalty::Mild)
+    ));
+    // An import stopped at the free-space floor is this node's disk: never charged.
+    let full = || Arc::new(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    assert!(!peer_caused(cc(PackError::IO(full()))));
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(PackError::IO(full())))
+        .is_none());
+
+    // Local / ambiguous errors -> NEVER charge the peer.
+    assert!(!peer_caused(cc(PackError::CorruptPack("local recovery".into()))));
+    assert!(!peer_caused(cc(PackError::PersistError("disk full".into()))));
+    assert!(!peer_caused(cc(PackError::Append("io".into()))));
+    assert!(!peer_caused(cc(PackError::ReadOnly)));
+    // Local IO (a leftover import dir we could not remove, a full disk) is never the peer's.
+    let io = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(!peer_caused(ConsensusChainError::IO(io())));
+    assert!(!peer_caused(cc(PackError::IO(Arc::new(io())))));
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&ConsensusChainError::IO(io()))
+        .is_none());
+    // A transport failure or timeout says nothing about the sender's bytes.
+    assert!(!peer_caused(cc(PackError::ReadError("timeout".into()))));
+    assert!(!peer_caused(ConsensusChainError::EpochMismatch));
+    assert!(!peer_caused(ConsensusChainError::PrevCommitteeEpochMismatch));
+    assert!(!peer_caused(ConsensusChainError::CrcError));
+    assert!(!peer_caused(ConsensusChainError::NoCurrentEpoch));
+    // The caller's own state for the wrong epoch, or a refused in-place import of the live epoch.
+    for error in [
+        cc(PackError::LocalEpochMismatch { local: 1, found: 2 }),
+        ConsensusChainError::LiveEpochImport(3),
+    ] {
+        assert!(!peer_caused(error));
+    }
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(
+        PackError::LocalEpochMismatch { local: 1, found: 2 }
+    ))
+    .is_none());
+}
+
+/// Encode `cert` as primary gossip on the primary topic, as the network layer delivers it.
+fn encode_certificate_gossip(cert: tn_types::Certificate) -> GossipMessage {
+    let data = tn_types::encode(&PrimaryGossip::Certificate(Box::new(cert)));
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
+    GossipMessage { source: None, data, sequence_number: None, topic }
+}
+
+/// A validation ticket that reports to a fresh channel, and the receiver for its verdict.
+fn gossip_ticket(
+    id: &str,
+) -> (
+    GossipValidation<PrimaryRequest, PrimaryResponse>,
+    tokio::sync::mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    (GossipValidation::new(MessageId::from(id.as_bytes().to_vec()), PeerId::random(), tx), rx)
+}
+
+/// Whether the next command on `verdicts` reports `expected` for a held gossip message.
+async fn next_verdict_is(
+    verdicts: &mut tokio::sync::mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    expected: GossipVerdict,
+) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), verdicts.recv()).await.ok().flatten().is_some_and(
+        |command| {
+            matches!(
+                command,
+                NetworkCommand::ReportGossipValidation { verdict, .. } if verdict == expected
+            )
+        },
+    )
+}
+
+/// A certificate whose aggregate signature does not verify against the committee is an author
+/// content fault with a fatal penalty, and its ticket reports Reject (#1772).
+#[tokio::test]
+async fn invalid_certificate_signature_rejects_and_charges_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, mut verdicts) = gossip_ticket("bad-aggregate");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.is_author_content_fault(), "a bad aggregate is the author's fault: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal)),
+        "a bad aggregate must be a fatal penalty: {err:?}"
+    );
+    assert!(pending.is_pending(), "the handler must leave the failed verdict to the caller");
+    pending.settle_error(&err).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Reject).await,
+        "a bad aggregate must report Reject"
+    );
+}
+
+/// The signed author of a certificate whose aggregate fails takes a fatal penalty, which the peer
+/// manager waives for committee keys. The strike in the verification slots is the cost: the
+/// author gets no slot during its cooldown, and another author still gets one (#1772).
+#[tokio::test]
+async fn invalid_certificate_author_is_cooled_down() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, _verdicts) = gossip_ticket("bad-aggregate-cooldown");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.is_author_content_fault(), "a bad aggregate is the author's fault: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Fatal)),
+        "a bad aggregate must be a fatal penalty: {err:?}"
+    );
+
+    // process_gossip strikes the author on this fault.
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    let author = other.last_authority().primary_public_key();
+    let honest = other.authorities().next().expect("authority").primary_public_key();
+    assert_ne!(author, honest, "the fixture committee has more than one authority");
+    slots.strike(author);
+    assert!(slots.take(Some(author), None).is_none(), "a struck author must be cooled down");
+    assert!(slots.take(Some(honest), None).is_some(), "another author must still get a slot");
+}
+
+/// A certificate that verifies reports Accept and frees its verification slot before the
+/// downstream certificate work (#1772).
+#[tokio::test]
+async fn valid_certificate_accepts_before_downstream() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let msg =
+        encode_certificate_gossip(committee.certificate(&committee.header_from_last_authority()));
+    let slots = GossipSlots::new(1);
+    let (validation, mut verdicts) = gossip_ticket("valid");
+    let mut pending =
+        PendingGossip::new(validation, slots.take(None, None).expect("free shared slot"));
+    assert!(slots.take(None, None).is_none(), "the shared bucket holds one message");
+
+    // Only the verdict and the slot are checked; the downstream result is not part of the fix.
+    let _ = handler.process_gossip_with(&msg, &mut pending).await;
+    assert!(!pending.is_pending(), "a verified certificate must get a verdict");
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Accept).await,
+        "a verified certificate must report Accept"
+    );
+    assert!(
+        slots.take(None, None).is_some(),
+        "the verdict must free the slot while the message is still held"
+    );
+}
+
+/// A replay of a certificate this node already verified is ignored before the aggregate check:
+/// the handler returns `Ok(())` with no verdict, and the dropped ticket reports Ignore, so the
+/// replay is not forwarded (#1772).
+#[tokio::test]
+async fn replayed_certificate_is_ignored_before_verification() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let msg =
+        encode_certificate_gossip(committee.certificate(&committee.header_from_last_authority()));
+
+    // First delivery: the aggregate verifies and the ticket reports Accept. The digest is recorded
+    // before the accept, so the downstream result does not matter here.
+    let (validation, mut verdicts) = gossip_ticket("first-delivery");
+    let mut first = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    let _ = handler.process_gossip_with(&msg, &mut first).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Accept).await,
+        "the first delivery of a valid certificate must report Accept"
+    );
+    drop(first);
+
+    // Second delivery of the same frame: the known-certificate check returns before the verify.
+    let (validation, mut verdicts2) = gossip_ticket("replay");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "a replay of a known certificate is not a fault"
+    );
+    assert!(pending.is_pending(), "a replay must not get a verdict from the handler");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts2, GossipVerdict::Ignore).await,
+        "a replay must report Ignore, so it is not forwarded"
+    );
+}
+
+/// A certificate for an epoch with no known committee cannot be verified: the handler returns
+/// `Ok(())`, so no peer is charged, and the dropped ticket reports Ignore (#1772).
+#[tokio::test]
+async fn unknown_committee_certificate_ignores_without_penalty() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    let future =
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(5).build();
+    let cert = future.certificate(&future.header_from_last_authority());
+    assert_eq!(cert.epoch(), 5, "the certificate must be for an epoch the handler does not know");
+    let msg = encode_certificate_gossip(cert);
+    let (validation, mut verdicts) = gossip_ticket("unknown-committee");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "an unknown committee is not a fault, so no penalty applies"
+    );
+    assert!(pending.is_pending(), "unverifiable gossip must not get Accept");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "a ticket dropped without a verdict must report Ignore"
+    );
+}
+
+/// A certificate for an earlier epoch is ignored before any verification: the handler returns
+/// `Ok(())` with the ticket pending, so no peer is charged, and the dropped ticket reports
+/// Ignore. Its aggregate does not verify, so a verify would have returned an error (#1772).
+#[tokio::test]
+async fn earlier_epoch_certificate_is_ignored_before_verification() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types_at_epoch(temp_dir.path(), 1).await;
+    // A second committee at epoch 0 signs with keys that the handler's committee does not hold.
+    let earlier = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let cert = earlier.certificate(&earlier.header_from_last_authority());
+    assert_eq!(cert.epoch(), 0, "the certificate must be for an earlier epoch than the handler's");
+    let msg = encode_certificate_gossip(cert);
+    let (validation, mut verdicts) = gossip_ticket("earlier-epoch");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    assert!(
+        handler.process_gossip_with(&msg, &mut pending).await.is_ok(),
+        "an earlier-epoch certificate is not a fault, so no penalty applies"
+    );
+    assert!(pending.is_pending(), "an earlier-epoch certificate must not get a verdict");
+    drop(pending);
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "an earlier-epoch certificate must report Ignore, so it is not forwarded"
+    );
+}
+
+/// A consensus result with a bad signature from a committee key is an author content fault of
+/// the strike class. Its penalty stays Mild, its ticket reports Reject, and the author's own
+/// delivery strikes the author (#1772).
+#[tokio::test]
+async fn forged_consensus_result_strikes_its_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, .. } = create_test_types(temp_dir.path()).await;
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let auth = committee.first_authority();
+    let config = auth.consensus_config();
+    let key_config = config.key_config();
+    let key = key_config.public_key();
+    // The committee key signs another hash, so the signature does not cover the gossiped result.
+    let other_hash = ConsensusHeaderDigest::from(B256::random());
+    let signed = ConsensusResult::digest_data(epoch, round, number, other_hash);
+    let signature = key_config.request_signature_direct(&encode(&to_intent_message(signed)));
+    let result = ConsensusResult { epoch, round, number, hash, validator: key, signature };
+    let topic =
+        TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(config.chain_id()));
+    let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+    let (validation, mut verdicts) = gossip_ticket("forged-consensus-result");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.strikes_gossip_author(), "a forged consensus result must strike: {err:?}");
+    assert!(
+        matches!(Option::<Penalty>::from(&err), Some(Penalty::Mild)),
+        "a forged consensus result keeps its mild penalty: {err:?}"
+    );
+    assert_eq!(gossip_author_to_strike(&err, true, Some(key), Some(key)), Some(key));
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    slots.strike(key);
+    assert!(slots.take(Some(key), None).is_none(), "a struck author must be cooled down");
+    assert!(pending.is_pending(), "the handler must leave the failed verdict to the caller");
+    pending.settle_error(&err).await;
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Reject).await,
+        "a forged consensus result must report Reject"
+    );
+}
+
+/// A relayed forged certificate strikes no one, because any peer that once held the frame can
+/// deliver it again. The author's own delivery of the same frame strikes the author (#1772,
+/// GHSA-vw36).
+#[tokio::test]
+async fn relayed_forged_certificate_does_not_strike_author() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
+    // A second committee signs with keys that the handler's committee does not hold.
+    let other = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let msg = encode_certificate_gossip(other.certificate(&other.header_from_last_authority()));
+    let (validation, _verdicts) = gossip_ticket("relayed-bad-aggregate");
+    let mut pending = PendingGossip::new(
+        validation,
+        GossipSlots::new(1).take(None, None).expect("free shared slot"),
+    );
+    let err = handler.process_gossip_with(&msg, &mut pending).await.unwrap_err();
+    assert!(err.strikes_gossip_author(), "a bad aggregate must strike: {err:?}");
+
+    let author = other.last_authority().primary_public_key();
+    let relayer = other.authorities().next().expect("authority").primary_public_key();
+    assert_ne!(author, relayer, "the fixture committee has more than one authority");
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+    // relayed: the frame is rejected, but no one is struck
+    assert_eq!(gossip_author_to_strike(&err, true, Some(author), Some(relayer)), None);
+    assert!(slots.take(Some(author), None).is_some(), "a relayed frame must not strike its author");
+    // own delivery: the author is struck
+    let struck = gossip_author_to_strike(&err, true, Some(author), Some(author));
+    assert_eq!(struck, Some(author));
+    struck.into_iter().for_each(|a| slots.strike(a));
+    assert!(slots.take(Some(author), None).is_none(), "the author's own delivery must strike it");
+}
+
+/// With MAX_PENDING_GOSSIP_PER_PEER messages from one author in verification, the next message
+/// from that author is not admitted and its ticket reports Ignore. Another author still gets a
+/// slot, and the author's slots free when its messages settle (#1772).
+#[tokio::test]
+async fn gossip_slots_cap_per_author() {
+    let author_a = *tn_types::BlsKeypair::generate(&mut StdRng::from_seed([1; 32])).public();
+    let author_b = *tn_types::BlsKeypair::generate(&mut StdRng::from_seed([2; 32])).public();
+    let slots = GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER);
+
+    // Hold every slot for author A.
+    let held: Vec<PendingGossip> = (0..MAX_PENDING_GOSSIP_PER_PEER)
+        .map(|i| {
+            let (validation, _verdicts) = gossip_ticket(&format!("held-{i}"));
+            slots.admit(validation, Some(author_a), None).expect("author A is under the cap")
+        })
+        .collect();
+
+    // The next message from author A is over the cap: no slot, and its ticket reports Ignore.
+    let (validation, mut verdicts) = gossip_ticket("over-cap");
+    assert!(
+        slots.admit(validation, Some(author_a), None).is_none(),
+        "author A must not get a slot past the cap"
+    );
+    assert!(
+        next_verdict_is(&mut verdicts, GossipVerdict::Ignore).await,
+        "over-cap gossip must report Ignore"
+    );
+
+    // Another author has its own slots.
+    let (validation, _verdicts) = gossip_ticket("author-b");
+    assert!(
+        slots.admit(validation, Some(author_b), None).is_some(),
+        "author B must still get a slot"
+    );
+
+    // Settled messages free their slots for author A.
+    drop(held);
+    let (validation, _verdicts) = gossip_ticket("after-release");
+    assert!(
+        slots.admit(validation, Some(author_a), None).is_some(),
+        "author A must get a slot once its held messages settle"
+    );
+}
+
+// ---- bench5 f1-commit-lag ----
+
+/// A node whose committed round freezes is demoted once a certificate passes the activity window:
+/// committed 360 (execution at 352), certificate 403, window 40.
+///
+/// This is the path a commit held by the run-ahead gate takes: the gate stops the committed round,
+/// and the demotion follows 40 rounds later.
+#[tokio::test]
+async fn frozen_commit_is_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(352, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(360);
+
+    assert!(handler.behind_consensus(0, 403, None).await, "a frozen commit is behind");
+}
+
+/// Execution far behind the committed round is not behind while commits keep up with the
+/// committee: execution at 100, committed 400, certificate 403.
+///
+/// A pin: it duplicates `test_behind_consensus_committed_round_prevents_false_positive` with the
+/// lag consensus can now run ahead of execution.
+#[tokio::test]
+async fn execution_lag_beyond_window_is_not_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(100, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(400);
+
+    assert!(!handler.behind_consensus(0, 403, None).await, "execution lag alone is not behind");
+}
+
+// ---- bench5 f3-rejoin (vote path) ----
+
+/// A `CvvInactive` voter refuses a vote request at once with `NotActiveCvv`.
+///
+/// The header's execution block is never executed here, so a voter that reached
+/// `wait_for_execution` would hold the request until the vote timeout. The paused clock does not
+/// move, no time is recorded for the `exec_wait` stage, and the refusal counter moves by one. The
+/// refusal carries no penalty and answers the requester with a retryable response: the requester's
+/// `request_vote` asks again and leaves the vote retryable, and all its attempts together take less
+/// than one vote timeout.
+///
+/// A header an active voter signs (its block executed, genesis parents) from a second author is
+/// refused too and leaves no vote stored; once the node is active again the same header is signed.
+#[tokio::test(start_paused = true)]
+async fn test_vote_refused_while_inactive() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } = {
+        // the bus and the handler register their metrics with the recorder active while built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(peer, header.clone(), vec![])
+        .await
+        .expect_err("an inactive voter must refuse a new vote request");
+    assert_eq!(start.elapsed(), Duration::ZERO, "the refusal must not wait on execution");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv));
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::RecoverableError(_),
+        "the refusal must answer the requester with a retryable response"
+    );
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let refused = snapshot.iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.votes_refused_inactive_total").then_some(value)
+    });
+    assert_matches!(refused, Some(DebugValue::Counter(1)), "the refusal must be counted");
+    let exec_wait = snapshot.iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.vote_stage_seconds"
+            && key.key().labels().any(|l| l.key() == "stage" && l.value() == "exec_wait"))
+        .then_some(value)
+    });
+    assert!(
+        !matches!(exec_wait, Some(DebugValue::Histogram(samples)) if !samples.is_empty()),
+        "the refusal must not reach the execution wait"
+    );
+
+    let voter = *committee.first_authority().authority().protocol_key();
+    let start = tokio::time::Instant::now();
+    let (result, responses) = request_vote_in_process(&handler, voter, peer, header).await;
+    assert_matches!(result, Err(NetworkError::RPCRetryable(_)), "the vote must stay retryable");
+    assert!(
+        responses.len() > 1
+            && responses.iter().all(|r| matches!(r, PrimaryResponse::RecoverableError(_))),
+        "the requester must retry, and every refusal must be recoverable: {responses:?}"
+    );
+    assert!(
+        start.elapsed() < Parameters::default().vote_timeout,
+        "the requester's attempts must not wait on the inactive voter, took {:?}",
+        start.elapsed()
+    );
+
+    let second = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let second_peer = *second.authority().protocol_key();
+    let signable = second
+        .header_builder(&committee.committee())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let node_storage = committee.first_authority().consensus_config().node_storage().clone();
+    assert_matches!(
+        handler.vote(second_peer, signable.clone(), vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "an inactive voter must not sign a header an active voter signs"
+    );
+    assert!(node_storage.read_vote_info(&second.id())?.is_none(), "no vote may be stored");
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    assert_matches!(
+        handler.vote(second_peer, signable, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "the same header must be signed once the node is active"
+    );
+    assert!(node_storage.read_vote_info(&second.id())?.is_some(), "the vote must be stored");
+
+    Ok(())
+}
+
+/// A voter demoted while a vote request waits on execution refuses at the signature instead of
+/// signing, and stores no vote.
+///
+/// Block 1 executes half a second into the request in the same step that turns the node inactive,
+/// so the request passes every check and reaches the signature as an inactive node.
+#[tokio::test(start_paused = true)]
+async fn test_vote_refused_when_demoted_mid_request() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, block.hash()))
+        .created_at(1)
+        .build();
+    let demote = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+
+    assert_matches!(
+        handler.vote(peer, header, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "a node demoted before it signs must refuse"
+    );
+    demote.await?;
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a node demoted before it signs must store no vote");
+
+    Ok(())
+}
+
+/// A vote this node signed while active is still recast after it turns inactive, and a new header
+/// from the same author is refused.
+///
+/// The inactive refusal sits after the recast fast path, so an author whose header this node
+/// already voted for gets the same vote back instead of a refusal.
+#[tokio::test]
+async fn test_vote_recast_while_inactive() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let builder = || {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(1)
+    };
+    let header = builder().build();
+
+    let PrimaryResponse::Vote(vote) = handler.vote(peer, header.clone(), vec![]).await? else {
+        panic!("an active voter must vote for a valid header");
+    };
+
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+    let PrimaryResponse::Vote(recast) = handler.vote(peer, header.clone(), vec![]).await? else {
+        panic!("an inactive voter must recast the vote it already signed for this header");
+    };
+    assert_eq!(recast.header_digest(), vote.header_digest());
+    assert_eq!(recast.author(), vote.author());
+    assert_eq!(recast.signature(), vote.signature());
+
+    let next = builder().round(2).build();
+    assert_ne!(next.digest(), header.digest());
+    assert_matches!(
+        handler.vote(peer, next, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "an inactive voter must refuse a header it has not voted for"
+    );
+
+    Ok(())
+}
+
+/// A voter a moment behind on execution still votes on the requester's retry.
+///
+/// Block 1 executes 1.5 s after the first request, so the first attempt waits out
+/// [`VOTE_EXECUTION_WAIT`] and is refused as recoverable, and the requester's retry 250 ms later
+/// finds the block executed within its own wait and earns the vote. Before the bound, the first
+/// attempt held the request until the 5 s vote timeout.
+#[tokio::test(start_paused = true)]
+async fn test_request_vote_retry_votes_once_execution_catches_up() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, block.hash()))
+        .created_at(1)
+        .build();
+    let lag = VOTE_EXECUTION_WAIT + VOTE_EXECUTION_WAIT / 2;
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(lag).await;
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+
+    let start = tokio::time::Instant::now();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+    assert_matches!(result, Ok(RequestVoteResult::Vote(_)), "the retry must earn the vote");
+    assert_matches!(
+        responses.as_slice(),
+        [PrimaryResponse::RecoverableError(_), PrimaryResponse::Vote(_)],
+        "one recoverable refusal, then the vote: {responses:?}"
+    );
+    assert!(
+        start.elapsed() < Parameters::default().vote_timeout,
+        "the vote must arrive before a single vote timeout, took {:?}",
+        start.elapsed()
+    );
+    execute.await?;
+
+    Ok(())
+}
+
+/// Records every `primary` warn line as `message key=value ...` on the thread it is installed on
+/// with [`tracing::subscriber::set_default`].
+struct PrimaryWarnLines(Arc<Mutex<Vec<String>>>);
+
+/// Appends an event's message and fields to a line in the order the event records them.
+struct LineVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for LineVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.push_str(&format!("{value:?}"));
+        } else {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
+}
+
+impl tracing::Subscriber for PrimaryWarnLines {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "primary" && *metadata.level() == tracing::Level::WARN
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut LineVisitor(&mut line));
+        self.0.lock().push(line);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The `we are behind` line ends with the execution backlog and both round lags: the newest known
+/// header is output 4,500 and the engine processed output 3 at round 352 (its stored header reads
+/// leader round 0, so the execution lag takes the processed round), consensus committed round 360
+/// and the proposer is at round 405.
+#[tokio::test]
+async fn behind_line_reports_execution_and_commit_lag() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let sub_dag = |number: u64| {
+        let cert = Certificate::default();
+        CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        )
+    };
+    for number in 1..=3u64 {
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag(number)).await;
+    }
+    // the engine processed output 3, the header `write_subdag_for_test` stored for it
+    let processed = tn_types::ConsensusOutput::new(
+        sub_dag(3),
+        ConsensusHeaderDigest::default(),
+        3,
+        false,
+        Default::default(),
+        Vec::new(),
+    );
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(352, processed.num_hash(), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(360);
+    consensus_bus.primary_round_updates().send_replace(405);
+    consensus_bus
+        .last_consensus_header()
+        .send_replace(Some(tn_types::ConsensusHeader { number: 4_500, ..Default::default() }));
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(PrimaryWarnLines(lines.clone()));
+    assert!(handler.behind_consensus(0, 403, None).await, "committed 360 + 40 < 403 is behind");
+
+    let lines = lines.lock();
+    let behind: Vec<_> = lines
+        .iter()
+        .filter(|line| line.starts_with("we are behind, go to catchup mode!"))
+        .collect();
+    assert_eq!(behind.len(), 1, "one behind line: {lines:?}");
+    assert!(
+        behind[0].contains(" exec_number=3 exec_round=0 processed_consensus_round=352 "),
+        "the stored output resolves the executed number: {}",
+        behind[0]
+    );
+    assert!(
+        behind[0].ends_with(
+            " reason=\"outside_gc_window\" newest_header_number=4500 backlog_outputs=4497 \
+             exec_lag_rounds=8 commit_lag_rounds=45"
+        ),
+        "the lag fields follow the existing ones: {}",
+        behind[0]
+    );
+}
+
+// ---- bench5 f3-rejoin ----
+
+/// The `tn_primary.rejoin_grace_holds_total` holds counted since the previous snapshot (a
+/// snapshot swaps every counter it reads back to zero); zero while unregistered.
+fn rejoin_grace_holds(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count)
+                if key.key().name() == "tn_primary.rejoin_grace_holds_total" =>
+            {
+                Some(count)
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A handler whose committed round (5) is outside the gc window of a round-60 certificate, with
+/// its bus metrics bound to `recorder`.
+async fn create_test_types_outside_gc_window(
+    path: &Path,
+    recorder: &DebuggingRecorder,
+) -> TestTypes {
+    let types = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(recorder);
+        create_test_types(path).await
+    };
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(5, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    types.consensus_bus.recent_blocks().send_replace(recent);
+    types.consensus_bus.committed_round_updates().send_replace(5);
+    types
+}
+
+/// A node promoted back into consensus holds its gc-window demotion for `REJOIN_DEMOTION_GRACE`:
+/// inside the grace a certificate past the window (committed 5 + 40 < 60) is counted but the node
+/// stays active, and once the grace has passed the same certificate demotes it. Every hold is
+/// counted, but the hold line is logged at most once a second and reports the holds since the
+/// previous line. The held demotion taking effect fails the rejoin.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_holds_gc_window_demotion() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(PrimaryWarnLines(lines.clone()));
+    let hold_lines = || {
+        lines
+            .lock()
+            .iter()
+            .filter(|line| {
+                line.starts_with("behind the gc window inside the rejoin grace; holding demotion")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // two holds within a second: both counted, one line
+    tokio::time::advance(Duration::from_secs(28)).await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held inside the grace");
+    tokio::time::advance(Duration::from_millis(500)).await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held again inside the grace");
+    assert!(consensus_bus.is_active_cvv(), "still active inside the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 2, "every hold is counted");
+    let held = hold_lines();
+    assert_eq!(held.len(), 1, "two holds within a second log one line: {held:?}");
+    assert!(held[0].ends_with(" holds_since_last_line=1"), "{}", held[0]);
+
+    // the next line, a second later, carries the hold that was not logged
+    tokio::time::advance(
+        tn_types::REJOIN_DEMOTION_GRACE - Duration::from_millis(28_500) - Duration::from_millis(1),
+    )
+    .await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held until the grace ends");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 1);
+    let held = hold_lines();
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert!(held[1].ends_with(" holds_since_last_line=2"), "{}", held[1]);
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(handler.behind_consensus(0, 60, None).await, "demoted once the grace has passed");
+    assert!(consensus_bus.is_cvv_inactive(), "inactive after the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0, "a demotion is not a hold");
+    assert_eq!(hold_lines().len(), 2, "a demotion logs no hold line");
+    let state = *consensus_bus.rejoin_state().borrow();
+    assert_eq!(state.attempts(0), 1, "the held demotion fails the rejoin");
+    assert!(!state.is_pending(0), "the demotion settles the rejoin");
+}
+
+/// The grace holds only the gc-window demotion: a node an epoch behind is demoted at once, which
+/// fails the rejoin, and a promotion recorded for another epoch holds nothing and is not settled
+/// by this epoch's demotion.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_does_not_hold_epoch_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+
+    // a certificate past the early rounds of the next epoch: epoch_behind, not the gc window
+    assert!(handler.behind_consensus(1, 60, None).await, "an epoch behind is never held");
+    assert!(consensus_bus.is_cvv_inactive(), "demoted inside the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0);
+    assert_eq!(consensus_bus.rejoin_state().borrow().attempts(0), 1, "a failed rejoin");
+
+    // a promotion keyed to another epoch does not hold this epoch's gc-window demotion
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(7, tokio::time::Instant::now(), false));
+    assert!(handler.behind_consensus(0, 60, None).await, "another epoch's promotion holds nothing");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0);
+    let state = *consensus_bus.rejoin_state().borrow();
+    assert_eq!(state.attempts(7), 0);
+    assert!(state.is_pending(7), "another epoch's promotion is not settled");
+}
+
+/// The grace holds only while the incoming round leads the committed round by at most
+/// `ROUNDS_TO_KEEP - gc_depth`: one round past that bound peers have pruned rounds the rebuild
+/// needs, so a node promoted a moment ago is demoted, which fails the rejoin.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_is_bounded_by_the_rebuild_window() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+    let gc_depth = committee.first_authority().consensus_config().parameters().gc_depth;
+    let bound = tn_types::ROUNDS_TO_KEEP - gc_depth;
+
+    // committed 5: a certificate at the bound is held, one past it demotes inside the time grace
+    assert!(!handler.behind_consensus(0, 5 + bound, None).await, "held at the rebuild bound");
+    assert!(consensus_bus.is_active_cvv(), "still active at the bound");
+    assert!(handler.behind_consensus(0, 5 + bound + 1, None).await, "demoted past the bound");
+    assert!(consensus_bus.is_cvv_inactive(), "inactive inside the time grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 1, "only the hold at the bound is counted");
+    assert_eq!(consensus_bus.rejoin_state().borrow().attempts(0), 1, "a failed rejoin");
+}
+
+/// A rejoin fails only when its demotion comes inside the grace or is the one the grace held. A
+/// node whose held demotion ends with a round inside the activity window before the grace runs
+/// out, and a node that sees no certificate during the grace (cut off) and is demoted after it,
+/// both keep the attempt.
+#[tokio::test(start_paused = true)]
+async fn rejoin_outlasting_the_grace_is_not_a_failed_attempt() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let TestTypes { handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    let attempts = || consensus_bus.rejoin_state().borrow().attempts(0);
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+
+    // held, then a round inside the window (committed 5 + 40 is not below 45): the hold ends
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held inside the grace");
+    assert!(!handler.behind_consensus(0, 45, None).await, "inside the window again");
+    // past the grace and behind again: demoted, but the rejoin outlasted the grace
+    tokio::time::advance(tn_types::REJOIN_DEMOTION_GRACE).await;
+    assert!(handler.behind_consensus(0, 60, None).await, "demoted after the grace");
+    assert_eq!(attempts(), 0, "a rejoin that held past the grace is not a failed attempt");
+    assert!(!consensus_bus.rejoin_state().borrow().is_pending(0), "the demotion settles it");
+
+    // promoted again, then nothing arrives until the grace has passed
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now(), false));
+    tokio::time::advance(tn_types::REJOIN_DEMOTION_GRACE + Duration::from_secs(1)).await;
+    assert!(handler.behind_consensus(0, 60, None).await, "demoted on the first certificate");
+    assert_eq!(attempts(), 0, "a node cut off for the whole grace keeps its attempt");
+}
+
+// ---- bench5 f1-commit-lag ----
+
+/// SEC-6 / N1: a snapshot-restored voter can never check a header's execution block below its
+/// floor. It refuses at once with the final, unpenalized `BelowRestoreFloor`, neither the fork
+/// error `UnknownExecutionResult` nor the retryable `ExecutionBehind`, counts no execution-behind
+/// refusal and stores no vote.
+#[tokio::test]
+async fn vote_below_restore_floor_is_refused_without_penalty() -> eyre::Result<()> {
+    /// A datadir restored at block 100 that attests no block.
+    struct RestoredAt100;
+    impl tn_types::CanonicalExecutionReader for RestoredAt100 {
+        fn canonical_execution_hash(&self, _: u64) -> Option<BlockHash> {
+            None
+        }
+        fn restored_state_floor(&self) -> Option<u64> {
+            Some(100)
+        }
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    // executed through block 120 after a restore at block 100
+    consensus_bus.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            1,
+            ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+            Some(SealedHeader::seal_slow(ExecHeader { number: 120, ..Default::default() })),
+        )
+    });
+    consensus_bus.set_canonical_reader(Arc::new(RestoredAt100));
+
+    let author = committee.last_authority();
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(50, BlockHash::ZERO))
+        .build();
+    let err = handler
+        .vote(*author.authority().protocol_key(), header, vec![])
+        .await
+        .expect_err("a block below the floor cannot be checked");
+
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::BelowRestoreFloor {
+            header_block: 50,
+            floor: 100
+        })
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::Error(_),
+        "the refusal is final, so the requester stops asking this voter"
+    );
+    let behind =
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count)
+                if key.key().name() == "tn_primary.votes_refused_execution_behind_total" =>
+            {
+                Some(count)
+            }
+            _ => None,
+        });
+    assert_eq!(behind.unwrap_or_default(), 0, "not an execution-behind refusal");
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a refused header stores no vote");
     Ok(())
 }
 

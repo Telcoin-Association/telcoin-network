@@ -1,0 +1,16 @@
+{
+  "recorded_at": "2026-09-30",
+  "tested_commit": "4452bc133febb5b48d1a8bd6674518fced41f6bd",
+  "run_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36761345764/job/110044392245",
+  "artifact_id": 11118312678,
+  "artifact_digest": "sha256:d9a91e974051d5e3245992699b31d6ec1643b3957d0e8f127316fe7d66600658",
+  "full_summary_sha256": "e6e13f3b9fb785a5342b28d65ad4e0e0977f885319558f3d76076ca7c02fbabe",
+  "observed": {
+    "status": "failed",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "peer_source_sha256": "d41d2f4d8ab9846260050ef58ba0c013b0043938abb75234b1aed21720a5c95f",
+    "error": "listener failed: Error: Io(Custom { kind: NotConnected, error: ConnectionLost(TimedOut) })\n"
+  },
+  "phase": "listener final stream close, after both dialers verified their echoed frames",
+  "resolution": "keep dialer endpoint alive until listener ECHO completion, then release it through stdin; retain existing close and traffic checks"
+}

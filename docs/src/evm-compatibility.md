@@ -103,7 +103,7 @@ The base fee is **not removed from circulation** on TN. It is credited to the ch
 
 | Network | Chain ID |
 | ------- | -------- |
-| Mainnet | `487`    |
+| Mainnet | `731`    |
 | Testnet | `2017`   |
 
 ### Blob Transactions (EIP-4844)
@@ -214,4 +214,4 @@ commit). Contracts that need unbiasable randomness must not rely on `PREVRANDAO`
 | Blob transactions    | Supported                            | Not used                      |
 | Contract languages   | Solidity, Vyper, etc.                | Same                          |
 | Tooling              | Hardhat, Foundry, ethers.js, viem    | Same                          |
-| Chain IDs            | 1 (mainnet)                          | 487 (mainnet), 2017 (testnet) |
+| Chain IDs            | 1 (mainnet)                          | 731 (mainnet), 2017 (testnet) |

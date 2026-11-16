@@ -12,7 +12,7 @@ use tn_types::{test_genesis, Bytes, Encodable2718 as _, GenesisAccount, TaskMana
 struct PoolArgs {
     /// Operator settings delivered to the production pool constructor.
     #[command(flatten)]
-    txpool: reth::args::TxPoolArgs,
+    txpool: reth_node_core::args::TxPoolArgs,
 }
 
 /// Construct the production pool over funded accounts, retaining its backing environment.

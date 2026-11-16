@@ -26,10 +26,10 @@
 //! from the request, so the `raw` bytes and the `tx` fields both carry the corrected
 //! fees, where patching the response would desynchronize them. The delegate's remaining
 //! defaults (nonce, chain id, value) are fee-independent. Gas estimation depends on the
-//! request's fees: pricing first activates the caller-balance gas cap and validates the
-//! filled cap against the pending header's base fee. Estimating before filling fees
-//! preserves reth's ordering and avoids introducing either check for an unpriced
-//! request. Requests with an explicit gas limit skip estimation.
+//! request's fees: pricing first activates the caller-balance gas cap. Estimating
+//! before filling fees preserves reth's ordering for unpriced requests. Explicit
+//! fee caps are validated against the worker's epoch fee, matching the simulation
+//! RPCs. Requests with an explicit gas limit skip estimation.
 //!
 //! Legacy `gasPrice` requests receive no EIP-1559 defaults from this handler or reth.
 //!
@@ -39,7 +39,7 @@
 //! pool admission (issue #1159), so a filled blob request cannot be submitted here and
 //! the field is not worth a second intercept.
 
-use crate::TNPrimitives;
+use crate::{evm::TnEvmConfig, rpc_call::estimate_gas_at_epoch, TNPrimitives};
 use alloy::rpc::types::TransactionRequest;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
@@ -129,7 +129,7 @@ where
         + EstimateCall
         + LoadFee
         + EthApiTypes<NetworkTypes = alloy::network::Ethereum>
-        + RpcNodeCore<Primitives = TNPrimitives>
+        + RpcNodeCore<Primitives = TNPrimitives, Evm = TnEvmConfig>
         + Clone
         + Send
         + Sync
@@ -144,8 +144,8 @@ where
         tracing::trace!(target: "rpc::eth", ?request, "Serving eth_fillTransaction");
         let mut request = request;
         // Preserve reth's estimate-before-fees ordering. Pricing an unpriced request
-        // first activates the sender-balance gas allowance and checks the cap against
-        // the pending header's fee, which can exceed this worker's epoch fee.
+        // first activates the sender-balance gas allowance. Explicit fee caps are
+        // checked against the current epoch fee by the shared simulation helper.
         // Supplying gas here makes the delegate skip its own estimate.
         // Leave a missing sender to the delegate's validation before any estimate call.
         if request.from.is_some() && request.gas.is_none() {
@@ -159,11 +159,12 @@ where
             if request.sidecar.is_some() && request.blob_versioned_hashes.is_none() {
                 request.populate_blob_hashes();
             }
-            let gas = EstimateCall::estimate_gas_at(
+            let gas = estimate_gas_at_epoch(
                 &self.eth_api,
                 request.clone(),
                 alloy::eips::BlockId::pending(),
                 None,
+                &self.base_fee,
             )
             .await?;
             request.gas = Some(gas.saturating_to());

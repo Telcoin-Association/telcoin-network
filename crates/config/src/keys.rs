@@ -208,6 +208,12 @@ fn warn_if_key_permissions_are_loose(
 ) {
 }
 
+/// Whether the key file at `path` exists. An error checking (for example an unreadable keys
+/// directory) is returned rather than read as "absent", so it is reported against the real path.
+fn key_file_exists(path: &std::path::Path) -> eyre::Result<bool> {
+    std::fs::exists(path).map_err(|e| eyre::eyre!("cannot check key file {}: {e}", path.display()))
+}
+
 /// Private key material and derivation inputs shared by a key manager.
 struct KeyConfigInner {
     /// DO NOT expose the private key to other code. Tests provide their own primary key.
@@ -218,6 +224,9 @@ struct KeyConfigInner {
     /// Seed string for worker network keypairs. Per-worker keypairs are derived on demand from
     /// the primary keypair and this seed; see [`KeyConfig::worker_network_keypair`].
     worker_network_seed: String,
+    /// True when the BLS key is kept on disk in the cleartext keyfile (`bls.key`) rather than
+    /// wrapped with a passphrase (`bls.kw`); see [`KeyConfig::bls_key_is_cleartext`].
+    bls_key_cleartext: bool,
 }
 
 impl std::fmt::Debug for KeyConfigInner {
@@ -227,6 +236,7 @@ impl std::fmt::Debug for KeyConfigInner {
             .field("primary_keypair", &self.primary_keypair)
             .field("primary_network_keypair", &self.primary_network_keypair)
             .field("worker_network_seed", &"[REDACTED]")
+            .field("bls_key_cleartext", &self.bls_key_cleartext)
             .finish()
     }
 }
@@ -335,14 +345,42 @@ impl KeyConfig {
     }
 
     /// Read a key config file that contains the primary BLS key in Base 58 format.
+    ///
+    /// The passphrase is taken by value so it is cleared from memory as soon as the key is
+    /// unwrapped, rather than living as long as the caller's stack frame.
     pub fn read_config<TND: TelcoinDirs>(
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
     ) -> eyre::Result<Self> {
         let keys_dir = tn_datadir.node_keys_path();
-        // If we don't have a wrapped file then try an unencrypted file before failure.
-        let passphrase = if std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).unwrap_or(false) {
+        // Without a wrapped file only a passphrase-less read falls back to the cleartext file: a
+        // supplied passphrase means the key is expected wrapped, so its absence is an error.
+        let passphrase = if key_file_exists(&keys_dir.join(BLS_WRAPPED_KEYFILE))? {
+            // A passphrase-less read loads the cleartext file; with only the wrapped one on disk
+            // say so here rather than fail on the missing cleartext file without a path.
+            if passphrase.is_none() && !key_file_exists(&keys_dir.join(BLS_KEYFILE))? {
+                return Err(eyre::eyre!(
+                    "no BLS key passphrase was supplied but the BLS key is encrypted in {} and \
+                     there is no cleartext {BLS_KEYFILE}; a passphrase source is needed to unlock it",
+                    keys_dir.join(BLS_WRAPPED_KEYFILE).display()
+                ));
+            }
             passphrase
+        } else if passphrase.is_some() {
+            let cleartext = keys_dir.join(BLS_KEYFILE);
+            return Err(if key_file_exists(&cleartext)? {
+                eyre::eyre!(
+                    "a BLS key passphrase was supplied but there is no encrypted key file {}; \
+                     refusing to load the cleartext {BLS_KEYFILE} in its place",
+                    keys_dir.join(BLS_WRAPPED_KEYFILE).display()
+                )
+            } else {
+                eyre::eyre!(
+                    "a BLS key passphrase was supplied but no key files found in {}: neither \
+                     {BLS_WRAPPED_KEYFILE} nor {BLS_KEYFILE} exists; generate the node keys first",
+                    keys_dir.display()
+                )
+            });
         } else {
             None
         };
@@ -368,6 +406,7 @@ impl KeyConfig {
             std::fs::read_to_string(tn_datadir.node_keys_path().join(WORKER_NETWORK_SEED_FILE))
                 .unwrap_or_else(|_| "worker network keypair".to_string());
         let bytes = Zeroizing::new(bs58::decode(contents.as_str().trim()).into_vec()?);
+        let bls_key_cleartext = passphrase.is_none();
         let primary_keypair = if let Some(passphrase) = passphrase {
             Self::unwrap_bls_key(&bytes, &passphrase)?
         } else {
@@ -380,6 +419,7 @@ impl KeyConfig {
                 primary_keypair,
                 primary_network_keypair,
                 worker_network_seed: worker_seed,
+                bls_key_cleartext,
             }),
         })
     }
@@ -388,18 +428,20 @@ impl KeyConfig {
     /// stored encrypted (`bls.kw`) or in cleartext (`bls.key`).
     ///
     /// Lets callers distinguish "no keys generated yet" from "keys present but
-    /// unreadable" (e.g. an incorrect passphrase) when reporting errors.
-    pub fn keys_exist<TND: TelcoinDirs>(tn_datadir: &TND) -> bool {
+    /// unreadable" (e.g. an incorrect passphrase) when reporting errors. An error checking
+    /// either file (for example a keys directory this user cannot search) is returned, as
+    /// [`Self::read_config`] returns it, rather than read as "no keys".
+    pub fn keys_exist<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<bool> {
         let keys_dir = tn_datadir.node_keys_path();
-        std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).unwrap_or(false)
-            || std::fs::exists(keys_dir.join(BLS_KEYFILE)).unwrap_or(false)
+        Ok(key_file_exists(&keys_dir.join(BLS_WRAPPED_KEYFILE))?
+            || key_file_exists(&keys_dir.join(BLS_KEYFILE))?)
     }
 
     /// Generate a new random primary BLS key and save to the config file.
     /// Note, this is not very secure in that it is writing the private key to a file...
     pub fn generate_and_save<TND: TelcoinDirs>(
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
     ) -> eyre::Result<Self> {
         Self::generate_and_save_with_rounds(tn_datadir, passphrase, PBKDF2_HMAC_ROUNDS)
     }
@@ -413,7 +455,7 @@ impl KeyConfig {
     #[cfg(feature = "test-utils")]
     pub fn generate_and_save_insecure<TND: TelcoinDirs>(
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         rounds: u32,
     ) -> eyre::Result<Self> {
         if rounds == 0 {
@@ -431,7 +473,7 @@ impl KeyConfig {
     /// at `rounds` when a passphrase is given.
     fn generate_and_save_with_rounds<TND: TelcoinDirs>(
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         rounds: u32,
     ) -> eyre::Result<Self> {
         // note: StdRng uses ChaCha12
@@ -443,6 +485,7 @@ impl KeyConfig {
         // Make sure we have the validator dir, owner-only.
         // Don't error out if path exists.
         create_keys_dir(&tn_datadir.node_keys_path())?;
+        let bls_key_cleartext = passphrase.is_none();
         if let Some(passphrase) = passphrase {
             let contents = Self::wrap_bls_key(&primary_keypair, &passphrase, rounds)?;
             write_secret_file(&tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE), &contents)?;
@@ -469,6 +512,7 @@ impl KeyConfig {
                 primary_keypair,
                 primary_network_keypair,
                 worker_network_seed: worker_seed.to_string(),
+                bls_key_cleartext,
             }),
         })
     }
@@ -482,8 +526,18 @@ impl KeyConfig {
                 primary_keypair,
                 primary_network_keypair,
                 worker_network_seed: "worker network keypair".to_string(),
+                bls_key_cleartext: false,
             }),
         }
+    }
+
+    /// Returns `true` when the BLS key is kept on disk in the cleartext keyfile (`bls.key`):
+    /// it was read from that file without a passphrase, or generated without one.
+    ///
+    /// Returns `false` for a key wrapped with a passphrase (`bls.kw`) and for a key supplied
+    /// through [`Self::new_with_testing_key`], which never touches disk.
+    pub fn bls_key_is_cleartext(&self) -> bool {
+        self.inner.bls_key_cleartext
     }
 
     /// Provide the primaries public key.
@@ -688,7 +742,7 @@ mod tests {
             // without depending on the `test-utils` feature being enabled.
             KeyConfig::generate_and_save_with_rounds(
                 &datadir,
-                Some("passphrase".to_string()),
+                Some(Zeroizing::new("passphrase".to_string())),
                 TEST_ONLY_INSECURE_ROUNDS,
             )
             .expect("generate keys");
@@ -887,7 +941,7 @@ mod tests {
     fn test_bls_passphrase() {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = tmp_dir.path().to_path_buf();
-        let pp = Some("test_bls_passphrase".to_string());
+        let pp = Some(Zeroizing::new("test_bls_passphrase".to_string()));
         // fast rounds: this test covers the wrap/unwrap plumbing, not the work factor
         // (the production round count is pinned by `test_bls_passphrase_production_rounds`)
         let kc = KeyConfig::generate_and_save_with_rounds(&datadir, pp.clone(), 1)
@@ -895,7 +949,11 @@ mod tests {
         let kc2 = KeyConfig::read_config(&datadir, pp).expect("load config");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
         assert!(KeyConfig::read_config(&datadir, None).is_err());
-        assert!(KeyConfig::read_config(&datadir, Some("not_passphrase".to_string())).is_err());
+        assert!(KeyConfig::read_config(
+            &datadir,
+            Some(Zeroizing::new("not_passphrase".to_string()))
+        )
+        .is_err());
     }
 
     /// The true production write path: `generate_and_save` must emit the headerless layout,
@@ -905,7 +963,8 @@ mod tests {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = tmp_dir.path().to_path_buf();
         let pp = "production_rounds";
-        let kc = KeyConfig::generate_and_save(&datadir, Some(pp.to_string())).expect("key config");
+        let kc = KeyConfig::generate_and_save(&datadir, Some(Zeroizing::new(pp.to_string())))
+            .expect("key config");
 
         // decode the on-disk file and pin the headerless layout: salt | nonce | ct (+16-byte tag)
         let contents = std::fs::read_to_string(datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))
@@ -928,7 +987,8 @@ mod tests {
             "production keyfile must open at PBKDF2_HMAC_ROUNDS"
         );
 
-        let kc2 = KeyConfig::read_config(&datadir, Some(pp.to_string())).expect("load config");
+        let kc2 = KeyConfig::read_config(&datadir, Some(Zeroizing::new(pp.to_string())))
+            .expect("load config");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
     }
 
@@ -942,8 +1002,9 @@ mod tests {
         let expected = keypair.to_bytes();
         let wrapped = wrap_test_only(&keypair, "test_only_weak", TEST_ONLY_INSECURE_ROUNDS);
         let datadir = install_wrapped(&tmp_dir, &wrapped);
-        let kc = KeyConfig::read_config(&datadir, Some("test_only_weak".to_string()))
-            .expect("read test_only weak file");
+        let kc =
+            KeyConfig::read_config(&datadir, Some(Zeroizing::new("test_only_weak".to_string())))
+                .expect("read test_only weak file");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), expected);
     }
 
@@ -955,8 +1016,9 @@ mod tests {
         let expected = keypair.to_bytes();
         let wrapped = wrap_test_only(&keypair, "test_only_strong", PBKDF2_HMAC_ROUNDS);
         let datadir = install_wrapped(&tmp_dir, &wrapped);
-        let kc = KeyConfig::read_config(&datadir, Some("test_only_strong".to_string()))
-            .expect("read test_only strong file");
+        let kc =
+            KeyConfig::read_config(&datadir, Some(Zeroizing::new("test_only_strong".to_string())))
+                .expect("read test_only strong file");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), expected);
     }
 
@@ -966,7 +1028,7 @@ mod tests {
     fn test_truncated_wrapped_file_errors() {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = install_wrapped(&tmp_dir, &bs58::encode([0_u8; 10]).into_string());
-        assert!(KeyConfig::read_config(&datadir, Some("any".to_string())).is_err());
+        assert!(KeyConfig::read_config(&datadir, Some(Zeroizing::new("any".to_string()))).is_err());
     }
 
     /// The test-utils-gated insecure writer rejects a zero round count and round-trips.
@@ -975,7 +1037,7 @@ mod tests {
     fn test_generate_and_save_insecure() {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = tmp_dir.path().to_path_buf();
-        let pp = Some("insecure".to_string());
+        let pp = Some(Zeroizing::new("insecure".to_string()));
         assert!(KeyConfig::generate_and_save_insecure(&datadir, pp.clone(), 0).is_err());
         let kc = KeyConfig::generate_and_save_insecure(&datadir, pp.clone(), 1)
             .expect("insecure BLS key config");
@@ -992,13 +1054,13 @@ mod tests {
         let kc2 =
             KeyConfig::read_config(&tmp_dir.path().to_path_buf(), pp.clone()).expect("load config");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
-        // Note this is Ok and not an Err because since we don't have a passphrase the wrong one is
-        // just ignored.
+        // a passphrase against a cleartext-only key dir is refused rather than ignored, so the
+        // cleartext key is never loaded in place of an expected encrypted one
         assert!(KeyConfig::read_config(
             &tmp_dir.path().to_path_buf(),
-            Some("not_passphrase".to_string())
+            Some(Zeroizing::new("not_passphrase".to_string()))
         )
-        .is_ok());
+        .is_err());
     }
 
     /// The advisory's `KeyConfig`-level regression test: formatting a whole config must not
@@ -1092,5 +1154,144 @@ mod tests {
         assert_eq!(kc.worker_network_public_key(0), legacy);
         assert_ne!(kc.worker_network_public_key(1), kc.worker_network_public_key(0));
         assert_eq!(kc.worker_network_public_key(1), kc.worker_network_public_key(1));
+    }
+
+    /// A supplied passphrase never falls back to a cleartext `bls.key`: without `bls.kw` the read
+    /// fails, and the same key still loads when no passphrase is given.
+    #[test]
+    fn read_config_refuses_passphrase_without_wrapped_keyfile() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        let generated = KeyConfig::generate_and_save_with_rounds(&datadir, None, 1)
+            .expect("generate cleartext key");
+        assert!(datadir.node_keys_path().join(BLS_KEYFILE).exists());
+        assert!(!datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE).exists());
+
+        let err = KeyConfig::read_config(&datadir, Some(Zeroizing::new("passphrase".to_string())))
+            .expect_err("a passphrase must not load the cleartext key");
+        let msg = err.to_string();
+        assert!(msg.contains("refusing to load the cleartext bls.key"), "{msg}");
+        assert!(msg.contains(BLS_WRAPPED_KEYFILE), "{msg}");
+
+        let loaded = KeyConfig::read_config(&datadir, None).expect("cleartext read");
+        assert_eq!(loaded.primary_public_key(), generated.primary_public_key());
+        assert!(loaded.bls_key_is_cleartext());
+    }
+
+    /// An empty key directory with a passphrase says that no key files were found, naming both
+    /// files, instead of pointing at a cleartext file that is not there either.
+    #[test]
+    fn read_config_with_passphrase_and_no_keys_says_no_key_files_found() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        let err = KeyConfig::read_config(&datadir, Some(Zeroizing::new("passphrase".to_string())))
+            .expect_err("no keys");
+        let msg = err.to_string();
+        assert!(msg.contains("no key files found"), "{msg}");
+        assert!(msg.contains(BLS_WRAPPED_KEYFILE) && msg.contains(BLS_KEYFILE), "{msg}");
+        assert!(!msg.contains("refusing to load the cleartext"), "{msg}");
+    }
+
+    /// The mirror case: an encrypted key with no passphrase and no cleartext file names the
+    /// encrypted file and asks for a passphrase source, instead of failing on the missing
+    /// `bls.key` with a bare "No such file or directory". The passphrase still unlocks it.
+    #[test]
+    fn read_config_without_passphrase_and_only_wrapped_key_asks_for_a_passphrase() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        let pp = Some(Zeroizing::new("passphrase".to_string()));
+        let generated = KeyConfig::generate_and_save_with_rounds(&datadir, pp.clone(), 1)
+            .expect("generate wrapped key");
+        let wrapped = datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE);
+        assert!(wrapped.exists());
+        assert!(!datadir.node_keys_path().join(BLS_KEYFILE).exists());
+
+        let err = KeyConfig::read_config(&datadir, None).expect_err("no passphrase");
+        let msg = err.to_string();
+        assert!(msg.contains(&wrapped.display().to_string()), "{msg}");
+        assert!(msg.contains("encrypted"), "{msg}");
+        assert!(msg.contains("passphrase source is needed"), "{msg}");
+
+        let loaded = KeyConfig::read_config(&datadir, pp).expect("wrapped read");
+        assert_eq!(loaded.primary_public_key(), generated.primary_public_key());
+    }
+
+    /// An unreadable keys directory is reported as an error on that directory, not as a missing
+    /// encrypted key file, with or without a passphrase. `keys_exist` reports the same error
+    /// rather than "no keys".
+    #[cfg(unix)]
+    #[test]
+    fn read_config_reports_an_unreadable_keys_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        KeyConfig::generate_and_save_with_rounds(
+            &datadir,
+            Some(Zeroizing::new("passphrase".to_string())),
+            TEST_ONLY_INSECURE_ROUNDS,
+        )
+        .expect("wrapped key");
+        let keys_dir = datadir.node_keys_path();
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("lock keys dir");
+        // root reads through a mode 000 directory, so there is nothing to check as root
+        let locked = std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).is_err();
+        let results = [Some(Zeroizing::new("passphrase".to_string())), None]
+            .map(|passphrase| KeyConfig::read_config(&datadir, passphrase).map(|_| ()));
+        let exist = KeyConfig::keys_exist(&datadir);
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock keys dir");
+        if !locked {
+            return;
+        }
+        for result in results {
+            let msg = result.expect_err("unreadable keys dir").to_string();
+            assert!(msg.contains("cannot check key file"), "{msg}");
+            assert!(!msg.contains("no encrypted key file"), "{msg}");
+        }
+        let msg = exist.expect_err("keys_exist on an unreadable keys dir").to_string();
+        assert!(msg.contains("cannot check key file"), "{msg}");
+    }
+
+    /// `bls_key_is_cleartext` reports how the key is kept on disk on both the generate and the
+    /// read path: wrapped keys report false, cleartext keys true.
+    #[test]
+    fn bls_key_is_cleartext_tracks_the_keyfile() {
+        let wrapped_dir = TempDir::new().expect("tmp dir");
+        let wrapped_path = wrapped_dir.path().to_path_buf();
+        let pp = Some(Zeroizing::new("passphrase".to_string()));
+        let wrapped = KeyConfig::generate_and_save_with_rounds(&wrapped_path, pp.clone(), 1)
+            .expect("generate wrapped key");
+        assert!(!wrapped.bls_key_is_cleartext());
+        assert!(!KeyConfig::read_config(&wrapped_path, pp).expect("read").bls_key_is_cleartext());
+
+        let clear_dir = TempDir::new().expect("tmp dir");
+        let clear_path = clear_dir.path().to_path_buf();
+        let clear =
+            KeyConfig::generate_and_save_with_rounds(&clear_path, None, 1).expect("generate");
+        assert!(clear.bls_key_is_cleartext());
+        assert!(KeyConfig::read_config(&clear_path, None).expect("read").bls_key_is_cleartext());
+
+        assert!(!KeyConfig::new_with_testing_key(random_keypair()).bls_key_is_cleartext());
+    }
+
+    /// With both keyfiles on disk, a read without a passphrase loads the cleartext `bls.key` and
+    /// reports it, so a caller can refuse that key even though `bls.kw` exists.
+    #[test]
+    fn read_without_passphrase_beside_wrapped_key_reports_cleartext() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        let pp = Some(Zeroizing::new("passphrase".to_string()));
+        KeyConfig::generate_and_save_with_rounds(&datadir, pp.clone(), 1).expect("wrapped key");
+        let stale = KeyConfig::generate_and_save_with_rounds(&datadir, None, 1).expect("stale key");
+        assert!(datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE).exists());
+
+        let loaded = KeyConfig::read_config(&datadir, None).expect("cleartext read");
+        assert!(loaded.bls_key_is_cleartext());
+        assert_eq!(loaded.primary_public_key(), stale.primary_public_key());
+        assert!(!KeyConfig::read_config(&datadir, pp)
+            .expect("wrapped read")
+            .bls_key_is_cleartext());
     }
 }

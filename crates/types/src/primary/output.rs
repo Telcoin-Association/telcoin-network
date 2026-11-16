@@ -14,6 +14,7 @@ use std::{
     collections::VecDeque,
     fmt::{self, Display, Formatter},
     sync::Arc,
+    time::Instant,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
@@ -79,6 +80,13 @@ pub struct ConsensusOutput {
     close_epoch: bool,
     /// Cached digest of the consensus header for this output.
     consensus_header_hash_cache: ConsensusHeaderDigest,
+    /// When this node handed the output to its engine (see [`Self::forwarded_at`]).
+    ///
+    /// Transient and node-local like `close_epoch`: never serialized, never part of the
+    /// consensus header digest and never an execution input. A plain `Option<Instant>` needs no
+    /// wrapper because this type derives only `Clone` and `Debug`; equality and hashing go
+    /// through the digest.
+    forwarded_at: Option<Instant>,
 }
 
 // NOTE: only [Self::inner] is serialized. `close_epoch` is intentionally NOT part of the
@@ -86,6 +94,7 @@ pub struct ConsensusOutput {
 // digest) and is always recomputed from `committed_at() >= epoch_boundary`. Any consumer that
 // deserializes a [ConsensusOutput] MUST recompute it via `EpochManager::process_output` before
 // trusting [ConsensusOutput::close_epoch] — a deserialized output always reports `false`.
+// `forwarded_at` is likewise local observability state: a deserialized output reports `None`.
 impl Serialize for ConsensusOutput {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -104,7 +113,12 @@ impl<'de> Deserialize<'de> for ConsensusOutput {
         let inner = ConsensusOutputInner::deserialize(deserializer)?;
         let consensus_header_hash_cache =
             ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
-        Ok(Self { inner: Arc::new(inner), close_epoch: false, consensus_header_hash_cache })
+        Ok(Self {
+            inner: Arc::new(inner),
+            close_epoch: false,
+            consensus_header_hash_cache,
+            forwarded_at: None,
+        })
     }
 }
 
@@ -128,7 +142,7 @@ impl ConsensusOutput {
         });
         let consensus_header_hash_cache =
             ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
-        ConsensusOutput { inner, close_epoch, consensus_header_hash_cache }
+        ConsensusOutput { inner, close_epoch, consensus_header_hash_cache, forwarded_at: None }
     }
     pub fn new_with_subdag(
         sub_dag: CommittedSubDag,
@@ -277,6 +291,24 @@ impl ConsensusOutput {
     /// The engine should make a system call to consensus registry contract to close the epoch.
     pub fn close_epoch(&self) -> bool {
         self.close_epoch
+    }
+
+    /// Stamp the instant this node hands the output to its engine.
+    ///
+    /// `EpochManager::process_output` stamps it just before the send on the engine channel, so
+    /// the engine can time the hop, a send blocked on a full channel included. Observability
+    /// only; see [`Self::forwarded_at`].
+    pub fn set_forwarded_at(&mut self, at: Instant) {
+        self.forwarded_at = Some(at);
+    }
+
+    /// The instant this node handed the output to its engine, or `None` when nothing stamped it
+    /// (a deserialized output, or one built outside the forwarding path such as in tests).
+    ///
+    /// Node-local and transient: it is not serialized, not part of [`Self::digest`] and never
+    /// an execution input. The engine reads it into `tn_engine_forward_wait_seconds`.
+    pub fn forwarded_at(&self) -> Option<Instant> {
+        self.forwarded_at
     }
 
     /// The source of randomness used to shuffle future committees at the epoch boundary: the
@@ -713,10 +745,10 @@ impl CommittedSubDag {
         if leader_ms >= min_ms {
             return leader_ms;
         }
-        // the previous leader of the same epoch is an ancestor of this one and certified parents
-        // are strictly older post-fork, so an in-epoch clamp needs an earlier clamp at the epoch
-        // seam; it stays a warning as a tripwire. the first commit of an epoch is routinely
-        // raised above the previous epoch's closing timestamp, which is expected
+        // the previous leader of the same epoch is normally an ancestor of this one (after a
+        // schedule change it can be one committed indirectly), and certified parents are strictly
+        // older post-fork, so an in-epoch clamp normally follows one at the epoch seam and is a
+        // tripwire warning. raising an epoch's first commit above the previous close is expected
         if previous_sub_dag.is_some_and(|s| s.leader_epoch() == leader.epoch()) {
             warn!(
                 target: "tn::consensus",
@@ -1120,8 +1152,8 @@ mod tests {
     }
 
     /// An epoch whose leaders carry millisecond commit timestamps under the running cfg:
-    /// `u32::MAX` under `adiri` (the placeholder `SUBSECOND_TIMESTAMP_FORK_EPOCH` itself,
-    /// compared with `>=`), epoch zero elsewhere (non-adiri is active from genesis).
+    /// `u32::MAX` under `adiri` (above `SUBSECOND_TIMESTAMP_FORK_EPOCH`, 747, compared with
+    /// `>=`), epoch zero elsewhere (non-adiri is active from genesis).
     fn v2_epoch() -> Epoch {
         let epoch = if cfg!(feature = "adiri") { u32::MAX } else { 0 };
         // anti-vacuity: every post-fork assertion below means nothing on an inactive epoch
@@ -1555,8 +1587,9 @@ mod tests {
     }
 
     /// Epoch of the frozen V2 consensus header vector: `u32::MAX` is sub-second-active under
-    /// BOTH cfgs (adiri's placeholder `SUBSECOND_TIMESTAMP_FORK_EPOCH` is `u32::MAX`, compared
-    /// with `>=`; non-adiri everywhere), so one hex constant pins the bytes for every build.
+    /// BOTH cfgs (adiri activates at `SUBSECOND_TIMESTAMP_FORK_EPOCH` (747), far below
+    /// `u32::MAX`, compared with `>=`; non-adiri everywhere), so one hex constant pins the bytes
+    /// for every build.
     const GOLDEN_V2_EPOCH: Epoch = u32::MAX;
 
     /// Deterministic BLS signature from a seeded keypair (BLS signing is deterministic).

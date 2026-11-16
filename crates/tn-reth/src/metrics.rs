@@ -1,13 +1,49 @@
 //! Prometheus metrics for the reth execution environment.
 //!
-//! The counter series are exported under the `tn_reth` scope, in three unrelated groups.
+//! The counter series are exported under the `tn_reth` scope, in five unrelated groups.
 //!
-//! Block building. Two series count transactions that `build_block_from_batch_payload`
-//! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
-//! certified batch carried a transaction whose signer could not be recovered) and
-//! `tn_reth.invalid_txs_skipped_total` (expected - duplicates/invalid transactions across
-//! independently-batching workers, labeled by `reason`, see [`InvalidTxSkipReason`]). See
-//! [`RethEnvMetrics`] and the skip-reason docs for per-series semantics.
+//! Block building. Two series count transactions that block building
+//! (`build_block_from_batch_payload`, or `recover_output_signers` followed by
+//! `build_block_from_recovered_payload`) declines to include in a block:
+//! `tn_reth.unrecoverable_txs_dropped_total` (alertable - a certified batch carried a transaction
+//! whose signer could not be recovered) and `tn_reth.invalid_txs_skipped_total` (expected -
+//! duplicates/invalid transactions across independently-batching workers, labeled by `reason`, see
+//! [`InvalidTxSkipReason`]). See [`RethEnvMetrics`] and the skip-reason docs for per-series
+//! semantics. A third series, `tn_reth.exec_cache_stale_hits_total` (alertable), counts checked
+//! hits of the cross-block execution cache that differed from the parent state, and a fourth,
+//! `tn_reth.parallel_state_root_mismatches_total` (alertable), sampled block roots whose parallel
+//! storage roots differed from the serial computation. A fifth,
+//! `tn_reth.account_walk_fallbacks_total` (labeled by `reason`, see [`AccountWalkFallback`]),
+//! counts blocks whose split account walk ran on one thread instead, and a sixth,
+//! `tn_reth.storage_walk_fallbacks_total` (labeled by `reason`, see [`StorageWalkFallback`]), hot
+//! storage tries whose split storage root was not used. Beside them,
+//! `tn_reth.account_walk_splits_total` counts the blocks whose root the split account walk composed
+//! and `tn_reth.storage_walk_splits_total` the hot storage tries whose storage root was composed
+//! from the split's pieces, so the share of the splits that ran can be read (see
+//! [`record_account_walk_split`] and [`record_storage_walk_splits`]). A seventh,
+//! `tn_reth.parallel_state_root_task_failures_total` (labeled by `reason`, see
+//! [`ParallelRootTaskFailure`]), counts the parallel state-root tasks that failed and left their
+//! part to the serial computation.
+//!
+//! Persistence. `tn_reth.tx_body_inline_rows_total` counts transactions a datadir that stores
+//! transactions by batch position stored inline instead (expected zero; see
+//! [`record_tx_body_inline_rows`]).
+//!
+//! Transaction reads of such a datadir (`env::tx_bodies`): `tn_reth.tx_body_resolves_total`
+//! (labeled by `source`: `recent`, `cold`, `live_pack`, `closed_pack`, `memory`, `scoped`) counts
+//! the blocks whose position rows were resolved, `tn_reth.tx_body_resolve_failures_total` (labeled
+//! by `reason`, alertable) those that failed, `tn_reth.tx_body_pack_opens_total` the closed-epoch
+//! packs the resolver opened, the gauge `tn_reth.tx_body_cache_bytes` (labeled by `part`: `recent`,
+//! `cold`) the decoded-batch cache's size, and the histogram `tn_reth.tx_body_resolve_seconds` the
+//! resolves that read a pack. See [`register_tx_body_series`].
+//!
+//! Six histograms in the same group time the stages of each block built, one sample per block
+//! each: `tn_reth.block_signer_recovery_seconds` (per batch, ahead of the build: in the bytes
+//! build before the builder is set up, in `recover_output_signers` concurrently across the
+//! output's batches), then `tn_reth.block_execute_seconds`, `tn_reth.block_finish_seconds` (with
+//! `tn_reth.block_hashed_state_seconds` and `tn_reth.block_state_root_seconds` inside it), and
+//! `tn_reth.block_overlay_extend_seconds`. Execute, finish and overlay extend run back to back.
+//! See [`RethEnvMetrics`] for the span each one covers.
 //!
 //! Observer transaction forwarding. A base series counts every transaction handed to the
 //! forwarder ([`crate::WorkerRpcForwarder`]): `tn_reth.forwarded_txns_queued_total`. Read
@@ -27,6 +63,15 @@
 //! and `tn_reth.canon_state_resync_read_failures_total` counts canonical account reads the
 //! post-lag resync absorbed and retried. See [`RethEnvMetrics`] for per-series semantics.
 //! `tn_reth.txpool_expired_txs_total` counts parked transactions removed by the age sweep.
+//! When a worker retires, `tn_reth.retired_pool_txns_moved_total` counts the transactions its
+//! pool hands to an active worker, and `tn_reth.retired_pool_txns_dropped_total` (labeled by
+//! `reason`, see [`HandoffDropReason`]) counts the ones the active worker refused.
+//!
+//! RPC submission forwarding (`--forward-txs`). `tn_reth.rpc_tx_forwarded_total` counts every
+//! raw submission by how it ended (labeled by `outcome`, see [`RpcTxForwardOutcome`]), and
+//! `tn_reth.rpc_tx_forward_target_failures_total` counts failed attempts against one target
+//! (labeled by the target's index and the failure `kind`, see [`RpcTxForwardFailure`]). See
+//! [`RpcTxForwardMetrics`].
 //!
 //! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
 //!
@@ -39,8 +84,9 @@
 //!
 //! # Two mechanisms in one module
 //!
-//! The counters use the `reth_metrics::Metrics` derive; the epoch-close gauges use the
-//! `metrics::gauge!` / `metrics::describe_gauge!` macros. The split is not stylistic:
+//! The counters and the block-timing histograms use the `reth_metrics::Metrics` derive; the
+//! epoch-close gauges use the `metrics::gauge!` / `metrics::describe_gauge!` macros. The split
+//! is not stylistic:
 //!
 //! 1. The per-call gauge carries a `call` label, which a derive field cannot express — the derive
 //!    generates one unlabelled series per field.
@@ -52,16 +98,26 @@
 //!    `new_with_labels`; the gauges get the property for free, which is what lets a real epoch
 //!    close be asserted on (`env/epoch.rs`).
 //!
+//! The block-timing histograms stay on the derive despite that: they record on every block, and
+//! a cached handle records without the registry lookup a macro makes on each call. The test that
+//! drives them through real block building (`env/execution.rs`) therefore binds the static
+//! itself, under its own recorder, which holds because nextest runs each test in its own
+//! process.
+//!
 //! Everything here binds to the process-global `metrics` recorder, so
 //! `tn_metrics::install_recorder` must run first — the node installs it before opening the
-//! database (`RethEnv::new_database`), and the two registration entry points ([`init`], called
-//! from `RethEnv::new`, and [`ForwarderMetrics::init`], called from
-//! `WorkerRpcForwarder::new`) then force registration so every counter exists at zero from
-//! process start.
+//! database (`RethEnv::new_database`), and the registration entry points ([`init`], called
+//! from `RethEnv::new`, [`ForwarderMetrics::init`], called from `WorkerRpcForwarder::new`, and
+//! [`RpcTxForwardMetrics::init`], called when `RethEnv::new` builds the submission forwarder)
+//! then force registration so every counter exists at zero from process start.
 
 use alloy_evm::InvalidTxError;
-use reth_metrics::{metrics::Counter, Metrics};
+use reth_metrics::{
+    metrics::{Counter, Histogram},
+    Metrics,
+};
 use reth_revm::context::result::InvalidTransaction;
+use reth_transaction_pool::error::PoolErrorKind;
 use std::sync::LazyLock;
 use tracing::warn;
 
@@ -80,8 +136,8 @@ use crate::{evm::SYSTEM_CALL_GAS_LIMIT, RethDb};
 /// the noop one.
 pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnvMetrics::default);
 
-/// Register every [`RethEnvMetrics`] counter and every labeled skip series with the global
-/// recorder without recording an event.
+/// Register every [`RethEnvMetrics`] counter, every labeled skip series and every retired-pool
+/// handoff series with the global recorder without recording an event.
 ///
 /// For the derive-based counters, registration happens when the `LazyLock` is first forced.
 /// Register before the expiry task or any drop or lag-recovery path first uses the counters.
@@ -99,11 +155,23 @@ pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnv
 /// renders no step for the first event.
 pub(crate) fn init() {
     LazyLock::force(&RETH_METRICS);
+    metrics::counter!(TX_BODY_INLINE_ROWS).increment(0);
     register_invalid_tx_skip_series();
+    register_account_walk_fallback_series();
+    register_storage_walk_fallback_series();
+    register_walk_split_series();
+    register_parallel_root_task_failure_series();
+    register_retired_pool_handoff_series();
+    register_tx_body_series();
 }
 
 /// Metrics for the execution environment: block building from certified batch payloads, plus
 /// the worker pool's canonical-state subscription health and parked-transaction expiry.
+///
+/// The `block_*_seconds` histograms time the stages of each block built
+/// (`build_block_from_batch_payload`, or `build_block_from_recovered_payload` after
+/// `recover_output_signers`). Each records one sample per block, when its span completes without
+/// error, so a failed build leaves no sample for the stage that failed or any stage after it.
 ///
 /// The unrecoverable-drop counter and the labeled skip series under [`INVALID_TXS_SKIPPED`]
 /// cover transactions that `build_block_from_batch_payload` silently declines to include in
@@ -124,11 +192,55 @@ pub(crate) struct RethEnvMetrics {
 
     /// Transactions dropped while building a block because their signer could not be recovered.
     ///
+    /// Counted at recovery: in the bytes build per block, before the builder is set up (a build
+    /// that then fails still counts its drops), and in `recover_output_signers` per consensus
+    /// output, which the engine runs when the output is queued, ahead of its blocks (an output
+    /// dropped from the queue at shutdown and replayed after a restart counts twice). Counting
+    /// ahead of the blocks also counts drops for blocks never built: an output dropped from the
+    /// queue unexecuted (the max-round return, or an earlier output's execution error) has
+    /// already counted its drops, and when one of an output's blocks fails, the counter already
+    /// holds the drops of the batches after it.
+    ///
     /// Alert on any nonzero value. A certified sub-DAG is fixed and identical on every honest
     /// node, so an unrecoverable transaction is dropped rather than halting the network (see
     /// issues #933 / #938); reaching that path at all means a batch carrying undecodable
     /// transaction bytes was certified, i.e. batch validation was bypassed somewhere upstream.
     pub(crate) unrecoverable_txs_dropped_total: Counter,
+
+    /// Checked hits of the cross-block execution cache that differed from the parent state.
+    ///
+    /// Alert on any nonzero value. One hit of each kind in `CHECK_ONE_HIT_IN` is re-read from
+    /// the parent state (`env/exec_cache.rs`); a stale one means an invariant of the cache failed.
+    /// That block is discarded and built again without the cache, so it is the block a node
+    /// without the cache builds. Earlier blocks are not checked again: unchecked stale hits in
+    /// them may already have forked this node from its peers, and they are persisted. The node's
+    /// leader check (it goes inactive) or a certified epoch record other than its own (it stops)
+    /// finds such a block later; nothing repairs it short of a sync from scratch. Compare its
+    /// recent block hashes with a peer's before trusting it, and report it. `TN_EXEC_CACHE=0` on
+    /// this node (read when the env is created, so a restart) turns the cache off; that is safe on
+    /// one node, since a node without the cache builds the blocks a correct cache must. The
+    /// sample follows this node's own cache's hit counts, so a zero on one node says nothing
+    /// about another.
+    pub(crate) exec_cache_stale_hits_total: Counter,
+
+    /// Compared block roots whose parallel storage roots gave another root or other trie updates
+    /// than the serial computation.
+    ///
+    /// Alert on any nonzero value. The blocks whose number is a multiple of
+    /// `CHECK_ONE_BLOCK_IN`, of those with parallel work (storage-root tasks or a split account
+    /// walk), are also computed serially (`env/output_overlay/parallel.rs`); a difference means
+    /// the parallel path is wrong. The block uses the serial result. Every node checks the same
+    /// blocks, but the unchecked blocks the same bug hit carry the wrong root: on every node for a
+    /// bug every path shares, on some for a bug in one path that scheduling picks. The check
+    /// cannot see a wrong trie node an unchecked block persisted. The response is network-wide:
+    /// switch the parallel paths off on every node (`TN_PARALLEL_STATE_ROOT=0`; read at the first
+    /// block, so a restart) and report it; switching one node off only parts it from its peers,
+    /// and switching off repairs no persisted node. A node whose pool runs one thread runs the
+    /// same parallel code. The error log says whether the split composed the block's root; a
+    /// block the split composed is also counted as [`AccountWalkFallback::Mismatch`], a block
+    /// with composed storage roots as [`StorageWalkFallback::Mismatch`]. Those say which splits
+    /// ran, not which part was wrong.
+    pub(crate) parallel_state_root_mismatches_total: Counter,
 
     /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
     ///
@@ -159,6 +271,48 @@ pub(crate) struct RethEnvMetrics {
     /// does not fall back to zero means the resync is stuck retrying the same senders and
     /// the pool's view of them stays stale.
     pub(crate) canon_state_resync_read_failures_total: Counter,
+
+    /// Time to execute one block's transactions.
+    ///
+    /// Spans creating the block builder, the pre-execution changes and the transaction loop, and
+    /// ends where [`RethEnvMetrics::block_finish_seconds`] starts. Signer recovery runs before it
+    /// ([`RethEnvMetrics::block_signer_recovery_seconds`]).
+    pub(crate) block_execute_seconds: Histogram,
+
+    /// Time to recover the signers of one batch's transactions, in parallel on rayon: one sample
+    /// per batch, and so per block built from a batch.
+    ///
+    /// Not part of [`RethEnvMetrics::block_execute_seconds`]: the bytes build recovers before the
+    /// builder is set up, and the engine recovers a whole output's batches concurrently in
+    /// `recover_output_signers` on a background job, ahead of the output's blocks, so the samples
+    /// of one output can overlap each other and earlier outputs' execution.
+    pub(crate) block_signer_recovery_seconds: Histogram,
+
+    /// Time for the block builder's `finish` on one block.
+    ///
+    /// Spans the post-execution changes (on an epoch-closing block, the closing system calls),
+    /// merging the state transitions, hashing the post-state
+    /// ([`RethEnvMetrics::block_hashed_state_seconds`]), the state root
+    /// ([`RethEnvMetrics::block_state_root_seconds`]) and assembling the block. It ends where
+    /// [`RethEnvMetrics::block_overlay_extend_seconds`] starts.
+    pub(crate) block_finish_seconds: Histogram,
+
+    /// Time to hash one block's post-execution bundle state (`hashed_post_state`).
+    ///
+    /// Part of [`RethEnvMetrics::block_finish_seconds`].
+    pub(crate) block_hashed_state_seconds: Histogram,
+
+    /// Time to compute one block's state root and trie updates over the output's accumulated
+    /// overlay (`OutputTrieOverlay::layered_root_with_updates`), including opening and closing
+    /// the read-only database transaction the root runs over.
+    ///
+    /// Part of [`RethEnvMetrics::block_finish_seconds`].
+    pub(crate) block_state_root_seconds: Histogram,
+
+    /// Time from the end of `finish` to the built block: taking the bundle, sorting the block's
+    /// hashed state and trie updates, then extending the output's overlay with them
+    /// (`OutputTrieOverlay::extend_from_block`).
+    pub(crate) block_overlay_extend_seconds: Histogram,
 }
 
 impl RethEnvMetrics {
@@ -166,6 +320,23 @@ impl RethEnvMetrics {
     pub(crate) fn record_txpool_expired_transactions(&self, removed: usize) {
         self.txpool_expired_txs_total.increment(u64::try_from(removed).unwrap_or(u64::MAX));
     }
+}
+
+/// Counter name for transactions a datadir that stores transactions by batch position stored
+/// inline: those of a persisted block that had no positions (`RethEnv::persist_executed_output`).
+///
+/// Expected zero in production. A block is stored inline when its batch does not hash to its
+/// header's `ommers_hash`, which happens on adiri's duplicate-batch epochs (at or below
+/// `ADIRI_DUP_BATCH_EPOCH`); anywhere else a nonzero rate means positions were lost on the way
+/// to the persist. Inline rows read correctly; they cost the space the pointer format saves. The
+/// first such persist in a process logs a warning naming the block and the reason. A datadir that
+/// stores every transaction inline never counts here.
+const TX_BODY_INLINE_ROWS: &str = "tn_reth.tx_body_inline_rows_total";
+
+/// Count `rows` transactions stored inline in a datadir that stores them by batch position (see
+/// [`TX_BODY_INLINE_ROWS`]). The macro path keeps the series observable from a unit test.
+pub(crate) fn record_tx_body_inline_rows(rows: u64) {
+    metrics::counter!(TX_BODY_INLINE_ROWS).increment(rows);
 }
 
 /// Counter name for transactions skipped while building a block because the EVM rejected them
@@ -313,6 +484,354 @@ fn register_invalid_tx_skip_series() {
 /// series observable from a unit test.
 pub(crate) fn record_invalid_tx_skipped(reason: InvalidTxSkipReason) {
     metrics::counter!(INVALID_TXS_SKIPPED, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for blocks whose state root would split the account walk but ran it on one thread
+/// (`env/output_overlay/account_split.rs`), kept next to its only emission helper so the
+/// registration in [`register_account_walk_fallback_series`] and the increment in
+/// [`record_account_walk_fallback`] cannot drift apart. One series per [`AccountWalkFallback`].
+const ACCOUNT_WALK_FALLBACKS: &str = "tn_reth.account_walk_fallbacks_total";
+
+/// Why a block's split account walk ran on one thread (or, for [`Self::Mismatch`], why its
+/// result was replaced by the serial one). Labels [`ACCOUNT_WALK_FALLBACKS`].
+///
+/// Only blocks the split would take count: a node with `TN_PARALLEL_ACCOUNT_WALK=0` or
+/// `TN_PARALLEL_STATE_ROOT=0` counts nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountWalkFallback {
+    /// Fewer changed accounts than `SPLIT_MIN_ACCOUNTS`: the split's fixed costs are not worth
+    /// paying. Expected on most blocks of a quiet chain.
+    FewChanges,
+    /// The stored account trie failed the pre-check (a first nibble's node missing or with a leaf
+    /// or an extension child): a trie of a few thousand accounts or fewer, as a chain has from
+    /// genesis. Not tried, so free: the walk ran on one thread with the storage-root tasks, as
+    /// with `TN_PARALLEL_ACCOUNT_WALK=0`. Expected on every block the split would take while the
+    /// trie is small.
+    SmallTrie,
+    /// The trie passed the pre-check, but the block's own changes left a shape the split does not
+    /// compose: a first nibble's node with a leaf or an extension child (the block removed all
+    /// but one account under a second-level path, or added the first under an empty one), fewer
+    /// than two non-empty first nibbles, or a rebuilt node that failed its hash check. Rare. The
+    /// block paid for the subtries, and then the walk on one thread computed again every storage
+    /// root they had taken from the tasks.
+    Shape,
+    /// The database holds an account-trie node at the empty path, which reth never writes.
+    /// Alert on any nonzero value: the stored trie is not one reth wrote.
+    StoredRootNode,
+    /// A sampled serial check found the root or trie updates wrong on a block whose root the
+    /// split composed; the block used the serial result. It says the split ran, not that the
+    /// split was the wrong part: the storage-root tasks and the storage split ran too, and a
+    /// block with composed storage roots also counts [`StorageWalkFallback::Mismatch`]. Alert on
+    /// any nonzero value: also counted in `tn_reth.parallel_state_root_mismatches_total`, whose
+    /// response (`TN_PARALLEL_STATE_ROOT=0` on every node) applies.
+    Mismatch,
+}
+
+impl AccountWalkFallback {
+    /// Every variant, for zero-registration in [`register_account_walk_fallback_series`]. Extend
+    /// it with [`Self::label`]'s match.
+    const ALL: [Self; 5] =
+        [Self::FewChanges, Self::SmallTrie, Self::Shape, Self::StoredRootNode, Self::Mismatch];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::FewChanges => "few_changes",
+            Self::SmallTrie => "small_trie",
+            Self::Shape => "shape",
+            Self::StoredRootNode => "stored_root_node",
+            Self::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// Register one account-walk fallback series per [`AccountWalkFallback`] at zero. Called from
+/// [`init`], for the reasons given there.
+fn register_account_walk_fallback_series() {
+    AccountWalkFallback::ALL.iter().for_each(|reason| {
+        metrics::counter!(ACCOUNT_WALK_FALLBACKS, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one block whose split account walk fell back, labeled by [`AccountWalkFallback`]. The
+/// macro path re-resolves the recorder on every call, keeping the series observable from a unit
+/// test.
+pub(crate) fn record_account_walk_fallback(reason: AccountWalkFallback) {
+    metrics::counter!(ACCOUNT_WALK_FALLBACKS, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for hot storage tries whose storage root would be split by first nibble but was
+/// computed on one task or by the walk (`env/output_overlay/storage_split.rs`), kept next to its
+/// only emission helper so the registration in [`register_storage_walk_fallback_series`] and the
+/// increment in [`record_storage_walk_fallback`] cannot drift apart. One series per
+/// [`StorageWalkFallback`].
+const STORAGE_WALK_FALLBACKS: &str = "tn_reth.storage_walk_fallbacks_total";
+
+/// Why a hot storage trie (a storage-root target with at least `SPLIT_MIN_SLOTS` changed slots)
+/// was not split, or its split result not used. Labels [`STORAGE_WALK_FALLBACKS`]; counted once
+/// per such trie and block.
+///
+/// Only tries the split would take count: a node with `TN_PARALLEL_STORAGE_WALK=0` or
+/// `TN_PARALLEL_STATE_ROOT=0` counts nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageWalkFallback {
+    /// The stored trie failed the pre-check (a first-nibble node missing or with a leaf or
+    /// extension child): a trie of a few thousand slots or fewer. Not tried, so free: its storage
+    /// root ran on one task.
+    SmallTrie,
+    /// The pieces composed nothing (the block's changes left a first-nibble node that is not a
+    /// branch over hashed children, fewer than two non-empty first nibbles, or an empty storage):
+    /// the block paid for the pieces and then the walk computed the storage root serially.
+    Shape,
+    /// The database holds a storage-trie node at the empty path, which reth never writes. Alert
+    /// on any nonzero value: the stored trie is not one reth wrote.
+    StoredRootNode,
+    /// A sampled serial check found the root or trie updates wrong on a block with at least one
+    /// composed storage root; the block used the serial result. Counted once per such block, not
+    /// per trie. It says the split ran, not that the split was the wrong part: a block the
+    /// account split composed also counts [`AccountWalkFallback::Mismatch`]. Alert on any nonzero
+    /// value: also counted in `tn_reth.parallel_state_root_mismatches_total`, whose response
+    /// (`TN_PARALLEL_STATE_ROOT=0` on every node) applies.
+    Mismatch,
+}
+
+impl StorageWalkFallback {
+    /// Every variant, for zero-registration in [`register_storage_walk_fallback_series`]. Extend
+    /// it with [`Self::label`]'s match.
+    const ALL: [Self; 4] = [Self::SmallTrie, Self::Shape, Self::StoredRootNode, Self::Mismatch];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SmallTrie => "small_trie",
+            Self::Shape => "shape",
+            Self::StoredRootNode => "stored_root_node",
+            Self::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// Register one storage-walk fallback series per [`StorageWalkFallback`] at zero. Called from
+/// [`init`], for the reasons given there.
+fn register_storage_walk_fallback_series() {
+    StorageWalkFallback::ALL.iter().for_each(|reason| {
+        metrics::counter!(STORAGE_WALK_FALLBACKS, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one hot storage trie whose split fell back, labeled by [`StorageWalkFallback`]. The
+/// macro path re-resolves the recorder on every call, keeping the series observable from a unit
+/// test.
+pub(crate) fn record_storage_walk_fallback(reason: StorageWalkFallback) {
+    metrics::counter!(STORAGE_WALK_FALLBACKS, "reason" => reason.label()).increment(1);
+}
+
+/// Counter name for blocks whose root the split account walk composed
+/// (`env/output_overlay/account_split.rs`), kept next to its only emission helper,
+/// [`record_account_walk_split`]. Read against [`ACCOUNT_WALK_FALLBACKS`]: the two together, less
+/// its `mismatch` reason (a composed block also counted there), are the blocks the split would
+/// take.
+const ACCOUNT_WALK_SPLITS: &str = "tn_reth.account_walk_splits_total";
+
+/// Counter name for hot storage tries whose storage root the walk took composed from the split's
+/// pieces (`env/output_overlay/storage_split.rs`), once per trie and block, kept next to its only
+/// emission helper, [`record_storage_walk_splits`]. Read against [`STORAGE_WALK_FALLBACKS`]: the
+/// two together are the hot tries the split would take, less the `mismatch` reason (counted per
+/// block) and the tries with a piece that failed or was never computed (in neither; a failed piece
+/// is counted in [`PARALLEL_ROOT_TASK_FAILURES`]).
+const STORAGE_WALK_SPLITS: &str = "tn_reth.storage_walk_splits_total";
+
+/// Register [`ACCOUNT_WALK_SPLITS`] and [`STORAGE_WALK_SPLITS`] at zero. Called from [`init`], for
+/// the reasons given there.
+fn register_walk_split_series() {
+    metrics::counter!(ACCOUNT_WALK_SPLITS).increment(0);
+    metrics::counter!(STORAGE_WALK_SPLITS).increment(0);
+}
+
+/// Count one block whose root the split account walk composed. Called once per such block, on the
+/// thread that computed its root, after the walk; the macro path re-resolves the recorder on every
+/// call, keeping the series observable from a unit test, at one registry lookup per block.
+pub(crate) fn record_account_walk_split() {
+    metrics::counter!(ACCOUNT_WALK_SPLITS).increment(1);
+}
+
+/// Count `tries` hot storage tries whose storage root was composed from the split's pieces. Called
+/// once per block, on the thread that computed its root, after the walk; a block with none records
+/// nothing.
+pub(crate) fn record_storage_walk_splits(tries: usize) {
+    if tries > 0 {
+        metrics::counter!(STORAGE_WALK_SPLITS).increment(tries as u64);
+    }
+}
+
+/// Counter name for parallel state-root work (a storage-root task, a walk helper, an account
+/// subtrie or a storage piece) that failed and left its part to the serial computation
+/// (`env/output_overlay/parallel.rs`), kept next to its only emission helper so the registration
+/// in [`register_parallel_root_task_failure_series`] and the increment in
+/// [`record_parallel_root_task_failure`] cannot drift apart. One series per
+/// [`ParallelRootTaskFailure`].
+const PARALLEL_ROOT_TASK_FAILURES: &str = "tn_reth.parallel_state_root_task_failures_total";
+
+/// Why a piece of a block's parallel state-root work failed. Labels
+/// [`PARALLEL_ROOT_TASK_FAILURES`]; counted once per failed task, helper, subtrie or piece.
+///
+/// A failure costs time, not correctness: the block computes that part serially, on this node
+/// only. It is the one place a node's parallel work differs from its peers'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParallelRootTaskFailure {
+    /// Opening the task's read-only transaction failed.
+    Provider,
+    /// A database read failed.
+    Database,
+    /// The task's transaction saw another finalized block than the walk's: something wrote the
+    /// state or trie tables while an output's blocks were built. Alert on any nonzero value: the
+    /// node has no such writer (`parallel.rs`'s module docs), and a writer that did not advance
+    /// the finalized block would go unseen.
+    TipMoved,
+    /// The task panicked.
+    Panicked,
+}
+
+impl ParallelRootTaskFailure {
+    /// Every variant, for zero-registration in [`register_parallel_root_task_failure_series`].
+    /// Extend it with [`Self::label`]'s match.
+    const ALL: [Self; 4] = [Self::Provider, Self::Database, Self::TipMoved, Self::Panicked];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Database => "database",
+            Self::TipMoved => "tip_moved",
+            Self::Panicked => "panicked",
+        }
+    }
+}
+
+/// Register one parallel-root task failure series per [`ParallelRootTaskFailure`] at zero.
+/// Called from [`init`], for the reasons given there.
+fn register_parallel_root_task_failure_series() {
+    ParallelRootTaskFailure::ALL.iter().for_each(|reason| {
+        metrics::counter!(PARALLEL_ROOT_TASK_FAILURES, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count one failed piece of parallel state-root work, labeled by [`ParallelRootTaskFailure`].
+/// Called on the failure path only. The macro path re-resolves the recorder on every call,
+/// keeping the series observable from a unit test.
+pub(crate) fn record_parallel_root_task_failure(reason: ParallelRootTaskFailure) {
+    metrics::counter!(PARALLEL_ROOT_TASK_FAILURES, "reason" => reason.label()).increment(1);
+}
+
+/// Counter names for the retired-worker pool handoff, kept next to their only emission sites so
+/// the registration in [`register_retired_pool_handoff_series`] and the increments below cannot
+/// drift apart.
+///
+/// When a node runs fewer workers, each retired worker hands its pool to an active worker
+/// (`WorkerTxPool::migrate_transactions_to`). The moved series is the denominator. The dropped
+/// series counts the transactions the active worker refused, one series per
+/// [`HandoffDropReason`]. This node's RPC accepted those transactions, and the handoff discards
+/// them.
+const RETIRED_POOL_TXNS_MOVED: &str = "tn_reth.retired_pool_txns_moved_total";
+const RETIRED_POOL_TXNS_DROPPED: &str = "tn_reth.retired_pool_txns_dropped_total";
+
+/// Why an active worker refused a transaction from a retired worker's pool.
+///
+/// The variants label [`RETIRED_POOL_TXNS_DROPPED`], one series per reason, all registered at
+/// zero by [`register_retired_pool_handoff_series`]. Each variant maps one refusing
+/// [`PoolErrorKind`]. `AlreadyImported` maps to no reason, because the active worker already
+/// holds the transaction and the handoff is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum HandoffDropReason {
+    /// Validation refused the transaction (nonce, balance, size, gas limit, fee or type).
+    Invalid,
+    /// The active worker holds a transaction with the same sender and nonce at a higher price.
+    ReplacementUnderpriced,
+    /// The fee cap is below the protocol minimum.
+    FeeCapBelowMinimum,
+    /// The sender already fills its slot capacity in the active worker's pool.
+    SpammerExceededCapacity,
+    /// The active worker's pool was full and discarded the transaction on insert.
+    DestinationFull,
+    /// The sender has a transaction of a conflicting type (blob or normal) in the active worker.
+    ConflictingTransactionType,
+    /// Any other insertion or validation failure, for example an unreachable validation service.
+    Other,
+}
+
+impl HandoffDropReason {
+    /// Every variant, for zero-registration in [`register_retired_pool_handoff_series`].
+    ///
+    /// Hand-maintained like [`ForwardDropReason::ALL`]: extend it in the same edit as a new
+    /// variant, because the register-at-zero test iterates this same list.
+    const ALL: [Self; 7] = [
+        Self::Invalid,
+        Self::ReplacementUnderpriced,
+        Self::FeeCapBelowMinimum,
+        Self::SpammerExceededCapacity,
+        Self::DestinationFull,
+        Self::ConflictingTransactionType,
+        Self::Other,
+    ];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::ReplacementUnderpriced => "replacement_underpriced",
+            Self::FeeCapBelowMinimum => "fee_cap_below_minimum",
+            Self::SpammerExceededCapacity => "spammer_exceeded_capacity",
+            Self::DestinationFull => "destination_full",
+            Self::ConflictingTransactionType => "conflicting_transaction_type",
+            Self::Other => "other",
+        }
+    }
+
+    /// Classify a pool insertion error. Return `None` when the destination already holds the
+    /// transaction, because that is a completed handoff and not a refusal.
+    pub(crate) fn from_kind(kind: &PoolErrorKind) -> Option<Self> {
+        match kind {
+            PoolErrorKind::AlreadyImported => None,
+            PoolErrorKind::InvalidTransaction(_) => Some(Self::Invalid),
+            PoolErrorKind::ReplacementUnderpriced => Some(Self::ReplacementUnderpriced),
+            PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(_) => Some(Self::FeeCapBelowMinimum),
+            PoolErrorKind::SpammerExceededCapacity(_) => Some(Self::SpammerExceededCapacity),
+            PoolErrorKind::DiscardedOnInsert => Some(Self::DestinationFull),
+            PoolErrorKind::ExistingConflictingTransactionType(..) => {
+                Some(Self::ConflictingTransactionType)
+            }
+            PoolErrorKind::Other(_) => Some(Self::Other),
+        }
+    }
+}
+
+/// Register the retired-pool moved series and one dropped series per [`HandoffDropReason`] at
+/// zero.
+///
+/// A shrink is rare, so without a zero baseline the first refusal burst renders no `rate()`
+/// step, and a reason that never fired cannot be told apart from a mistyped label value.
+fn register_retired_pool_handoff_series() {
+    metrics::counter!(RETIRED_POOL_TXNS_MOVED).increment(0);
+    HandoffDropReason::ALL.iter().for_each(|reason| {
+        metrics::counter!(RETIRED_POOL_TXNS_DROPPED, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count transactions an active worker accepted from a retired worker's pool.
+///
+/// The denominator the dropped series reads against. A transaction the active worker already
+/// held is not counted here, because this pass did not move it.
+pub(crate) fn record_retired_pool_txns_moved(count: u64) {
+    metrics::counter!(RETIRED_POOL_TXNS_MOVED).increment(count);
+}
+
+/// Count transactions an active worker refused from a retired worker's pool, labeled by
+/// [`HandoffDropReason`].
+///
+/// The call site pairs this with one summary `warn!` per handoff pass. Each transaction counted
+/// here was accepted by this node's RPC and is discarded.
+pub(crate) fn record_retired_pool_txns_dropped(reason: HandoffDropReason, count: u64) {
+    metrics::counter!(RETIRED_POOL_TXNS_DROPPED, "reason" => reason.label()).increment(count);
 }
 
 /// Counter names for the observer forwarder, kept next to their only emission sites so the
@@ -505,6 +1024,132 @@ impl ForwarderMetrics {
     }
 }
 
+/// Counter names for `--forward-txs` submission forwarding (`crate::rpc_tx_forward`), kept next
+/// to their only emission sites so registration and increments cannot drift apart.
+const RPC_TX_FORWARDED: &str = "tn_reth.rpc_tx_forwarded_total";
+const RPC_TX_FORWARD_TARGET_FAILURES: &str = "tn_reth.rpc_tx_forward_target_failures_total";
+
+/// How one raw submission on a forwarding node ended.
+///
+/// Labels `tn_reth.rpc_tx_forwarded_total`, one series per outcome, all registered at zero by
+/// [`RpcTxForwardMetrics::init`]. The four outcomes partition the submissions the forwarding
+/// handler received.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RpcTxForwardOutcome {
+    /// A target returned a transaction hash.
+    Accepted,
+    /// A target returned a JSON-RPC error, which the client received unchanged, or the request
+    /// was too large to forward (a target answered HTTP 413, or the client's own size cap refused
+    /// it) and the client received the oversized-request error. Expected traffic (nonce too low,
+    /// already known, underpriced), but alertable when it climbs while `accepted` stays flat: a
+    /// target that answers every request with an error (method not found on a port without the
+    /// `eth` namespace) is never failed over.
+    UpstreamError,
+    /// The node's own checks refused the transaction before any target saw it.
+    RejectedLocally,
+    /// No target answered within the submission budget, and the client received the fixed
+    /// unavailable error. Alertable: the node is refusing every submission while this lasts.
+    Unavailable,
+}
+
+impl RpcTxForwardOutcome {
+    /// Every variant, for zero-registration in [`RpcTxForwardMetrics::init`].
+    ///
+    /// Hand-maintained alongside the exhaustive match in [`Self::label`].
+    const ALL: [Self; 4] =
+        [Self::Accepted, Self::UpstreamError, Self::RejectedLocally, Self::Unavailable];
+
+    /// The `outcome` label value this variant records under.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::UpstreamError => "upstream_error",
+            Self::RejectedLocally => "rejected_locally",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Why one forward attempt against one target ended without a JSON-RPC reply.
+///
+/// Labels `tn_reth.rpc_tx_forward_target_failures_total` together with the target's index.
+/// Every such failure demotes the target and moves the submission to the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RpcTxForwardFailure {
+    /// The target did not answer within the attempt timeout.
+    Timeout,
+    /// The connection failed, the target answered with a non-2xx status other than 413, or its
+    /// body was oversized, empty or not JSON.
+    Transport,
+    /// The target answered 2xx with JSON that is not a JSON-RPC reply to the request: it does not
+    /// parse as a response, carries another request's id, or its result is not a hash.
+    Malformed,
+}
+
+impl RpcTxForwardFailure {
+    /// Every variant, for zero-registration in [`RpcTxForwardMetrics::init`].
+    ///
+    /// Hand-maintained alongside the exhaustive match in [`Self::label`].
+    const ALL: [Self; 3] = [Self::Timeout, Self::Transport, Self::Malformed];
+
+    /// The `kind` label value this variant records under.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// Metrics for `--forward-txs` submission forwarding (`crate::rpc_tx_forward`).
+///
+/// A target is labeled by its index in the configured list, never by its URL: the list is
+/// private operator configuration, and a scrape endpoint is not. Associated functions rather
+/// than instance handles, for the same late-binding reason as [`ForwarderMetrics`].
+pub(crate) struct RpcTxForwardMetrics;
+
+impl RpcTxForwardMetrics {
+    /// Register every outcome series, and every failure series of each of the `target_count`
+    /// targets, at zero.
+    ///
+    /// Called once when `RethEnv::new` builds the forwarder, after the CLI installed the
+    /// global recorder, for the reason [`init`] gives.
+    pub(crate) fn init(target_count: usize) {
+        RpcTxForwardOutcome::ALL.iter().for_each(|outcome| {
+            metrics::counter!(RPC_TX_FORWARDED, "outcome" => outcome.label()).increment(0);
+        });
+        (0..target_count).for_each(|index| {
+            RpcTxForwardFailure::ALL.iter().for_each(|kind| {
+                metrics::counter!(
+                    RPC_TX_FORWARD_TARGET_FAILURES,
+                    "target" => index.to_string(),
+                    "kind" => kind.label()
+                )
+                .increment(0);
+            });
+        });
+    }
+
+    /// Count one submission by how it ended.
+    pub(crate) fn record_outcome(outcome: RpcTxForwardOutcome) {
+        metrics::counter!(RPC_TX_FORWARDED, "outcome" => outcome.label()).increment(1);
+    }
+
+    /// Count one failed attempt against the target at `index` in the configured list.
+    ///
+    /// The call site pairs with a `debug!` line carrying the error, which names the target by
+    /// the same index.
+    pub(crate) fn record_target_failure(index: usize, kind: RpcTxForwardFailure) {
+        metrics::counter!(
+            RPC_TX_FORWARD_TARGET_FAILURES,
+            "target" => index.to_string(),
+            "kind" => kind.label()
+        )
+        .increment(1);
+    }
+}
+
 /// Report sampled reth database metrics (table sizes, page usage, freelist).
 ///
 /// Intended as a pre-scrape hook for the prometheus metrics endpoint. Lives here to keep
@@ -620,7 +1265,8 @@ impl EpochCloseGas {
 /// for. Every node runs that closing block, so the series is fleet-wide rather than
 /// proposer-only, and it covers closing blocks re-executed while syncing — a replayed value is
 /// still a true observation of what that epoch cost, which is what makes a `max_over_time` query
-/// over these gauges meaningful.
+/// over these gauges meaningful. RPC re-execution of a sealed closing block does not call it
+/// (`TNBlockExecutionCtx::replay`), so an RPC client cannot overwrite the gauges.
 ///
 /// Publishes nothing at all when no call was recorded, rather than a zero total that would read
 /// as a free boundary — the same rule the per-call series follows.
@@ -660,6 +1306,68 @@ pub(crate) fn record_epoch_close_gas(gas: &EpochCloseGas) {
             );
         }
     }
+}
+
+/// Counter of the blocks whose transactions, stored by batch position, were resolved, labeled by
+/// where the batch was found (`source`).
+const TX_BODY_RESOLVES: &str = "tn_reth.tx_body_resolves_total";
+
+/// Counter of the blocks whose transactions, stored by batch position, could not be resolved,
+/// labeled by why (`reason`). Alert on any nonzero value: the read returned an error, and every
+/// later read of those transactions will until the packs are restored.
+const TX_BODY_RESOLVE_FAILURES: &str = "tn_reth.tx_body_resolve_failures_total";
+
+/// Counter of the closed epochs' consensus packs the transaction resolver opened. Each open reads
+/// about 4 MiB of bloom filters; a steady rate means history reads keep moving between more than
+/// four epochs.
+const TX_BODY_PACK_OPENS: &str = "tn_reth.tx_body_pack_opens_total";
+
+/// Gauge of the bytes the decoded-batch cache holds, labeled by `part` (`recent`, `cold`).
+const TX_BODY_CACHE_BYTES: &str = "tn_reth.tx_body_cache_bytes";
+
+/// Histogram of the resolves that read a consensus pack, in seconds.
+const TX_BODY_RESOLVE_SECONDS: &str = "tn_reth.tx_body_resolve_seconds";
+
+/// Register the transaction resolver's series at zero, every label value of each labeled one.
+/// Called from [`init`].
+fn register_tx_body_series() {
+    use crate::env::tx_bodies::{BatchSource, TxBodyErrorKind};
+
+    for source in BatchSource::LABELS {
+        metrics::counter!(TX_BODY_RESOLVES, "source" => source).increment(0);
+    }
+    for reason in TxBodyErrorKind::LABELS {
+        metrics::counter!(TX_BODY_RESOLVE_FAILURES, "reason" => reason).increment(0);
+    }
+    metrics::counter!(TX_BODY_PACK_OPENS).increment(0);
+    for part in ["recent", "cold"] {
+        metrics::gauge!(TX_BODY_CACHE_BYTES, "part" => part).set(0.0);
+    }
+}
+
+/// Count one block whose position rows were resolved from `source`.
+pub(crate) fn record_tx_body_resolve(source: &'static str) {
+    metrics::counter!(TX_BODY_RESOLVES, "source" => source).increment(1);
+}
+
+/// Count one block whose position rows failed to resolve, for `reason`.
+pub(crate) fn record_tx_body_resolve_failure(reason: &'static str) {
+    metrics::counter!(TX_BODY_RESOLVE_FAILURES, "reason" => reason).increment(1);
+}
+
+/// Count one closed-epoch pack the resolver opened.
+pub(crate) fn record_tx_body_pack_open() {
+    metrics::counter!(TX_BODY_PACK_OPENS).increment(1);
+}
+
+/// Set the bytes the decoded-batch cache's `part` holds.
+pub(crate) fn set_tx_body_cache_bytes(part: &'static str, bytes: usize) {
+    metrics::gauge!(TX_BODY_CACHE_BYTES, "part" => part).set(bytes as f64);
+}
+
+/// Record the time of one resolve that read a pack.
+pub(crate) fn record_tx_body_resolve_seconds(elapsed: std::time::Duration) {
+    metrics::histogram!(TX_BODY_RESOLVE_SECONDS).record(elapsed);
 }
 
 #[cfg(test)]
@@ -819,6 +1527,69 @@ mod tests {
             });
     }
 
+    /// [`init`] must register the retired-pool moved series and one dropped series per
+    /// [`HandoffDropReason`] at zero, and a recorded refusal must move only its own reason's
+    /// series.
+    #[test]
+    fn test_retired_pool_handoff_series_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, register_retired_pool_handoff_series);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(series(&snapshot, RETIRED_POOL_TXNS_MOVED), DebugValue::Counter(0)));
+        HandoffDropReason::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, RETIRED_POOL_TXNS_DROPPED, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_retired_pool_txns_moved(5);
+            record_retired_pool_txns_dropped(HandoffDropReason::DestinationFull, 2);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(series(&snapshot, RETIRED_POOL_TXNS_MOVED), DebugValue::Counter(5)));
+        assert!(matches!(
+            reason_series(&snapshot, RETIRED_POOL_TXNS_DROPPED, "destination_full"),
+            DebugValue::Counter(2)
+        ));
+        HandoffDropReason::ALL
+            .into_iter()
+            .filter(|reason| *reason != HandoffDropReason::DestinationFull)
+            .for_each(|reason| {
+                assert!(
+                    matches!(
+                        reason_series(&snapshot, RETIRED_POOL_TXNS_DROPPED, reason.label()),
+                        DebugValue::Counter(0)
+                    ),
+                    "a destination_full refusal must not move the {} series",
+                    reason.label()
+                );
+            });
+    }
+
+    /// A duplicate is a completed handoff; every other insertion error is a refusal.
+    #[test]
+    fn test_handoff_drop_reason_classifies_pool_errors() {
+        assert_eq!(HandoffDropReason::from_kind(&PoolErrorKind::AlreadyImported), None);
+        assert_eq!(
+            HandoffDropReason::from_kind(&PoolErrorKind::DiscardedOnInsert),
+            Some(HandoffDropReason::DestinationFull)
+        );
+        assert_eq!(
+            HandoffDropReason::from_kind(&PoolErrorKind::ReplacementUnderpriced),
+            Some(HandoffDropReason::ReplacementUnderpriced)
+        );
+    }
+
     /// [`register_invalid_tx_skip_series`] must register one skip series per
     /// [`InvalidTxSkipReason`] at zero, and a recorded skip must move only its own reason's
     /// series.
@@ -870,6 +1641,149 @@ mod tests {
                     reason.label()
                 );
             });
+    }
+
+    /// [`register_storage_walk_fallback_series`] registers one series per
+    /// [`StorageWalkFallback`] at zero, and a recorded fallback moves only its own reason's.
+    #[test]
+    fn test_storage_walk_fallbacks_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, register_storage_walk_fallback_series);
+        let snapshot = snapshotter.snapshot().into_vec();
+        StorageWalkFallback::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, STORAGE_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_storage_walk_fallback(StorageWalkFallback::SmallTrie);
+            record_storage_walk_fallback(StorageWalkFallback::SmallTrie);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        StorageWalkFallback::ALL.into_iter().for_each(|reason| {
+            let expected = if reason == StorageWalkFallback::SmallTrie { 2 } else { 0 };
+            assert!(
+                matches!(
+                    reason_series(&snapshot, STORAGE_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(n) if *n == expected
+                ),
+                "reason {} must read {expected}",
+                reason.label()
+            );
+        });
+    }
+
+    /// [`register_walk_split_series`] registers both split counters at zero; each record moves only
+    /// its own, and a block with no composed storage root records nothing.
+    #[test]
+    fn test_walk_splits_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let counts = || {
+            let snapshot = snapshotter.snapshot().into_vec();
+            [ACCOUNT_WALK_SPLITS, STORAGE_WALK_SPLITS].map(|name| {
+                snapshot
+                    .iter()
+                    .find(|(key, ..)| key.key().name() == name)
+                    .map(|(.., value)| match value {
+                        DebugValue::Counter(n) => *n,
+                        other => panic!("{name} is not a counter: {other:?}"),
+                    })
+                    .unwrap_or_else(|| panic!("{name} not registered"))
+            })
+        };
+        metrics::with_local_recorder(&recorder, register_walk_split_series);
+        assert_eq!(counts(), [0, 0]);
+
+        metrics::with_local_recorder(&recorder, || {
+            record_account_walk_split();
+            record_storage_walk_splits(0);
+        });
+        assert_eq!(counts(), [1, 0]);
+        // a snapshot reads each counter's increments since the last one
+        metrics::with_local_recorder(&recorder, || record_storage_walk_splits(3));
+        assert_eq!(counts(), [0, 3]);
+    }
+
+    /// [`register_account_walk_fallback_series`] registers one series per
+    /// [`AccountWalkFallback`] at zero, and a recorded fallback moves only its own reason's.
+    #[test]
+    fn test_account_walk_fallbacks_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, register_account_walk_fallback_series);
+        let snapshot = snapshotter.snapshot().into_vec();
+        AccountWalkFallback::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, ACCOUNT_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_account_walk_fallback(AccountWalkFallback::Shape);
+            record_account_walk_fallback(AccountWalkFallback::Shape);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        AccountWalkFallback::ALL.into_iter().for_each(|reason| {
+            let expected = if reason == AccountWalkFallback::Shape { 2 } else { 0 };
+            assert!(
+                matches!(
+                    reason_series(&snapshot, ACCOUNT_WALK_FALLBACKS, reason.label()),
+                    DebugValue::Counter(n) if *n == expected
+                ),
+                "reason {} must read {expected}",
+                reason.label()
+            );
+        });
+    }
+
+    /// [`register_parallel_root_task_failure_series`] registers one series per
+    /// [`ParallelRootTaskFailure`] at zero, and a recorded failure moves only its own reason's.
+    #[test]
+    fn test_parallel_root_task_failures_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, register_parallel_root_task_failure_series);
+        let snapshot = snapshotter.snapshot().into_vec();
+        ParallelRootTaskFailure::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, PARALLEL_ROOT_TASK_FAILURES, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_parallel_root_task_failure(ParallelRootTaskFailure::TipMoved);
+            record_parallel_root_task_failure(ParallelRootTaskFailure::TipMoved);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        ParallelRootTaskFailure::ALL.into_iter().for_each(|reason| {
+            let expected = if reason == ParallelRootTaskFailure::TipMoved { 2 } else { 0 };
+            assert!(
+                matches!(
+                    reason_series(&snapshot, PARALLEL_ROOT_TASK_FAILURES, reason.label()),
+                    DebugValue::Counter(n) if *n == expected
+                ),
+                "reason {} must read {expected}",
+                reason.label()
+            );
+        });
     }
 
     /// [`InvalidTxSkipReason::classify`] must map each named cause to its own label and

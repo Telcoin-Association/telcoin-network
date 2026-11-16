@@ -67,6 +67,17 @@ impl NetworkType {
             Self::Worker(id) => format!("/tn-worker-{id}-peer-exchange-{chain_id}/0.0.1"),
         }
     }
+
+    /// Current-record retrieval protocol, isolated by chain, role and worker identity.
+    ///
+    /// `/0.0.1` carries a unit request and an optional `(BLS key, NodeRecord)` response.
+    /// Negotiation failure leaves legacy Kademlia discovery available.
+    pub fn record_exchange_protocol_name(&self, chain_id: u64) -> String {
+        match self {
+            Self::Primary => format!("/tn-primary-record-exchange-{chain_id}/0.0.1"),
+            Self::Worker(id) => format!("/tn-worker-{id}-record-exchange-{chain_id}/0.0.1"),
+        }
+    }
 }
 
 /// libp2p gossipsub protocol-id prefix, namespaced by `chain_id` so nodes on

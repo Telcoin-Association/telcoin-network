@@ -1,0 +1,89 @@
+//! Contains the main provider types and traits for interacting with the blockchain's storage.
+
+use reth_chainspec::EthereumHardforks;
+use reth_db_api::table::Value;
+use reth_node_types::{NodePrimitives, NodeTypes, NodeTypesWithDB};
+
+mod database;
+pub use database::*;
+
+mod static_file;
+pub use static_file::{
+    StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderBuilder,
+    StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileWriteCtx, StaticFileWriter,
+};
+// TN(TN-0119): per-segment sync timings for benches.
+pub use static_file::{SegmentSyncStats, StaticFileSyncStats, SyncPhaseStats};
+// TN(TN-0122): which segments' new jars carry checksums under storage v2.
+pub use static_file::checksummed_segment;
+// TN(TN-0133): a gap between a segment's jars.
+pub use static_file::StaticFileGapError;
+// TN(TN-0135): a jar without checksums in a storage-v2 datadir.
+pub use static_file::UncheckedJarError;
+// TN(TN-0137): a compressed changeset jar met by a point lookup.
+pub use static_file::CompressedChangesetJarError;
+// TN(TN-0201): jar formats, and the rows of a `Transactions` jar with tagged values.
+pub use static_file::{
+    decode_tx_row, encode_tx_ref, JarFormat, TaggedJarError, TxPositionsError, TxRow, TxRowError,
+    TX_ROW_INLINE, TX_ROW_REF,
+};
+// TN(TN-0202): resolving the `Transactions` rows that store positions.
+pub use static_file::{TxBodyReadError, TxBodyResolver, TxBodyResolverInstalled};
+
+mod state;
+pub use state::{
+    historical::{
+        compute_history_rank, history_info, needs_prev_shard_check, HistoricalStateProvider,
+        HistoricalStateProviderRef, HistoryInfo, LowestAvailableBlocks,
+    },
+    latest::{LatestStateProvider, LatestStateProviderRef},
+    overlay::{OverlayStateProvider, OverlayStateProviderFactory},
+};
+
+mod consistent_view;
+pub use consistent_view::{ConsistentDbView, ConsistentViewError};
+
+mod blockchain_provider;
+pub use blockchain_provider::BlockchainProvider;
+
+mod consistent;
+pub use consistent::ConsistentProvider;
+
+// RocksDB currently only supported on Unix platforms
+// Windows support is planned for future releases
+#[path = "rocksdb_stub.rs"]
+pub(crate) mod rocksdb;
+
+pub use rocksdb::{
+    PruneShardOutcome, PrunedIndices, RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBProvider,
+    RocksDBRawIter, RocksDBStats, RocksDBTableStats, RocksTx,
+};
+
+/// Helper trait to bound [`NodeTypes`] so that combined with database they satisfy
+/// [`ProviderNodeTypes`].
+pub trait NodeTypesForProvider
+where
+    Self: NodeTypes<
+        ChainSpec: EthereumHardforks,
+        Storage: ChainStorage<Self::Primitives>,
+        Primitives: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>,
+    >,
+{
+}
+
+impl<T> NodeTypesForProvider for T where
+    T: NodeTypes<
+        ChainSpec: EthereumHardforks,
+        Storage: ChainStorage<T::Primitives>,
+        Primitives: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>,
+    >
+{
+}
+
+/// Helper trait keeping common requirements of providers for [`NodeTypesWithDB`].
+pub trait ProviderNodeTypes
+where
+    Self: NodeTypesForProvider + NodeTypesWithDB,
+{
+}
+impl<T> ProviderNodeTypes for T where T: NodeTypesForProvider + NodeTypesWithDB {}

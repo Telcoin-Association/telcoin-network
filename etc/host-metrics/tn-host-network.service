@@ -1,0 +1,10 @@
+[Unit]
+Description=Telcoin host network collector (node_exporter textfile)
+Documentation=https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=TEXTFILE_DIR=/var/lib/node_exporter/textfile
+ExecStartPre=/bin/mkdir -p /var/lib/node_exporter/textfile
+ExecStart=/usr/local/bin/tn-host-network.sh

@@ -225,9 +225,10 @@ impl<DB: Database> BatchFetcher<DB> {
             // 2) fetch from peers over network
             //
             // NOTE: `request_batches` performs bounded retries (3 attempts with 500ms backoff)
-            // internally, so RPCError here means all retries were exhausted. The `if let Ok()`
-            // intentionally swallows that error to retry the outer infinite loop, which will
-            // re-check local storage and try peers again.
+            // internally and is bounded by a total timeout, so an error here means all retries
+            // were exhausted or the timeout expired. The `if let Ok()` intentionally swallows that
+            // error to retry the outer infinite loop, which will re-check local storage and try
+            // peers again.
             if let Ok(mut new_batches) = self.request_batches_from_peers(&mut missing_digests).await
             {
                 self.metrics.record_batches_fetched("remote", new_batches.len());
@@ -334,7 +335,7 @@ impl<DB: Database> BatchFetcher<DB> {
     ) -> WorkerNetworkResult<HashMap<BlockHash, Batch>> {
         // request batches and return to caller
         let recovered_batches =
-            self.network.request_batches(missing_digests).await?.into_iter().collect();
+            self.network.request_batches(missing_digests, None).await?.into_iter().collect();
 
         Ok(recovered_batches)
     }

@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy clippy-fix docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint yubikey-setup
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -9,8 +9,20 @@ NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
 
 .DEFAULT: help
 
-# Default tag is latest if not specified
-TAG ?= latest
+# Image repository of the ad-hoc images that docker-adiri, docker-devnet and docker-push
+# build or push. Release images have their own packages, ghcr.io/telcoin-association/tn-mainnet
+# for mainnet tags and ghcr.io/telcoin-association/tn-testnet for adiri tags, and only
+# etc/release.sh writes them (release-build pushes the tag, release-publish moves the alias).
+GHCR_IMAGE := ghcr.io/telcoin-association/tn-dev
+
+# Ad-hoc images are always $(GHCR_IMAGE):dev-<flavor>-$(TAG), so TAG defaults to the
+# 12-character commit. The release-* targets take TAG as a release tag
+# (vX.Y.Z[-adiri][-rcN]); see docs/src/maintainers/releasing.md.
+TAG ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+
+# Linter images for release-lint, pinned by digest.
+ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+SHELLCHECK_IMAGE := koalaman/shellcheck-alpine:v0.11.0@sha256:9955be09ea7f0dbf7ae942ac1f2094355bb30d96fffba0ec09f5432207544002
 
 # git commit embedded in the image version string (vergen override; avoids needing .git in
 # the build context). Falls back to `unknown` outside a git checkout.
@@ -43,7 +55,7 @@ help:
 	@echo "    :::> Run all tests using cargo test (fallback if nextest not installed)." ;
 	@echo ;
 	@echo "make test-faucet" ;
-	@echo "    :::> Test faucet integration test in main binary." ;
+	@echo "    :::> Run the faucet e2e test (e2e-tests built with its faucet feature)." ;
 	@echo ;
 	@echo "make test-restarts" ;
 	@echo "    :::> Test restart integration tests." ;
@@ -54,6 +66,23 @@ help:
 	@echo "make test-e2e-governance-safe" ;
 	@echo "    :::> Build the adiri e2e node binary and run the governance-Safe fork across a live boundary." ;
 	@echo "    :::> The only lane where TN_GOVERNANCE_SAFE_FORK_EPOCH is not inert." ;
+	@echo ;
+	@echo "make test-e2e-reth-migration" ;
+	@echo "    :::> Build the default (tn-lmdb) and MDBX e2e node binaries; start a committee on MDBX and restart each validator on tn-lmdb." ;
+	@echo "    :::> Each must migrate its reth database and follow the chain. TN_BIN_PATH_PREV = MDBX binary, TN_BIN_PATH = default binary." ;
+	@echo ;
+	@echo "make test-e2e-resync" ;
+	@echo "    :::> Build the default (tn-lmdb) and MDBX e2e binaries; upgrade a validator of a TN_RESYNC_BIN_PREV committee in place, run db reset-execution" ;
+	@echo "    :::> on it, and require it to rebuild from genesis and match a validator still on PREV. TN_RESYNC_BIN_PREV defaults to the MDBX binary." ;
+	@echo ;
+	@echo "make build-e2e-bin-prev" ;
+	@echo "    :::> Build the e2e node binary at TN_PREV_REF (default ba7654d8a) for the mixed-binary (rolling upgrade) e2e tests." ;
+	@echo "    :::> Export the path it prints as TN_BIN_PATH_PREV; the tests that need it skip without it." ;
+	@echo ;
+	@echo "make test-upgrade" ;
+	@echo "    :::> Run the rolling upgrade test: four validators upgraded in place from TN_BIN_PATH_PREV to this tree's binary." ;
+	@echo "    :::> TN_BIN_PATH_PREV defaults to the binary build-e2e-bin-prev leaves behind; run that first or export another path." ;
+	@echo "    :::> To check an upgrade, build the release the network runs: make build-e2e-bin-prev TN_PREV_REF=<release>. The default ref is not a release." ;
 	@echo ;
 	@echo "make coverage" ;
 	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
@@ -66,16 +95,21 @@ help:
 	@echo "    :::> cargo fmt (nightly toolchain pinned in rust-nightly)" ;
 	@echo ;
 	@echo "make clippy" ;
-	@echo "    :::> cargo clippy for all features with fix enabled (nightly toolchain pinned in rust-nightly)." ;
+	@echo "    :::> The CI clippy lane (./etc/ci-lanes.sh clippy): the release graph, all features, and all features but mdbx (nightly toolchain pinned in rust-nightly)." ;
+	@echo "make clippy-fix" ;
+	@echo "    :::> cargo clippy --fix over all features, then over the default features (the tn-lmdb arms)." ;
 	@echo ;
 	@echo "make docker-login" ;
-	@echo "    :::> Setup docker registry using gcloud artifacts." ;
+	@echo "    :::> Log docker in to ghcr.io as your GitHub user; at docker's password prompt, paste a classic PAT with write:packages only." ;
 	@echo ;
 	@echo "make docker-adiri" ;
-	@echo "    :::> Build telcoin-network binary and push to gcloud artifact registry with latest image tag." ;
+	@echo "    :::> Build a multi-arch adiri image and push it to ghcr.io/telcoin-association/tn-dev as dev-adiri-<TAG> (TAG defaults to the short commit)." ;
+	@echo ;
+	@echo "make docker-devnet" ;
+	@echo "    :::> Build a multi-arch devnet (faucet) image and push it to ghcr.io/telcoin-association/tn-dev as dev-devnet-<TAG>." ;
 	@echo ;
 	@echo "make docker-push" ;
-	@echo "    :::> Push adiri:latest image to gcloud artifact registry." ;
+	@echo "    :::> Push the local dev-adiri-<TAG> image to ghcr.io/telcoin-association/tn-dev." ;
 	@echo ;
 	@echo "make docker-builder" ;
 	@echo "    :::> Create docker builder for building telcoin-network binary container images." ;
@@ -101,17 +135,50 @@ help:
 	@echo "make book-serve" ;
 	@echo "    :::> Serve the docs book at localhost:3000 with live reload." ;
 	@echo ;
+	@echo "make release-prep TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Prepare the release PR: set the workspace version, refresh Cargo.lock, add the CHANGELOG section." ;
+	@echo ;
+	@echo "make release-tag TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Create and push the GPG-signed release tag on the origin/main tip." ;
+	@echo ;
+	@echo "make release-build TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Build the linux/amd64 image and tarball, push the image to tn-mainnet or tn-testnet by the tag's network, and upload the assets to the draft release." ;
+	@echo ;
+	@echo "make release-sign TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Add this maintainer's GPG signature over SHA256SUMS to the draft release." ;
+	@echo ;
+	@echo "make release-verify TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Verify the tag, assets, signatures and image digest of a release." ;
+	@echo ;
+	@echo "make release-publish TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Verify, then publish the draft release and move the latest or adiri image alias." ;
+	@echo ;
+	@echo "make release-lint" ;
+	@echo "    :::> Run actionlint and shellcheck (pinned Docker images) on the release workflow and scripts." ;
+	@echo ;
+	@echo "make yubikey-setup" ;
+	@echo "    :::> One-time maintainer setup: provision the release signing key on a YubiKey (etc/yubikey-setup.sh run)." ;
+	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
 attest:
 	./etc/test-and-attest.sh ;
 
+# Run transport qualification on the attest box with explicit hardware evidence.
+.PHONY: quic-attest
+quic-attest:
+	@test -n "$(QUIC_EVIDENCE_DIR)" -a -n "$(QUIC_QUALIFICATION_REPORT)" || { echo "Set QUIC_EVIDENCE_DIR and QUIC_QUALIFICATION_REPORT"; exit 1; }
+	python3 -I testing/quic-interop/attest.py --output "$(QUIC_EVIDENCE_DIR)" --qualification "$(QUIC_QUALIFICATION_REPORT)"
+
 # check for unused dependencies
 udeps:
 	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +$(NIGHTLY) udeps --package {}" ;
 
+# --all-features builds the reth database on MDBX (tn-reth's opt-in `mdbx`), so the default
+# features check the default backend's (tn-lmdb's) test code too.
 check:
 	cargo check --workspace --all-features --all-targets ;
+	cargo check --workspace --all-targets ;
 
 # run workspace unit tests (using nextest for faster parallel execution)
 test:
@@ -121,12 +188,15 @@ test:
 # NOTE: tests that pin fork epochs through TN_*_FORK_EPOCH (proposer, voter, sub-DAG clamp,
 # payload and engine tests) rely on nextest's one-process-per-test model; the overrides are
 # latched once per process, so under a single-process `cargo test` those tests fail loudly.
+# The worker gateway's throttled-warning log tests rely on the same model (their throttles
+# are process-wide statics) and skip themselves with a message outside it.
 test-cargo:
 	cargo test --workspace --no-fail-fast -- --show-output ;
 
-# run faucet integration test
+# run the faucet e2e test; `crates/e2e-tests/tests/it/faucet.rs` compiles only with the e2e-tests
+# `faucet` feature
 test-faucet:
-	cargo nextest run --package telcoin-network --features faucet --test it ;
+	cargo nextest run --package e2e-tests --features faucet --test it faucet:: ;
 
 # Build the node binary once so e2e test processes reuse it via TN_BIN_PATH instead of
 # rebuilding it through escargot (~3-10s of cargo overhead per test process). Built under the
@@ -144,6 +214,10 @@ test-faucet:
 # overridden by the flag).
 E2E_TARGET_ROOT := $(if $(CARGO_TARGET_DIR),$(if $(filter /%,$(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR),$(CURDIR)/$(CARGO_TARGET_DIR)),$(CURDIR)/target)
 
+# The e2e builds name no package (-p): at the virtual root cargo builds the bin with every
+# member's features unified, so the e2e-tests crate's `tn-reth/test-utils` reaches this node
+# binary too. The e2e lanes and the attested run therefore run a test-utils node, unlike the
+# release image, which builds `-p telcoin-network` (etc/Dockerfile).
 .PHONY: build-e2e-bin
 build-e2e-bin:
 	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$(E2E_TARGET_ROOT)" ;
@@ -171,6 +245,68 @@ build-e2e-bin-adiri:
 # Location of the binary built by build-e2e-bin-adiri. Same expression pairing as E2E_BIN above,
 # so the producing and the consuming path cannot diverge.
 E2E_BIN_ADIRI := $(E2E_TARGET_ROOT_ADIRI)/e2e/telcoin-network
+
+# Target root for the MDBX e2e node binary: the one whose reth execution database runs on MDBX,
+# the legacy backend, instead of the default tn-lmdb. Nested in E2E_TARGET_ROOT, and separate from
+# it, for the same reasons as E2E_TARGET_ROOT_ADIRI: `mdbx` changes tn-reth and everything built on
+# it, so a shared root would rebuild on every switch between lanes and leave
+# `target/e2e/telcoin-network` running whichever backend built last, with no way for a lane
+# consuming TN_BIN_PATH to tell.
+E2E_TARGET_ROOT_MDBX := $(E2E_TARGET_ROOT)/mdbx-e2e
+
+# Build the node binary WITH `mdbx`: the previous binary of the migration and resync lanes below
+# (what a testnet node runs before it upgrades). Like build-e2e-bin it builds without `adiri`, so
+# the fork variables below mean on those lanes what they mean on test-restarts, test-epochs and
+# test-sigkill.
+.PHONY: build-e2e-bin-mdbx
+build-e2e-bin-mdbx:
+	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils,telcoin-network/mdbx --target-dir "$(E2E_TARGET_ROOT_MDBX)" ;
+
+# Location of the binary built by build-e2e-bin-mdbx. Same expression pairing as E2E_BIN above,
+# so the producing and the consuming path cannot diverge.
+E2E_BIN_MDBX := $(E2E_TARGET_ROOT_MDBX)/e2e/telcoin-network
+
+# The commit the mixed-binary (rolling upgrade) e2e tests run as the PREVIOUS node version: the old
+# half of an in-place upgrade, or a validator still on the old binary when the rest of the network
+# has moved on. Defaults to ba7654d8a, the main commit #1453 was merged onto, so the old binary is
+# the last one built without the sub-second timestamp change. Any commit-ish works; the release
+# this one upgrades from is
+#   make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri
+# which peers with this tree. Adiri itself upgrades from it all at once, not one validator at a
+# time (crates/tn-reth/README.md, "Upgrading a testnet node").
+TN_PREV_REF ?= ba7654d8a
+
+# Source checkout and target root for the previous binary. Both are NESTED in E2E_TARGET_ROOT, like
+# E2E_TARGET_ROOT_ADIRI, so a developer's CARGO_TARGET_DIR is honored the same way and the
+# `target/` ignore rule covers them. The sources are a detached git worktree rather than a fresh
+# clone or a checkout of this tree: it shares this clone's objects (nothing to fetch), leaves this
+# checkout's branch and files alone, and builds the ref with its own Makefile, Cargo.lock and
+# .cargo/config.toml, so the binary is what that ref builds and not old sources under new build
+# settings. The target root is separate for the same reason the adiri one is: a shared root would
+# rebuild the whole graph on every switch and leave target/e2e/telcoin-network holding whichever
+# sources built last.
+E2E_PREV_SRC := $(E2E_TARGET_ROOT)/prev-src
+E2E_TARGET_ROOT_PREV := $(E2E_TARGET_ROOT)/prev-e2e
+
+# Location of the binary built by build-e2e-bin-prev, passed to the mixed-binary e2e tests via
+# TN_BIN_PATH_PREV. The old ref's Makefile derives its --target-dir from CARGO_TARGET_DIR, which
+# the build sets to E2E_TARGET_ROOT_PREV, so this is the same expression pairing as E2E_BIN.
+E2E_BIN_PREV := $(E2E_TARGET_ROOT_PREV)/e2e/telcoin-network
+
+# Build the node binary at TN_PREV_REF with that ref's own `make build-e2e-bin`. The script adds the
+# worktree or checks the ref out in it, initializes tn-contracts with --reference to this
+# checkout's copy (the contract history comes from local objects instead of a second download),
+# builds, and fails unless the binary's --version names the ref's commit. The steps and their edge
+# cases are described in etc/build-prev-e2e-bin.sh.
+#
+# The worktree is registered with this clone, so `git worktree list` shows it. Remove it with
+#   git worktree remove --force target/prev-src
+# (--force because it holds an initialized submodule). `cargo clean` deletes the directory but not
+# the registration, which `git worktree list` then marks prunable: `git worktree prune` clears it,
+# and the next build-e2e-bin-prev replaces it rather than registering the path a second time.
+.PHONY: build-e2e-bin-prev
+build-e2e-bin-prev:
+	./etc/build-prev-e2e-bin.sh "$(TN_PREV_REF)" "$(E2E_PREV_SRC)" "$(E2E_TARGET_ROOT_PREV)" "$(E2E_BIN_PREV)" ;
 
 # Seed-signature fork epoch for the e2e lanes (#1032). Defaults to u32::MAX so the default
 # lanes run the fork DORMANT (wire-identical to pre-fork mainnet); non-adiri builds are
@@ -264,11 +400,32 @@ TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH ?= 2
 test-restarts: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
+.PHONY: test-sigkill
+# Reproduce abrupt validator restarts across a measured epoch boundary, with retained capture.
+SIGKILL_FILTER ?= test(sigkill::)
+test-sigkill: build-e2e-bin
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --profile sigkill --locked -p e2e-tests --test it --run-ignored all -E '$(SIGKILL_FILTER)' ;
+
 # run epoch integration tests (same filter as the public-tests epoch line). The scheduled
-# Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable
-# exported so every spawned node opens MDBX in Durable.
+# Durable e2e lane (#1149) runs this and test-restarts nightly; the spawned nodes' tndb
+# consensus DB syncs for real at every durability barrier.
 test-epochs: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+
+# The previous binary test-upgrade runs: an exported TN_BIN_PATH_PREV wins, otherwise the one
+# build-e2e-bin-prev leaves at E2E_BIN_PREV.
+TN_BIN_PATH_PREV ?= $(E2E_BIN_PREV)
+
+# run the mixed-binary (rolling upgrade) test: four validators start on TN_BIN_PATH_PREV and are
+# upgraded in place, one at a time, to this tree's binary (tests/it/upgrade.rs). Both binaries get
+# the same fork pins. The previous binary is not built here, because which ref to compare against
+# is the caller's choice; without one the target stops rather than letting the test skip. Before an
+# upgrade, compare against the release the network runs (make build-e2e-bin-prev
+# TN_PREV_REF=<release>): TN_PREV_REF's default is the commit the sub-second timestamp tests need.
+.PHONY: test-upgrade
+test-upgrade: build-e2e-bin
+	@test -x "$(TN_BIN_PATH_PREV)" || { echo "no previous node binary at $(TN_BIN_PATH_PREV): run make build-e2e-bin-prev TN_PREV_REF=<release> or export TN_BIN_PATH_PREV" ; exit 1 ; }
+	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(TN_BIN_PATH_PREV)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_upgrade ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
@@ -314,7 +471,7 @@ test-e2e-forked:
 # All five sibling fork variables are pinned explicitly rather than left to the build: an adiri
 # build compiles DIFFERENT fork epochs for every one of them than a default build, which has
 # all five active from genesis (adiri: seed-signature 383, multi-workers 570, PREVRANDAO 574,
-# leader-seeded ordering 567, sub-second timestamps u32::MAX). Forwarding the same values the
+# leader-seeded ordering 567, sub-second timestamps 747). Forwarding the same values the
 # lanes above use overrides those compiled constants and is what keeps this lane differing from
 # `test-epochs` in exactly one dimension — the governance-Safe fork. (adiri also compiles in
 # CONSENSUS_REGISTRY_FORK_EPOCH = 407 and ADIRI_DUP_BATCH_EPOCH = 160; the first is far outside a
@@ -323,6 +480,39 @@ test-e2e-forked:
 # other lane must not use.
 test-e2e-governance-safe: build-e2e-bin-adiri
 	TN_BIN_PATH="$(E2E_BIN_ADIRI)" TN_E2E_ADIRI_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_governance_safe_fork ;
+
+# run the MDBX to tn-lmdb reth database migration on live validators
+# (crates/e2e-tests/tests/it/reth_db_migration.rs): the committee starts on the MDBX e2e binary,
+# then each validator in turn restarts on the default (tn-lmdb) e2e binary and must migrate its
+# reth database and follow the chain. Both binaries are built from this tree, in these roles:
+#   TN_BIN_PATH_PREV = E2E_BIN_MDBX  the `mdbx` build, reth database on MDBX (what a node runs now)
+#   TN_BIN_PATH      = E2E_BIN       the default build, tn-lmdb (what the node is upgraded to)
+# TN_E2E_TN_LMDB_BIN=1 is the marker the test reads to tell this lane from `make test-e2e`, which
+# selects every #[ignore] test with TN_BIN_PATH at the default binary and no MDBX previous binary;
+# without it the test skips.
+.PHONY: test-e2e-reth-migration
+test-e2e-reth-migration: build-e2e-bin build-e2e-bin-mdbx
+	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(E2E_BIN_MDBX)" TN_E2E_TN_LMDB_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all reth_db_migration:: ;
+
+# run the execution database rebuild (crates/e2e-tests/tests/it/resync.rs): a committee starts on
+# TN_RESYNC_BIN_PREV (an MDBX reth database), validator-4 is upgraded in place to the default
+# (tn-lmdb) e2e binary (its reth database migrates, and its consensus database too when PREV
+# predates tndb), then stopped, reset with `db reset-execution --force`, and started again: it
+# must rebuild its execution database from genesis, rejoin the committee, and agree with
+# validator-1 (still on PREV) on every block and on historical reads. TN_E2E_TN_LMDB_BIN=1
+# declares TN_BIN_PATH the tn-lmdb build (see test-e2e-reth-migration).
+#
+# TN_RESYNC_BIN_PREV defaults to this tree's MDBX e2e binary. The release the network runs is the
+# real PREV: make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri, then
+# make test-e2e-resync TN_RESYNC_BIN_PREV=$(E2E_BIN_PREV). It peers with this tree, keeps its
+# consensus database in tndb already, and writes no storage layout marker, so the upgraded
+# validator migrates its reth database and records the marker.
+TN_RESYNC_BIN_PREV ?= $(E2E_BIN_MDBX)
+
+.PHONY: test-e2e-resync
+test-e2e-resync: build-e2e-bin build-e2e-bin-mdbx
+	@test -x "$(TN_RESYNC_BIN_PREV)" || { echo "no previous node binary at $(TN_RESYNC_BIN_PREV)" ; exit 1 ; }
+	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(TN_RESYNC_BIN_PREV)" TN_E2E_TN_LMDB_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all resync:: ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -335,32 +525,43 @@ coverage-html:
 
 # format using the nightly toolchain pinned in rust-nightly
 fmt:
-	cargo +$(NIGHTLY) fmt ;
+	cargo +$(NIGHTLY) fmt --all ;
 
-# clippy formatter + try to fix problems (nightly toolchain pinned in rust-nightly)
+# lint what CI lints: the three passes of `./etc/ci-lanes.sh clippy` (the release graph; the
+# workspace's every target with every feature, which runs reth on MDBX; and with every feature but
+# `mdbx`, the default tn-lmdb arms), under the lane's flags (nightly toolchain pinned in
+# rust-nightly)
 clippy:
-	cargo +$(NIGHTLY) clippy --workspace --all-features --fix ;
+	./etc/ci-lanes.sh clippy ;
 
-# login to gcloud artifact registry for managing docker images
+# apply clippy's fixes to the code of both reth backends: every feature (the `mdbx` arms), then
+# the default features (the tn-lmdb arms `--all-features` never compiles)
+clippy-fix:
+	cargo +$(NIGHTLY) clippy --workspace --all-targets --all-features --fix ;
+	cargo +$(NIGHTLY) clippy --workspace --all-targets --fix ;
+
+# log docker in to ghcr.io as your GitHub user; docker prompts for the password:
+# paste a classic PAT with write:packages only, never the gh token
 docker-login:
-	gcloud auth application-default login ;
-	gcloud auth configure-docker us-docker.pkg.dev ;
+	docker login ghcr.io --username "$$(gh api user --jq .login)" ;
 
-# build and push latest adiri image for amd64 and arm64
+# build and push an ad-hoc adiri image for amd64 and arm64 as dev-adiri-$(TAG)
 # CARGO_FEATURES=adiri compiles in the epoch-gated testnet fork logic. The authoritative
 # list is crates/types/src/forks.rs; a running node logs its compiled schedule at startup
 # (target "cli", "fork schedule (adiri)").
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-adiri-$(TAG)" . --push ;
 
-# build and push latest devnet image for amd64 and arm64
-# CARGO_FEATURES=faucet compiles in the faucet support only
+# build and push an ad-hoc devnet image for amd64 and arm64 as dev-devnet-$(TAG)
+# CARGO_FEATURES=faucet compiles in the faucet support only. A faucet build refuses mainnet
+# (chain id 731) and starts on any other chain but adiri only with --allow-faucet-on-chain
+# (TN_ALLOW_FAUCET_ON_CHAIN=true).
 docker-devnet:
-	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-devnet-$(TAG)" . --push ;
 
-# push local adiri:latest to the gcloud artifact registry
+# push the local ad-hoc adiri image to $(GHCR_IMAGE)
 docker-push:
-	docker push us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) ;
+	docker push "$(GHCR_IMAGE):dev-adiri-$(TAG)" ;
 
 # docker buildx used for multiple processor image building
 docker-builder:
@@ -425,3 +626,18 @@ book:
 # serve the docs book at localhost:3000 with live reload
 book-serve:
 	mdbook serve docs --open ;
+
+# release pipeline: every step runs etc/release.sh, which parses and checks TAG.
+# Runbook: docs/src/maintainers/releasing.md.
+release-prep release-tag release-build release-sign release-verify release-publish:
+	@test "$(origin TAG)" != file || { echo "usage: make $@ TAG=vX.Y.Z[-adiri][-rcN]"; exit 2; }
+	./etc/release.sh $(patsubst release-%,%,$@) "$(TAG)"
+
+# one-time maintainer setup for the release signing key; runbook: docs/src/maintainers/yubikey-setup.md
+yubikey-setup:
+	./etc/yubikey-setup.sh run
+
+# lint the release workflows and scripts with pinned actionlint and shellcheck images
+release-lint:
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color .github/workflows/release.yaml .github/workflows/docs.yaml
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE) shellcheck -x -S style etc/release.sh etc/yubikey-setup.sh .github/scripts/verify_commit_hash.sh

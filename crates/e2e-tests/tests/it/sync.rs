@@ -63,15 +63,15 @@ async fn test_observer_pack_imports_after_epoch_close_inner() -> eyre::Result<()
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for i in 0..4 {
+    for (i, url) in client_urls.iter_mut().enumerate() {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
-        client_urls[i].push_str(&format!(":{rpc_port}"));
+        url.push_str(&format!(":{rpc_port}"));
         // The late-joining observer forwards accepted txns to the committee's advertised
         // RPC endpoints; without this each seal is refused with NotValidator and the
         // txns stay pending in the observer's pool until an endpoint is discoverable.
         advertise_worker_rpc(&temp_path, i, rpc_port)?;
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer_pack_import", 0));
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, "observer_pack_import", 0));
     }
 
     // Wait for validators to start serving RPC.
@@ -116,7 +116,7 @@ async fn test_observer_pack_imports_after_epoch_close_inner() -> eyre::Result<()
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for observer!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "observer_pack_import", 0));
+    guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "observer_pack_import", 0));
 
     // Wait for the observer to catch up. We compare consensus header heights to avoid
     // racing with EVM execution lag. The deadline allows pack download + verify + apply

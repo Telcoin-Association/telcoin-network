@@ -13,8 +13,20 @@ pub enum FetchError {
     NotFound,
     /// The calculated and recorded crc32 codes do not match for the record.
     CrcFailed,
+    /// A structural on-disk index value was out of range (bad bucket element count, invalid
+    /// overflow pointer, or a bucket the mapping does not cover). Distinct from [`Self::NotFound`]
+    /// and [`Self::CrcFailed`]: the CRC-free read path surfaces corruption here instead of
+    /// panicking on, or silently masking, an untrusted value.
+    CorruptIndex(String),
     /// Requested record size is too large.
     RequestedSizeTooLarge(u32, u32),
+    /// The key is not the index's fixed key size (a caller error, not a miss).
+    KeySize {
+        /// The index's key size in bytes.
+        expected: usize,
+        /// The size of the key given.
+        got: usize,
+    },
     /// Requested record size is too large after decompression.
     RequestedDecompressSizeTooLarge(u32),
 }
@@ -28,6 +40,10 @@ impl fmt::Display for FetchError {
             Self::IO(e) => write!(f, "io: {e}"),
             Self::NotFound => write!(f, "not found"),
             Self::CrcFailed => write!(f, "crc32 mismatch"),
+            Self::CorruptIndex(e) => write!(f, "corrupt index: {e}"),
+            Self::KeySize { expected, got } => {
+                write!(f, "key is {got} bytes, the index's keys are {expected}")
+            }
             Self::RequestedSizeTooLarge(requested, max) => {
                 write!(f, "requested record size is too large: requested {requested}, max {max}")
             }

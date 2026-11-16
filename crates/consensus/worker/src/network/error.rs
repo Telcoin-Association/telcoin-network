@@ -1,6 +1,6 @@
 //! Worker's network-related errors.
 use tn_network_libp2p::{error::NetworkError, Penalty};
-use tn_types::{BatchValidationError, BcsError, BlockHash, Epoch};
+use tn_types::{BatchValidationError, BcsError, BlockHash, BlsPublicKey, Epoch, B256};
 use tokio::time::error::Elapsed;
 
 /// Result alias for results that possibly return [`WorkerNetworkError`].
@@ -71,6 +71,27 @@ pub enum WorkerNetworkError {
     /// Invalid batch epoch.
     #[error("Got batch from epoch {0} expected {1}")]
     BatchEpochMismatch(Epoch, Epoch),
+    /// A peer reported a batch whose digest already failed validation in this epoch.
+    ///
+    /// The worker refuses the repeat without validating it again (issue #1774).
+    #[error("batch {0} was already rejected in this epoch")]
+    RejectedBatchRepeat(B256),
+    /// A committee peer reported a new batch while this worker already stores its bound of
+    /// uncommitted reported batches (issue #1794).
+    ///
+    /// The bound is `MAX_UNCOMMITTED_REPORTED_BATCHES_PER_REPORTER` in the request handler. The
+    /// condition clears as commits evict the reporter's batches from the cache, so the response
+    /// is retryable and there is no penalty.
+    #[error("reporter {peer} is at its bound of uncommitted reported batches, refusing {digest}")]
+    ReporterOverQuota {
+        /// The committee key that reported the batch.
+        ///
+        /// Boxed: the key is 288 bytes and would dominate the error enum (clippy
+        /// `result_large_err` and `large_enum_variant`).
+        peer: Box<BlsPublicKey>,
+        /// The digest of the refused batch.
+        digest: B256,
+    },
 }
 
 impl WorkerNetworkError {
@@ -124,7 +145,8 @@ impl WorkerNetworkError {
             | WorkerNetworkError::TooManyBatches { .. }
             | WorkerNetworkError::UnexpectedBatch(_)
             | WorkerNetworkError::DuplicateBatch(_)
-            | WorkerNetworkError::RequestHashMismatch => Some(Penalty::Fatal),
+            | WorkerNetworkError::RequestHashMismatch
+            | WorkerNetworkError::RejectedBatchRepeat(_) => Some(Penalty::Fatal),
             // ignore
             WorkerNetworkError::Timeout(_)
             | WorkerNetworkError::DBInsert(_)
@@ -134,6 +156,9 @@ impl WorkerNetworkError {
             | WorkerNetworkError::Network(_)
             | WorkerNetworkError::BatchEpochMismatch(_, _)
             | WorkerNetworkError::Internal(_) => None,
+            // the key is at its bound of uncommitted stored batches, which frees when a commit
+            // frees its batches or when they age out; an honest key can reach it in a commit stall
+            WorkerNetworkError::ReporterOverQuota { .. } => None,
         }
     }
 
@@ -150,7 +175,9 @@ impl WorkerNetworkError {
     /// [`Penalty::Fatal`] (faults in a message's encoding, declared topic, identity, or
     /// count). [`Self::BatchValidation`] is also `Fatal` for some subvariants but is
     /// deliberately excluded: it arises only on the request/response path, where the
-    /// peer *is* the originator and penalizing it is correct. Of this set, only
+    /// peer *is* the originator and penalizing it is correct. [`Self::RejectedBatchRepeat`]
+    /// is also `Fatal` and is excluded for the same reason: it arises only on the request
+    /// path, which charges the peer that sent the repeat, not the batch author. Of this set, only
     /// [`Self::Bcs`] and [`Self::InvalidTopic`] are currently reachable from the gossip
     /// handler; the rest are classified for forward-safety.
     pub fn is_author_content_fault(&self) -> bool {
@@ -168,9 +195,12 @@ impl WorkerNetworkError {
             // Not author-content faults on any current path. `BatchValidation` is
             // content-determined, but only arises on the request/response path (where
             // the peer is the originator, so its own penalty is correct) and never
-            // reaches the gossip handler; the rest are transport-peer behavior,
-            // timeouts, or faults local to this node.
+            // reaches the gossip handler. `RejectedBatchRepeat` also arises only on the
+            // request path: the sender of the repeat is charged, not the batch author, who
+            // can be a different peer. The rest are transport-peer behavior, timeouts, or
+            // faults local to this node.
             WorkerNetworkError::BatchValidation(_)
+            | WorkerNetworkError::RejectedBatchRepeat(_)
             | WorkerNetworkError::NonCommitteeBatch
             | WorkerNetworkError::Internal(_)
             | WorkerNetworkError::Timeout(_)
@@ -182,7 +212,8 @@ impl WorkerNetworkError {
             | WorkerNetworkError::DBInsert(_)
             | WorkerNetworkError::DBCommit(_)
             | WorkerNetworkError::DBRead(_)
-            | WorkerNetworkError::BatchEpochMismatch(_, _) => false,
+            | WorkerNetworkError::BatchEpochMismatch(_, _)
+            | WorkerNetworkError::ReporterOverQuota { .. } => false,
         }
     }
 }

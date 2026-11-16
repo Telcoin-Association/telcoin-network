@@ -3,20 +3,24 @@
 use crate::{
     aggregators::VotesAggregator,
     network::{PrimaryNetworkHandle, RequestVoteResult},
-    state_sync::StateSynchronizer,
+    state_sync::{verify_stored_certificate, StateSynchronizer},
     ConsensusBus,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
 use tn_storage::{tables::ProposedCertificates, CertificateStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Header, HeaderDigest,
-    Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
+    AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Epoch, Header,
+    HeaderDigest, Noticer, Notifier, Round, TaskError, TaskManager, TaskResult, TaskSpawner,
+    TnReceiver, TnSender, Vote,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, enabled, error, info, instrument, warn};
 
 #[cfg(test)]
@@ -53,14 +57,24 @@ pub(crate) struct Certifier<DB> {
     network: PrimaryNetworkHandle,
     /// Spawn epoch-related tasks.
     task_spawner: TaskSpawner,
-    /// Notifier to cancel pending proposals and vote requests if new header is received.
+    /// Notifier to cancel pending proposals and vote requests if a different header is received.
     new_proposal: Notifier,
     /// Lock to make sure we are only in one header proposal at a time.
     /// Should not generally happen but can lead to leader cert equivocation
     /// if it does so be really sure.
     proposal_lock: Arc<Mutex<()>>,
+    /// The digest of the header whose proposal task is still running, if any, the signal that
+    /// asks that proposal to re-issue the vote requests that ended in an error, and when
+    /// [`Self::run`] received that header.
+    ///
+    /// Set by [`Self::run`] before it spawns a proposal and cleared when that task ends, however
+    /// it ends (see [`InFlightProposal`]).
+    in_flight: InFlightMarker,
     /// Prometheus metrics for vote collection and certificate formation.
     metrics: crate::PrimaryMetrics,
+    /// The consensus channels: reports own headers that a newer own header cancelled to the
+    /// proposer (see [`Self::report_canceled`]).
+    consensus_bus: ConsensusBus,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -116,7 +130,9 @@ impl<DB: Database> Certifier<DB> {
                 task_spawner,
                 new_proposal: Notifier::new(),
                 proposal_lock: Arc::new(Mutex::new(())),
+                in_flight: Arc::default(),
                 metrics,
+                consensus_bus,
             }
             .run(rx_headers)
             .await;
@@ -139,6 +155,7 @@ impl<DB: Database> Certifier<DB> {
     ) -> DagResult<Vote> {
         let mut missing_parents: Option<Vec<HeaderDigest>> = None;
         let mut attempt: u32 = 0;
+        let round = header.round();
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
 
         // loop until vote received
@@ -147,32 +164,48 @@ impl<DB: Database> Certifier<DB> {
             attempt += 1;
 
             // peers may respond to a vote requesting missing parents
-            let parents = missing_parents.map(|missing_parents| {
-                // collect missing parents requested by peer in order to vote for this header
-                let expected_count = missing_parents.len();
-                let parents: Vec<_> = certificate_store
-                    .read_all(
+            let parents = match missing_parents {
+                Some(missing_parents) => {
+                    // collect missing parents requested by peer in order to vote for this header
+                    let expected_count = missing_parents.len();
+                    let stored = certificate_store.read_all(
                         missing_parents
                             .into_iter()
                             // only provide certs that are parents for the requested vote
                             .filter(|parent| header.parents().contains(parent)),
-                    )?
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                    )?;
 
-                // sanity check for missing parents
-                if parents.len() != expected_count {
-                    error!(
-                        target: "primary::certifier",
-                        "tried to read {expected_count} missing certificates requested by remote primary for vote request, but only found {}",
-                        parents.len()
-                    );
-                    return Err(DagError::ProposedHeaderMissingCertificates);
+                    // a parent fetched under another certificate holds signature bytes this node
+                    // never checked: the voter verifies what it is sent and caches a refusal of
+                    // this header on a bad copy, so a copy that fails here counts as not held
+                    let mut parents = Vec::with_capacity(expected_count);
+                    for parent in stored.into_iter().flatten() {
+                        if let Some(parent) =
+                            verify_stored_certificate(&certificate_store, &committee, parent)
+                                .await?
+                        {
+                            parents.push(parent);
+                        }
+                    }
+
+                    // sanity check for missing parents
+                    if parents.len() != expected_count {
+                        error!(
+                            target: "primary::certifier",
+                            "tried to read {expected_count} missing certificates requested by remote primary for vote request, but only found {} with a valid signature",
+                            parents.len()
+                        );
+                        return Err(DagError::ProposedHeaderMissingCertificates);
+                    }
+
+                    parents
                 }
+                None => vec![],
+            };
 
-                Ok(parents)
-            }).unwrap_or(Ok(vec![]))?;
+            // the round trip of this attempt alone: earlier attempts and the retry delays between
+            // them are on their own lines
+            let attempt_start = Instant::now();
 
             // listen for requests from peers
             tokio::select! {
@@ -180,18 +213,45 @@ impl<DB: Database> Certifier<DB> {
                     // process response from peer
                     match vote_result {
                         Ok(RequestVoteResult::Vote(vote)) => {
-                            debug!(target: "primary::certifier", ?authority, ?vote, "Ok response received after request vote");
+                            // logged for every vote, including the ones that arrive after the
+                            // proposal reached quorum
+                            debug!(
+                                target: "primary::certifier",
+                                ?authority,
+                                round,
+                                attempt,
+                                elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                ?vote,
+                                "Ok response received after request vote"
+                            );
                             // happy path - vote recieved
                             break vote;
                         }
                         Ok(RequestVoteResult::MissingParents(parents)) => {
-                            debug!(target: "primary::certifier", ?authority, ?parents, "Ok missing parents response received after request vote");
+                            debug!(
+                                target: "primary::certifier",
+                                ?authority,
+                                round,
+                                attempt,
+                                elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                ?parents,
+                                "Ok missing parents response received after request vote"
+                            );
                             // retrieve missing parents so peer can vote
                             missing_parents = Some(parents);
                         }
                         Err(error) => {
                             if let NetworkError::RPCError(error) = error {
-                                error!(target: "primary::certifier", ?authority, ?error, ?header, "fatal request for requested vote");
+                                error!(
+                                    target: "primary::certifier",
+                                    ?authority,
+                                    round,
+                                    attempt,
+                                    elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                    ?error,
+                                    ?header,
+                                    "fatal request for requested vote"
+                                );
                                 return Err(DagError::NetworkError(format!(
                                     "irrecoverable error requesting vote for {header}: {error}"
                                 )));
@@ -202,18 +262,22 @@ impl<DB: Database> Certifier<DB> {
                                 warn!(
                                     target: "primary::certifier",
                                     ?authority,
-                                    ?error,
                                     header = %header.digest(),
+                                    round,
                                     attempt,
+                                    elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                    ?error,
                                     "vote request still failing after the fast retries; retrying every 10s until the proposal is superseded"
                                 );
                             } else if attempt.is_power_of_two() {
                                 debug!(
                                     target: "primary::certifier",
                                     ?authority,
-                                    ?error,
                                     header = %header.digest(),
+                                    round,
                                     attempt,
+                                    elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                    ?error,
                                     "retryable error requesting vote"
                                 );
                             }
@@ -279,10 +343,17 @@ impl<DB: Database> Certifier<DB> {
     }
 
     /// Propose a header produced by this authority.
+    ///
+    /// Each wake of `reissue_failed` asks again every peer whose vote request has ended in an error
+    /// since the last wake. The requests still in flight and the votes already received are kept.
     #[instrument(level = "debug", skip_all, fields(round = header.round(), epoch = header.epoch()))]
-    async fn propose_header(&self, header: Header) -> DagResult<Certificate> {
+    async fn propose_header(
+        &self,
+        header: Header,
+        reissue_failed: &Notify,
+    ) -> DagResult<Certificate> {
         debug!(target: "primary::certifier", auth=?self.authority_id, "proposing header");
-        let proposal_start = std::time::Instant::now();
+        let proposal_start = Instant::now();
 
         // only propose headers in current epoch
         if header.epoch() != self.committee.epoch() {
@@ -306,56 +377,55 @@ impl<DB: Database> Certifier<DB> {
         let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
-        // create a channel for receiving votes from peers
-        let (tx_votes, mut rx_votes) = tokio::sync::mpsc::unbounded_channel();
-
-        // create network requests for votes from peers
-        let peers = self.committee.others_primaries_by_id(Some(&self.authority_id)).into_iter();
-        for (name, target) in peers {
-            let header_clone = header.clone();
-            let tx_votes = tx_votes.clone();
-            let network = self.network.clone();
-            let certificate_store = self.certificate_store.clone();
-            let committee = self.committee.clone();
-            let cancel_proposal = self.new_proposal.subscribe();
-            let task_name = format!("vote-{header:?}-{name}");
-            self.task_spawner.spawn_task(task_name, async move {
-                // process request for vote
-                let _ = tx_votes.send(
-                    // this will exit early on cancel_proposal
-                    Self::request_vote(
-                        name,
-                        header_clone,
-                        target,
-                        certificate_store,
-                        network,
-                        committee,
-                        cancel_proposal,
-                    )
-                    .await,
-                );
-                Ok(())
-            });
+        // create a channel for receiving votes from peers. this method keeps a sender to re-issue
+        // failed requests, so the channel never closes: `outstanding` counts the vote tasks that
+        // have not reported yet
+        let (tx_votes, mut rx_votes) = mpsc::unbounded_channel();
+        let mut outstanding = 0usize;
+        for (name, target) in self.committee.others_primaries_by_id(Some(&self.authority_id)) {
+            self.spawn_vote_request(&header, name, target, &tx_votes);
+            outstanding += 1;
         }
 
-        // drop sender so channel closes when all vote tasks complete
-        drop(tx_votes);
+        // the header carries only a whole-second creation time while the sub-second fork is
+        // inactive, so the age runs from when `run` marked it in flight instead: it covers the
+        // wait for the proposal lock and this proposal's setup. a header without that mark (one
+        // already superseded, or a proposal not started by `run`) is aged from this proposal's
+        // start
+        let received = self
+            .in_flight
+            .lock()
+            .as_ref()
+            .filter(|(digest, ..)| *digest == header.digest())
+            .map_or(proposal_start, |(.., received)| *received);
+        debug!(
+            target: "primary::certifier",
+            round = header.round(),
+            epoch = header.epoch(),
+            header_age_ms = duration_ms(received.elapsed()),
+            peers = outstanding,
+            "vote requests issued"
+        );
+
+        // the peers whose vote request ended in an error since the last re-issue
+        let mut failed = Vec::new();
 
         // loop through requests until complete or cancelled
         loop {
-            // certificate created - no more votes needed
-            if certificate.is_some() {
+            // certificate created - no more votes needed, or every vote task has reported
+            if certificate.is_some() || outstanding == 0 {
                 break;
             }
 
             // receive votes or exit early if new proposal replaces this header before certification
             tokio::select! {
-                result = rx_votes.recv() => {
+                Some((name, target, result)) = rx_votes.recv() => {
                     debug!(target: "primary::certifier", auth=?self.authority_id, ?result, "next request in unordered futures");
+                    outstanding -= 1;
 
                     match result {
                         // happy path
-                        Some(Ok(vote)) => {
+                        Ok(vote) => {
                             let authority_id = vote.author.clone();
                             self.metrics.votes_received_total.increment(1);
                             // prevent invalid votes from derailing certification process
@@ -374,19 +444,30 @@ impl<DB: Database> Certifier<DB> {
                         },
 
                         // handle vote error
-                        Some(Err(e)) => {
+                        Err(e) => {
                             error!(
                                 target: "primary::certifier",
                                 auth=?self.authority_id,
                                 "failed to get vote for header {header:?}: {e:?}"
                             );
                             self.metrics.vote_request_failures_total.increment(1);
+                            // a cancelled request belongs to a proposal that is being replaced
+                            if !matches!(e, DagError::Canceled) {
+                                failed.push((name, target));
+                            }
                         }
+                    }
+                },
 
-                        // all sending channels have dropped
-                        None => {
-                            break;
-                        }
+                // the identical header was re-sent: a peer whose request ended in an error may
+                // answer differently now, for example once it can map this node's network key
+                _ = reissue_failed.notified() => {
+                    if !failed.is_empty() {
+                        debug!(target: "primary::certifier", auth=?self.authority_id, peers = failed.len(), "re-issuing failed vote requests");
+                    }
+                    for (name, target) in failed.drain(..) {
+                        self.spawn_vote_request(&header, name, target, &tx_votes);
+                        outstanding += 1;
                     }
                 },
 
@@ -400,6 +481,13 @@ impl<DB: Database> Certifier<DB> {
 
         // log detailed header info if we failed to form a certificate
         let certificate = certificate.ok_or_else(|| {
+            info!(
+                target: "consensus::metrics",
+                round = header.round(),
+                epoch = header.epoch(),
+                reason = "no_certificate",
+                "header uncertified"
+            );
             if enabled!(tracing::Level::WARN) {
                 let mut msg = format!(
                     "Failed to form certificate from header {header:#?} with parent certificates:"
@@ -429,46 +517,157 @@ impl<DB: Database> Certifier<DB> {
         Ok(certificate)
     }
 
+    /// Spawn a task that asks the peer `name`, at network key `target`, for its vote on `header`.
+    ///
+    /// The task reports the outcome on `tx_votes` together with the peer, so a request that ended
+    /// in an error can be issued again.
+    fn spawn_vote_request(
+        &self,
+        header: &Header,
+        name: AuthorityIdentifier,
+        target: BlsPublicKey,
+        tx_votes: &mpsc::UnboundedSender<(AuthorityIdentifier, BlsPublicKey, DagResult<Vote>)>,
+    ) {
+        let header = header.clone();
+        let tx_votes = tx_votes.clone();
+        let network = self.network.clone();
+        let certificate_store = self.certificate_store.clone();
+        let committee = self.committee.clone();
+        let cancel_proposal = self.new_proposal.subscribe();
+        let task_name = format!("vote-{header:?}-{name}");
+        self.task_spawner.spawn_task(task_name, async move {
+            // this will exit early on cancel_proposal
+            let result = Self::request_vote(
+                name.clone(),
+                header,
+                target,
+                certificate_store,
+                network,
+                committee,
+                cancel_proposal,
+            )
+            .await;
+            let _ = tx_votes.send((name, target, result));
+            Ok(())
+        });
+    }
+
     /// The method to spawn tasks related to a header proposal.
     ///
     /// This listens for new proposal notifications to exit early.
     /// The method returns once enough votes are processed to certify the proposal,
     /// or if a new proposal arrives.
-    async fn spawn_header_proposal(self, header: Header) -> TaskResult {
-        // Grab this before the lock so quick exit after the lock if need to.
-        let new_proposal_noticer = self.new_proposal.subscribe();
+    ///
+    /// `new_proposal_noticer` must be subscribed to `new_proposal` before the task running this
+    /// method is spawned (see [`Self::run`]), so a later header's notification cannot land before
+    /// it exists. `reissue_failed` is passed on to [`Self::propose_header`].
+    async fn spawn_header_proposal(
+        self,
+        header: Header,
+        new_proposal_noticer: Noticer,
+        reissue_failed: &Notify,
+    ) -> TaskResult {
         // Make sure other proposal's are shutdown and done before we check if
         // this header is already certified.  Any existing proposals should have been cancelled
         // before this call.
+        let lock_start = Instant::now();
         let _guard = self.proposal_lock.lock().await;
+        debug!(
+            target: "primary::certifier",
+            round = header.round(),
+            lock_wait_ms = duration_ms(lock_start.elapsed()),
+            "proposal lock acquired"
+        );
         let header_digest = header.digest();
-        if let Ok(Some(cert)) =
-            self.config.node_storage().get::<ProposedCertificates>(&header_digest)
-        {
+        // a later header superseded this one while it waited for the lock. the select below
+        // polls its branches in random order, so without this check a superseded header could
+        // still spawn its vote requests
+        if new_proposal_noticer.noticed() {
+            debug!(target: "primary::certifier", %header_digest, "header superseded before its proposal started; skipping proposal");
+            // this path runs before the already-certified check below, so it also takes the
+            // identical re-send of a header certified earlier (the max-delay re-send): only a
+            // header with no stored certificate is reported, and a read error reports nothing
+            if matches!(
+                self.config.node_storage().get::<ProposedCertificates>(&header_digest),
+                Ok(None)
+            ) {
+                self.report_canceled(header.round(), header.epoch(), header_digest);
+            }
+            return Ok(());
+        }
+        let stored_certificate =
+            self.config.node_storage().get::<ProposedCertificates>(&header_digest);
+        // a read error falls through into the proposal below, and that header may already hold a
+        // stored and gossiped certificate: a cancel reports only a header known to have none
+        let report_on_cancel = matches!(stored_certificate, Ok(None));
+        if let Ok(Some(cert)) = stored_certificate {
             info!(target: "primary::certifier", "asked to propose a header that is already certified {header_digest}, skipping proposal and re-publishing");
             // We have already processed this certificate, doing so again could produce signature
             // equivocation and destroy deterministic randomness (based on the leader
             // signature). Since we got here try to re-publish the certificate on gossip
-            // network
+            // network, but only once the record is durable.
+            //
+            // The record can still be memory-only here. The proposal task that formed it releases
+            // the proposal lock right after its insert, before its own barrier acks, so this task
+            // can read the row while its disk write is still queued. The proposer's `LastProposed`
+            // barrier for a same-digest reproposal does not cover that write: `persist` queues its
+            // barrier when called and the runner acks in FIFO order, so a barrier covers only the
+            // writes queued before it, and the reproposal's barrier can be queued before the
+            // insert. Gossiping a memory-only record lets a crash or a failed commit lose it, so a
+            // restart misses this guard and certifies the header again, possibly over a different
+            // 2f+1 subset and with a different aggregate signature (#963, #964). This task read
+            // the row, so the row's insert was queued before the barrier below, and the barrier
+            // covers it. This is the same fence #979 put on the vote fast-recast (issue #1530).
+            //
+            // Release the lock first. This path inserts nothing, so it needs no exclusion, and
+            // holding the lock across a whole-DB barrier would stall every other proposal (see
+            // the comment where the formed-certificate path drops the lock).
+            //
+            // If the barrier fails, the epoch DB has latched a failed commit (or its runner is
+            // gone), so the record can be lost on restart. Refuse to republish and end the epoch:
+            // `run_epoch` then finds the store unable to make writes durable and stops the node.
+            // This task is not critical, so returning the error alone would not end the epoch.
+            drop(_guard);
+            self.config
+                .node_storage()
+                .persist::<ProposedCertificates>()
+                .await
+                .inspect_err(|e| {
+                    error!(target: "primary::certifier", "durable barrier failed for already-certified certificate, refusing to re-publish; ending the epoch (the node stops if its stores cannot write): {e}");
+                    self.config.shutdown().notify();
+                })
+                .map_err(|e| TaskError::from_message(e.to_string()))?;
             if let Err(e) = self.network.publish_certificate(cert).await {
                 error!(target: "primary::certifier", ?e, "failed to re-gossip certificate");
             }
             return Ok(());
         }
+        // the header moves into its proposal below; a cancel reports it by round, epoch and digest
+        let (header_round, header_epoch) = (header.round(), header.epoch());
         tokio::select! {
             // listen for new_proposal notification to exit
             // NOTE: sub here is okay bc no loop
             _ = new_proposal_noticer => {
                 debug!(target: "primary::certifier", "new proposal notification received");
+                if report_on_cancel {
+                    self.report_canceled(header_round, header_epoch, header_digest);
+                }
                 Ok(())
             },
 
             // receive enough votes for certification (or exit early)
-            proposal_result = self.propose_header(header) => {
+            proposal_result = self.propose_header(header, reissue_failed) => {
                 match proposal_result {
                     Ok(mut certificate) => {
+                        // A failed insert leaves no guard record, so a later proposal of this header
+                        // could certify it again with a different aggregate. End the epoch (this
+                        // certificate never leaves the node): `run_epoch` then stops the node if
+                        // the store can no longer make writes durable. This task is spawned as a
+                        // non-critical task, and the task manager discards a non-critical task's
+                        // error, so returning it alone would not end the epoch (issue #1530).
                         if let Err(e) = self.config.node_storage().insert::<ProposedCertificates>(&header_digest, &certificate) {
-                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate: {e}");
+                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate; ending the epoch (the node stops if its stores cannot write): {e}");
+                            self.config.shutdown().notify();
                             return Err(TaskError::from_message(e.to_string()));
                         }
 
@@ -476,17 +675,17 @@ impl<DB: Database> Certifier<DB> {
                         //
                         // The lock exists to make the already-certified check at the top of this
                         // method atomic with the insert above, and that pair is now complete: the
-                        // insert updates the in-memory layer synchronously, so any later proposal
-                        // reaching that check already observes this certificate. Nothing below
-                        // needs the exclusion.
+                        // insert is readable as soon as it returns, so any later proposal reaching
+                        // that check already observes this certificate. Nothing below needs the
+                        // exclusion.
                         //
-                        // Holding it across the barrier would be actively harmful, because
-                        // `persist` is a *whole-DB* barrier - the table parameter is unused
-                        // and only selects which of the three DBs to target - so it defers while
-                        // any write txn on the epoch DB is open and drains only at refcount zero,
-                        // with no timeout. Under catch-up or epoch close that is tens to hundreds
-                        // of milliseconds during which every other proposal would queue behind this
-                        // lock. Do not widen this critical section back out.
+                        // Holding it across the barrier would be actively harmful: `persist` waits
+                        // for a sync round of the whole epoch environment's log (the table only
+                        // selects the environment) covering every write made before it, so it
+                        // waits on the disk (an msync, plus an fsync if the log grew), longest on
+                        // a slow volume, under catch-up or at epoch close, and every other proposal
+                        // would queue behind this lock meanwhile. Do not widen this critical
+                        // section back out.
                         drop(_guard);
 
                         // Wait for the `ProposedCertificates` record to be durable before
@@ -502,15 +701,18 @@ impl<DB: Database> Certifier<DB> {
                         // record is not on disk, so the internal processing and gossip publish below
                         // would externalize a certificate whose guard record can be lost on restart -
                         // exactly the re-proposal and leader-signature perturbation this barrier
-                        // exists to prevent. Refuse and fail the task (mirroring the insert failure
-                        // handled above) rather than externalize a non-durable certificate
-                        // (issue #975).
+                        // exists to prevent. Refuse rather than externalize a non-durable certificate
+                        // (issue #975), and end the epoch as the vote barriers do (#979), after
+                        // which `run_epoch` finds the store unable to make writes durable and stops
+                        // the node: returning the error from this non-critical task alone would not
+                        // end the epoch (issue #1530).
                         self.config
                             .node_storage()
                             .persist::<ProposedCertificates>()
                             .await
                             .map_err(|e| {
-                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize: {e}");
+                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize; ending the epoch (the node stops if its stores cannot write): {e}");
+                                self.config.shutdown().notify();
                                 TaskError::from_message(e.to_string())
                             })?;
 
@@ -536,6 +738,9 @@ impl<DB: Database> Certifier<DB> {
                                     auth=?self.authority_id,
                                     "certifier cancelled proposed header task"
                                 );
+                                if report_on_cancel {
+                                    self.report_canceled(header_round, header_epoch, header_digest);
+                                }
                                 Ok(())
                             }
                             // log other errors loudly
@@ -554,6 +759,47 @@ impl<DB: Database> Certifier<DB> {
         }
     }
 
+    /// Report that the own header at `round` of `epoch` with `digest` will never be certified: a
+    /// newer own header cancelled its proposal before a certificate formed.
+    ///
+    /// Logs the `header uncertified` line with `reason=canceled`, and tells the proposer so it
+    /// can move the header's batch digests to its next header: only the author can aggregate the
+    /// votes for its header, and the proposer never sends a header below its round again. The
+    /// line counts every cancel, including the idle cancels of headers without digests that the
+    /// proposer's `digests resent` line never shows. Since #1821 it covers all three cancel paths
+    /// (superseded before the proposal started, the notice in the outer select, and the cancel arm
+    /// inside the proposal); before, only that inner arm logged it, so `reason=canceled` counts
+    /// from earlier runs are lower and not comparable with later ones.
+    ///
+    /// Called only where `new_proposal` ends the proposal of a header without a stored certificate,
+    /// never where a proposal ends without a certificate: the identical header re-sent on the
+    /// max-delay tick may still be certified then. A shutdown also fires `new_proposal`; nothing
+    /// is logged or reported once it has.
+    ///
+    /// Never waits: a full queue drops the report with a debug line, and the digests then wait for
+    /// the proposer's next own commit, which re-queues every uncommitted header below it.
+    fn report_canceled(&self, round: Round, epoch: Epoch, digest: HeaderDigest) {
+        if self.config.shutdown().is_notified() {
+            return;
+        }
+        info!(
+            target: "consensus::metrics",
+            round,
+            epoch,
+            reason = "canceled",
+            "header uncertified"
+        );
+        if let Err(e) = self.consensus_bus.uncertified_own_headers().try_send((round, digest)) {
+            debug!(
+                target: "primary::certifier",
+                round,
+                %digest,
+                %e,
+                "uncertified own header report dropped"
+            );
+        }
+    }
+
     /// Execute the main certification task.  Will run until shutdown is signalled.
     /// If this exits outside of shutdown it will log an error and this will trigger a node
     /// shutdown.
@@ -566,14 +812,42 @@ impl<DB: Database> Certifier<DB> {
                 Some(header) = rx_headers.recv() => {
                     debug!(target: "primary::certifier", ?header, "{:?} received header!", &self.authority_id);
 
+                    // the proposer re-sends its last header unchanged while it waits for parents.
+                    // restarting that proposal would cancel its vote requests and discard the votes
+                    // already received, so a header whose votes take longer than the re-send
+                    // interval to reach quorum could never be certified. the vote requests in
+                    // flight retry on their own until answered; only the requests that already
+                    // ended in an error are issued again
+                    let digest = header.digest();
+                    let in_flight = match InFlightProposal::start(&self.in_flight, digest) {
+                        Ok(in_flight) => in_flight,
+                        Err(reissue_failed) => {
+                            debug!(target: "primary::certifier", %digest, "identical re-proposal while certification is in flight; keeping vote collection and re-issuing failed vote requests");
+                            // stores a permit if the proposal is not waiting yet, so the wake is
+                            // not lost
+                            reissue_failed.notify_one();
+                            continue;
+                        }
+                    };
+
                     // cancel any outstanding proposals and vote requests
                     self.new_proposal.notify();
+
+                    // subscribe here, not in the task: `Notifier` does not latch, so the next
+                    // header's notify can land before this task is first polled
+                    let cancel = self.new_proposal.subscribe();
 
                     // spawn certifier task so new proposals can cancel
                     let certifier = self.clone();
                     self.task_spawner.spawn_task(
-                        format!("propose-header-{:?}", header.digest()),
-                        certifier.spawn_header_proposal(header)
+                        format!("propose-header-{digest:?}"),
+                        async move {
+                            // held until the task ends, however it ends
+                            let in_flight = in_flight;
+                            certifier
+                                .spawn_header_proposal(header, cancel, &in_flight.reissue_failed)
+                                .await
+                        },
                     );
                 },
 
@@ -587,5 +861,76 @@ impl<DB: Database> Certifier<DB> {
                 }
             }
         }
+    }
+}
+
+/// Marks a header as the certifier's proposal in flight for as long as this guard lives.
+///
+/// [`Certifier::run`] moves one into each proposal task it spawns, so the mark clears however the
+/// task ends: a certificate, a cancellation, an error, the already-certified republish, or the task
+/// being dropped before it runs. A later copy of the same header then starts a new proposal.
+struct InFlightProposal {
+    /// The certifier's record of the header in flight and its re-issue signal.
+    marker: InFlightMarker,
+    /// The digest this guard marked.
+    digest: HeaderDigest,
+    /// Asks this proposal to re-issue the vote requests that ended in an error.
+    ///
+    /// Each proposal gets its own, so a wake meant for one header never reaches the next.
+    reissue_failed: Arc<Notify>,
+}
+
+impl InFlightProposal {
+    /// Mark `digest` as in flight with a new re-issue signal, or, if it already is, return the
+    /// re-issue signal of the proposal in flight.
+    fn start(marker: &InFlightMarker, digest: HeaderDigest) -> Result<Self, Arc<Notify>> {
+        let mut current = marker.lock();
+        if let Some((_, reissue_failed, _)) =
+            current.as_ref().filter(|(in_flight, ..)| *in_flight == digest)
+        {
+            return Err(reissue_failed.clone());
+        }
+        let reissue_failed = Arc::new(Notify::new());
+        // `run` marks a header right after receiving it, so this is its receive time
+        *current = Some((digest, reissue_failed.clone(), Instant::now()));
+        Ok(Self { marker: marker.clone(), digest, reissue_failed })
+    }
+}
+
+impl Drop for InFlightProposal {
+    fn drop(&mut self) {
+        let mut current = self.marker.lock();
+        // a different header may have replaced this one; its mark is not ours to clear
+        if current.as_ref().is_some_and(|(in_flight, ..)| *in_flight == self.digest) {
+            *current = None;
+        }
+    }
+}
+
+/// The certifier's record of its proposal in flight: the header's digest, the signal that asks
+/// that proposal to re-issue the vote requests that ended in an error, and when [`Certifier::run`]
+/// received the header (the start of `header_age_ms` in the `vote requests issued` line).
+type InFlightMarker = Arc<parking_lot::Mutex<Option<(HeaderDigest, Arc<Notify>, Instant)>>>;
+
+/// Whole milliseconds in `duration`, saturating at `u64::MAX`, for the timing fields of the
+/// certifier's log lines.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duration_ms;
+    use std::time::Duration;
+
+    /// Sub-millisecond remainders round down and a duration past `u64::MAX` milliseconds
+    /// saturates instead of wrapping.
+    #[test]
+    fn duration_ms_truncates_and_saturates() {
+        assert_eq!(duration_ms(Duration::ZERO), 0);
+        assert_eq!(duration_ms(Duration::from_micros(999)), 0);
+        assert_eq!(duration_ms(Duration::from_micros(1_999)), 1);
+        assert_eq!(duration_ms(Duration::from_secs(10)), 10_000);
+        assert_eq!(duration_ms(Duration::MAX), u64::MAX);
     }
 }

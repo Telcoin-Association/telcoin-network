@@ -38,7 +38,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_output_to_header").unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
             .await
             .unwrap();
@@ -65,7 +65,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
 
     // yield for subscriber to spawn
@@ -85,7 +85,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -165,7 +165,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_executor_output_ordering").unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -187,7 +187,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
     tokio::task::yield_now().await;
 
@@ -204,7 +204,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -275,7 +275,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_executor_output_ordering").unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -297,7 +297,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
     tokio::task::yield_now().await;
 
@@ -314,7 +314,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -418,7 +418,7 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_duplicate_batch_digest").unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -441,7 +441,7 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
     tokio::task::yield_now().await;
 
@@ -512,7 +512,7 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -625,7 +625,7 @@ async fn test_subscriber_dup_batch_across_certs() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
     tokio::task::yield_now().await;
 
@@ -684,6 +684,17 @@ async fn test_subscriber_dup_batch_across_certs() -> eyre::Result<()> {
     let expected_digests: Vec<BlockHash> =
         sub_dag.headers().iter().flat_map(|header| header.payload().keys().copied()).collect();
     assert_eq!(expected_digests.len(), 4, "two payloads of two with one shared digest");
+
+    // the subscriber's fork check waits until local execution reaches each leader's execution
+    // block (the default block 0 here), so record that block as executed
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
+    consensus_bus.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
+    });
 
     // feed the subdag straight to the subscriber
     consensus_bus.sequence().send(sub_dag).await?;
@@ -833,6 +844,17 @@ async fn test_subscriber_epoch_boundary_mid_second() -> eyre::Result<()> {
     let reaches: Vec<bool> =
         sub_dags.iter().map(|sub_dag| sub_dag.reaches_epoch_boundary(BOUNDARY)).collect();
     assert_eq!(reaches, [false, true, true], "boundary predicate on the seconds grid");
+
+    // the subscriber's fork check waits until local execution reaches each leader's execution
+    // block (the default block 0 here), so record that block as executed
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
+    consensus_bus.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
+    });
 
     // feed all three before reading any output, so a subscriber that kept pulling past the
     // boundary would find the third already queued

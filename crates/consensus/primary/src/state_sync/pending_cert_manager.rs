@@ -5,7 +5,7 @@
 
 use crate::error::{CertManagerError, CertManagerResult};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use tn_types::{Certificate, Hash as _, HeaderDigest, Round};
+use tn_types::{Certificate, Hash as _, HeaderDigest, Round, SignatureVerificationState};
 use tracing::debug;
 
 /// A certificate that is missing parents and pending approval.
@@ -159,6 +159,23 @@ impl PendingCertificateManager {
         }
 
         Some((round, digest))
+    }
+
+    /// Replace a pending certificate with `certificate` if `certificate` was verified directly.
+    ///
+    /// A pending copy fetched under another certificate holds signature bytes this node has not
+    /// checked; a directly verified copy of the same header replaces it, so the copy accepted
+    /// once the parents arrive is one this node can attach and serve without another check.
+    pub(super) fn replace_with_direct_copy(&mut self, certificate: Certificate) {
+        if !matches!(
+            certificate.signature_verification_state(),
+            SignatureVerificationState::VerifiedDirectly(_)
+        ) {
+            return;
+        }
+        if let Some(pending) = self.pending.get_mut(&certificate.digest()) {
+            pending.certificate = certificate;
+        }
     }
 
     /// Returns whether a certificate is being tracked

@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
+use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, ServiceClass, TNMessage};
 use tn_types::{
     error::HeaderError, roaring_container_count, AuthorityIdentifier, Certificate, ConsensusResult,
     Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest, Round,
@@ -37,6 +37,14 @@ impl TNMessage for PrimaryRequest {
         match self {
             Self::PeerExchange { peers } => Some(peers.clone()),
             _ => None,
+        }
+    }
+
+    fn service_class(&self) -> ServiceClass {
+        match self {
+            Self::Vote { .. } => ServiceClass::Vote,
+            Self::EpochRecord { .. } => ServiceClass::EpochRecord,
+            Self::PeerExchange { .. } => ServiceClass::Other,
         }
     }
 }
@@ -246,6 +254,23 @@ impl PrimaryResponse {
         matches!(self, PrimaryResponse::Error(_))
     }
 
+    /// The reply a peer sends for an epoch-record request it cannot serve because it holds no
+    /// certified record for `epoch` (or `hash`).
+    ///
+    /// This is the error the request handler returns for the same request, encoded the way every
+    /// request error is encoded, so a requester can tell this definitive answer apart from other
+    /// error replies (such as a responder that has not resolved the requester yet). A request
+    /// naming neither gets the invalid-request reply, which is equally final.
+    pub fn unavailable_epoch_record(epoch: Option<Epoch>, hash: Option<EpochDigest>) -> Self {
+        // the precedence mirrors `RequestHandler::retrieve_epoch_record`: a digest wins
+        let error = match (epoch, hash) {
+            (_, Some(hash)) => PrimaryNetworkError::UnavailableEpochDigest(hash),
+            (Some(epoch), None) => PrimaryNetworkError::UnavailableEpoch(epoch),
+            (None, None) => PrimaryNetworkError::InvalidEpochRequest,
+        };
+        Self::into_error_ref(&error)
+    }
+
     pub(crate) fn into_error_ref(error: &PrimaryNetworkError) -> Self {
         match error {
             PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { ours, theirs })
@@ -260,6 +285,12 @@ impl PrimaryResponse {
             PrimaryNetworkError::Timeout(_) => {
                 Self::RecoverableError(PrimaryRPCError(error.to_string()))
             }
+            // the voter is catching up or its execution is behind the header and refuses to vote
+            // for now: the same request succeeds once it has caught up, so the requester retries
+            // instead of giving up on this node
+            PrimaryNetworkError::InvalidHeader(
+                HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. },
+            ) => Self::RecoverableError(PrimaryRPCError(error.to_string())),
             PrimaryNetworkError::InvalidHeader(_)
             | PrimaryNetworkError::Decode(_)
             | PrimaryNetworkError::Certificate(_)
@@ -301,5 +332,35 @@ pub struct PrimaryRPCError(pub String);
 impl From<PeerExchangeMap> for PrimaryResponse {
     fn from(value: PeerExchangeMap) -> Self {
         Self::PeerExchange { peers: value }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PrimaryRequest;
+    use std::sync::Arc;
+    use tn_network_libp2p::{PeerExchangeMap, ServiceClass, TNMessage};
+    use tn_types::Header;
+
+    /// A vote request has the vote class.
+    #[test]
+    fn vote_is_vote_class() {
+        let request =
+            PrimaryRequest::Vote { header: Arc::new(Header::default()), parents: Vec::new() };
+        assert_eq!(request.service_class(), ServiceClass::Vote);
+    }
+
+    /// An epoch record request has the epoch record class.
+    #[test]
+    fn epoch_record_is_epoch_record_class() {
+        let request = PrimaryRequest::EpochRecord { epoch: None, hash: None };
+        assert_eq!(request.service_class(), ServiceClass::EpochRecord);
+    }
+
+    /// Peer exchange is answered inline and has the other class.
+    #[test]
+    fn peer_exchange_is_other_class() {
+        let request = PrimaryRequest::PeerExchange { peers: PeerExchangeMap::default() };
+        assert_eq!(request.service_class(), ServiceClass::Other);
     }
 }

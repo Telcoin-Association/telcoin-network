@@ -1,0 +1,196 @@
+{
+  "advisory": "RUSTSEC-2024-0373",
+  "advisory_sha256": "e5c0eba785cc39d83831b996a6b08329838b34554123f3f046c5051da70ebf6f",
+  "affected_control": "0.11.6",
+  "all_workspace_advisory_ids": [
+    "RUSTSEC-2026-0204",
+    "RUSTSEC-2026-0258",
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0220",
+    "RUSTSEC-2026-0103",
+    "RUSTSEC-2025-0055"
+  ],
+  "carried_applicability": "not affected: >= 0.11.7",
+  "carried_quinn_proto": "0.11.18",
+  "carried_scan": {
+    "command": [
+      "$EVIDENCE/tn-1431-tools/cargo-audit-aarch64-apple-darwin-v0.22.2/cargo-audit",
+      "audit",
+      "--no-fetch",
+      "--db",
+      "$EVIDENCE/tn-1431-advisory-db",
+      "--file",
+      "$NODE/Cargo.lock",
+      "--json"
+    ],
+    "exit_code": 1,
+    "stderr": "carried-audit.stderr",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "carried-audit.stdout",
+    "stdout_sha256": "92b56bdccbcd3c1e435bf4dfb4c94b771f89b3914f8129991cf0947ce164cede",
+    "transport_findings": [],
+    "workspace_finding_count": 7
+  },
+  "carried_stack": {
+    "libp2p-quic": "0.14.0",
+    "libp2p-tls": "0.7.0",
+    "quinn": "0.11.9",
+    "quinn-proto": "0.11.18",
+    "rustls": "0.23.45"
+  },
+  "control_source": {
+    "sha256": "ba92fb39ec7ad06ca2582c0ca834dfeadcaf06ddfc8e635c80aa7e1c05315fdd",
+    "url": "https://crates.io/api/v1/crates/quinn-proto/0.11.6/download"
+  },
+  "controls": {
+    "path": {
+      "resolved": {
+        "id": "path+file://$EVIDENCE/tn-1431-advisory-evidence-2/sources/quinn-proto-0.11.6#quinn-proto@0.11.6",
+        "name": "quinn-proto",
+        "source": null,
+        "version": "0.11.6"
+      },
+      "results": {
+        "cargo-audit": {
+          "command": [
+            "$EVIDENCE/tn-1431-tools/cargo-audit-aarch64-apple-darwin-v0.22.2/cargo-audit",
+            "audit",
+            "--no-fetch",
+            "--db",
+            "$EVIDENCE/tn-1431-advisory-db",
+            "--file",
+            "$EVIDENCE/tn-1431-advisory-evidence-2/path/Cargo.lock",
+            "--json"
+          ],
+          "exit_code": 0,
+          "known_advisory_reported": false,
+          "stderr": "path-cargo-audit.stderr",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout": "path-cargo-audit.stdout",
+          "stdout_sha256": "97d564ef3aedd7d030eaf2d77736313236e6595ed30141f36a3e2f9bf3369368"
+        },
+        "cargo-deny": {
+          "command": [
+            "$EVIDENCE/tn-1431-tools/cargo-deny-0.20.2-aarch64-apple-darwin/cargo-deny",
+            "--format",
+            "json",
+            "--manifest-path",
+            "$EVIDENCE/tn-1431-advisory-evidence-2/path/Cargo.toml",
+            "--config",
+            "$EVIDENCE/tn-1431-advisory-evidence-2/deny.toml",
+            "--locked",
+            "check",
+            "advisories"
+          ],
+          "exit_code": 0,
+          "known_advisory_reported": false,
+          "stderr": "path-cargo-deny.stderr",
+          "stderr_sha256": "02d186150402cda84d64b50da1dea4b586274b3afbd3fbaf078a7c4e389920c3",
+          "stdout": "path-cargo-deny.stdout",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    "registry": {
+      "resolved": {
+        "id": "registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.6",
+        "name": "quinn-proto",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.11.6"
+      },
+      "results": {
+        "cargo-audit": {
+          "command": [
+            "$EVIDENCE/tn-1431-tools/cargo-audit-aarch64-apple-darwin-v0.22.2/cargo-audit",
+            "audit",
+            "--no-fetch",
+            "--db",
+            "$EVIDENCE/tn-1431-advisory-db",
+            "--file",
+            "$EVIDENCE/tn-1431-advisory-evidence-2/registry/Cargo.lock",
+            "--json"
+          ],
+          "exit_code": 1,
+          "known_advisory_reported": true,
+          "stderr": "registry-cargo-audit.stderr",
+          "stderr_sha256": "8060055c6ef799c622a659c5b05a03815ad0ec69fea970e5999fb26bc0426e47",
+          "stdout": "registry-cargo-audit.stdout",
+          "stdout_sha256": "afd9235e3b73da47595588b95536bc69a2734371bb8f236e78b5ac4be1284a85"
+        },
+        "cargo-deny": {
+          "command": [
+            "$EVIDENCE/tn-1431-tools/cargo-deny-0.20.2-aarch64-apple-darwin/cargo-deny",
+            "--format",
+            "json",
+            "--manifest-path",
+            "$EVIDENCE/tn-1431-advisory-evidence-2/registry/Cargo.toml",
+            "--config",
+            "$EVIDENCE/tn-1431-advisory-evidence-2/deny.toml",
+            "--locked",
+            "check",
+            "advisories"
+          ],
+          "exit_code": 1,
+          "known_advisory_reported": true,
+          "stderr": "registry-cargo-deny.stderr",
+          "stderr_sha256": "1a6ca3d778bf73415c1df5960e0e822f83e8f64f0c4026a7ce64d14f385d3faa",
+          "stdout": "registry-cargo-deny.stdout",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    }
+  },
+  "database_revision": "9b3a3b73a7f42606494c943e95f8196e9994df46",
+  "full_summary_sha256": "f3c1dfc0d15fc76d63e780b69bc598a05796df3d4e0d66961e637132e438e10b",
+  "recorded_at": "2026-09-30",
+  "retained_output_hashes": {
+    "cargo-audit-version.json": "e7f01894b5c2e540baae7ea87d1f5fba3705b1485d2b9ebc40fa0096d1df20e3",
+    "cargo-audit-version.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "cargo-audit-version.stdout": "8748580845bee726903e69bc4543958fb01e2594317e6c68bf80114bff13d541",
+    "cargo-deny-version.json": "81d22b051feb80f53a823dfc4027ddb9f26be80586225375fdcef6eee908c8c3",
+    "cargo-deny-version.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "cargo-deny-version.stdout": "1758f5ea93d8ad3585079f05c19358b7bb969cce1bf6c7bdab6659a8cd1ef6b8",
+    "carried-audit.json": "23e38f69c297ee0a537ce8ee56ae78390191abbf9dcdf67362de3e75bd66b339",
+    "carried-audit.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "carried-audit.stdout": "92b56bdccbcd3c1e435bf4dfb4c94b771f89b3914f8129991cf0947ce164cede",
+    "database-revision.json": "6facc1905e608e7c1f0df50c9a75038defe27cfb7218bef30bde37d9d9ad458d",
+    "database-revision.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "database-revision.stdout": "2610912ad46e534f3833105d74daa82083a31ba0c0e0f7f7352126a166fa3284",
+    "path-cargo-audit.json": "fb765e3155ff89eb9f59b668db55d838d1e04d5070aef286ae9f065f29901232",
+    "path-cargo-audit.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "path-cargo-audit.stdout": "97d564ef3aedd7d030eaf2d77736313236e6595ed30141f36a3e2f9bf3369368",
+    "path-cargo-deny.json": "4377b5d192a7d0b0843e6fc51de7be52949cec78d2a7860b7df761d2bcbbe955",
+    "path-cargo-deny.stderr": "02d186150402cda84d64b50da1dea4b586274b3afbd3fbaf078a7c4e389920c3",
+    "path-cargo-deny.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "path-metadata.json": "d21ad27d3dc429a29c5a3172ab78bedfe0f6c4ddc06e5134f15f1125c81c2c69",
+    "path-metadata.stderr": "11695ceafbf0ce0deb3f3fad3efbb4d9a000095ddde6212b653be9c49edba2af",
+    "path-metadata.stdout": "97d67e930748a0e94fea852108a43d90a5c228beb0661fb0b43da60fc9752949",
+    "registry-cargo-audit.json": "3252fb2e74a18dbf6dd0ff8cf23028f34fca931ecbcaa9016e5bb6b779af4ebd",
+    "registry-cargo-audit.stderr": "8060055c6ef799c622a659c5b05a03815ad0ec69fea970e5999fb26bc0426e47",
+    "registry-cargo-audit.stdout": "afd9235e3b73da47595588b95536bc69a2734371bb8f236e78b5ac4be1284a85",
+    "registry-cargo-deny.json": "6fa8fb5995b32404621617c837589b72daaa900192a2f68f3785428125b8b23d",
+    "registry-cargo-deny.stderr": "1a6ca3d778bf73415c1df5960e0e822f83e8f64f0c4026a7ce64d14f385d3faa",
+    "registry-cargo-deny.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "registry-metadata.json": "dc171ef1dc14dd4d3bfc9b44ce397b274575159402797bc9242ed265bdb40259",
+    "registry-metadata.stderr": "65ad4bd34ac6aa2945d3d84884725d0e50232fdbae46f4a71e66c4963b55cecd",
+    "registry-metadata.stdout": "e3fe3b19d7df5b3718c881aa14bc1eeaf822bdbe315513ecdb7315abdf6216fe",
+    "summary.json": "f3c1dfc0d15fc76d63e780b69bc598a05796df3d4e0d66961e637132e438e10b"
+  },
+  "review_scope": [
+    "aws-lc-rs",
+    "aws-lc-sys",
+    "libp2p-quic",
+    "libp2p-tls",
+    "quinn",
+    "quinn-proto",
+    "ring",
+    "rustls",
+    "rustls-webpki"
+  ],
+  "scanners": {
+    "cargo-audit": "cargo-audit 0.22.2",
+    "cargo-deny": "cargo-deny 0.20.2"
+  },
+  "status": "passed"
+}

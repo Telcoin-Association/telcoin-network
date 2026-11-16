@@ -3,10 +3,12 @@
 //! Used by the typed sync `MissingCertificates` responder to read the certificates a
 //! requesting peer is missing from local storage.
 
+use super::verify_stored_certificate;
 use crate::{
     error::{PrimaryNetworkError, PrimaryNetworkResult},
     network::MissingCertificatesRequest,
 };
+use futures::{Stream, StreamExt as _};
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, BinaryHeap},
@@ -153,6 +155,33 @@ where
             }
         }
         Ok(None)
+    }
+
+    /// Stream the certificates to serve, each with an aggregate signature this node has checked.
+    ///
+    /// A stored certificate this node has not verified directly (one a fetch received under
+    /// another certificate) is verified first and the outcome stored with it (see
+    /// [`verify_stored_certificate`]), so a peer never receives signature bytes this node took on
+    /// trust, and a request triggers at most one check per stored certificate, ever. A copy that
+    /// fails is left out; the requester fetches it from another peer, as any missing parent. The
+    /// checks count toward the processing-time limit.
+    pub(crate) fn into_verified_stream(
+        self,
+    ) -> impl Stream<Item = PrimaryNetworkResult<Certificate>> + Send {
+        let store = self.config.node_storage().clone();
+        let committee = self.config.committee().clone();
+        futures::stream::iter(self).filter_map(move |cert| {
+            let (store, committee) = (store.clone(), committee.clone());
+            async move {
+                match cert {
+                    Ok(cert) => verify_stored_certificate(&store, &committee, cert)
+                        .await
+                        .map_err(PrimaryNetworkError::from)
+                        .transpose(),
+                    Err(e) => Some(Err(e)),
+                }
+            }
+        })
     }
 
     /// Return a bool representing the max limits for this function.

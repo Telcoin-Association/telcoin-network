@@ -12,11 +12,12 @@ These ensure that all nodes meet a foundational standard, contributing positivel
 ## Pre-installation review
 
 Operators are required to submit detailed specifications of their intended node setup to Telcoin Network development team for approval before installation.
-Please contact our DevOps team at grant@telcoin.org with your proposed hardware specifications.
+Please email support@telcoin.org with your proposed hardware specifications.
 
 ## Summary
 
 Each figure on this page comes from a code constant, from the resource model in [How these numbers were derived](#how-these-numbers-were-derived), or from the benchmark described in that section.
+The validator disk IOPS figures instead come from the execution benchmark in [Execution database: disk and memory](execution-database-hardware.md), which ran on this release's execution database.
 The benchmark ran on 2026-09-23 on two GCP fleets, and its results are in the [benchmark report](https://claude.ai/artifact/6qpBKmd3eKNaRBuxUtPPCR), also committed as `bench/reports/2026-09-bench-10v.html` in the tn-transaction-generator repository.
 On this page, e2 means the e2-custom-4-8192 fleet (4 vCPU, which is 2 physical cores, and 8 GB; run r20260923-0708) and c3 means the c3-highcpu-8 fleet (8 vCPU, which is 4 physical cores, and 16 GB; run r20260923-0515).
 Each cell below says whether its figure is measured, modelled or provisional, and its note gives the run and the `sizing.json` field or the formula behind it.
@@ -25,8 +26,8 @@ Benchmark sources and code references are listed at the end of the page.
 
 | Role | Tier | CPU (physical cores, PassMark single-thread) | RAM | Storage (capacity, sustained IOPS, MB/s, DWPD) | Network |
 | --- | --- | --- | --- | --- | --- |
-| Validator | Minimum | 8 physical cores (twice the measured 4) [^b-val-cpu-min] [^doubling] | 32 GB ECC (twice the measured 16 GB) [^b-val-ram-min] [^doubling] | 2 TB TLC NVMe, 10,000 write IOPS, 300 MB/s, 2.4 DWPD (modelled from measured demand) [^b-val-disk-min] | 200 Mbps symmetric (measured demand, modelled margin) [^b-net] |
-| Validator | Recommended | 16 physical cores, PassMark 3,500 or higher (twice the minimum; PassMark modelled) [^b-val-cpu-rec] [^doubling] | 64 GB ECC (twice the minimum) [^b-val-ram-rec] [^doubling] | 4 TB TLC NVMe, 20,000 IOPS, 500 MB/s, 1.2 DWPD (modelled from measured demand) [^b-val-disk-rec] | 1 Gbps (measured demand, modelled margin) [^b-net] |
+| Validator | Minimum | 8 physical cores (twice the measured 4) [^b-val-cpu-min] [^doubling] | 32 GB ECC (twice the measured 16 GB) [^b-val-ram-min] [^doubling] | 2 TB TLC NVMe, 20,000 sustained write IOPS and 800 MiB/s (about 840 MB/s) (both measured on this release's execution database in storage layout v2), 2.4 DWPD (modelled from measured demand) [^b-val-disk-min] [^exec-disk] | 200 Mbps symmetric (measured demand, modelled margin) [^b-net] |
+| Validator | Recommended | 16 physical cores, PassMark 3,500 or higher (twice the minimum; PassMark modelled) [^b-val-cpu-rec] [^doubling] | 64 GB ECC (twice the minimum) [^b-val-ram-rec] [^doubling] | 4 TB TLC NVMe: local NVMe, or 40,000 sustained IOPS and 800 MiB/s or more on cloud block storage (measured on this release's execution database in storage layout v2), 1.2 DWPD (modelled from measured demand) [^b-val-disk-rec] [^exec-disk] | 1 Gbps (measured demand, modelled margin) [^b-net] |
 | Validator | Headroom | As recommended (modelled) [^b-head] | 64 GB ECC (as recommended) [^b-head] [^doubling] | 12 TB, otherwise as recommended (modelled) [^b-head-disk] | 1 Gbps (modelled) [^b-head] |
 | Observer (follower) | Minimum | 2 physical cores (measured) [^b-obs-min] | 8 GB (measured) [^b-obs-min] | As validator minimum (measured demand) [^b-obs-disk] | 50 Mbps (measured demand, provisional figure kept) [^b-obs-net] |
 | Observer (follower) | Recommended | 4 physical cores (measured) [^b-obs-rec] | 16 GB (measured) [^b-obs-rec] | As validator recommended (measured demand) [^b-obs-disk] | 50 Mbps (measured demand, provisional figure kept) [^b-obs-net] |
@@ -40,8 +41,11 @@ Every validator tier also needs a p95 round-trip time well below 1 s to at least
 The tiers mean:
 
 - Minimum: the smallest configuration that kept up with the benchmark's mixed phase without memory or IO stalls, with enough memory for the restart replay peak described under [Memory](#memory).
-- Recommended: enough margin that p95 use of CPU, memory, disk IOPS and bandwidth stays below half of capacity at the benchmark load, plus one year of storage growth at the [per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling) (about 260 TPS with the 6-hour epochs mainnet and testnet use). Storage uses the ceiling because the benchmark's load is far above what the release can sustain with 6-hour epochs.
-- Headroom: sized for the highest sustained load the current release can carry, which is set by the batch-cache ceiling, including restart replay at that load and three years of storage growth. That load is under a thirteenth of what the benchmark ran, so the recommended CPU, memory and network already cover it. Headroom beyond Recommended is about storage growth and RPC caching, not throughput.
+- Recommended: enough margin that p95 use of CPU, memory, disk IOPS and bandwidth stays below half of capacity at the benchmark load, plus one year of storage growth at the [per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling) (about 260 TPS with the 6-hour epochs mainnet and testnet use).
+  Storage keeps that figure as its planning load, although the batch cache no longer limits throughput to it.
+- Headroom: sized for the same planning load, including restart replay at that load and three years of storage growth.
+  That load is under a thirteenth of what the benchmark ran, so the recommended CPU, memory and network already cover it.
+  Headroom beyond Recommended is about storage growth and RPC caching, not throughput.
 
 Those rules describe the single-worker validators the benchmark ran, and [Single-worker figures from the benchmark](#single-worker-figures-from-the-benchmark) lists what they gave: 4 physical cores and 16 GB minimum, 32 GB recommended.
 The validator CPU and memory tiers above are twice that, a margin for the worker count that governance is expected to raise above one over the next 12 months.
@@ -49,7 +53,8 @@ The minimum tier is twice the measured single-worker minimum, and the recommende
 Storage and network keep their derived figures, and the observer tiers are not doubled.
 [Why validator CPU and memory are doubled](#why-validator-cpu-and-memory-are-doubled) says what each worker adds, and [Expected service life](#expected-service-life) says how long each tier lasts.
 
-Neither fleet's 100 GB network-attached volume ran free of IO stalls (see [Storage](#storage)), so every tier's disk figures come from measured demand plus margin, not from a tested volume.
+Neither fleet's 100 GB network-attached volume ran free of IO stalls (see [Storage](#storage)), so the disk capacity, throughput and endurance figures come from measured demand plus margin, not from a tested volume.
+The validator IOPS figures come from cloud volumes tested with this release's execution database [^exec-disk].
 
 Cloud vCPUs are usually hyperthreads, so 8 vCPUs are 4 physical cores, and the minimum tier's 8 physical cores are a 16-vCPU instance.
 Compare physical cores when reading this table.
@@ -89,8 +94,8 @@ These do not change with the worker count:
   One engine executes one consensus output at a time on one blocking thread [^engine-single], and a header carries at most 10 batch digests in total, shared across the node's workers in round-robin order [^header-cap].
   More workers let a validator seal batches in parallel, and an output can carry more blocks than the benchmark's outputs did, but never more than the header cap allows.
 - The batch cache.
-  There is one cache environment per process, keyed by batch hash with no worker id [^cache-shared], so the [per-epoch ceiling](#per-epoch-batch-cache-ceiling) of about 260 TPS bounds the committee's batch data whatever the worker count.
-- Storage growth and network bandwidth, which follow committed batch bytes and so stay under the same ceiling.
+  There is one cache log per process, keyed by batch hash with no worker id [^cache-shared], so all workers share it.
+- Storage growth and network bandwidth, which follow committed batch bytes, so the tiers size them for the same planning load.
   Their tier figures are not doubled.
 
 The doubling is a provisioning margin, not a measurement.
@@ -101,7 +106,7 @@ Four workers need a multi-worker benchmark before this page can size them, and t
 ### Expected service life
 
 Storage is the resource that runs out.
-CPU and memory are sized for a load the release cannot reach.
+CPU and memory are sized for far more than the planning load.
 
 The table gives the time to fill each tier's capacity from the growth formula under [Storage](#storage), with idle growth included: about 8 GB a day at the 6-hour ceiling and 3.2 GB a day at 100 TPS of the benchmark mix.
 β_reth is a lower bound on growth, so these are the longest each capacity can be expected to last.
@@ -117,8 +122,8 @@ The DWPD ratings in the summary are twice the write rate modelled at the ceiling
 
 CPU and memory are not expected to be the limit in any tier.
 The minimum tier is twice a host that carried 5,384 TPS, about twenty times the 6-hour ceiling, with its engine queue at 3 or below and memory pressure at zero.
-Two things could exhaust that margin: more workers than the doubling was sized for, or a release that raises the batch-cache ceiling toward the thousands of TPS the benchmark ran.
-A multi-worker benchmark is due before the worker count reaches four, and a ceiling change ships as a release, so this page will be re-derived before either matters.
+Two things could exhaust that margin: more workers than the doubling was sized for, or sustained load toward the thousands of TPS the benchmark ran, which the batch cache no longer caps (see [Per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling)).
+A multi-worker benchmark is due before the worker count reaches four, and this page will be re-derived before sustained load approaches the benchmark's.
 
 For a three-year hardware cycle, the recommended tier holds at loads up to about 100 TPS of the benchmark mix.
 At the ceiling its disk fills in about 16 months, so plan a storage upgrade then or start on the headroom tier.
@@ -143,6 +148,13 @@ The benchmark moved these provisional figures, before the multi-worker doubling:
 - The follower observer minimum fell from 4 to 2 physical cores and settled at 8 GB, with 16 GB recommended.
 
 Validator RAM (16 and 32 GB for one worker), storage capacity (2 and 4 TB) and network (200 Mbps and 1 Gbps) held.
+
+This release's execution database (tn-lmdb) then moved the validator disk IOPS, measured with the execution benchmark rather than the network benchmark [^exec-disk]:
+
+- The minimum disk rose from 10,000 to 20,000 sustained write IOPS. Its commits are bound by write IOPS on cloud block storage: at 4,500 IOPS one peak output's commit took 12.3 s, and at 10,000 IOPS a busy output took 964 ms, which left no margin.
+- The recommended disk changed from 20,000 IOPS to local NVMe, or 40,000 IOPS on cloud block storage.
+- The throughput floor rose to 800 MiB/s (about 840 MB/s) on both tiers, from 300 and 500 MB/s: at 20,000 IOPS, 300 MiB/s made a busy output 28% slower and a peak one 32% slower than 800 MiB/s did.
+- Capacity and endurance held.
 
 Earlier versions of this page asked validators for 16 cores / 32 threads, 128 GB of RAM and 4 to 7.5 TB of NVMe, and observers for 8 cores / 16 threads and 16 to 32 GB.
 Those figures were not derived from measurement.
@@ -236,8 +248,8 @@ M_out ≈ 2 · N · b_h · S_b · (k_q · I + k_exec)
 
 At the protocol maximum (N = 10, b_h = 10, S_b = 1 MB) one output could hold 200 MB, and 73 of them 14.6 GB.
 A second, lower limit applies.
-Replay never crosses an epoch boundary [^replay], and at loads up to the [per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling) an epoch's batch data fits in the 1 GiB batch cache.
-So at those loads replay holds at most about 1 GiB of batch data, times k_q, on top of the execution working set.
+Replay never crosses an epoch boundary [^replay], so it holds at most one epoch's batch data.
+At the tiers' planning load, the [per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling) with 6-hour epochs, that is about 1 GiB of batch data, times k_q, on top of the execution working set.
 
 The benchmark could not separate k_q and k_exec from the rest of resident memory.
 Its consensus outputs averaged 1.0 to 1.25 MB of batch data and never exceeded 5.5 MB (`prometheus.tn_primary_consensus_output_bytes`), so even a full 73-output backlog held under 0.4 GB of batch data, too little to isolate.
@@ -250,6 +262,8 @@ PC_hot shows in disk reads.
 The c3 validators held 2.1 to 3.1 GB of file-backed pages and read almost nothing from disk (5 IOPS at p95).
 The e2 validators held 1.7 to 1.8 GB, and five of the ten read 1,800 to 3,000 IOPS at p95, most likely page-cache misses.
 So PC_hot is about 3 GB at the benchmark's chain size, and it grows with state.
+
+Every node also keeps an execution cache of at most about 260 MiB, which the model above does not count: about 160 MiB of fixed tables plus the code of up to 4,096 contracts ([Execution database: disk and memory](execution-database-hardware.md#memory)).
 
 Disable swap.
 A swapping validator keeps running but executes slowly, and because votes wait on execution it drags on the committee instead of failing visibly.
@@ -266,10 +280,11 @@ Plan capacity from the growth formula, not from the size of the chain today.
 | --- | --- | --- |
 | `db`, `static_files` | Execution database and static files | β_reth per transaction |
 | `consensus-db/epochs` | Consensus packs: committed outputs with their batches, one directory per epoch | β_pack per transaction |
-| `consensus-db/cache` | Batch cache | Fixed 1 GiB maximum, reused each epoch |
-| `consensus-db/epoch` | Current epoch's consensus tables | Fixed 512 MiB maximum, cleared each epoch |
+| `consensus-db/tndb/cache` | Batch cache (a tndb log) | Its uncommitted batches, plus removed ones until the next compaction (see [Per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling)) |
+| `consensus-db/tndb/epoch` | Current epoch's consensus tables (a tndb log) | Grows through the epoch and resets when it closes: 212 MB measured 28,800 rounds into an epoch at 10 validators [^epoch-log] |
+| `consensus-db/tndb/kad` | Peer records (a tndb log) | Small |
 
-Paths are set in `crates/config` [^datadir], and the two fixed maximum sizes in `crates/storage` [^cache-max].
+Paths are set in `crates/config` [^datadir] and `crates/storage` [^tndb-layout].
 
 Daily growth is:
 
@@ -286,10 +301,13 @@ Together the β values are about 345 bytes per transaction.
 Both are measured on the benchmark mix, whose average transaction is about 190 bytes in a batch (188 on c3, about 190 on e2) [^b-txbytes].
 Both fleets agree to within 3%.
 β_reth is a lower bound because the execution database file `db/mdbx.dat` kept the same 4.3 GB size from node start to teardown in every run: MDBX allocates that file in large steps, so growth inside it did not show, and only static-file growth was counted.
+These runs predate this release's execution database: it runs on tn-lmdb (`db/tn-lmdb.dat`, which grows in steps of at most 1 GiB, `--db.growth-step`, and gives back its unused tail at a clean close), and a new datadir uses reth's storage layout v2, which moves change sets and transaction senders out of the database into static files.
+β_reth has not been measured on that combination yet.
 The [storage growth planning](#storage-growth-planning) table applies the formula to other loads.
 
 Execution reads state on its single thread, so random-read latency adds directly to execution time.
-The consensus database also syncs to disk on every commit in production builds [^mdbx-durable].
+The consensus database also syncs to disk before every vote, header or certificate leaves the node [^tndb-durable].
+It commits in groups: one sync covers every write made before it starts, and `persist` returns once every write before it is durable, so writes that arrive together share a sync.
 
 Disk demand at p95 on the busiest validator was [^b-disk]:
 
@@ -302,19 +320,29 @@ c3 wrote more bytes in fewer, larger IOs, and its extra memory kept reads in pag
 Disk was the tightest resource in both fleets.
 On e2, write IOPS ran at 57% to 62% of the volume's 9,000 IOPS limit, and IO pressure was the highest pressure signal on every node.
 On c3, every validator's p95 write rate sat between 181 and 190 MB/s, about 75% of the 240 MiB/s per-VM cap, and IO pressure was around 50% at p95, so the volume was the tightest resource on c3 as well.
-Size sustained IOPS from these p95 figures and write throughput from the c3 plateau, with the same 2x margin as the recommended tier: 2 × (2,990 + 5,120) is 16,220 IOPS, so the recommended tier asks for 20,000, and twice the c3 plateau is 380 MB/s, so it asks for 500.
+On the previous execution database (MDBX), sizing write throughput from the c3 plateau with the same 2x margin as the recommended tier gave twice 190, 380 MB/s, and the recommended tier asked for 500. This release's execution database sets both tiers' floor at 800 MiB/s, measured [^exec-disk].
+On the previous execution database (MDBX), the same margin on these p95 IOPS figures gave 2 × (2,990 + 5,120) = 16,220 IOPS, and the tiers asked for 10,000 and 20,000.
+This release's execution database needs more: each consensus output ends in one durable commit whose time on cloud block storage is set by the disk's IOPS limit, so the minimum asks for 20,000 sustained write IOPS and the recommended tier for local NVMe or 40,000 IOPS [^exec-disk].
 Quote sustained figures, not burst.
 Endurance is covered under [Storage: TLC over QLC](#storage-tlc-over-qlc).
+This release's execution database commits are bound by write IOPS on cloud disks: [Execution database: disk and memory](execution-database-hardware.md) gives their measured commit times and the `--db.gap-fill` setting.
 
 #### Per-epoch batch-cache ceiling
 
-Every batch a validator creates or receives is written to the batch cache in `consensus-db/cache` [^cache-tables].
-The cache is an MDBX environment with a fixed 1 GiB maximum [^cache-max], and batches leave it only when the epoch closes [^cache-clear].
-The batch data produced by the whole committee in one epoch must therefore fit in about 1 GiB to stay on disk, whatever hardware the node has.
+Every batch a validator creates or receives is written to the batch cache in `consensus-db/tndb/cache` [^cache-tables].
+A batch leaves it when the consensus output that commits it, already saved to the epoch's pack, is forwarded to execution, and a batch that is never committed leaves when the epoch closes [^cache-clear].
+The validator's own uncommitted batches are the exception: they stay until the next epoch starts, which resubmits their transactions and then removes them.
+So the cache holds batches waiting to be committed and those that never will be, not the epoch's committed batch data.
 
+The cache is a tndb log with no fixed maximum [^cache-compact].
+A removal appends a record, and the log compacts in the background once it is at least 256 MiB and twice its length after the last compaction: the batches still live are rewritten into a new file, and the old one is deleted.
+So between compactions its log holds the live batches plus removed ones, up to the larger of 256 MiB and twice the live data at the last compaction.
+Each file also keeps up to 128 MiB of preallocated space, and a running compaction briefly holds a second copy of the live batches.
+
+Releases before tndb kept the cache in an MDBX file with a fixed 1 GiB maximum [^cache-max].
 Mainnet and testnet run 6-hour epochs [^epoch-mainnet].
 New genesis files default to 8 hours unless `--epoch-duration-in-secs` is set [^epoch-default].
-Dividing 1 GiB by the epoch length gives the ceiling:
+Dividing that 1 GiB by the epoch length gave a ceiling on the rate at which batches could be left uncommitted over an epoch, and the tiers keep its 6-hour value as their planning load:
 
 | Epoch length | Batch bytes per second | TPS at 110 B | TPS at 188 to 192 B (benchmark mix, measured) | TPS at 250 B | TPS at 400 B |
 | --- | --- | --- | --- | --- | --- |
@@ -325,30 +353,30 @@ Dividing 1 GiB by the epoch length gives the ceiling:
 
 The 110, 250 and 400 B columns count raw transaction bytes.
 The benchmark measured about 190 B of batch data per transaction for its mix, which includes batch encoding [^b-txbytes].
-At that size the 6-hour ceiling is about 260 TPS (259 to 264); an 8-hour epoch would allow about 200.
-These are still upper bounds, because MDBX page overhead inside the cache is not included.
+At that size the 6-hour figure is about 260 TPS (259 to 264), and an 8-hour epoch gives about 200.
+tndb removes the limit itself: uncommitted batch data takes more disk until it is committed or the epoch closes, and nothing caps the rate.
 
-Reaching the ceiling does not stop the node, but it moves new batches into memory.
-The node reaches the cache through a layered database: an insert writes the batch to an in-memory layer, returns, and leaves the MDBX write to a background thread, which drops the in-memory copy once the write succeeds [^seal-fatal].
-When the MDBX file is full the write fails, and the background thread logs an error that starts `DB Insert node_batches_cache` (target `layered_db_runner`), sets a failure flag and keeps the batch in memory.
-Only a durability check (`persist`) reads that flag, and the worker never makes one, so it keeps sealing batches.
-From then until the epoch closes the node holds every new batch in RAM, and resident memory climbs with the committee's batch volume.
-No metric reports this, so alert on the log line (see [Capacity monitoring](validator-operations.md#capacity-monitoring)).
-The worker's `FatalDBFailure` error fires only when the insert call itself fails, for example because the database thread has gone.
-More hardware does not raise the ceiling because the size is a compiled-in constant.
-A release with a larger cache or a shorter epoch length does.
+A batch write the disk cannot take fails at once and is taken back; the batch is not kept in memory instead [^tndb-write-fail].
+The worker's seal then returns `FatalDBFailure` for that batch.
+Log growth preallocates its disk blocks, so on ext4 or xfs a full disk surfaces as a write error, not a crash (see [Operating system](#operating-system)), and a compaction gives way while less than 256 MiB is free.
+A failed sync stops that database: every later write fails until the node restarts, and `tn_storage_tndb_failed` reads 1.
+Alert on it and on compaction abandons (see [Capacity monitoring](validator-operations.md#capacity-monitoring)).
 
-The ceiling also caps chain growth.
-At 6-hour epochs a committee can carry at most about 4.3 GB of batch data per day, 1.57 TB per year.
+The tiers use the 6-hour figure as their planning load for chain growth; no release enforces it.
+At that load a committee carries about 4.3 GB of batch data per day, 1.57 TB per year.
 Disk growth is that amount times m = (β_reth + β_pack) / 190 B, which is about 1.8 on the benchmark mix, plus G_idle.
 That gives about 7.8 GB a day, or with G_idle about 2.9 TB a year and 8.8 TB over three years (lower bounds, because β_reth is).
-m is close to 1.8 for transfer-heavy and contract-heavy loads too, so this bound holds whatever the mix.
+m is close to 1.8 for transfer-heavy and contract-heavy loads too, so this figure holds whatever the mix.
 The recommended and headroom tiers use it.
+A committee that sustains more batch data fills disks sooner (see [Storage growth planning](#storage-growth-planning)).
 
-At 20-minute epochs the ceiling is in the thousands of TPS, so a benchmark with short epochs measures hardware limits, not this ceiling.
-The benchmark stayed below its own 20-minute ceiling: its epochs carried about 0.52 to 0.55 GB of batch data on average, and no node logged a batch-cache insert failure.
-The cache file still reached its 1 GiB maximum on every c3 validator and on four of the ten e2 validators (the other six stopped at 960 MiB), because MDBX never shrinks the file.
-File size is a high-water mark, not live occupancy (see [Capacity monitoring](validator-operations.md#capacity-monitoring)).
+The 2026-09 benchmarks ran on MDBX, before tndb.
+At 20-minute epochs the MDBX ceiling was in the thousands of TPS, so a benchmark with short epochs measured hardware limits, not this ceiling.
+The benchmark stayed below its own 20-minute ceiling: its epochs carried about 0.52 to 0.55 GB of batch data on average.
+The cache file still reached its 1 GiB maximum on every c3 validator and on four of the ten e2 validators (the other six stopped at 960 MiB), because MDBX never shrinks the file [^cache-max].
+A re-run on 2026-09-29 (r20260929-1647) with faster disks raised throughput enough to fill the cache inside a 20-minute epoch: every validator logged `DB Insert node_batches_cache: environment map size limit reached` in the last minutes of two epochs.
+Both runs used a release that kept every batch until the epoch closed.
+tndb has neither the maximum nor the high-water mark: the cache's files shrink back to the live batches at each compaction.
 
 ### Networking
 
@@ -391,7 +419,10 @@ Supported: Linux LTS releases (Debian 11+, Ubuntu 20.04+, Red Hat Enterprise Lin
 Use a kernel with pressure stall information (mainline 4.20 or later) so the checks in [Capacity monitoring](validator-operations.md#capacity-monitoring) work.
 
 - Disable swap (see [Memory](#memory)).
-- Run time sync (chrony or systemd-timesyncd). A node rejects a header timestamped more than 1 s ahead of its own clock and waits out any smaller difference before voting [^drift]. Clock error of 1 s makes a validator reject honest headers or have its own rejected, and smaller errors delay its votes.
+- Put the datadir on ext4 or xfs, the default filesystems of the supported distributions. As its storage files grow, the node reserves real disk blocks for them with `fallocate`, so a full disk fails a write with an error and the node stops cleanly. On a filesystem without `fallocate` (ext2, ext3, NFS, many FUSE filesystems) growth falls back to sparse files, and a full disk can instead crash the node with SIGBUS. Copy-on-write filesystems (btrfs, ZFS) accept `fallocate` but do not guarantee the space for a later write. Data the node had already synced is kept either way.
+- Leave the node's virtual address-space limit unlimited, the default. The consensus database reserves address space, not RAM or disk: 16 GiB for each of its three logs and 1 GiB for each of its 14 table indexes, about 62 GiB, and up to about 23 GiB more for each compaction that runs [^tndb-reserve] (the three logs compact independently, so up to about 62 GiB more when all three compact at once). Under a lower limit (`ulimit -v`, systemd `LimitAS=`, a container's `--ulimit as`) the node logs `could not reserve ... bytes of address space` and maps each file at its length instead, which takes more address space as the files grow. Under a tight limit a later write then fails, `tn_storage_tndb_failed` reads 1, and the node stops.
+- On bare metal, turn off CPU and NVMe power saving. A validator writes and syncs each consensus output before execution sees it, then idles until the next one, so with power saving on, the CPU and drive wake from low-power states for every output. Set the CPU frequency governor to `performance` (`cpupower frequency-set -g performance`, or a `tuned` profile such as `latency-performance`, so it lasts across reboots). Disable NVMe autonomous power state transitions (APST) with the kernel parameter `nvme_core.default_ps_max_latency_us=0`. On a test machine this cut the wait before execution from 18.4 ms to 6.6 ms per output [^power]. On cloud VMs the provider usually controls both, and the guest cannot change them. Check with `cpupower frequency-info` and `nvme get-feature /dev/nvme0 -f 0x0c -H`.
+- Run time sync (chrony or systemd-timesyncd). A validator waits out a header timestamped up to `max_header_time_drift_tolerance` ahead of its own clock before voting: 250 ms by default, 1 s in a data directory first started by a binary from before sub-second timestamps, and rounded up to whole seconds in epochs before the sub-second timestamp fork. A header further ahead gets no vote yet and costs its proposer nothing, and the proposer retries; only a header more than the tolerance plus `vote_timeout` ahead (5.25 s at the defaults) is rejected without a score penalty [^drift]. Clock error within the tolerance delays votes by up to that error. Error beyond it holds back a validator's votes on honest headers, or other validators' votes on its own headers, until the difference shrinks, and error beyond the tolerance plus `vote_timeout` makes a validator reject honest headers or have its own rejected.
 
 Email support@telcoin.org to confirm hardware specifications before purchasing any equipment.
 
@@ -439,15 +470,16 @@ The `--rpc-cache.*` flags bound it [^rpc-cache]:
 
 | Flag | Default | Holds |
 | --- | --- | --- |
-| `--rpc-cache.max-blocks` | 5000 | Full blocks |
-| `--rpc-cache.max-receipts` | 2000 | Receipts, per block |
+| `--rpc-cache.max-blocks` | 1000 | Full blocks |
+| `--rpc-cache.max-receipts` | 500 | Receipts, per block |
 | `--rpc-cache.max-headers` | 1000 | Headers |
 | `--rpc-cache.max-concurrent-db-requests` | 512 | Concurrent database reads behind the cache |
 | `--rpc-cache.max-cached-tx-hashes` | 30000 | Transaction hash lookups |
 
 The block, receipt and header limits count entries, not bytes.
-Each block comes from one batch [^block-per-batch], and a batch can be up to 1 MB, so 5000 cached blocks can hold up to 5 GB of transaction data before decoding overhead.
-At the benchmark's average batch of about 64 KB, the same 5000 blocks hold about 0.3 GB.
+Each block comes from one batch [^block-per-batch], and a batch can be up to 1 MB, so 1000 cached blocks can hold up to 1 GB of transaction data before decoding overhead.
+At the benchmark's average batch of about 64 KB, the same 1000 blocks hold about 64 MB.
+Earlier releases defaulted to 5000 blocks and 2000 blocks' receipts, up to 5 GB of blocks.
 If resident memory grows with RPC load, lower `--rpc-cache.max-blocks` first.
 Disable swap on observers too.
 
@@ -455,8 +487,7 @@ Disable swap on observers too.
 
 An observer stores the same execution database and consensus packs as a validator, so use the same capacity, IOPS and endurance figures.
 In the benchmark the observer wrote 64 MB/s (e2) and 174 MB/s (c3) at p95, at 4,770 and 1,790 write IOPS [^b-obs-disk].
-It does not write batches into the batch cache from gossip, and its cache file reached only 64 to 192 MiB against 1 GiB on validators.
-The per-epoch ceiling still limits the chain it follows.
+It does not write batches into the batch cache from gossip; in the 2026-09 benchmark (on MDBX) its cache file reached only 64 to 192 MiB against 1 GiB on validators.
 
 ### Networking
 
@@ -495,8 +526,7 @@ Every disk figure is a lower bound, because β_reth is.
 | 1000 TPS | Contract-heavy | About 250 B | 38.8 GB | 14.1 TB | 42.4 TB | No |
 
 The last column compares the batch bytes per transaction with the 6-hour ceiling of 49,710 batch bytes per second.
-Rows marked "No" need a release with a larger batch cache or shorter epochs before the network can carry them.
-They are listed so operators can plan hardware for that release.
+Rows marked "No" are above the planning load the tiers are sized for, so at those loads disks fill sooner than [Expected service life](#expected-service-life) says.
 
 Worked example for 100 TPS of the benchmark mix over one year, with idle growth:
 
@@ -537,7 +567,7 @@ That is 0.37 DWPD on a 2 TB drive and 0.18 DWPD on a 4 TB drive, and 1,340 TB wr
 Compare TBW with the drive's rated endurance, and buy a drive rated for at least twice the computed DWPD.
 
 The benchmark's write rate at load was 137 MB/s (e2) and 190 MB/s (c3) at p95 [^b-disk].
-At 190 MB/s a drive takes 16.4 TB a day, 4.1 DWPD on a 4 TB drive, but the release cannot sustain that load with 6-hour epochs.
+At 190 MB/s a drive takes 16.4 TB a day, 4.1 DWPD on a 4 TB drive, but the ratings below are sized for the planning load, not for the benchmark's load.
 Per landed transaction, the node process wrote 23 to 46 KB on e2 validators and 61 to 71 KB on c3 validators, about 70 to 200 times what the data directory grew [^b-writes].
 At the 6-hour ceiling of about 260 TPS that is 6 to 19 MB/s on top of the idle 4 to 9 MB/s, about 0.9 to 2.4 TB a day.
 That is 0.2 to 0.6 DWPD on a 4 TB drive and 0.4 to 1.2 DWPD on a 2 TB drive (modelled).
@@ -569,7 +599,7 @@ The benchmark measured β_reth, β_pack, PC_hot and cache bytes per transaction,
 | Epoch length | 20 minutes, so the mixed phase crosses about two epoch boundaries |
 | Fleets | e2-custom-4-8192 (4 vCPU, 8 GB), run r20260923-0708; c3-highcpu-8 (8 vCPU, 16 GB), run r20260923-0515 |
 | Disk | 100 GB pd-ssd boot disk per node |
-| Node image | `us-docker.pkg.dev/telcoin-network/tn-public/adiri:v0.1.0-devnet` |
+| Node image | Internal `v0.1.0-devnet` build from `etc/Dockerfile`, not a published release |
 | Load generator | tn-transaction-generator, image `blast-v2-3644adc` |
 | Report | [Benchmark report](https://claude.ai/artifact/6qpBKmd3eKNaRBuxUtPPCR); committed copy `bench/reports/2026-09-bench-10v.html` in tn-transaction-generator |
 
@@ -595,7 +625,7 @@ Limits of the benchmark:
 - Egress includes JSON-RPC traffic to the in-zone load generators (see [Networking](#networking)).
 - β_reth misses growth inside the execution database file (see [Storage](#storage)).
 - In the e2 run, bench-validator-03 in australia-southeast1 fell behind at 08:15Z and ran as a follower for 53 minutes. Its worker could not report one batch and re-sealed it 1,457 times, and the node's process never restarted. Consensus stayed live with 9 batch producers. The failure is tracked separately.
-- In the c3 run, bench-validator-05, restarted after the 5-minute kill, had not resumed execution when the run ended 30 minutes later. Its static files did not grow and it reported no execution or batch metrics after the restart, so the c3 run had 9 executing validators from the kill at 06:20Z and gives no replay figure. This also needs its own investigation.
+- In the c3 run, bench-validator-05, restarted after the 5-minute kill, had not resumed execution when the run ended 30 minutes later. Its static files did not grow and it reported no execution or batch metrics after the restart, so the c3 run had 9 executing validators from the kill at 06:20Z and gives no replay figure. The investigation and missing capture are tracked in [issue #1510](https://github.com/Telcoin-Association/telcoin-network/issues/1510).
 - An earlier e2 run, r20260923-0215, is superseded. A load-generator bug re-sent pending transactions, so about a third of its batch content was duplicates (1.33 executed transactions per landed transaction). No sizing figure on this page comes from it.
 
 ### Networks running today
@@ -613,13 +643,14 @@ The node's idle footprint fits in 8 GB, and it writes several MB/s to disk even 
 
 | Figure | Source | Confidence |
 | --- | --- | --- |
-| Code constants (1 GiB batch cache, 64 + 8 output queue, 10 batches per header, 1 MB batch, 6 h mainnet epoch, 8 h CLI default) | Code | Exact for this release |
-| Batch-cache TPS ceiling | Constants and the measured 190 B per transaction | Modelled from a measured input; MDBX page overhead not included |
+| Code constants (64 + 8 output queue, 10 batches per header, 1 MB batch, 6 h mainnet epoch, 8 h CLI default, 256 MiB cache compaction threshold) | Code | Exact for this release |
+| Batch-cache TPS ceiling (the planning load) | The 1 GiB MDBX cache of earlier releases and the measured 190 B per transaction | Modelled from a measured input; a planning figure, not a limit of this release |
 | CPU, RAM, disk and network use at benchmark load | Benchmark, both fleets | Measured |
 | Single-worker minimum and recommended CPU and RAM | Benchmark and the tier rules | Measured |
 | Validator CPU and RAM tiers in the summary | Twice the single-worker figures | Modelled margin for the multi-worker rollout, not measured |
 | PassMark floor | Judgement; CPU scores were not recorded | Modelled |
-| Disk and network figures in every tier | Measured demand plus the tier margins | Modelled from measured demand |
+| Disk and network figures in every tier, except validator IOPS | Measured demand plus the tier margins | Modelled from measured demand |
+| Validator disk IOPS, minimum and recommended | Execution benchmark on cloud volumes of 4,500 to 40,000 IOPS, storage layout v2 (a migrated datadir stays on v1, which needs more) | Measured |
 | Replay memory peak | Benchmark, one e2 validator, one restart | Measured, single sample |
 | β_reth, β_pack | Benchmark mixed phase | Measured lower bounds for the benchmark mix |
 | PC_hot, M_base | On-node sampler | Measured proxies |
@@ -636,70 +667,76 @@ The node's idle footprint fits in 8 GB, and it writes several MB/s to disk even 
 ## Sources and code references
 
 Notes whose names start with `b-` cite the benchmark: the run, and the field in that run's `sizing.json` unless another file is named.
-`doubling` states the multi-worker rule, and the rest cite code.
+`exec-disk` cites the execution benchmark, `doubling` states the multi-worker rule, and the rest cite code.
 
 [^b-val-cpu-min]: Measured, r20260923-0708 (e2) and r20260923-0515 (c3). `gcp_by_role.validator.cpu_utilization`: e2 validators ran 44% mean (`mean_avg_nodes`), 55% p95 (`p95_max_node`) and 66% max of 4 vCPU; c3 validators ran 13%, 25% and 36% of 8 vCPU. `prometheus.tn_engine_queued_outputs`: every e2 validator reached 7 or 8 queued outputs, against a limit of 8, while no c3 validator passed 3. `prometheus.tn_batch_builder_pending_pool_transactions`: seven e2 pools peaked at 9,480 to 9,850 transactions, near the default limit of 10,000. The 2-core e2 hosts were execution-bound, so they fail the minimum rule; the 4-core c3 hosts pass it on CPU. The single-worker minimum is therefore 4 physical cores, and the summary doubles it to 8.
 [^b-val-ram-min]: Measured, r20260923-0708 and r20260923-0515. e2 (8 GB): `gcp_by_role.validator.memory_percent_used.p95_max_node` 81%, `telcoin_rss_bytes.p95_max_node` 7.15 GB, `sampler_by_node.*.psi_mem_some_avg10.run_max` 0.9 to 4%, replay peak 7.0 GB. c3 (16 GB): 52%, 10.8 GB, PSI memory 0. 8 GB left no room for the replay peak, so the single-worker minimum is 16 GB, and the summary doubles it to 32 GB.
-[^b-val-disk-min]: Modelled from measured demand. The minimum takes twice the e2 p95 write IOPS (5,120, `gcp_by_role.validator.disk_write_ops_per_sec.p95_max_node`) and sets throughput above the c3 plateau of 190 MB/s (`disk_write_bytes_per_sec.p95_max_node`), because both fleets' 100 GB volumes showed IO stalls. 2 TB holds about 8 months of growth at the 6-hour ceiling (about 8 GB a day with idle growth). 2.4 DWPD is twice the modelled 0.4 to 1.2 DWPD at the ceiling (see [Endurance](#endurance-from-the-measured-write-rate)).
+[^b-val-disk-min]: Modelled from measured demand, except IOPS and throughput. The IOPS figure is measured on this release's execution database (see the `exec-disk` note); on the previous one (MDBX) the network benchmark's demand set it at 10,000, twice the e2 p95 write IOPS (5,120, `gcp_by_role.validator.disk_write_ops_per_sec.p95_max_node`). The throughput floor is measured too: at 20,000 IOPS, 300 MiB/s made a busy output 28% slower and a peak one 32% slower than 800 MiB/s (see the `exec-disk` note), and a peak commit writes about 300 MiB. On MDBX it was set above the c3 plateau of 190 MB/s (`disk_write_bytes_per_sec.p95_max_node`), because both fleets' 100 GB volumes showed IO stalls. 2 TB holds about 8 months of growth at the 6-hour ceiling (about 8 GB a day with idle growth). 2.4 DWPD is twice the modelled 0.4 to 1.2 DWPD at the ceiling (see [Endurance](#endurance-from-the-measured-write-rate)).
 [^b-net]: Measured demand, r20260923-0708 and r20260923-0515, `gcp_by_role.validator.network_sent_bytes_per_sec.p95_max_node` and `network_received_bytes_per_sec.p95_max_node`: out 56 Mbps (e2) and 86 Mbps (c3), in 24 and 21 Mbps. 200 Mbps symmetric clears the measured p95 with room for catch-up. 1 Gbps keeps p95 under a tenth of capacity and leaves room for catch-up and serving epoch packs, which the benchmark did not measure. Egress includes RPC traffic to the load generator.
 [^b-val-cpu-rec]: Cores measured, r20260923-0515: 25% p95 and 36% max of 8 vCPU (`gcp_by_role.validator.cpu_utilization`) on 4 physical cores, under the half-capacity line, with the engine queue at 3 or below, so the single-worker recommended figure is 4 physical cores; the summary's 16 is twice the doubled minimum. The PassMark figure is modelled: the benchmark did not record CPU models or scores, and 3,500 is a floor chosen for single-thread speed, not a measurement.
 [^b-val-ram-rec]: Measured, r20260923-0515: 16 GB ran at 52% p95 (`gcp_by_role.validator.memory_percent_used.p95_max_node`), just over half of capacity, so the single-worker recommended figure is 32 GB; the summary's 64 GB is twice the doubled minimum.
-[^b-val-disk-rec]: Modelled from measured demand. 20,000 sustained IOPS is above twice the e2 p95 read plus write IOPS (2 × (2,990 + 5,120) = 16,220; `disk_read_ops_per_sec.p95_max_node`, `disk_write_ops_per_sec.p95_max_node`). 500 MB/s is above twice the c3 write plateau (380 MB/s). 4 TB covers one year at the 6-hour ceiling (2.9 TB) with room to spare. 1.2 DWPD is twice the modelled 0.2 to 0.6 DWPD at the ceiling.
-[^b-head]: Modelled. The highest sustained load this release carries is the 6-hour batch-cache ceiling, about 260 TPS, under a thirteenth of the e2 fleet's 3,569 TPS. The recommended CPU, memory and network cover that load, and replay at it holds at most 1 GiB of batch data. Headroom therefore adds storage (and, for public RPC observers, memory), not throughput.
+[^b-val-disk-rec]: Modelled from measured demand, except IOPS and throughput. Local NVMe was the fastest disk the execution benchmark measured with gap fill off and one state-root thread (it was not measured with the node's defaults), and on cloud block storage 40,000 IOPS cut the commit to about 160 ms of a busy output and 410 ms of a peak one (see the `exec-disk` note). On the previous execution database (MDBX) the network benchmark set it at 20,000, above twice the e2 p95 read plus write IOPS (2 × (2,990 + 5,120) = 16,220; `disk_read_ops_per_sec.p95_max_node`, `disk_write_ops_per_sec.p95_max_node`). Throughput: 800 MiB/s or more, the highest cloud figure measured (every 10,000 to 40,000 IOPS run but one 20,000 IOPS run at 300 MiB/s was at 800 MiB/s); on MDBX it was 500 MB/s, above twice the c3 write plateau (380 MB/s). 4 TB covers one year at the 6-hour ceiling (2.9 TB) with room to spare. 1.2 DWPD is twice the modelled 0.2 to 0.6 DWPD at the ceiling.
+[^b-head]: Modelled. Headroom is sized for the planning load, the 6-hour batch-cache ceiling of about 260 TPS, under a thirteenth of the e2 fleet's 3,569 TPS. The recommended CPU, memory and network cover that load, and replay at it holds at most about 1 GiB of batch data. Headroom therefore adds storage (and, for public RPC observers, memory), not throughput.
 [^b-head-disk]: Modelled: G_day = 86400 · λ · 345 B + G_idle at the ceiling is about 8 GB a day, 8.8 TB over three years (a lower bound). 12 TB holds that with about a third to spare.
 [^b-obs-min]: Measured, r20260923-0708, `gcp_by_role.observer`: the e2 observer (2 physical cores, 8 GB) used 22% mean and 27% p95 CPU, 38% of memory at p95 (3.7 GB resident), and peaked at 1% memory pressure. It fell behind at times (engine queue at 8) but caught up after its restart.
 [^b-obs-rec]: Measured, r20260923-0515, `gcp_by_role.observer`: the c3 observer (4 physical cores, 16 GB) used 13% CPU and 15% memory at p95 with its engine queue at 3 or below. The e2 shape already meets the half-capacity rule on CPU and memory, but its execution fell behind at times, so the recommended tier uses the c3 shape.
 [^b-obs-disk]: Measured demand, `gcp_by_role.observer.disk_write_bytes_per_sec.p95_max_node` and `disk_write_ops_per_sec.p95_max_node`: 64 MB/s at 4,770 IOPS (e2) and 174 MB/s at 1,790 IOPS (c3), the same order as a validator. An observer keeps the same archive data, so it uses the validator disk figures.
 [^b-obs-net]: Measured demand, `gcp_by_role.observer.network_received_bytes_per_sec.p95_max_node` and `network_sent_bytes_per_sec.p95_max_node`: 2.7 Mbps (e2) and 4.5 Mbps (c3) in, under 1 Mbps out. 50 Mbps is the provisional figure, kept because it is more than ten times the measured demand. Initial sync from genesis was not measured.
-[^b-rpc]: Modelled; the benchmark sent no RPC load to the observer. Minimum: the follower's recommended CPU, and the follower's 8 GB plus up to 5 GB for the default RPC caches (5000 blocks of up to 1 MB), rounded to 16 GB. Recommended 32 GB and headroom 64 GB leave room for concurrent RPC work and for raising the cache limits. The 8-core CPU figure is the provisional estimate, kept until RPC load is measured. Network is the follower's 50 Mbps plus RPC traffic.
+[^b-rpc]: Modelled; the benchmark sent no RPC load to the observer. Minimum: the follower's recommended CPU, and the follower's 8 GB plus up to 1 GB for the default RPC caches (1000 blocks of up to 1 MB), rounded to 16 GB. Recommended 32 GB and headroom 64 GB leave room for concurrent RPC work and for raising the cache limits. The 8-core CPU figure is the provisional estimate, kept until RPC load is measured. Network is the follower's 50 Mbps plus RPC traffic.
 [^b-mbase]: Measured, r20260923-0708 and r20260923-0515, sampler CSVs (`sampler/*.csv`, `rss_anon_kb`) in the idle window after funding and before load: 0.4 to 0.5 GB per validator, 0.3 GB before funding, 0.2 GB on the observer. The chain was new, so long-running nodes sit higher.
 [^b-pchot]: Measured proxy, `sampler_by_node.*.rss_file_kb.run_max` against `gcp_by_node.*.disk_read_ops_per_sec` (p95): c3 validators held 2.1 to 3.1 GB of file-backed pages and read at most 5 IOPS; e2 validators held 1.7 to 1.8 GB and five of ten read 1,800 to 3,000 IOPS.
 [^b-replay]: Measured, r20260923-0708, bench-validator-05 killed at 08:30:12Z and restarted at 08:35:11Z: `prometheus.reth_process_resident_memory_bytes` peaked at 6.9 GB and the sampler's `rss_total_kb` at 7.0 GB, with `tn_engine_queued_outputs` at 8. The validators that never stopped peaked at 7.2 GB (`telcoin_rss_bytes.max_max_node`).
 [^b-beta-reth]: Measured, `storage_growth.beta_reth_bytes_per_tx.median`: 251 (r20260923-0708) and 257 (r20260923-0515) bytes per landed transaction over the mixed window. `db/mdbx.dat` stayed at 4,295,995,405 bytes on every node in every run (sampler `db_bytes`), so this counts `static_files` growth only.
 [^b-beta-pack]: Measured, `storage_growth.beta_pack_bytes_per_tx.median`: 92 (r20260923-0708) and 94 (r20260923-0515). Packs for the open epoch are folded in at epoch close, so the figure is a lower bound when the window ends mid-epoch.
 [^b-txbytes]: Measured from Prometheus over each fleet's mixed window: batch bytes divided by batch transactions (`tn_worker_batch_size_bytes`, `tn_worker_batch_transactions`) is 188 B on c3 (r20260923-0515) and about 190 B on e2 (r20260923-0708), about 340 transactions and 63 to 65 KiB per batch. The e2 figure excludes bench-validator-03's re-sealed batches and is approximated from the histogram means. The superseded e2 run r20260923-0215 measured 192 B.
+[^exec-disk]: Measured with the execution benchmark, described in [Execution database: disk and memory](execution-database-hardware.md#disk): durable commits, storage layout v2, outputs back to back. With the node's defaults (gap fill `auto`, parallel state roots), on 2026-11-12 on a c3-highcpu-8 (16 GB) with the datadir on a Hyperdisk Balanced data disk at 800 MiB/s, mean of two runs (benchmark built from `6886de251` with the gap fill chooser of `b3623540f`; the command is under [By provisioned IOPS](execution-database-hardware.md#by-provisioned-iops-with-the-nodes-defaults)), a busy output took 964 ms at 10,000 IOPS (commit 680 ms), 629 ms at 20,000 (339 ms) and 486 ms at 40,000 (157 ms), and a peak output 2,463, 1,964 and 1,670 ms (commits 1,310, 782 and 408 ms): 1.04, 1.59 and 2.06 busy outputs a second, and 0.41, 0.51 and 0.60 peak ones. 20,000 IOPS at 300 MiB/s, below the minimum tier's throughput, gave 807 ms busy and 2,598 ms peak. These ran on a development build: engine format 7, without the release's storage-root split (see that page). The curve is for layout v2: a datadir migrated from an earlier release stays on layout v1 until it is rebuilt, and v1's commits took 2.4 s against v2's 1.4 s per peak commit at 20,000 IOPS with gap fill off. Earlier runs with gap fill off and one state-root thread took 12.3 s per peak commit at 4,500 IOPS (c3-highmem-8) and 1.4 s at 20,000 IOPS, where the node wrote about 18,000 IOPS of about 5 KiB each during commits, and 2,682 ms per peak output and 685 ms per busy one on local NVMe (c3-standard-8-lssd).
 [^b-disk]: Measured, `gcp_by_role.validator.disk_*_per_sec.p95_max_node`: e2 2,990 read and 5,120 write IOPS (5,570 max) at 137 MB/s (145 max); c3 5 read and 2,440 write IOPS at 190 MB/s. IO pressure from `sampler_by_node.*.psi_io_some_avg10.run_max`. Volume limits from each run's `limits` section and the report.
 [^b-writes]: Measured, `sampler_by_node.*.growth_mixed.io_write_bytes` over the mixed window, divided by `storage_growth.chain_tx_in_window` and by the data directory's growth, excluding the restarted validator. The process write rate is `storage_growth.telcoin_process_write_bytes_per_sec`: 56 MB/s median on e2 and 163 MB/s on c3. The scaling to 260 TPS is modelled.
 [^doubling]: Modelled margin, not measured. The benchmark ran one worker per validator. The summary's validator minimum is twice the single-worker minimum and its recommended tier is twice that minimum, to cover the worker count governance is expected to raise over the next 12 months (see [Why validator CPU and memory are doubled](#why-validator-cpu-and-memory-are-doubled)). Storage, network and observer figures are not doubled.
 [^engine-single]: `crates/engine/src/lib.rs:66-68` (one pending execution task), `crates/engine/src/lib.rs:159` (execution on a blocking thread).
 [^ecrecover]: `crates/tn-reth/src/env/execution.rs:167-181`.
-[^rayon]: `crates/telcoin-network-cli/src/node.rs:218-226` (global pool size is available cores minus 2, at least 1).
+[^rayon]: `crates/telcoin-network-cli/src/node.rs:208-216` (global pool size is available cores minus 2, at least 1).
 [^batch-validator]: `crates/batch-validator/src/validator.rs:170`.
-[^vote-wait]: `crates/consensus/primary/src/network/handler.rs:787`.
-[^commit-wait]: `crates/consensus/primary/src/consensus/state.rs:501-502`.
-[^quorum]: `crates/types/src/committee.rs:1090-1091`.
-[^replay]: `crates/node/src/manager/node/start_epoch.rs:88-104` (replay loop; lines 89-97 refuse to cross an epoch boundary).
-[^gc]: `crates/types/src/primary/mod.rs:49` (`MAX_GC_DEPTH = 50`), `crates/config/src/node.rs:345-346` (default gc depth), `crates/storage/src/consensus_pack.rs:1587-1589` (batches per output bound).
-[^txpool]: `crates/tn-reth/src/cli.rs:88`; default from reth v1.11.3 `crates/transaction-pool/src/config.rs:18`.
-[^canon]: reth v1.11.3 `crates/chain-state/src/in_memory.rs:28`, used through `crates/tn-reth/src/env/helpers.rs:91-92`.
-[^rpc-cache]: `crates/tn-reth/src/rpc_server_args.rs:234-236`; defaults from reth v1.11.3 `crates/rpc/rpc-server-types/src/constants.rs:115-127`.
+[^vote-wait]: `crates/consensus/primary/src/network/handler.rs:911-914`.
+[^commit-wait]: `crates/consensus/primary/src/consensus/state.rs:584-585`.
+[^quorum]: `crates/types/src/committee.rs:1191-1192`.
+[^replay]: `crates/node/src/manager/node/start_epoch.rs:120-149` (replay loop; lines 121-129 refuse to cross an epoch boundary).
+[^gc]: `crates/types/src/primary/mod.rs:52` (`MAX_GC_DEPTH = 50`), `crates/config/src/node.rs:338-339` (default gc depth), `crates/storage/src/consensus_pack.rs:5311-5313` (`max_batches_per_output`: the batches-per-output bound).
+[^txpool]: `crates/tn-reth/src/cli.rs:89`; default from reth v1.11.3 `crates/transaction-pool/src/config.rs:18`.
+[^canon]: reth v1.11.3 `crates/chain-state/src/in_memory.rs:28`, used through `crates/tn-reth/src/env/helpers.rs:87-88`.
+[^rpc-cache]: `crates/tn-reth/src/rpc_server_args.rs:238-240`; defaults from reth v1.11.3 `crates/rpc/rpc-server-types/src/constants.rs:115-127`.
 [^leader]: `crates/consensus/primary/src/consensus/bullshark.rs:137-138` (even rounds), `crates/consensus/primary/src/consensus/bullshark.rs:201-212` (f+1 support from round r+1).
-[^max-batches]: `crates/types/src/primary/mod.rs:71` (`MAX_HEADER_NUM_OF_BATCHES = 10`).
-[^threshold]: `crates/config/src/node.rs:328-330` (proposal threshold 5).
-[^batch-limits]: `crates/types/src/worker/sealed_batch.rs:197-198` (30,000,000 gas), `crates/types/src/worker/sealed_batch.rs:208-209` (1,000,000 bytes), `crates/config/src/node.rs:357-358` (batch sealed after 1 s).
-[^to-engine]: `crates/node/src/manager/node.rs:81` (`TO_ENGINE_CAPACITY = 64`), `crates/node/src/manager/node.rs:838`.
+[^max-batches]: `crates/types/src/primary/mod.rs:96` (`MAX_HEADER_NUM_OF_BATCHES = 10`).
+[^threshold]: `crates/config/src/node.rs:317-319` (proposal threshold 5).
+[^batch-limits]: `crates/types/src/worker/sealed_batch.rs:211-212` (30,000,000 gas), `crates/types/src/worker/sealed_batch.rs:224-225` (1,000,000 bytes), `crates/config/src/node.rs:350-352` (batch sealed after 1 s).
+[^to-engine]: `crates/node/src/manager/node.rs:85` (`TO_ENGINE_CAPACITY = 64`), `crates/node/src/manager/node.rs:873`.
 [^engine-queue]: `crates/engine/src/lib.rs:52` (`MAX_QUEUED_OUTPUTS = 8`), `crates/engine/src/lib.rs:271`.
-[^archive]: `crates/tn-reth/src/cli.rs:517` (`ensure_archive_mode`).
-[^datadir]: `crates/config/src/traits.rs:148` (`consensus-db/epochs`), `crates/config/src/traits.rs:181` (`consensus-db`), `crates/config/src/traits.rs:185` (`db`).
-[^cache-max]: `crates/storage/src/lib.rs:161` (`EPOCH_MAX = 512 MB`), `crates/storage/src/lib.rs:163` (`CACHE_MAX = 1024 MB`), `crates/storage/src/lib.rs:170-175`, `crates/storage/src/mdbx/database.rs:165-171` (fixed maximum size; the file never shrinks).
-[^mdbx-durable]: `crates/storage/src/mdbx/database.rs:197-198`.
-[^cache-tables]: `crates/storage/src/lib.rs:109-114` (`TableHint::Cache` tables); writers at `crates/consensus/worker/src/network/handler.rs:265`, `crates/consensus/worker/src/network/handler.rs:297`, `crates/consensus/worker/src/batch_fetcher.rs:253`, `crates/consensus/worker/src/worker.rs:388`.
-[^cache-clear]: `crates/node/src/manager/node/close_epoch.rs:774`; see also `crates/state-sync/src/lib.rs:118-119`.
-[^epoch-mainnet]: `chain-configs/testnet/genesis.yaml:103` (ConsensusRegistry epoch-duration slot, `0x5460` = 21,600 s). Mainnet launches with the same 6-hour epochs; the mainnet genesis in this repository (`chain-configs/mainnet/genesis.yaml:99`) still encodes 86,400 s at the time of writing and is being regenerated. Epoch length is a genesis parameter (`--epoch-duration-in-secs`), not a node setting, so operators cannot change it.
+[^archive]: `crates/tn-reth/src/cli.rs:550` (`ensure_archive_mode`).
+[^datadir]: `crates/config/src/traits.rs:156` (`consensus-db/epochs`), `crates/config/src/traits.rs:189` (`consensus-db`), `crates/config/src/traits.rs:193` (`db`).
+[^cache-max]: Releases before tndb: the MDBX cache environment's fixed maximum (`PROD_CACHE_MAX = 1024 MB`) and the epoch environment's (`PROD_EPOCH_MAX = 512 MB`) in `crates/storage/src/mdbx/database.rs`, opened with `shrink_threshold: Some(0)` (the file never shrinks). tndb replaced it as the node's consensus database in 2026-10.
+[^cache-compact]: `crates/storage/src/tndb/split.rs:35` (`CACHE_AUTO_MIN_BYTES = 256 MiB` for the cache log) and `crates/storage/src/tndb/split.rs:58` (`env_options`), `crates/storage/src/tndb/store.rs:695` (`wants_compaction`: at least that long, at least twice its length after the last compaction, and holding a dead row), `crates/storage/src/tndb/compact.rs` (the module docs: only live rows are copied into the new generation, which replaces the old one), `crates/storage/src/tndb/README.md` (Compaction).
+[^tndb-durable]: `crates/storage/src/lib.rs:375-387` (`open_db`: tndb in group commit), `crates/storage/src/tndb/commit.rs:285-307` (`persist` resolves once the sync covering every earlier write is done), `crates/storage/src/tndb/README.md` (Durability).
+[^tndb-layout]: `crates/storage/src/tndb/mod.rs:34` (`TNDB_DIR`), `crates/storage/src/tndb/split.rs` (`ENVIRONMENTS`: `epoch`, `kad`, `cache`).
+[^tndb-reserve]: `crates/storage/src/tndb/store.rs` (`LOG_MAP_RESERVE`, 16 GiB per log), `crates/storage/src/archive/btree_index/index.rs` (`BTX_MAP_RESERVE`, 1 GiB per index), `crates/storage/src/lib.rs` (`mod tables`: 14 tables), `crates/storage/src/tndb/compact.rs` (`Builder`: a compaction opens a new log and indexes beside the old ones), `crates/storage/src/archive/data_file.rs` (`MmapDataFile`: the fallback when the reservation fails), `crates/storage/src/tndb/README.md` (Limits and choices).
+[^epoch-log]: Measured on Linux on 2026-10-13 in the tndb baseline run of `workload_startup_reload` (`crates/storage/src/workload_bench.rs`: a 10-validator committee 28,800 rounds into an epoch): 1,326,760 rows, 212.1 MB on disk. To reproduce it, run `BASELINE_ONLY=workload_startup_reload etc/storage-baseline-bench.sh <dir>` (see the script's usage notes). `crates/storage/src/tndb/split.rs:41` (`EPOCH_AUTO_MIN_BYTES`) and `crates/storage/src/tndb/store.rs:705` (`note_if_emptied`: the epoch-close clear empties every table and the log compacts at once).
+[^cache-tables]: `crates/storage/src/lib.rs:122-129` (`TableHint::Cache` tables); writers at `crates/consensus/worker/src/network/handler.rs:269`, `crates/consensus/worker/src/network/handler.rs:363`, `crates/consensus/worker/src/network/primary.rs:119`, `crates/consensus/worker/src/batch_fetcher.rs:253`, `crates/consensus/worker/src/worker.rs:355`, `crates/consensus/worker/src/worker.rs:421`.
+[^cache-clear]: `crates/node/src/manager/node/run_epoch.rs:668-684` and `crates/node/src/manager/node/run_epoch.rs:1235-1249` (`process_output` evicts the output's batches from `NodeBatchesCache` and `OurNodeBatchesCache` in one transaction before forwarding it; a failure is logged and not retried), `crates/consensus/executor/src/subscriber.rs:226-255`, `crates/consensus/executor/src/subscriber.rs:398-429`, `crates/consensus/executor/src/subscriber.rs:779-786` and `crates/state-sync/src/lib.rs:150-159` (each output is saved and persisted to the pack before it is sent on), `crates/node/src/manager/node/close_epoch.rs:985-996` (the epoch-close clear; it leaves `OurNodeBatchesCache` to `orphan_batches`, which resubmits the transactions of the node's own uncommitted batches when the next epoch starts and then removes them), `crates/consensus/worker/src/network/handler.rs:167-173` (late gossip for an evicted batch fetches and caches it again until the epoch closes).
+[^epoch-mainnet]: `chain-configs/mainnet/genesis.yaml:98` and `chain-configs/testnet/genesis.yaml:103` (ConsensusRegistry epoch-duration slot, `0x5460` = 21,600 s in both files). Epoch length is a genesis parameter (`--epoch-duration-in-secs`), not a node setting, so operators cannot change it.
 [^epoch-default]: `crates/telcoin-network-cli/src/genesis/mod.rs:93`.
-[^seal-fatal]: `crates/storage/src/composite_db.rs:35` (the cache database runs in cache mode, `full_memory = false`), `crates/storage/src/layered_db.rs:477-482` (insert writes the in-memory layer and queues the MDBX write), `crates/storage/src/layered_db.rs:257-289` (a failed MDBX write is logged at error level, latches `commit_failed` and keeps the in-memory copy), `crates/storage/src/layered_db.rs:320-335` and `crates/storage/src/layered_db.rs:557-575` (only the `persist` barrier reads the latch), `crates/consensus/worker/src/worker.rs:322-326` and `crates/consensus/worker/src/worker.rs:388-391` (`FatalDBFailure` only when the insert call returns an error).
+[^tndb-write-fail]: `crates/storage/src/tndb/store.rs` (`Core::write`: a batch that fails to append is rolled back and its error returned), `crates/consensus/worker/src/worker.rs:355-359` and `crates/consensus/worker/src/worker.rs:421-423` (`FatalDBFailure` when the insert returns an error), `crates/storage/src/archive/data_file.rs:1261-1272` (`grow_to` preallocates), `crates/storage/src/tndb/compact.rs:134-136` and `crates/storage/src/tndb/compact.rs:402-412` (a compaction gives way below 256 MiB free), `crates/storage/src/tndb/commit.rs:406` and `crates/storage/src/tndb/store.rs:444-455` (a failed sync latches, stopping writes until a restart), `crates/storage/src/tndb/metrics.rs:25` (`tn_storage_tndb_failed`).
 [^qw-fanout]: `crates/consensus/worker/src/quorum_waiter.rs:136-137`.
-[^header-delay]: `crates/config/src/node.rs:336-342` (2.5 s maximum, 1 s minimum).
-[^drift]: `crates/consensus/primary/src/network/handler.rs:889-915`, `crates/config/src/network.rs:360` (1 s tolerance).
-[^observer-role]: `crates/node/src/manager/node.rs:1047-1064`, `crates/telcoin-network-cli/src/node.rs:157-160`.
-[^forward]: `crates/consensus/worker/src/worker.rs:310-312`, `crates/consensus/worker/src/worker.rs:254-296`.
+[^header-delay]: `crates/config/src/node.rs:325-331` (2.5 s maximum, 1 s minimum).
+[^drift]: `crates/consensus/primary/src/network/handler.rs:767-829` (`check_header_lead`: a lead within the tolerance is passed on to be waited out at 777-787, a lead within the tolerance plus `vote_timeout` gets a retryable answer with no penalty at 788-816, and a larger lead is rejected at 817-828), `crates/consensus/primary/src/network/handler.rs:877-878` (a deferral is answered on arrival), `crates/consensus/primary/src/network/handler.rs:1019-1032` (the wait before voting), `penalty_from_header_error` in `crates/consensus/primary/src/error/network.rs` (no score penalty for relative clock skew), `crates/config/src/network.rs:736-737` (`max_header_time_drift_tolerance`), `crates/config/src/network.rs:774` (250 ms default), `crates/config/src/node.rs:333-335` (5 s `vote_timeout` default). The node writes its network config only when the file is missing (`crates/config/src/traits.rs:76-83`), so a data directory first started by an older binary keeps the `1` that binary wrote, read as 1 s. `crates/telcoin-network-cli/README.md`, section `max_header_time_drift_tolerance (network-config)`, shows how to check and change it.
+[^power]: Measured in October 2026 on a laptop with an Intel i7-1360P and an SK Hynix NVMe drive, on Linux 7.1 with ext4, using the consensus pack benchmark (`pack_bench::consensus_pack_workload` in `crates/storage/src/pack_bench.rs`; see the Benchmarks section of `crates/storage/README.md`). The run used a 10-validator committee, 2 consensus outputs a second, and 100 batches of 16 KB per output. With the default power settings, saving an output took 9.1 ms and syncing it 9.3 ms (p50), 18.4 ms together. With the `performance` governor and APST off, they took 4.2 ms and 2.3 ms, 6.6 ms together before rounding. Run back to back, with no idle time between outputs, they took 3.5 ms and 1.4 ms. Both settings were changed together, so their separate shares were not measured.
+[^observer-role]: `crates/node/src/manager/node.rs:984-987`, `crates/telcoin-network-cli/src/node.rs:347-358` (the `--observer` flag is removed and rejected).
+[^forward]: `crates/consensus/worker/src/worker.rs:337-339`, `crates/consensus/worker/src/worker.rs:281-323`.
 [^observer-gossip]: `crates/consensus/worker/src/network/handler.rs:138-144`.
-[^block-per-batch]: `crates/engine/src/payload_builder.rs:193-195`.
-[^workers-onchain]: `crates/node/src/manager/node.rs:479-500` (`read_num_workers_at_epoch_entry` reads `WorkerConfigs` at the block before the epoch's first block), `crates/tn-reth/src/env/epoch.rs:597-615` (the `getAllWorkerConfigs` system call), `crates/tn-reth/src/system_calls.rs:296-299` (the count is a `uint16`), `crates/types/src/committee.rs:978-979` (`number_of_workers`).
-[^workers-fork]: `crates/types/src/forks.rs:454` (`MULTI_WORKERS_FORK_EPOCH`, an adiri placeholder at the time of writing), `crates/types/src/forks.rs:452-453` (mainnet builds run the multi-worker layout from genesis), `crates/types/src/forks.rs:138` (the live adiri `WorkerConfigs` read `numWorkers() == 1` on 2026-08-18), `crates/node/src/manager/node.rs:111-124` (`check_worker_count_fork` rejects more than one worker before the fork).
-[^workers-per]: `crates/node/src/manager/node/start_epoch.rs:433-437` (one pool, RPC server, validator and network per on-chain worker, in id order), `crates/node/src/engine/inner.rs:155-182` (pool and RPC server), `crates/node/src/engine/inner.rs:248-258` (batch validator), `crates/node/src/manager/node/run_epoch.rs:381-397` (batch builder per worker).
-[^workers-pool]: `crates/tn-reth/src/txn_pool.rs:295` (each pool takes the full `txpool` config); the 20 MB per-subpool defaults are in [^txpool].
-[^workers-rpc]: `crates/tn-reth/src/env/rpc.rs:61` (`WORKER_PORT_STRIDE = 200`), `crates/tn-reth/src/env/rpc.rs:136-143` (worker 0 keeps the configured ports; worker k shifts its HTTP port down by 200·k and its WebSocket port up by 400·k).
-[^workers-swarm]: `crates/node/src/manager/node.rs:163-221` (`prepare_worker_networks` requires a distinct listen address and key per worker), `crates/node/src/manager/node.rs:1345-1380` (one long-running swarm per configured worker), `crates/node/src/manager/node/start_epoch.rs:871-872` (batch topic per worker).
-[^header-cap]: `crates/types/src/primary/header.rs:31` (the payload maps batch digest to worker id), `crates/types/src/primary/header.rs:137-149` (a header with more than `MAX_HEADER_NUM_OF_BATCHES` digests is rejected), `crates/consensus/primary/src/proposer.rs:699-732` (header slots are shared across workers round-robin, up to the cap in total).
-[^cache-shared]: `crates/node/src/manager/node.rs:690-703` (one consensus database per process, shared across epochs), `crates/storage/src/lib.rs:108-114` (cache tables keyed by batch hash only); the maximum size is in [^cache-max].
+[^block-per-batch]: `crates/engine/src/payload_builder.rs:194-196`.
+[^workers-onchain]: `crates/node/src/manager/node.rs:491-513` (`read_num_workers_at_epoch_entry` reads `WorkerConfigs` at the block before the epoch's first block), `crates/tn-reth/src/env/epoch.rs:597-615` (the `getAllWorkerConfigs` system call), `crates/tn-reth/src/system_calls.rs:296-299` (the count is a `uint16`), `crates/types/src/committee.rs:1078-1079` (`number_of_workers`).
+[^workers-fork]: `crates/types/src/forks.rs:504` (`MULTI_WORKERS_FORK_EPOCH`: adiri arms the fork at epoch 570), `crates/types/src/forks.rs:556-565` (mainnet builds run the multi-worker layout from genesis), `crates/types/src/forks.rs:138` (the live adiri `WorkerConfigs` read `numWorkers() == 1` on 2026-08-18), `crates/node/src/manager/node.rs:113-126` (`check_worker_count_fork` rejects more than one worker before the fork).
+[^workers-per]: `crates/node/src/manager/node/start_epoch.rs:589-609` (one pool, RPC server, validator and network per on-chain worker, in id order), `crates/node/src/engine/inner.rs:157-185` (pool and RPC server), `crates/node/src/engine/inner.rs:253-263` (batch validator), `crates/node/src/manager/node/run_epoch.rs:406-421` (batch builder per worker).
+[^workers-pool]: `crates/tn-reth/src/txn_pool.rs:315` (each pool takes the full `txpool` config); the 20 MB per-subpool defaults are in [^txpool].
+[^workers-rpc]: `crates/tn-reth/src/env/rpc.rs:67` (`WORKER_PORT_STRIDE = 200`), `crates/tn-reth/src/env/rpc.rs:142-148` (worker 0 keeps the configured ports; worker k shifts its HTTP port down by 200·k and its WebSocket port up by 400·k).
+[^workers-swarm]: `crates/node/src/manager/node.rs:173-236` (`prepare_worker_networks` requires a distinct listen address and key per worker), `crates/node/src/manager/node.rs:1667-1713` (one long-running swarm per configured worker), `crates/node/src/manager/node/start_epoch.rs:1071-1072` (batch topic per worker).
+[^header-cap]: `crates/types/src/primary/header.rs:34` (the payload maps batch digest to worker id), `crates/types/src/primary/header.rs:166-171` (a header with more than `MAX_HEADER_NUM_OF_BATCHES` digests is rejected), `crates/consensus/primary/src/proposer.rs:753-787` (header slots are shared across workers round-robin, up to the cap in total).
+[^cache-shared]: `crates/node/src/manager/node.rs:714-728` (one consensus database per process, shared across epochs), `crates/storage/src/lib.rs:122-126` (cache tables keyed by batch hash only); its compaction is in [^cache-compact].

@@ -1,0 +1,46 @@
+# Version updates for the actions the workflows use.
+#
+# The workflows pin every action to a full commit SHA, with the release in a trailing
+# comment (the pr.yaml header says why). A pin that nobody revisits goes stale:
+# Swatinem/rust-cache sat on a node20 release from January 2025 until this file was added.
+# Dependabot opens the bump as a pull request and rewrites the SHA and the version comment
+# together, which it does only while the comment is on the same line as the `uses:`.
+#
+# A Dependabot pull request is a pull request like any other. It changes .github/, so it
+# needs a code owner's review (.github/CODEOWNERS), and its head needs an attestation
+# (`make attest`) before `verify-on-chain` passes and it can be queued. Its workflow runs
+# get a read-only token and no secrets, which is all the pull-request workflows here use.
+# .github/ACTIONS.md ("Action pins") says what the reviewer checks.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # For this ecosystem `/` means .github/workflows (plus an action.yml at the root,
+    # which this repository does not have).
+    directory: /
+    schedule:
+      interval: weekly
+    # Dependabot proposes a release only once it is 7 days old, so one that is pulled or
+    # found to be compromised in its first days never reaches one of its pull requests. A
+    # pin set by hand skips this wait (.github/ACTIONS.md, "How a pin moves"). GitHub's
+    # own default is 3 days; the option accepts 1-90, and for this ecosystem only
+    # `default-days` is supported.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    # One pull request a week for every action but rust-cache. A pull request here cannot
+    # enter the merge queue until a maintainer has run the full local suite on its head
+    # commit and attested it (`make attest`), and taiki-e/install-action alone was
+    # released about five times a week in September 2026. One grouped pull request a week
+    # is one attestation a week.
+    groups:
+      actions:
+        patterns:
+          - "*"
+        # A rust-cache release can change how the cache key is computed, and the merge
+        # queue then builds cold from that pull request's own queue run until main has
+        # re-warmed. Excluded here, the bump arrives as a pull request of its own, so it
+        # is reviewed and timed on its own, without the other actions riding along. See
+        # "Caches" in .github/ACTIONS.md.
+        exclude-patterns:
+          - "Swatinem/rust-cache"

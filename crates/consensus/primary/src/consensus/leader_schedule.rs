@@ -173,6 +173,7 @@ impl LeaderSwapTable {
 
         good_nodes.iter().for_each(|good_node| {
             debug!(
+                target: "primary::leader_schedule",
                 "Good node on round {}: {} -> {}",
                 round,
                 good_node.id(),
@@ -185,6 +186,7 @@ impl LeaderSwapTable {
 
         bad_nodes.iter().for_each(|(_id, bad_node)| {
             debug!(
+                target: "primary::leader_schedule",
                 "Bad node on round {}: {} -> {}",
                 round,
                 bad_node.id(),
@@ -195,7 +197,10 @@ impl LeaderSwapTable {
             );
         });
 
-        debug!("Reputation scores on round {round}: {reputation_scores:?}");
+        debug!(
+            target: "primary::leader_schedule",
+            "Reputation scores on round {round}: {reputation_scores:?}"
+        );
 
         Self { round, good_nodes, bad_nodes }
     }
@@ -226,6 +231,7 @@ impl LeaderSwapTable {
                 .expect("There should be at least one good node available");
 
             trace!(
+                target: "primary::leader_schedule",
                 "Swapping bad leader {} -> {} for round {}",
                 leader,
                 good_node.id(),
@@ -281,7 +287,7 @@ impl LeaderSchedule {
     /// Atomically updates the leader swap table with the new provided one. Any leader queried from
     /// now on will get calculated according to this swap table until a new one is provided again.
     pub fn update_leader_swap_table(&self, table: LeaderSwapTable) {
-        trace!("Updating swap table {:?}", table);
+        trace!(target: "primary::leader_schedule", "Updating swap table {:?}", table);
 
         let mut write = self.leader_swap_table.write();
         *write = table;
@@ -291,6 +297,15 @@ impl LeaderSchedule {
     /// leader according to the provided LeaderSwapTable. Providing a different table can
     /// potentially produce a different leader for the same round.
     pub fn leader(&self, round: Round) -> Authority {
+        self.leader_with_swap(round).0
+    }
+
+    /// Returns the leader for the provided round and whether the leader swap table replaced the
+    /// round-robin authority with a good node.
+    ///
+    /// The returned authority is the one [`Self::leader`] returns; the flag only reports how it
+    /// was chosen, so observability callers can tell reputation swaps from the plain schedule.
+    pub(crate) fn leader_with_swap(&self, round: Round) -> (Authority, bool) {
         assert_eq!(round % 2, 0, "We should never attempt to do a leader election for odd rounds");
 
         // We apply round robin in leader election. Since we expect round to be an even number,
@@ -308,7 +323,10 @@ impl LeaderSchedule {
             .clone();
         let table = self.leader_swap_table.read();
 
-        table.swap(&leader.id(), round).unwrap_or(leader)
+        match table.swap(&leader.id(), round) {
+            Some(good_node) => (good_node, true),
+            None => (leader, false),
+        }
     }
 
     /// Returns the certificate originated by the leader of the specified round (if any). The
@@ -321,20 +339,75 @@ impl LeaderSchedule {
         round: Round,
         dag: &'a Dag,
     ) -> (Authority, Option<&'a Certificate>) {
+        let (leader, certificate, _swapped) = self.leader_certificate_with_swap(round, dag);
+        (leader, certificate)
+    }
+
+    /// Returns the leader of the specified round, its certificate if the DAG holds one, and
+    /// whether the leader swap table replaced the round-robin authority.
+    ///
+    /// The authority and certificate are the ones [`Self::leader_certificate`] returns.
+    pub(crate) fn leader_certificate_with_swap<'a>(
+        &self,
+        round: Round,
+        dag: &'a Dag,
+    ) -> (Authority, Option<&'a Certificate>, bool) {
         // Note: this function is often called with even rounds only. While we do not aim at random
         // selection yet (see issue https://github.com/MystenLabs/sui/issues/5182), repeated calls to this function
         // should still pick from the whole roster of leaders.
-        let leader = self.leader(round);
+        let (leader, swapped) = self.leader_with_swap(round);
 
         // Return its certificate and the certificate's digest.
         match dag.get(&round).and_then(|x| x.get(&leader.id())) {
-            None => (leader, None),
-            Some((_, certificate)) => (leader, Some(certificate)),
+            None => (leader, None, swapped),
+            Some((_, certificate)) => (leader, Some(certificate), swapped),
         }
     }
 
     pub fn num_of_bad_nodes(&self) -> usize {
         let read = self.leader_swap_table.read();
         read.bad_nodes.len()
+    }
+}
+
+#[cfg(test)]
+mod swap_flag_tests {
+    use super::*;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
+
+    /// `leader` returns the authority of `leader_with_swap`, and the swap flag is set exactly on
+    /// the rounds whose round-robin authority is a bad node.
+    #[test]
+    fn leader_matches_leader_with_swap() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let ids: Vec<AuthorityIdentifier> =
+            committee.authorities().iter().map(|authority| authority.id()).collect();
+
+        // spread scores make the lowest scored authority (position 0) the one bad node
+        let mut scores = ReputationScores::new(&committee);
+        scores.final_of_schedule = true;
+        for (score, id) in ids.iter().enumerate() {
+            scores.add_score(id, score as u64);
+        }
+        let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+        let schedule = LeaderSchedule::new(committee.clone(), table.clone());
+
+        let mut swaps = 0;
+        for round in (2..=64).step_by(2) {
+            let (leader, swapped) = schedule.leader_with_swap(round);
+            assert_eq!(schedule.leader(round).id(), leader.id());
+
+            let round_robin = &ids[(round as usize / 2 - 1) % ids.len()];
+            assert_eq!(swapped, table.swap(round_robin, round).is_some());
+            if swapped {
+                assert_ne!(&leader.id(), round_robin);
+                swaps += 1;
+            } else {
+                assert_eq!(&leader.id(), round_robin);
+            }
+        }
+        assert_eq!(swaps, 8, "position 0 leads every fourth leader round");
     }
 }

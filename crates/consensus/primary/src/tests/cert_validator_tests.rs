@@ -1,10 +1,11 @@
 //! Certificate validator tests
 
-use super::CertificateValidator;
+use super::{verify_stored_certificate, CertificateValidator};
 use crate::{state_sync::CertificateManagerCommand, ConsensusBus};
+use assert_matches::assert_matches;
 use std::collections::BTreeSet;
 use tn_primary::test_utils::make_optimal_signed_certificates;
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     BlsSignature, Certificate, Hash as _, Round, SignatureVerificationState, TaskManager,
@@ -205,6 +206,98 @@ async fn test_process_fetched_certificates_in_parallel() -> eyre::Result<()> {
 
     // expect ok
     assert!(validator.process_fetched_certificates_in_parallel(certs).await.is_ok());
+
+    Ok(())
+}
+
+/// A certificate as a fetch stores it when another certificate in the response names it as a
+/// parent: `VerifiedIndirectly`, with the bytes it arrived with as its aggregate signature (the
+/// default signature when `corrupt`). Returns that certificate, as written to a fresh store, its
+/// valid signature, the store, and the committee.
+fn stored_indirect(corrupt: bool) -> (Certificate, BlsSignature, MemDatabase, tn_types::Committee) {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let committee = fixture.committee();
+    let mut certificate = fixture.certificate(&fixture.headers()[0]);
+    let valid = certificate.aggregated_signature().expect("fixture certificates are signed");
+    let signature = if corrupt { BlsSignature::default() } else { valid };
+    certificate.set_signature_verification_state(SignatureVerificationState::VerifiedIndirectly(
+        signature,
+    ));
+    let store = MemDatabase::default();
+    store.write(certificate.clone()).expect("write the indirect certificate");
+    (certificate, valid, store, committee)
+}
+
+/// Read `certificate` back from `store`, as a restarted node reads it.
+fn reread(store: &MemDatabase, certificate: &Certificate) -> Certificate {
+    store.read(certificate.digest()).expect("store readable").expect("certificate stays stored")
+}
+
+/// A stored `VerifiedIndirectly` certificate with a valid signature is verified once: the check is
+/// stored with it, and a stored `VerifiedDirectly` copy is returned without a second check.
+#[tokio::test]
+async fn test_verify_stored_indirect_certificate_once() -> eyre::Result<()> {
+    let (certificate, signature, store, committee) = stored_indirect(false);
+
+    let verified = verify_stored_certificate(&store, &committee, reread(&store, &certificate))
+        .await?
+        .expect("a valid signature verifies");
+    assert_matches!(
+        verified.signature_verification_state(),
+        SignatureVerificationState::VerifiedDirectly(sig) if *sig == signature
+    );
+    let stored = reread(&store, &certificate);
+    assert_matches!(
+        stored.signature_verification_state(),
+        SignatureVerificationState::VerifiedDirectly(sig) if *sig == signature,
+        "the check is written back with the certificate"
+    );
+
+    // a copy in the stored `VerifiedDirectly` state comes back as it is: were it checked again,
+    // these bytes would fail
+    let mut unchecked = stored;
+    unchecked.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    let returned = verify_stored_certificate(&store, &committee, unchecked)
+        .await?
+        .expect("a directly verified copy is returned without a check");
+    assert_matches!(
+        returned.signature_verification_state(),
+        SignatureVerificationState::VerifiedDirectly(sig) if *sig == BlsSignature::default()
+    );
+
+    Ok(())
+}
+
+/// A stored `VerifiedIndirectly` certificate whose signature does not verify is withheld, stays
+/// stored, and the failure is stored with it: read back again, as after a restart, it is withheld
+/// without a second check.
+#[tokio::test]
+async fn test_verify_stored_indirect_certificate_with_bad_signature() -> eyre::Result<()> {
+    let (certificate, valid, store, committee) = stored_indirect(true);
+
+    assert!(
+        verify_stored_certificate(&store, &committee, reread(&store, &certificate))
+            .await?
+            .is_none(),
+        "a signature that does not verify is withheld"
+    );
+    let stored = reread(&store, &certificate);
+    assert_matches!(
+        stored.signature_verification_state(),
+        SignatureVerificationState::Unsigned(sig) if *sig == BlsSignature::default(),
+        "the failed check is written back with the certificate"
+    );
+    assert!(
+        verify_stored_certificate(&store, &committee, stored.clone()).await?.is_none(),
+        "the copy read back after a restart is withheld"
+    );
+
+    // the stored failure is not checked again: even valid bytes in that state are withheld
+    let mut failed = stored;
+    failed.set_signature_verification_state(SignatureVerificationState::Unsigned(valid));
+    assert!(verify_stored_certificate(&store, &committee, failed).await?.is_none());
 
     Ok(())
 }

@@ -1,5 +1,6 @@
 //! Prometheus metrics for the batch builder.
 
+use crate::batch::BuildReason;
 use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
     Metrics,
@@ -26,6 +27,10 @@ pub(crate) struct BatchBuilderMetrics {
     pub(crate) peer_deferred_txs_total: Counter,
     /// Total transactions evicted for whole-batch limit violations, excluding descendants.
     pub(crate) unpackable_txs_total: Counter,
+    /// Max pool age per batch: the oldest included transaction's time from pool admission to
+    /// the end of selection, one sample per non-empty batch (the median is on the `batch built`
+    /// line).
+    pub(crate) pool_age_seconds: Histogram,
 }
 
 impl BatchBuilderMetrics {
@@ -59,6 +64,49 @@ impl BatchBuilderMetrics {
             "reason" => reason,
         )
         .increment(1);
+    }
+}
+
+/// Pre-resolved `tn_batch_builder.builds_total` handles for one worker, one per
+/// [`BuildReason`].
+///
+/// A saturated worker builds a gas-full batch every couple of hundred milliseconds, so the
+/// labelled series are resolved once per epoch rather than looked up on every build.
+#[derive(Clone, Debug)]
+pub(crate) struct BuildReasonCounters {
+    /// Batches whose selection drained the pending pool.
+    drained: Counter,
+    /// Batches closed by the gas limit.
+    gas_full: Counter,
+    /// Batches closed by the byte limit.
+    bytes_full: Counter,
+}
+
+impl BuildReasonCounters {
+    /// Resolve the `builds_total` series of `worker_id` for every reason.
+    pub(crate) fn new_for_worker(worker_id: WorkerId) -> Self {
+        let worker = worker_id.to_string();
+        let counter = |reason: BuildReason| {
+            metrics::counter!(
+                "tn_batch_builder.builds_total",
+                "worker" => worker.clone(),
+                "reason" => reason.label(),
+            )
+        };
+        Self {
+            drained: counter(BuildReason::Drained),
+            gas_full: counter(BuildReason::GasFull),
+            bytes_full: counter(BuildReason::BytesFull),
+        }
+    }
+
+    /// Count one non-empty batch built for `reason`.
+    pub(crate) fn record(&self, reason: BuildReason) {
+        match reason {
+            BuildReason::Drained => self.drained.increment(1),
+            BuildReason::GasFull => self.gas_full.increment(1),
+            BuildReason::BytesFull => self.bytes_full.increment(1),
+        }
     }
 }
 
@@ -105,6 +153,11 @@ mod tests {
             metrics.unpackable_txs_total.increment(2);
             metrics.seal_duration_seconds.record(0.25);
             metrics.record_seal_failure(0, &BlockSealError::Timeout);
+            metrics.pool_age_seconds.record(0.125);
+            let builds = BuildReasonCounters::new_for_worker(0);
+            builds.record(BuildReason::GasFull);
+            builds.record(BuildReason::GasFull);
+            builds.record(BuildReason::Drained);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -133,6 +186,22 @@ mod tests {
 
         find("tn_batch_builder.pending_pool_transactions");
         find("tn_batch_builder.seal_duration_seconds");
+
+        let (_, _, _, value) = find("tn_batch_builder.pool_age_seconds");
+        assert!(matches!(value, DebugValue::Histogram(samples) if samples.len() == 1));
+
+        // one pre-resolved series per reason, the unused one registered at zero
+        let builds = |reason: &str| {
+            snapshot.iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == "tn_batch_builder.builds_total"
+                    && key.key().labels().any(|l| l.key() == "reason" && l.value() == reason)
+                    && key.key().labels().any(|l| l.key() == "worker" && l.value() == "0"))
+                .then_some(value)
+            })
+        };
+        assert!(matches!(builds("gas_full"), Some(DebugValue::Counter(2))));
+        assert!(matches!(builds("drained"), Some(DebugValue::Counter(1))));
+        assert!(matches!(builds("bytes_full"), Some(DebugValue::Counter(0))));
     }
 
     /// The node's write for a worker without a batch builder lands on the builder's own series.

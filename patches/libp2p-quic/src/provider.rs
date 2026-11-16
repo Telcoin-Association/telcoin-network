@@ -19,6 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::{
+    future::Future,
     io,
     net::{SocketAddr, UdpSocket},
     task::{Context, Poll},
@@ -55,6 +56,9 @@ pub trait Provider: Unpin + Send + Sized + 'static {
 
     /// Sleep for specified amount of time.
     fn sleep(duration: Duration) -> BoxFuture<'static, ()>;
+
+    /// Run `future` to completion as a detached task of the runtime.
+    fn spawn<F: Future<Output = ()> + Send + 'static>(future: F);
 
     /// Sends data on the socket to the given address. On success,
     /// returns the number of bytes written.

@@ -1,0 +1,13 @@
+# Grafana dashboard provisioning for the observability compose profile.
+# compose.yaml mounts etc/grafana/telcoin-node-metrics.json under this path.
+apiVersion: 1
+
+providers:
+  - name: telcoin
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

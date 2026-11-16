@@ -1,9 +1,10 @@
 //! Error type to wrap various Reth errors.
 
-use alloy::primitives::Bytes;
-use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
+use alloy::primitives::{Bytes, B256};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
+use reth_rpc_builder::error::RpcError;
+use reth_rpc_eth_types::EthApiError;
 use tn_types::WorkerId;
 
 /// Result alias for [`TnRethError`].
@@ -43,6 +44,12 @@ pub enum TnRethError {
     /// it is treated as an error instead.
     #[error("receipts not found for existing block {0} during replay")]
     ReplayReceiptsMissing(u64),
+    /// A block built again without the execution cache, after a checked cache hit was stale,
+    /// saw a stale hit too. Impossible by construction (the rebuild reads no cache): a bug in
+    /// `RethEnv::build_recovered_block`, the build behind every block-building entry point.
+    /// Carries the block's parent hash.
+    #[error("execution cache: the uncached rebuild of a block on parent {0} saw a stale hit")]
+    ExecutionCacheStaleOnRebuild(alloy::primitives::B256),
     /// Failed to recover a transaction's signer from its signature.
     #[error(transparent)]
     SignerRecovery(#[from] alloy::consensus::crypto::RecoveryError),
@@ -103,6 +110,20 @@ pub enum TnRethError {
         /// The band offset for this worker (stride times worker id).
         offset: u32,
     },
+    /// Another process is serving the IPC socket this worker would bind.
+    ///
+    /// reth unlinks whatever is at the path before it listens, so a second node started on the
+    /// same host without `--instance` or `--ipcpath` would silently take the socket over while
+    /// the first kept serving an unlinked inode. A stale socket file (no listener) is not an
+    /// error: reth replaces it, which keeps restart-after-crash working.
+    #[error(
+        "another process is serving the IPC socket {path}; stop it, or start this node with \
+         --instance or --ipcpath"
+    )]
+    IpcSocketInUse {
+        /// The socket path this worker would have bound.
+        path: String,
+    },
     /// Multi-worker RPC derivation needs the ws base port at or above the http base.
     ///
     /// http bands stride down and ws bands stride up from the operator's bases, so
@@ -124,6 +145,23 @@ pub enum TnRethError {
         /// The operator-configured ws base port.
         ws: u16,
     },
+    /// A consensus output's build scope was handed a payload on a parent other than the block it
+    /// was last advanced to.
+    ///
+    /// The scope's trie overlay describes the post-state of exactly that block; building on any
+    /// other parent over it would compute wrong roots and fork the node, so the build fails
+    /// closed instead.
+    #[error("output build scope is at block {expected}, but the payload's parent is {got}")]
+    ScopeParentMismatch {
+        /// The block the scope was last advanced to.
+        expected: B256,
+        /// The payload's parent block.
+        got: B256,
+    },
+    /// `RethEnv::set_persisted_batch_sink` was called on an environment that already has a sink:
+    /// the first one stays.
+    #[error("a persisted-batch sink is already installed")]
+    PersistedBatchSinkAlreadySet,
 }
 
 impl From<TnRethError> for EthApiError {
@@ -134,6 +172,38 @@ impl From<TnRethError> for EthApiError {
             EthApiError::EvmCustom(value.to_string())
         }
     }
+}
+
+/// Whether `err` comes from an execution database that has failed for good in this process:
+/// tn-lmdb's failure latch (`MDBX_PANIC`: a failed write, sync or commit, or damage a read or
+/// write found, stops every later write and commit until the node restarts and reopens the
+/// database) or damage itself (`MDBX_CORRUPTED`, which latches it). No retry of the call in this
+/// process can succeed. The codes mean the same on the MDBX build (a fatal environment error, a
+/// corrupted database).
+pub fn database_failed(err: &ProviderError) -> bool {
+    use reth_db::{mdbx::Error as MdbxError, DatabaseError};
+    let ProviderError::Database(db) = err else { return false };
+    let code = match db {
+        DatabaseError::Open(info)
+        | DatabaseError::CreateTable(info)
+        | DatabaseError::Read(info)
+        | DatabaseError::Delete(info)
+        | DatabaseError::Commit(info)
+        | DatabaseError::InitTx(info)
+        | DatabaseError::InitCursor(info)
+        | DatabaseError::Stats(info) => info.code,
+        DatabaseError::Write(write) => write.info.code,
+        _ => return false,
+    };
+    [MdbxError::Panic, MdbxError::Corrupted].iter().any(|e| e.to_err_code() == code)
+}
+
+/// Test-only: the error a persist meets once tn-lmdb's failure latch has tripped (`MDBX_PANIC` at
+/// the begin of its write transaction), which [`database_failed`] reports.
+#[cfg(any(feature = "test-utils", test))]
+pub fn latched_database_error() -> ProviderError {
+    let info = reth_db::mdbx::Error::Panic.into();
+    ProviderError::Database(reth_db::DatabaseError::InitTx(info))
 }
 
 impl<T> From<std::sync::mpsc::SendError<T>> for TnRethError {
@@ -220,5 +290,44 @@ impl RestoredStateFloorError {
     /// Bundle the refused pin's block number with the floor it fell below.
     pub(crate) fn new(pinned: u64, floor: u64) -> Self {
         Self { pinned, floor }
+    }
+}
+
+#[cfg(test)]
+mod database_failed_tests {
+    use super::*;
+    use reth_db::{mdbx::Error as MdbxError, DatabaseError};
+
+    /// A latched tn-lmdb environment (`MDBX_PANIC`) or damage (`MDBX_CORRUPTED`), whichever
+    /// database call met it, has failed for good; any other database error, or a provider error
+    /// that is not a database error, has not.
+    #[test]
+    fn a_latched_or_damaged_database_has_failed_for_good() {
+        assert!(database_failed(&latched_database_error()));
+        let errors = |code: MdbxError| {
+            let info = || code.into();
+            [
+                DatabaseError::Open(info()),
+                DatabaseError::CreateTable(info()),
+                DatabaseError::Read(info()),
+                DatabaseError::Delete(info()),
+                DatabaseError::Commit(info()),
+                DatabaseError::InitTx(info()),
+                DatabaseError::InitCursor(info()),
+                DatabaseError::Stats(info()),
+            ]
+        };
+        for code in [MdbxError::Panic, MdbxError::Corrupted] {
+            for err in errors(code) {
+                assert!(database_failed(&ProviderError::Database(err.clone())), "{err:?}");
+            }
+        }
+        for code in [MdbxError::Busy, MdbxError::MapFull, MdbxError::KeyExist] {
+            for err in errors(code) {
+                assert!(!database_failed(&ProviderError::Database(err.clone())), "{err:?}");
+            }
+        }
+        assert!(!database_failed(&ProviderError::Database(DatabaseError::Decode)));
+        assert!(!database_failed(&ProviderError::HeaderNotFound(0u64.into())));
     }
 }

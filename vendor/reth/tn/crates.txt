@@ -1,0 +1,63 @@
+# Upstream reth paths vendored under vendor/reth, one per line, relative to the reth repo root.
+# Managed by tn/vendor.py (add/remove); the nested workspace members are exactly this list.
+# A trailing comment is allowed. Nested crates (codecs/derive, libmdbx-rs/mdbx-sys) are listed
+# separately because each is its own package.
+
+crates/chain-state
+crates/chainspec
+crates/cli/util
+crates/config
+crates/consensus/consensus
+crates/engine/primitives
+crates/errors
+crates/ethereum/engine-primitives
+crates/ethereum/evm
+crates/ethereum/hardforks
+crates/ethereum/primitives
+crates/evm/evm
+crates/evm/execution-errors
+crates/evm/execution-types
+crates/fs-util
+crates/metrics
+crates/net/eth-wire-types
+crates/net/network-api
+crates/net/peers
+crates/node/core
+crates/node/types
+crates/payload/primitives
+crates/primitives-traits
+crates/prune/types
+crates/revm
+crates/rpc/ipc
+crates/rpc/rpc
+crates/rpc/rpc-api
+crates/rpc/rpc-builder
+crates/rpc/rpc-convert
+crates/rpc/rpc-eth-api
+crates/rpc/rpc-eth-types
+crates/rpc/rpc-layer
+crates/rpc/rpc-server-types
+crates/stages/types
+crates/static-file/types
+crates/storage/codecs
+crates/storage/codecs/derive
+crates/storage/db
+crates/storage/db-api
+crates/storage/db-common
+crates/storage/db-models
+crates/storage/errors
+crates/storage/libmdbx-rs
+crates/storage/libmdbx-rs/mdbx-sys
+crates/storage/nippy-jar
+crates/storage/provider
+crates/storage/storage-api
+crates/storage/zstd-compressors
+crates/tasks
+crates/tokio-util
+crates/tracing
+crates/transaction-pool
+crates/trie/common
+crates/trie/db
+crates/trie/sparse
+crates/trie/trie
+testing/testing-utils  # dev-only: dev-dependency of vendored crates' tests

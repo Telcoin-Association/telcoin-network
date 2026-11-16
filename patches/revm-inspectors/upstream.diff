@@ -1,0 +1,1064 @@
+diff --git upstream/.gitignore upstream/.gitignore
+deleted file mode 100644
+index b23d7d652d5ff02efd4b57054c1df5bf66ed2adc..0000000000000000000000000000000000000000
+--- upstream/.gitignore
++++ /dev/null
+@@ -1,5 +0,0 @@
+-/target
+-Cargo.lock
+-.vscode
+-.idea
+-.DS_Store
+\ No newline at end of file
+diff --git upstream/src/tracing/builder/geth.rs patched/src/tracing/builder/geth.rs
+index ed563010e241eccb63c9f9e34b832d21f7ddaddd..cc997d7e07bb22134492c76dfff972bd7413b085 100644
+--- upstream/src/tracing/builder/geth.rs
++++ patched/src/tracing/builder/geth.rs
+@@ -40,6 +40,17 @@ impl GethTraceBuilder<'static> {
+     }
+ }
+ 
++/// TN(TN-0172): the bytes a struct log copies that its recorded step does not hold: its memory
++/// as one hex `String` per 32-byte word, and its copy of the contract's storage. The rest of the
++/// log (its fields and its stack) mirrors the step, which the recorded-bytes cap already counts.
++pub fn struct_log_copies(log: &StructLog) -> usize {
++    let word = |word: &alloc::string::String| core::mem::size_of_val(word) + word.len();
++    let memory = log.memory.as_ref().map_or(0, |words| words.iter().map(word).sum());
++    let slot = core::mem::size_of::<(B256, B256)>();
++    let storage = log.storage.as_ref().map_or(0, |storage| storage.len() * slot);
++    memory + storage
++}
++
+ impl<'a> GethTraceBuilder<'a> {
+     /// Returns a new instance of the builder from [`Cow::Borrowed`]
+     pub fn new_borrowed(nodes: &'a [CallTraceNode]) -> GethTraceBuilder<'a> {
+@@ -58,13 +69,17 @@ impl<'a> GethTraceBuilder<'a> {
+ 
+     /// Fill in the geth trace with all steps of the trace and its children traces in the order they
+     /// appear in the transaction.
++    ///
++    /// TN(TN-0172): `charge` is given each struct log's [`struct_log_copies`] once the log is
++    /// built; when it returns `false` the fill stops and returns `false`.
+     fn fill_geth_trace(
+         &self,
+         main_trace_node: &CallTraceNode,
+         opts: &GethDefaultTracingOptions,
+         storage: &mut HashMap<Address, BTreeMap<B256, B256>>,
+         struct_logs: &mut Vec<StructLog>,
+-    ) {
++        charge: &mut dyn FnMut(usize) -> bool,
++    ) -> bool {
+         // A stack with all the steps of the trace and all its children's steps.
+         // This is used to process the steps in the order they appear in the transactions.
+         // Steps are grouped by their Call Trace Node, in order to process them all in the order
+@@ -100,6 +115,11 @@ impl<'a> GethTraceBuilder<'a> {
+                 log.return_data = Some(step.returndata.clone());
+             }
+ 
++            // TN(TN-0172): count the log's own copies before keeping it.
++            if !charge(struct_log_copies(&log)) {
++                return false;
++            }
++
+             // Add step to geth trace
+             struct_logs.push(log);
+ 
+@@ -110,6 +130,7 @@ impl<'a> GethTraceBuilder<'a> {
+                 child_trace.push_steps_on_stack(&mut step_stack);
+             }
+         }
++        true
+     }
+ 
+     /// Generate a geth-style trace e.g. for `debug_traceTransaction`
+@@ -123,8 +144,21 @@ impl<'a> GethTraceBuilder<'a> {
+         return_value: Bytes,
+         opts: GethDefaultTracingOptions,
+     ) -> DefaultFrame {
++        self.geth_traces_charged(receipt_gas_used, return_value, opts, &mut |_| true)
++            .unwrap_or_default()
++    }
++
++    /// TN(TN-0172): [`Self::geth_traces`], giving `charge` each struct log's
++    /// [`struct_log_copies`] as the log is built. `None` once `charge` returns `false`.
++    pub fn geth_traces_charged(
++        &self,
++        receipt_gas_used: u64,
++        return_value: Bytes,
++        opts: GethDefaultTracingOptions,
++        charge: &mut dyn FnMut(usize) -> bool,
++    ) -> Option<DefaultFrame> {
+         if self.nodes.is_empty() {
+-            return Default::default();
++            return Some(Default::default());
+         }
+         // Fetch top-level trace
+         let main_trace_node = &self.nodes[0];
+@@ -132,15 +166,17 @@ impl<'a> GethTraceBuilder<'a> {
+ 
+         let mut struct_logs = Vec::with_capacity(self.trace_step_count());
+         let mut storage = HashMap::default();
+-        self.fill_geth_trace(main_trace_node, &opts, &mut storage, &mut struct_logs);
++        if !self.fill_geth_trace(main_trace_node, &opts, &mut storage, &mut struct_logs, charge) {
++            return None;
++        }
+ 
+-        DefaultFrame {
++        Some(DefaultFrame {
+             // If the top-level trace succeeded, then it was a success
+             failed: !main_trace.success,
+             gas: receipt_gas_used,
+             return_value,
+             struct_logs,
+-        }
++        })
+     }
+ 
+     /// Generate a geth-style traces for the call tracer.
+diff --git upstream/src/tracing/config.rs patched/src/tracing/config.rs
+index 1dbcf43eea825acd855a153cae370bd666aebd26..17ef691bf2f8c4b38a7afed7440b8f4fcfd46a26 100644
+--- upstream/src/tracing/config.rs
++++ patched/src/tracing/config.rs
+@@ -8,6 +8,18 @@ use alloy_rpc_types_trace::{
+ };
+ use revm::bytecode::opcode::OpCode;
+ 
++/// TN(TN-0079, TN-0153, TN-0172): the default for
++/// [`TracingInspectorConfig::max_recorded_bytes`], 160 MiB: reth's default
++/// `--rpc.max-response-size`. The cap counts what the trace holds, not its JSON. Calls' input and
++/// output serialize in hex, twice what the trace holds, so a call trace past the cap could not be
++/// returned anyway. A step can hold more than its JSON (about 200 bytes against 60 to 100 for a
++/// struct log with a small stack; for `vmTrace`, a copy of the whole memory after each write), so
++/// a struct-logger or `vmTrace` trace can be refused although its response would fit, at about a
++/// third of the cap or less. A tracer that returns no call input or output (the struct logger,
++/// `prestateTracer`) also refuses a transaction whose calls copy more than the cap. The cap does
++/// not follow `--rpc.max-response-size`.
++pub const DEFAULT_MAX_RECORDED_BYTES: usize = 160 << 20;
++
+ /// 256 bits each marking whether an opcode should be included into steps trace or not.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ #[must_use]
+@@ -76,6 +88,14 @@ pub struct TracingInspectorConfig {
+     pub record_logs: bool,
+     /// Whether to record immediate bytes for opcodes.
+     pub record_immediate_bytes: bool,
++    /// TN(TN-0079, TN-0153): the most bytes the trace may hold before the transaction halts
++    /// with a `trace too large` error: every call's and create's trace with its input or init
++    /// code and its output (TN-0153), and the recorded steps with their stack and memory
++    /// snapshots, return data and immediate bytes (TN-0079). Logs and storage changes are not
++    /// counted; gas bounds them. Counted per inspector, or across the inspectors that share a
++    /// counter ([`TracingInspector::share_recorded_bytes`]). `None` is no limit; the presets use
++    /// [`DEFAULT_MAX_RECORDED_BYTES`].
++    pub max_recorded_bytes: Option<usize>,
+ }
+ 
+ impl TracingInspectorConfig {
+@@ -91,6 +111,7 @@ impl TracingInspectorConfig {
+             exclude_precompile_calls: false,
+             record_logs: true,
+             record_immediate_bytes: true,
++            max_recorded_bytes: Some(DEFAULT_MAX_RECORDED_BYTES),
+         }
+     }
+ 
+@@ -106,6 +127,7 @@ impl TracingInspectorConfig {
+             record_logs: false,
+             record_opcodes_filter: None,
+             record_immediate_bytes: false,
++            max_recorded_bytes: Some(DEFAULT_MAX_RECORDED_BYTES),
+         }
+     }
+ 
+@@ -123,6 +145,7 @@ impl TracingInspectorConfig {
+             record_logs: false,
+             record_opcodes_filter: None,
+             record_immediate_bytes: false,
++            max_recorded_bytes: Some(DEFAULT_MAX_RECORDED_BYTES),
+         }
+     }
+ 
+@@ -163,6 +186,7 @@ impl TracingInspectorConfig {
+             record_logs: false,
+             record_opcodes_filter: None,
+             record_immediate_bytes: false,
++            max_recorded_bytes: Some(DEFAULT_MAX_RECORDED_BYTES),
+         }
+     }
+ 
+@@ -259,6 +283,10 @@ impl TracingInspectorConfig {
+         self.record_logs |= other.record_logs;
+         self.record_opcodes_filter = self.record_opcodes_filter.or(other.record_opcodes_filter);
+         self.record_immediate_bytes |= other.record_immediate_bytes;
++        self.max_recorded_bytes = match (self.max_recorded_bytes, other.max_recorded_bytes) {
++            (Some(a), Some(b)) => Some(a.min(b)),
++            (a, b) => a.or(b),
++        };
+         self
+     }
+ 
+@@ -438,6 +466,30 @@ impl TraceStyle {
+ mod tests {
+     use super::*;
+ 
++    /// TN(TN-0079): every preset carries the cap, and a merge keeps the tighter one.
++    #[test]
++    fn presets_cap_recorded_bytes() {
++        for config in [
++            TracingInspectorConfig::all(),
++            TracingInspectorConfig::none(),
++            TracingInspectorConfig::default_parity(),
++            TracingInspectorConfig::default_geth(),
++            TracingInspectorConfig::from_geth_config(&Default::default()),
++        ] {
++            assert_eq!(config.max_recorded_bytes, Some(DEFAULT_MAX_RECORDED_BYTES));
++        }
++        assert_eq!(TracingInspectorConfig::default().max_recorded_bytes, None);
++
++        let mut tight = TracingInspectorConfig::none();
++        tight.max_recorded_bytes = Some(1);
++        let mut merged = TracingInspectorConfig::default_geth();
++        merged.merge(tight);
++        assert_eq!(merged.max_recorded_bytes, Some(1));
++        let mut unlimited = TracingInspectorConfig::default();
++        unlimited.merge(TracingInspectorConfig::default_geth());
++        assert_eq!(unlimited.max_recorded_bytes, Some(DEFAULT_MAX_RECORDED_BYTES));
++    }
++
+     #[test]
+     fn test_parity_config() {
+         let mut s = HashSet::default();
+diff --git upstream/src/tracing/debug.rs patched/src/tracing/debug.rs
+index 5901d64b6bad3224610ae709b770ce781e972c52..362038be2038b5a036ef73fefb43b58af3a17cd9 100644
+--- upstream/src/tracing/debug.rs
++++ patched/src/tracing/debug.rs
+@@ -171,9 +171,8 @@ impl DebugInspector {
+             | Self::Erc7562Tracer(inspector, _)
+             | Self::Default(inspector, _) => inspector.fuse(),
+             Self::Noop(_) => {}
+-            Self::Mux(inspector, config) => {
+-                *inspector = MuxInspector::try_from_config(config.clone())?;
+-            }
++            // TN(TN-0172): fused, not rebuilt, so the recorded-bytes counter carries over.
++            Self::Mux(inspector, _) => inspector.fuse(),
+             #[cfg(feature = "js-tracer")]
+             Self::Js(inspector, code, config) => {
+                 *inspector =
+@@ -243,13 +242,14 @@ impl DebugInspector {
+             Self::Default(inspector, config) => {
+                 inspector.set_transaction_gas_limit(tx_env.gas_limit());
+                 inspector.set_transaction_caller(tx_env.caller());
++                // TN(TN-0172): the struct logs count against the trace cap as they are built.
+                 inspector
+-                    .geth_builder()
+-                    .geth_traces(
++                    .try_geth_traces(
+                         res.result.gas_used(),
+                         res.result.output().unwrap_or_default().clone(),
+                         *config,
+                     )
++                    .map_err(DebugInspectorError::TraceTooLarge)?
+                     .into()
+             }
+             #[cfg(feature = "js-tracer")]
+@@ -356,4 +356,7 @@ pub enum DebugInspectorError<DBError = core::convert::Infallible> {
+     /// Database error
+     #[error("database error: {0}")]
+     Database(DBError),
++    /// TN(TN-0172): the struct logs passed the trace cap while they were built.
++    #[error("{0}")]
++    TraceTooLarge(String),
+ }
+diff --git upstream/src/tracing/js/mod.rs patched/src/tracing/js/mod.rs
+index 95b43c7369d59f63bce2c68c2733a0fee051d7e2..616c80ee209e108871f340e3e4a99e94fc65a14f 100644
+--- upstream/src/tracing/js/mod.rs
++++ patched/src/tracing/js/mod.rs
+@@ -48,7 +48,12 @@ pub const LOOP_ITERATION_LIMIT: u64 = 200_000;
+ /// The recursion limit for function calls.
+ ///
+ /// Once exceeded, the function will throw an error.
+-pub const RECURSION_LIMIT: usize = 10_000;
++///
++/// TN: lowered from 10,000 to 128 as upstream did in #548 (a5638ca, released in 0.44.2). A
++/// recursive getter or setter re-enters the interpreter natively, so each level also uses native
++/// stack, and at 10,000 a tracer could overflow the 2 MiB stack of a tokio blocking thread and
++/// abort the node. See patches/revm-inspectors/PATCH.md.
++pub const RECURSION_LIMIT: usize = 128;
+ 
+ /// A javascript inspector that will delegate inspector functions to javascript functions
+ ///
+@@ -712,6 +717,52 @@ mod tests {
+         assert!(result.is_err());
+     }
+ 
++    /// TN: builds the inspector on a thread with the 2 MiB stack of a tokio blocking thread, where
++    /// the node builds it for `debug_trace*`.
++    fn new_on_blocking_sized_stack(code: &'static str) -> Result<(), String> {
++        std::thread::Builder::new()
++            .stack_size(2 * 1024 * 1024)
++            .spawn(move || {
++                JsInspector::new(code.to_string(), serde_json::Value::Null)
++                    .map(|_| ())
++                    .map_err(|err| err.to_string())
++            })
++            .unwrap()
++            .join()
++            .unwrap()
++    }
++
++    /// TN: a recursive getter is stopped by the recursion limit with a script error. With a limit
++    /// of 10,000 the native stack overflowed first and the process aborted.
++    #[test]
++    fn test_recursive_getter_is_stopped_by_recursion_limit() {
++        let res = new_on_blocking_sized_stack(
++            "{ setup: function() { var o = { get x() { return this.x; } }; return o.x; }, \
++             fault: function() {}, result: function() { return null; } }",
++        );
++        assert!(res.unwrap_err().contains("setup"));
++    }
++
++    /// TN: as above, through a setter.
++    #[test]
++    fn test_recursive_setter_is_stopped_by_recursion_limit() {
++        let res = new_on_blocking_sized_stack(
++            "{ setup: function() { var o = { set x(v) { this.x = v; } }; o.x = 1; }, \
++             fault: function() {}, result: function() { return null; } }",
++        );
++        assert!(res.unwrap_err().contains("setup"));
++    }
++
++    /// TN: a tracer that recurses less deeply than the limit still works.
++    #[test]
++    fn test_recursion_below_limit_is_allowed() {
++        new_on_blocking_sized_stack(
++            "{ setup: function() { function f(n) { return n == 0 ? 0 : f(n - 1); } f(100); }, \
++             fault: function() {}, result: function() { return null; } }",
++        )
++        .unwrap();
++    }
++
+     #[test]
+     fn test_fault_fn_not_callable() {
+         let code = r#"
+diff --git upstream/src/tracing/mod.rs patched/src/tracing/mod.rs
+index 39bf3cacc44304fc5a063e652d3d8de36a56250a..051eaf582d3f9256d39f629cbd34c1794587efce 100644
+--- upstream/src/tracing/mod.rs
++++ patched/src/tracing/mod.rs
+@@ -9,17 +9,21 @@ use crate::{
+         utils::gas_used,
+     },
+ };
+-use alloc::{boxed::Box, vec::Vec};
+-use core::{borrow::Borrow, mem};
++use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
++use core::{
++    borrow::Borrow,
++    mem,
++    sync::atomic::{AtomicUsize, Ordering},
++};
+ use revm::{
+     bytecode::opcode::{self, OpCode},
+     context::{JournalTr, LocalContextTr},
+-    context_interface::ContextTr,
++    context_interface::{ContextError, ContextTr},
+     inspector::JournalExt,
+     interpreter::{
+         interpreter_types::{Immediates, Jumps, LoopControl, ReturnData, RuntimeFlag},
+-        CallInput, CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Interpreter,
+-        InterpreterResult,
++        CallInput, CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas,
++        InstructionResult, Interpreter, InterpreterResult,
+     },
+     primitives::{hardfork::SpecId, Address, Bytes, Log, B256, U256},
+     Inspector, JournalEntry,
+@@ -35,7 +39,9 @@ pub use builder::{
+ };
+ 
+ mod config;
+-pub use config::{OpcodeFilter, StackSnapshotType, TracingInspectorConfig};
++pub use config::{
++    OpcodeFilter, StackSnapshotType, TracingInspectorConfig, DEFAULT_MAX_RECORDED_BYTES,
++};
+ 
+ mod fourbyte;
+ pub use fourbyte::FourByteInspector;
+@@ -92,6 +98,12 @@ pub struct TracingInspector {
+     ///
+     /// All `Vec<CallTraceStep>` are always empty but may have capacity.
+     reusable_step_vecs: Vec<Vec<CallTraceStep>>,
++    /// TN(TN-0079, TN-0153): the bytes the trace holds (its call traces with their input, init
++    /// code and output, and its recorded steps), checked against
++    /// [`TracingInspectorConfig::max_recorded_bytes`]. Kept across [`Self::fuse`], and shared
++    /// by the inspectors of one request through [`Self::share_recorded_bytes`], so the cap
++    /// bounds the request's trace, not one transaction's.
++    recorded_bytes: Arc<AtomicUsize>,
+ }
+ 
+ impl TracingInspector {
+@@ -116,6 +128,7 @@ impl TracingInspector {
+             // kept
+             config,
+             reusable_step_vecs,
++            recorded_bytes: _,
+         } = self;
+ 
+         // if we record steps we can reuse the individual calltracestep vecs
+@@ -144,6 +157,95 @@ impl TracingInspector {
+         self
+     }
+ 
++    /// TN(TN-0079): counts this inspector's recorded bytes in `counter`, so that several
++    /// inspectors (one per transaction of a block, say) share one cap.
++    pub fn share_recorded_bytes(mut self, counter: Arc<AtomicUsize>) -> Self {
++        self.recorded_bytes = counter;
++        self
++    }
++
++    /// TN(TN-0079, TN-0153): the bytes the trace holds so far, over every inspector sharing
++    /// the counter.
++    pub fn recorded_bytes(&self) -> usize {
++        self.recorded_bytes.load(Ordering::Relaxed)
++    }
++
++    /// TN(TN-0079, TN-0153): counts `bytes` more; past the cap, sets the `trace too large`
++    /// context error, which ends the transaction as TN-0017's interrupt does: revm returns it
++    /// as `EVMError::Custom` when the frame or the transaction ends.
++    #[inline]
++    fn charge<CTX: ContextTr>(&self, context: &mut CTX, bytes: usize) -> bool {
++        let total = self.recorded_bytes.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
++        let Some(max) = self.config.max_recorded_bytes else { return true };
++        if total <= max {
++            return true;
++        }
++        if context.error().is_ok() {
++            *context.error() = Err(ContextError::Custom(format!(
++                "trace too large: more than {max} bytes of calls and opcode steps recorded; \
++                 trace a smaller transaction, or for opcode steps set disableStack and leave \
++                 out enableMemory or vmTrace"
++            )));
++        }
++        false
++    }
++
++    /// TN(TN-0079): [`Self::charge`]s a step's `bytes`; past the cap, also halts the
++    /// interpreter, which then cannot carry on past a pending action.
++    #[inline]
++    fn record_bytes<CTX: ContextTr>(
++        &self,
++        interp: &mut Interpreter,
++        context: &mut CTX,
++        bytes: usize,
++    ) -> bool {
++        if self.charge(context, bytes) {
++            return true;
++        }
++        interp.bytecode.action().take();
++        interp.bytecode.reset_action();
++        interp.halt_fatal();
++        false
++    }
++
++    /// TN(TN-0172): the struct logger's frame, as [`GethTraceBuilder::geth_traces`] builds it,
++    /// with each log's [`geth::struct_log_copies`] (its memory as hex, its storage copy) added
++    /// to the recorded-bytes counter as the log is built. Past the cap the conversion stops and
++    /// this returns the `trace too large` message.
++    pub fn try_geth_traces(
++        &self,
++        receipt_gas_used: u64,
++        return_value: Bytes,
++        opts: alloy_rpc_types_trace::geth::GethDefaultTracingOptions,
++    ) -> Result<alloy_rpc_types_trace::geth::DefaultFrame, String> {
++        let max = self.config.max_recorded_bytes;
++        self.geth_builder()
++            .geth_traces_charged(receipt_gas_used, return_value, opts, &mut |bytes| {
++                let total =
++                    self.recorded_bytes.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
++                max.is_none_or(|max| total <= max)
++            })
++            .ok_or_else(|| {
++                format!(
++                    "trace too large: more than {} bytes of calls, opcode steps and struct logs; \
++                     trace a smaller transaction, or set disableStorage and leave out \
++                     enableMemory",
++                    max.unwrap_or_default()
++                )
++            })
++    }
++
++    /// TN(TN-0153): the result of a call or create refused at the cap, the one TN-0017's
++    /// interrupt returns. The context error [`Self::charge`] set ends the transaction before
++    /// revm hands this result to the calling frame.
++    fn trace_too_large(gas_limit: u64) -> InterpreterResult {
++        InterpreterResult::new(
++            InstructionResult::FatalExternalError,
++            Bytes::new(),
++            Gas::new(gas_limit),
++        )
++    }
++
+     /// Returns the config of the inspector.
+     pub const fn config(&self) -> &TracingInspectorConfig {
+         &self.config
+@@ -384,13 +486,18 @@ impl TracingInspector {
+     /// # Panics
+     ///
+     /// This expects an existing trace [Self::start_trace_on_call]
+-    fn fill_trace_on_call_end(
++    fn fill_trace_on_call_end<CTX: ContextTr>(
+         &mut self,
++        context: &mut CTX,
+         result: &InterpreterResult,
+         created_address: Option<Address>,
+     ) {
+         let InterpreterResult { result, ref output, ref gas } = *result;
+ 
++        // TN(TN-0153): the trace keeps the output, so it counts towards the cap; past the cap
++        // the trace keeps none and the context error ends the transaction.
++        let charged = self.charge(context, output.len());
++
+         let trace_idx = self.pop_trace_idx();
+         let trace = &mut self.traces.arena[trace_idx].trace;
+ 
+@@ -399,7 +506,7 @@ impl TracingInspector {
+ 
+         trace.status = Some(result);
+         trace.success = trace.status.is_some_and(|status| status.is_ok());
+-        trace.output = output.clone();
++        trace.output = if charged { output.clone() } else { Bytes::new() };
+ 
+         self.last_call_return_data = Some(output.clone());
+ 
+@@ -439,6 +546,8 @@ impl TracingInspector {
+         // Reuse the memory from the previous step if:
+         // - there is not opcode filter -- in this case we cannot rely on the order of steps
+         // - it exists and has not modified memory
++        // TN(TN-0079): only a fresh copy counts towards the cap; a reused snapshot is shared.
++        let mut memory_bytes = 0;
+         let memory = self.config.record_memory_snapshots.then(|| {
+             if self.config.record_opcodes_filter.is_none() {
+                 if let Some(prev) = node.trace.steps.last() {
+@@ -449,7 +558,9 @@ impl TracingInspector {
+                     }
+                 }
+             }
+-            RecordedMemory::new(&interp.memory.borrow().context_memory())
++            let memory = RecordedMemory::new(&interp.memory.borrow().context_memory());
++            memory_bytes = memory.len();
++            memory
+         });
+ 
+         let stack = if self.config.record_stack_snapshots.is_all()
+@@ -481,6 +592,28 @@ impl TracingInspector {
+             }
+         }
+ 
++        // TN(TN-0079): the step and what it copies; `step_end`'s pushed values are counted
++        // here from the opcode's output count. Past the cap the step is not recorded and the
++        // transaction halts.
++        let pushed_bytes = if self.config.record_stack_snapshots.is_all()
++            || self.config.record_stack_snapshots.is_pushes()
++        {
++            op.outputs() as usize * mem::size_of::<U256>()
++        } else {
++            0
++        };
++        let step_bytes = mem::size_of::<CallTraceStep>()
++            + stack.as_ref().map_or(0, |stack: &Box<[U256]>| stack.len() * mem::size_of::<U256>())
++            + memory_bytes
++            + returndata.len()
++            + immediate_bytes.as_ref().map_or(0, |bytes| bytes.len())
++            + pushed_bytes;
++        if !self.record_bytes(interp, context, step_bytes) {
++            self.record_step_end = false;
++            return;
++        }
++        let node = &mut self.traces.arena[trace_idx];
++
+         self.last_journal_len = context.journal_ref().journal().len();
+ 
+         let step_idx = node.trace.steps.len();
+@@ -649,7 +782,12 @@ where
+             .exclude_precompile_calls
+             .then(|| self.is_precompile_call(context, &to, &value));
+ 
+-        let input = inputs.input_data(context);
++        // TN(TN-0153): the call's trace and its copy of the input count towards the cap. Past
++        // the cap the call is not made: it ends with `FatalExternalError`, and the context
++        // error ends the transaction. The trace is still pushed, without the input, because
++        // `call_end` runs for this outcome too.
++        let charged = self.charge(context, mem::size_of::<CallTraceNode>() + inputs.input.len());
++        let input = if charged { inputs.input_data(context) } else { Bytes::new() };
+         self.start_trace_on_call(
+             context,
+             to,
+@@ -661,35 +799,43 @@ where
+             maybe_precompile,
+         );
+ 
+-        None
++        (!charged).then(|| {
++            CallOutcome::new(
++                Self::trace_too_large(inputs.gas_limit),
++                inputs.return_memory_offset.clone(),
++            )
++        })
+     }
+ 
+-    fn call_end(&mut self, _: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+-        self.fill_trace_on_call_end(&outcome.result, None);
++    fn call_end(&mut self, context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
++        self.fill_trace_on_call_end(context, &outcome.result, None);
+     }
+ 
+     fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+         let nonce = context.journal_mut().load_account(inputs.caller()).ok()?.info.nonce;
++        // TN(TN-0153): as in `call`, for the init code.
++        let charged =
++            self.charge(context, mem::size_of::<CallTraceNode>() + inputs.init_code().len());
+         self.start_trace_on_call(
+             context,
+             inputs.created_address(nonce),
+-            inputs.init_code().clone(),
++            if charged { inputs.init_code().clone() } else { Bytes::new() },
+             inputs.value(),
+             inputs.scheme().into(),
+             inputs.caller(),
+             inputs.gas_limit(),
+             Some(false),
+         );
+-        None
++        (!charged).then(|| CreateOutcome::new(Self::trace_too_large(inputs.gas_limit()), None))
+     }
+ 
+     fn create_end(
+         &mut self,
+-        _context: &mut CTX,
++        context: &mut CTX,
+         _inputs: &CreateInputs,
+         outcome: &mut CreateOutcome,
+     ) {
+-        self.fill_trace_on_call_end(&outcome.result, outcome.address);
++        self.fill_trace_on_call_end(context, &outcome.result, outcome.address);
+     }
+ 
+     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+@@ -765,3 +911,366 @@ impl CallInputExt for CallInputs {
+         }
+     }
+ }
++
++/// TN(TN-0079, TN-0153): the recorded-bytes cap.
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use revm::{
++        context::TxEnv,
++        context_interface::result::EVMError,
++        database::CacheDB,
++        database_interface::EmptyDB,
++        primitives::TxKind,
++        state::{AccountInfo, Bytecode},
++        InspectEvm, MainBuilder, MainContext,
++    };
++
++    const TARGET: Address = Address::with_last_byte(0xaa);
++    const CALLEE: Address = Address::with_last_byte(0xbb);
++
++    /// Runs `inspector` over `tx` with `contracts` deployed, and hands the inspector back.
++    fn inspect(
++        inspector: TracingInspector,
++        contracts: &[(Address, Vec<u8>)],
++        tx: TxEnv,
++    ) -> (TracingInspector, Result<(), String>) {
++        let mut db = CacheDB::new(EmptyDB::default());
++        for (address, code) in contracts {
++            db.insert_account_info(
++                *address,
++                AccountInfo::default().with_code(Bytecode::new_raw(code.clone().into())),
++            );
++        }
++        let mut evm = revm::Context::mainnet().with_db(db).build_mainnet_with_inspector(inspector);
++        let res = match evm.inspect_tx(tx) {
++            Ok(_) => Ok(()),
++            Err(EVMError::Custom(msg)) => Err(msg),
++            Err(err) => panic!("unexpected EVM error: {err:?}"),
++        };
++        (evm.inspector, res)
++    }
++
++    /// A call to [`TARGET`] running `code`, with `gas_limit`.
++    fn call_target(
++        inspector: TracingInspector,
++        contracts: &[(Address, Vec<u8>)],
++        gas_limit: u64,
++    ) -> (TracingInspector, Result<(), String>) {
++        inspect(
++            inspector,
++            contracts,
++            TxEnv { gas_limit, kind: TxKind::Call(TARGET), ..Default::default() },
++        )
++    }
++
++    /// Runs `inspector` over a call to a contract that loops until it runs out of gas, with a
++    /// stack of `depth` words, and hands the inspector back.
++    fn trace_loop(
++        inspector: TracingInspector,
++        depth: u8,
++        gas_limit: u64,
++    ) -> (TracingInspector, Result<(), String>) {
++        // PUSH1 1 (depth times); JUMPDEST; PUSH1 <jumpdest>; JUMP
++        let mut code = Vec::new();
++        for _ in 0..depth {
++            code.extend([0x60, 0x01]);
++        }
++        let jumpdest = code.len() as u8;
++        code.extend([0x5b, 0x60, jumpdest, 0x56]);
++        call_target(inspector, &[(TARGET, code)], gas_limit)
++    }
++
++    /// Code that STATICCALLs `callee` with `args` bytes of (zero) memory as calldata and all
++    /// its gas, in a loop until it runs out of gas. The calls' memory is paid for once.
++    fn call_loop(callee: Address, args: u16) -> Vec<u8> {
++        // JUMPDEST; retLen 0; retOffset 0; argsLen; argsOffset 0; callee; GAS; STATICCALL;
++        // POP; PUSH1 0; JUMP
++        let mut code = vec![0x5b, 0x60, 0x00, 0x60, 0x00, 0x61];
++        code.extend(args.to_be_bytes());
++        code.extend([0x60, 0x00, 0x73]);
++        code.extend(callee.as_slice());
++        code.extend([0x5a, 0xfa, 0x50, 0x60, 0x00, 0x56]);
++        code
++    }
++
++    /// Code that returns `len` bytes of (zero) memory.
++    fn returns(len: u16) -> Vec<u8> {
++        // PUSH2 len; PUSH1 0; RETURN
++        let mut code = vec![0x61];
++        code.extend(len.to_be_bytes());
++        code.extend([0x60, 0x00, 0xf3]);
++        code
++    }
++
++    /// Code that CREATEs contracts from `len` bytes of (zero) init code in a loop until it runs
++    /// out of gas.
++    fn create_loop(len: u16) -> Vec<u8> {
++        // JUMPDEST; PUSH2 len; offset 0; value 0; CREATE; POP; PUSH1 0; JUMP
++        let mut code = vec![0x5b, 0x61];
++        code.extend(len.to_be_bytes());
++        code.extend([0x60, 0x00, 0x60, 0x00, 0xf0, 0x50, 0x60, 0x00, 0x56]);
++        code
++    }
++
++    /// The presets that record calls but no steps: geth's call tracer and parity's traces.
++    fn call_presets(max_recorded_bytes: Option<usize>) -> [TracingInspectorConfig; 2] {
++        [
++            TracingInspectorConfig::from_geth_call_config(&Default::default()),
++            TracingInspectorConfig::default_parity(),
++        ]
++        .map(|mut config| {
++            config.max_recorded_bytes = max_recorded_bytes;
++            config
++        })
++    }
++
++    /// The bytes a trace's calls hold: their nodes, input and output.
++    fn call_bytes(inspector: &TracingInspector) -> usize {
++        inspector
++            .traces()
++            .nodes()
++            .iter()
++            .map(|n| mem::size_of::<CallTraceNode>() + n.trace.data.len() + n.trace.output.len())
++            .sum()
++    }
++
++    fn step_count(inspector: &TracingInspector) -> usize {
++        inspector.traces().nodes().iter().map(|n| n.trace.steps.len()).sum()
++    }
++
++    #[test]
++    fn steps_count_their_bytes() {
++        let inspector = TracingInspector::new(TracingInspectorConfig::default_geth());
++        let (inspector, res) = trace_loop(inspector, 8, 100_000);
++        res.unwrap();
++        let steps = step_count(&inspector);
++        let stack_words: usize = inspector
++            .traces()
++            .nodes()
++            .iter()
++            .flat_map(|n| n.trace.steps.iter())
++            .map(|s| s.stack.as_ref().map_or(0, |stack| stack.len()))
++            .sum();
++        assert!(steps > 100);
++        assert!(
++            inspector.recorded_bytes()
++                >= steps * mem::size_of::<CallTraceStep>() + stack_words * mem::size_of::<U256>(),
++            "{} bytes for {steps} steps and {stack_words} stack words",
++            inspector.recorded_bytes()
++        );
++    }
++
++    #[test]
++    fn a_trace_past_the_cap_halts_the_transaction() {
++        let mut config = TracingInspectorConfig::default_geth();
++        config.max_recorded_bytes = Some(64 << 10);
++        // under the EIP-7825 cap of the default (Osaka) spec
++        let (inspector, res) = trace_loop(TracingInspector::new(config), 16, 16_000_000);
++        let err = res.unwrap_err();
++        assert!(err.starts_with("trace too large: more than 65536 bytes"), "{err}");
++        // the trace holds what was recorded before the cap, and at most one step past it
++        assert!(inspector.recorded_bytes() < (64 << 10) + 8 * mem::size_of::<CallTraceStep>());
++        assert!(step_count(&inspector) > 16);
++    }
++
++    #[test]
++    fn without_a_cap_the_transaction_runs_out_of_gas() {
++        let mut config = TracingInspectorConfig::default_geth();
++        config.max_recorded_bytes = None;
++        let (inspector, res) = trace_loop(TracingInspector::new(config), 1, 200_000);
++        res.unwrap();
++        assert!(inspector.recorded_bytes() > 0);
++    }
++
++    #[test]
++    fn the_counter_survives_fuse_and_is_shared() {
++        let mut config = TracingInspectorConfig::default_geth();
++        config.max_recorded_bytes = Some(64 << 20);
++        let (mut inspector, res) = trace_loop(TracingInspector::new(config), 1, 100_000);
++        res.unwrap();
++        let first = inspector.recorded_bytes();
++        inspector.fuse();
++        assert_eq!(inspector.recorded_bytes(), first);
++        let (inspector, res) = trace_loop(inspector, 1, 100_000);
++        res.unwrap();
++        assert!(inspector.recorded_bytes() > first);
++
++        let counter = Arc::new(AtomicUsize::new(0));
++        let a = TracingInspector::new(config).share_recorded_bytes(counter.clone());
++        let b = TracingInspector::new(config).share_recorded_bytes(counter.clone());
++        let (a, res) = trace_loop(a, 1, 100_000);
++        res.unwrap();
++        let (b, res) = trace_loop(b, 1, 100_000);
++        res.unwrap();
++        assert_eq!(counter.load(Ordering::Relaxed), a.recorded_bytes());
++        assert_eq!(a.recorded_bytes(), b.recorded_bytes());
++        assert!(a.recorded_bytes() > first);
++
++        // the shared cap trips on the second transaction
++        let mut config = TracingInspectorConfig::default_geth();
++        config.max_recorded_bytes = Some(first + first / 2);
++        let counter = Arc::new(AtomicUsize::new(0));
++        let a = TracingInspector::new(config).share_recorded_bytes(counter.clone());
++        let b = TracingInspector::new(config).share_recorded_bytes(counter);
++        let (_, res) = trace_loop(a, 1, 100_000);
++        res.unwrap();
++        let (_, res) = trace_loop(b, 1, 100_000);
++        assert!(res.unwrap_err().starts_with("trace too large"));
++    }
++
++    #[test]
++    fn calls_count_their_bytes() {
++        // 256 bytes in and 64 out per call, under the default cap: the trace completes
++        let contracts = [(TARGET, call_loop(CALLEE, 256)), (CALLEE, returns(64))];
++        for config in call_presets(Some(DEFAULT_MAX_RECORDED_BYTES)) {
++            let (inspector, res) = call_target(TracingInspector::new(config), &contracts, 200_000);
++            res.unwrap();
++            let nodes = inspector.traces().nodes();
++            assert!(nodes.len() > 10);
++            assert!(nodes[1..].iter().all(|n| n.trace.data.len() == 256));
++            // the last call may run out of gas before it returns
++            assert!(nodes.iter().filter(|n| n.trace.output.len() == 64).count() >= nodes.len() - 2);
++            assert_eq!(inspector.recorded_bytes(), call_bytes(&inspector));
++        }
++    }
++
++    #[test]
++    fn calldata_past_the_cap_halts_the_transaction() {
++        // 16 KiB of calldata per call, about 130 gas each: 300,000 gas copies 34 MB
++        let contracts = [(TARGET, call_loop(CALLEE, 16 << 10))];
++        for config in call_presets(Some(64 << 10)) {
++            let (inspector, res) = call_target(TracingInspector::new(config), &contracts, 300_000);
++            let err = res.unwrap_err();
++            assert!(err.starts_with("trace too large: more than 65536 bytes"), "{err}");
++            // the refused call is traced without its input, and the trace holds at most the cap
++            // and the refused call's node
++            let refused = inspector.traces().nodes().last().unwrap();
++            assert!(refused.trace.data.is_empty());
++            assert_eq!(refused.trace.status, Some(InstructionResult::FatalExternalError));
++            assert!(call_bytes(&inspector) <= (64 << 10) + mem::size_of::<CallTraceNode>());
++        }
++    }
++
++    #[test]
++    fn output_past_the_cap_halts_the_transaction() {
++        // no calldata, 16 KiB of output per call
++        let contracts = [(TARGET, call_loop(CALLEE, 0)), (CALLEE, returns(16 << 10))];
++        for config in call_presets(Some(64 << 10)) {
++            let (inspector, res) =
++                call_target(TracingInspector::new(config), &contracts, 1_000_000);
++            assert!(res.unwrap_err().starts_with("trace too large"));
++            // the call returned; its trace keeps no output
++            let refused = inspector.traces().nodes().last().unwrap();
++            assert_eq!(refused.trace.status, Some(InstructionResult::Return));
++            assert!(refused.trace.output.is_empty());
++            assert!(call_bytes(&inspector) <= (64 << 10) + mem::size_of::<CallTraceNode>());
++        }
++    }
++
++    #[test]
++    fn init_code_past_the_cap_halts_the_transaction() {
++        // 16 KiB of init code per create
++        let contracts = [(TARGET, create_loop(16 << 10))];
++        for config in call_presets(Some(64 << 10)) {
++            let (inspector, res) =
++                call_target(TracingInspector::new(config), &contracts, 1_000_000);
++            assert!(res.unwrap_err().starts_with("trace too large"));
++            assert!(inspector.traces().nodes().len() > 2);
++            let refused = inspector.traces().nodes().last().unwrap();
++            assert!(refused.trace.data.is_empty());
++            assert_eq!(refused.trace.status, Some(InstructionResult::FatalExternalError));
++            assert!(call_bytes(&inspector) <= (64 << 10) + mem::size_of::<CallTraceNode>());
++        }
++    }
++
++    #[test]
++    fn transaction_input_past_the_cap_halts_before_it_runs() {
++        // the transaction's own calldata is the first call's input
++        for config in call_presets(Some(64 << 10)) {
++            let (inspector, res) = inspect(
++                TracingInspector::new(config),
++                &[(TARGET, call_loop(CALLEE, 0))],
++                TxEnv {
++                    gas_limit: 3_000_000,
++                    kind: TxKind::Call(TARGET),
++                    data: vec![0; 128 << 10].into(),
++                    ..Default::default()
++                },
++            );
++            assert!(res.unwrap_err().starts_with("trace too large"));
++            assert_eq!(inspector.traces().nodes().len(), 1);
++        }
++    }
++    /// TN(TN-0172): runs `code` at [`TARGET`] under the struct logger's `opts` and a cap of
++    /// `cap`, then builds its frame with [`TracingInspector::try_geth_traces`].
++    fn struct_logs(
++        opts: alloy_rpc_types_trace::geth::GethDefaultTracingOptions,
++        cap: Option<usize>,
++        code: Vec<u8>,
++        gas_limit: u64,
++    ) -> (TracingInspector, Result<alloy_rpc_types_trace::geth::DefaultFrame, String>) {
++        let mut config = TracingInspectorConfig::from_geth_config(&opts);
++        config.max_recorded_bytes = cap;
++        let (inspector, res) =
++            call_target(TracingInspector::new(config), &[(TARGET, code)], gas_limit);
++        res.expect("the steps fit the cap");
++        let frame = inspector.try_geth_traces(0, Bytes::new(), opts);
++        (inspector, frame)
++    }
++
++    /// Code that stores at `slots` storage slots, then reads slot 0 in a loop until it runs out
++    /// of gas.
++    fn store_then_read(slots: u8) -> Vec<u8> {
++        // PUSH1 1; PUSH1 slot; SSTORE (slots times); JUMPDEST; PUSH0; SLOAD; POP; PUSH2 <jd>; JUMP
++        let mut code = Vec::new();
++        for slot in 0..slots {
++            code.extend([0x60, 0x01, 0x60, slot, 0x55]);
++        }
++        let jumpdest = code.len() as u16;
++        code.extend([0x5b, 0x5f, 0x54, 0x50, 0x61]);
++        code.extend(jumpdest.to_be_bytes());
++        code.push(0x56);
++        code
++    }
++
++    #[test]
++    fn struct_logs_count_their_memory_copies() {
++        let opts = alloy_rpc_types_trace::geth::GethDefaultTracingOptions::default()
++            .enable_memory()
++            .disable_stack()
++            .disable_storage();
++        // 4 KiB of memory once (MSTORE at 4064), then a loop that reuses its snapshot
++        let mut code = vec![0x60, 0x01, 0x61, 0x0f, 0xe0, 0x52];
++        let jumpdest = code.len() as u8;
++        code.extend([0x5b, 0x60, jumpdest, 0x56]);
++
++        let (inspector, frame) = struct_logs(opts, None, code.clone(), 30_000);
++        let frame = frame.unwrap();
++        let copies: usize = frame.struct_logs.iter().map(geth::struct_log_copies).sum();
++        // each reused snapshot becomes 128 hex words again
++        assert!(copies > frame.struct_logs.len() * 128 * 64, "{copies} bytes");
++        assert!(inspector.recorded_bytes() > copies);
++
++        // the steps fit in 4 MiB; their logs repeat the 4 KiB of memory at every step
++        let (inspector, frame) = struct_logs(opts, Some(4 << 20), code, 30_000);
++        let err = frame.unwrap_err();
++        assert!(err.starts_with("trace too large: more than 4194304 bytes"), "{err}");
++        assert!(inspector.recorded_bytes() < (4 << 20) + 128 * 88 + 4096);
++    }
++
++    #[test]
++    fn struct_logs_count_their_storage_copies() {
++        let opts =
++            alloy_rpc_types_trace::geth::GethDefaultTracingOptions::default().disable_stack();
++        let (_, frame) = struct_logs(opts, None, store_then_read(64), 3_000_000);
++        let frame = frame.unwrap();
++        let sloads = frame.struct_logs.iter().filter(|log| log.op == "SLOAD").count();
++        let copies: usize = frame.struct_logs.iter().map(geth::struct_log_copies).sum();
++        assert!(sloads > 1_000, "{sloads} reads");
++        assert!(copies >= sloads * 64 * 64, "{copies} bytes for {sloads} reads");
++
++        let (_, frame) = struct_logs(opts, Some(copies), store_then_read(64), 3_000_000);
++        assert!(frame.unwrap_err().starts_with("trace too large"));
++    }
++}
+diff --git upstream/src/tracing/mux.rs patched/src/tracing/mux.rs
+index 12cbf368fdd962ce6eca29ad34c02d30c4d2c58e..e51cf5b5a4a06f1c27381d783454a721b5f38f23 100644
+--- upstream/src/tracing/mux.rs
++++ patched/src/tracing/mux.rs
+@@ -103,6 +103,18 @@ impl MuxInspector {
+         Ok(MuxInspector { four_byte, tracing, configs })
+     }
+ 
++    /// TN(TN-0172): readies the inspector for the next transaction, as a fresh one from
++    /// [`Self::try_from_config`] would be, except that the tracing inspector keeps its
++    /// recorded-bytes counter (see [`TracingInspector::fuse`]), so the cap bounds the request.
++    pub fn fuse(&mut self) {
++        if let Some(four_byte) = &mut self.four_byte {
++            core::mem::take(four_byte);
++        }
++        if let Some(tracing) = &mut self.tracing {
++            tracing.fuse();
++        }
++    }
++
+     /// Try converting this [MuxInspector] into a [MuxFrame].
+     pub fn try_into_mux_frame<DB: DatabaseRef>(
+         &self,
+@@ -288,3 +300,30 @@ pub enum Error {
+     #[error("error deserializing config: {0}")]
+     InvalidConfig(#[from] serde_json::Error),
+ }
++
++/// TN(TN-0172): the mux tracer's trace cap.
++#[cfg(test)]
++mod tests {
++    use crate::tracing::DebugInspector;
++    use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
++    use core::sync::atomic::Ordering;
++
++    /// The counter of a mux tracer's tracing inspector carries over a fuse, as the struct
++    /// logger's and the call tracer's do, so the cap bounds the request, not one transaction.
++    #[test]
++    fn fuse_keeps_the_recorded_bytes() {
++        let opts: GethDebugTracingOptions = serde_json::from_value(serde_json::json!({
++            "tracer": "muxTracer",
++            "tracerConfig": {"callTracer": {}},
++        }))
++        .unwrap();
++        let mut inspector = DebugInspector::new(opts).unwrap();
++        let DebugInspector::Mux(mux, _) = &inspector else { panic!("a mux tracer") };
++        let counter = mux.tracing.as_ref().unwrap().recorded_bytes.clone();
++        counter.fetch_add(1_000, Ordering::Relaxed);
++
++        inspector.fuse().unwrap();
++        let DebugInspector::Mux(mux, _) = &inspector else { panic!("a mux tracer") };
++        assert_eq!(mux.tracing.as_ref().unwrap().recorded_bytes(), 1_000);
++    }
++}

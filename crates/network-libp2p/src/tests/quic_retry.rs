@@ -15,6 +15,7 @@ use libp2p::{
     Multiaddr,
 };
 use std::{
+    num::NonZeroUsize,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -40,6 +41,10 @@ const CAP: u64 = 1;
 
 /// Concurrent unvalidated attempts in the scheduling test (more than `CAP`).
 const ATTEMPTS: u64 = 4;
+
+/// Accepted handshakes that may wait for the swarm in the spawned accept task test (fewer
+/// than `ATTEMPTS`, so that the queue bound is exercised).
+const ACCEPT_TASK_CAPACITY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
 
 /// Node limits with the default peer and connection values.
 fn node_limits() -> QuicIncomingLimits {
@@ -268,5 +273,25 @@ async fn retry_outcomes_yield_after_per_poll_cap() -> eyre::Result<()> {
     assert!(probe.cap_hits.load(Ordering::SeqCst) >= ATTEMPTS);
     assert!(stats.budget_yields() >= ATTEMPTS);
     dialers.iter().for_each(|dialer| dialer.abort());
+    Ok(())
+}
+
+/// With the spawned accept task (queue capacity 2) and Retry on, four fresh dials all
+/// establish: every attempt gets a Retry and then one accept, and the listener refuses
+/// nothing. The queue is smaller than the number of dials, so the bound is exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_accept_task_accepts_retried_dials() -> eyre::Result<()> {
+    let (mut config, stats) = listener_config(&Keypair::generate_ed25519(), true, node_limits());
+    config.inbound_accept_task = Some(ACCEPT_TASK_CAPACITY);
+    let (listener, addr) = listen(config).await?;
+    let server = serve(listener);
+    let dials = (0..ATTEMPTS).map(|_| dial_fresh(addr.clone()));
+    let outcomes = tokio::time::timeout(WAIT, futures::future::join_all(dials)).await?;
+    outcomes.into_iter().collect::<eyre::Result<Vec<()>>>()?;
+    wait_accepted(&stats, ATTEMPTS).await?;
+    assert!(stats.retried() >= ATTEMPTS, "every fresh dial gets a Retry");
+    assert_eq!(stats.accepted(), ATTEMPTS);
+    assert_eq!(stats.refused() + stats.ignored(), 0, "the listener refuses nothing");
+    server.abort();
     Ok(())
 }

@@ -124,7 +124,7 @@ use alloy::{
         eip4788::BEACON_ROOTS_ADDRESS,
         eip7685::{Requests, EMPTY_REQUESTS_HASH},
     },
-    primitives::{aliases::U184, Log},
+    primitives::{aliases::U184, Bloom, Log},
     sol_types::{SolCall as _, SolEventInterface as _},
 };
 use alloy_evm::{Database, Evm};
@@ -140,7 +140,6 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
     FromRecoveredTx, FromTxWithEncoded, OnStateHook, RecoveredTx,
 };
-use reth_primitives::logs_bloom;
 use reth_primitives_traits::proofs::calculate_withdrawals_root;
 use reth_revm::{
     context::{
@@ -195,6 +194,18 @@ pub struct TNBlockExecutionCtx {
     /// for the replay caveat that follows from that). Execution reads only the rewards counter
     /// today — the gas and fee data is carried so the epoch-closing block executor can reach it.
     pub gas_accumulator: GasAccumulator,
+    /// Whether this context re-executes a sealed block (`context_for_block`), as the RPC's
+    /// traces and `debug_executionWitness` do, rather than executing the block being produced
+    /// (`context_for_next_block`). The RPC's own uses of `context_for_next_block`
+    /// (`eth_simulateV1`, the pending block) never close an epoch.
+    ///
+    /// A replay publishes nothing to the node's operators: no epoch-close gas gauges or headroom
+    /// warning (`crate::metrics::record_epoch_close_gas`) and no registry event logs
+    /// ([`surface_system_call_logs`]). Those describe the node's own execution and were
+    /// published when the block was produced; an RPC client replaying a closing block would
+    /// otherwise overwrite the gauges operators alert on. Execution never reads this field, so
+    /// a replay computes the same block.
+    pub replay: bool,
     /// Test-only slash injection for the epoch boundary, copied from the payload
     /// (`context_for_next_block`). Feeds the executor's `epoch_boundary_slashes` seam so a test
     /// can drive a non-empty slash list through the production close path. Production builds have
@@ -303,6 +314,8 @@ pub(crate) struct TNBlockExecutor<Evm, Spec, R: ReceiptBuilder> {
 /// caller-supplied and the contract does not dedupe it. That is moot while
 /// [`TNBlockExecutor::epoch_boundary_slashes`] returns an empty list, but enabling slashing should
 /// revisit this level rather than assume the bound above.
+///
+/// A replay ([`TNBlockExecutionCtx::replay`]) does not reach this function either.
 fn surface_system_call_logs(description: &str, logs: &[Log]) {
     logs.iter().map(classify_system_call_log).for_each(|classified| match classified {
         SystemCallLog::Registry(log, event) => log_registry_event(description, log, &event),
@@ -422,9 +435,9 @@ where
     /// No receipt is built for a system call, matching Ethereum: the logs it emits reach neither
     /// the receipts root, the header `logs_bloom`, nor `eth_getLogs`, and they must not, since
     /// adding them would change `receipts_root` and be a hard fork. The success arm instead hands
-    /// them to [`surface_system_call_logs`], which is where the node-side `info!` lines and their
-    /// rationale live. That path is observational only and runs after the result is known good;
-    /// it touches neither `res.state` nor the gas accounting.
+    /// them to [`surface_system_call_logs`] (not on a replay), which is where the node-side
+    /// `info!` lines and their rationale live. That path is observational only and runs after the
+    /// result is known good; it touches neither `res.state` nor the gas accounting.
     fn transact_and_commit_system_call(
         &mut self,
         contract: Address,
@@ -446,7 +459,9 @@ where
         match &res.result {
             ExecutionResult::Success { gas_used, gas_refunded, logs, .. } => {
                 self.epoch_close_gas.push(label, gas_spent(*gas_used, *gas_refunded));
-                surface_system_call_logs(description, logs);
+                if !self.ctx.replay {
+                    surface_system_call_logs(description, logs);
+                }
             }
             ExecutionResult::Revert { output, gas_used } => {
                 let reason = alloy::sol_types::decode_revert_reason(output)
@@ -1957,8 +1972,11 @@ where
             // reads it and no state is touched. It lands here, after the calls have succeeded,
             // because any failure above already aborted the block: there is no partial epoch
             // close to report gas for. A system call runs at `gas_price: 0`, so this gas never
-            // enters `self.gas_used` and these gauges are the only place it is visible.
-            crate::metrics::record_epoch_close_gas(&self.epoch_close_gas);
+            // enters `self.gas_used` and these gauges are the only place it is visible. A replay
+            // publishes nothing (`TNBlockExecutionCtx::replay`).
+            if !self.ctx.replay {
+                crate::metrics::record_epoch_close_gas(&self.epoch_close_gas);
+            }
         }
 
         Ok((
@@ -2050,6 +2068,18 @@ where
     }
 }
 
+/// The header's `receipts_root` and `logs_bloom` from one bloom per receipt.
+///
+/// The block bloom is the OR of the receipt blooms, so the blooms computed for the receipts root
+/// are reused instead of hashing every log's address and topics a second time. Both values are
+/// the same as `Receipt::calculate_receipt_root_no_memo` and `logs_bloom` over all logs.
+fn receipts_root_and_logs_bloom(receipts: &[Receipt]) -> (B256, Bloom) {
+    let receipts_with_bloom = receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+    let receipts_root = proofs::calculate_receipt_root(&receipts_with_bloom);
+    let logs_bloom = receipts_with_bloom.iter().fold(Bloom::ZERO, |acc, r| acc | r.bloom_ref());
+    (receipts_root, logs_bloom)
+}
+
 /// Block builder for TN.
 #[derive(Debug, Clone)]
 pub struct TNBlockAssembler<ChainSpec = reth_chainspec::ChainSpec> {
@@ -2091,8 +2121,7 @@ where
 
         let timestamp = evm_env.block_env.timestamp().saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
-        let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
-        let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
+        let (receipts_root, logs_bloom) = receipts_root_and_logs_bloom(receipts);
 
         // set excess blob gas 0
         let excess_blob_gas = Some(0);
@@ -3068,5 +3097,57 @@ mod tests {
         assert_eq!(burns[0].0, victim, "the burned consensus NFT was the slashed validator's");
 
         Ok(())
+    }
+
+    /// The assembler's receipts root and logs bloom are the values of the two computations they
+    /// replaced (the receipts root with a bloom computed per receipt, then the bloom of every log
+    /// again), so the header's bytes are unchanged: every transaction type, receipts with no logs,
+    /// with several and with shared topics, and no receipts at all.
+    #[test]
+    fn receipts_root_and_logs_bloom_equal_the_separate_computations() {
+        use alloy::consensus::TxType;
+        use reth_primitives_traits::logs_bloom;
+
+        let mut rng = StdRng::seed_from_u64(0x7c);
+        let shared_topic = B256::from(rng.random::<[u8; 32]>());
+        let tx_types = [TxType::Legacy, TxType::Eip2930, TxType::Eip1559, TxType::Eip7702];
+        for count in [0, 1, 2, 5, 33, 200] {
+            let mut cumulative_gas_used = 0;
+            let receipts: Vec<Receipt> = (0..count)
+                .map(|i| {
+                    cumulative_gas_used += rng.random_range(21_000..200_000);
+                    let logs = (0..rng.random_range(0..6))
+                        .map(|_| {
+                            let mut topics: Vec<B256> = (0..rng.random_range(0..4))
+                                .map(|_| B256::from(rng.random::<[u8; 32]>()))
+                                .collect();
+                            if rng.random_bool(0.3) {
+                                topics.push(shared_topic);
+                            }
+                            let data: Vec<u8> =
+                                (0..rng.random_range(0..70)).map(|_| rng.random()).collect();
+                            Log::new_unchecked(
+                                Address::from(rng.random::<[u8; 20]>()),
+                                topics,
+                                data.into(),
+                            )
+                        })
+                        .collect();
+                    Receipt {
+                        tx_type: tx_types[i % tx_types.len()],
+                        success: rng.random_bool(0.8),
+                        cumulative_gas_used,
+                        logs,
+                    }
+                })
+                .collect();
+
+            let (receipts_root, bloom) = receipts_root_and_logs_bloom(&receipts);
+            assert_eq!(receipts_root, Receipt::calculate_receipt_root_no_memo(&receipts));
+            assert_eq!(bloom, logs_bloom(receipts.iter().flat_map(|r| r.logs())));
+            if receipts.iter().any(|r| !r.logs.is_empty()) {
+                assert_ne!(bloom, Bloom::ZERO, "{count} receipts with logs");
+            }
+        }
     }
 }

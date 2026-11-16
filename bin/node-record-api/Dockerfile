@@ -32,6 +32,12 @@ COPY bin/ ./bin/
 COPY crates/ ./crates/
 COPY chain-configs/ ./chain-configs/
 COPY tn-contracts/ ./tn-contracts/
+# Workspace members and [patch.crates-io] path sources named by the root
+# Cargo.toml; cargo cannot load the workspace without them, even for -p.
+COPY examples/ ./examples/
+COPY patches/ ./patches/
+# The vendored reth: the root Cargo.toml's reth-* dependencies are paths into it.
+COPY vendor/ ./vendor/
 
 # Build only the API binary, then move it out of the cache mount so the
 # runtime stage can COPY it.
@@ -67,6 +73,7 @@ COPY --from=builder /tmp/node-record-api /usr/local/bin/node-record-api
 EXPOSE 8080
 
 # The daemon requires --chain-id plus a bootstrap and a key source: pass
-# --committee-file (or --bootstrap with --rpc-url / --keys-file), or their
+# --bootstrap or --bootstrap-servers-file (or a --committee-file that lists
+# bootstrap servers) and --committee-file, --rpc-url or --keys-file, or their
 # NODE_RECORD_API_* environment variables, at run time.
 ENTRYPOINT ["node-record-api"]

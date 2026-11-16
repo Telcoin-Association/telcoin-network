@@ -10,13 +10,13 @@ use crate::{
 };
 use std::{collections::HashSet, sync::Arc};
 use tn_config::ConsensusConfig;
-use tn_storage::CertificateStore;
+use tn_storage::{CertificateStore, StoreResult};
 use tn_types::{
-    error::CertificateError, Certificate, Database, Hash as _, HeaderDigest, Round,
+    error::CertificateError, Certificate, Committee, Database, Hash as _, HeaderDigest, Round,
     SignatureVerificationState, TaskSpawner, TnSender as _,
 };
 use tokio::sync::oneshot;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 #[cfg(test)]
 #[path = "../tests/cert_validator_tests.rs"]
@@ -360,5 +360,73 @@ where
 
             Ok(certs)
         })
+    }
+}
+
+/// Return a stored certificate with an aggregate signature this node has checked itself, or
+/// `None` if its signature does not verify.
+///
+/// A fetched certificate that another certificate in the same response names as a parent is
+/// stored `VerifiedIndirectly`: its header is bound to a directly verified descendant, but its
+/// signature bytes and signer bitmap are the responder's, unchecked. Before such a copy is handed
+/// to a peer it is verified here, on the blocking pool, and the outcome is written back with the
+/// certificate, so each stored certificate costs at most one verification, across restarts too. A
+/// copy that fails is stored `Unsigned`, the state of a certificate without a valid quorum
+/// signature, and is never handed on; it stays stored because its header, which is all the DAG
+/// and the vote read, is authentic. A directly verified copy is returned as it is, without any
+/// work.
+pub(crate) async fn verify_stored_certificate<DB: Database>(
+    store: &DB,
+    committee: &Committee,
+    certificate: Certificate,
+) -> StoreResult<Option<Certificate>> {
+    match certificate.signature_verification_state() {
+        SignatureVerificationState::VerifiedDirectly(_) | SignatureVerificationState::Genesis => {
+            return Ok(Some(certificate));
+        }
+        SignatureVerificationState::VerifiedIndirectly(_)
+        | SignatureVerificationState::Unverified(_) => {}
+        // a stored copy is unsigned only once it failed below
+        SignatureVerificationState::Unsigned(_) => return Ok(None),
+    }
+
+    let committee = committee.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        let mut certificate = certificate;
+        let result = certificate
+            .validate_received()
+            .and_then(|()| certificate.validate_and_verify(&committee));
+        (certificate, result)
+    })
+    .await;
+    let (mut certificate, result) = match verified {
+        Ok(verified) => verified,
+        Err(e) => {
+            // cancelled at shutdown (or panicked): withhold the certificate and leave its stored
+            // state as it is, so the next use verifies it
+            debug!(target: "primary::cert_validator", ?e, "stored certificate verification task failed");
+            return Ok(None);
+        }
+    };
+
+    // record a failure too, so no later use of this copy, nor a peer's request, checks it again
+    if let (Err(_), Some(signature)) = (&result, certificate.aggregated_signature()) {
+        certificate
+            .set_signature_verification_state(SignatureVerificationState::Unsigned(signature));
+    }
+    store.write(certificate.clone())?;
+    match result {
+        Ok(()) => Ok(Some(certificate)),
+        Err(e) => {
+            warn!(
+                target: "primary::cert_validator",
+                digest = %certificate.digest(),
+                round = certificate.round(),
+                origin = %certificate.origin(),
+                ?e,
+                "stored certificate failed direct verification; it is not handed on"
+            );
+            Ok(None)
+        }
     }
 }

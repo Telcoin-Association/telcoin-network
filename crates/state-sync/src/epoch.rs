@@ -3,15 +3,20 @@
 #[cfg(test)]
 use tn_test_utils as _;
 
-use futures::StreamExt as _;
+use eyre::WrapErr as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use std::{
     future::{ready, Future},
     time::Duration,
 };
 
+use tn_network_libp2p::error::NetworkError;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
-use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordValidation};
-use tn_types::{ConsensusHeaderDigest, Epoch, Noticer, TaskSpawner};
+use tn_storage::{
+    consensus::ConsensusChain,
+    epoch_records::{EpochDbError, EpochRecordValidation},
+};
+use tn_types::{ConsensusHeaderDigest, Epoch, Noticer, TaskError, TaskSpawner};
 use tracing::{debug, error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
@@ -26,12 +31,44 @@ const STARTUP_SYNC_PASS_TIMEOUT: Duration = Duration::from_secs(EPOCH_COLLECT_RE
 /// Cadence for checking whether a startup dial has established a connection.
 const STARTUP_PEER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Pause before repeating a startup pass that no peer answered.
+///
+/// Peers between epochs drop inbound primary requests for a fraction of a second, so a short
+/// pause lets the next pass reach them once they serve again.
+const STARTUP_SYNC_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// How long unanswered startup passes are repeated before their silence counts as the answer.
+///
+/// A peer between epochs drops inbound primary requests for well under a second, so this covers a
+/// restart into a transitioning network several times over. It stays short because at genesis,
+/// and whenever the whole network restarts at once, every peer drops requests until its own first
+/// epoch starts, which happens only after its own startup sync: without this cap every node would
+/// sit out the full [`STARTUP_SYNC_TIMEOUT`] before serving anyone. A node that gives up on a
+/// longer gap and starts an epoch the network already closed is still demoted once the record
+/// collector stores a later epoch's certified record (see `run_epoch` in `tn-node`).
+const STARTUP_SYNC_UNANSWERED_BUDGET: Duration = Duration::from_secs(2);
+
+/// Where a collection pass stopped (see [`collect_epoch_records`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CollectedPass {
+    /// The last collected epoch: the cursor the next pass starts from.
+    epoch: Epoch,
+    /// False when the pass stopped because no peer answered the request for the next epoch (no
+    /// peer, a dropped request, an unresolved responder). Such a pass says nothing about the
+    /// network's newest record. Every other stop is a peer's answer: it does not hold the epoch,
+    /// or it sent a record this node refused or cannot anchor yet.
+    definitive: bool,
+}
+
 /// Cursor and injected operations carried between startup collection passes.
 struct StartupSyncState<Collect, Progress> {
     /// Last collected epoch, or the predecessor of the certified prefix after a capped pass.
     last_epoch: Epoch,
-    /// A completed pass to compare against the next result when detecting quiescence.
+    /// The previous pass's epoch when it was definitive, compared against the next result when
+    /// detecting quiescence.
     previous_pass: Option<Epoch>,
+    /// When the current run of unanswered passes began; `None` once a pass is answered.
+    unanswered_since: Option<tokio::time::Instant>,
     /// Fetch and validate records from the current cursor.
     collect: Collect,
     /// Read the first epoch without a historical certificate.
@@ -43,16 +80,23 @@ struct StartupSyncState<Collect, Progress> {
 /// The caller must seed the trusted genesis committee before calling this function and start the
 /// background record collector afterward. Records use the same locally anchored validation as
 /// background collection. Peer readiness is polled until a connection is established. Network
-/// failures never fail startup: two equal consecutive pass results, a capped pass without
-/// certified-prefix progress, shutdown, or a thirty-second deadline stop collection. The deadline
-/// includes the peer wait. Each pass has a five-second cap, so connected peers that cannot yet
-/// serve certificates do not consume the full deadline.
+/// failures never fail startup: two consecutive definitive passes ending at the same epoch, a
+/// capped pass without certified-prefix progress, shutdown, or a thirty-second deadline stop
+/// collection. A pass is definitive when it ends on a peer's answer, normally "I do not have that
+/// epoch" at the network's tip. A pass that no peer answered (a dropped request, an unresolved
+/// peer, no peer at all) is repeated after a short pause and does not count toward quiescence
+/// until no peer has answered for [`STARTUP_SYNC_UNANSWERED_BUDGET`]: two such failures must not
+/// read as "nothing newer exists", but a network starting all at once cannot answer anyone until
+/// its nodes finish this sync themselves. The deadline includes the peer wait.
+/// Each pass has a five-second cap, so connected peers that cannot yet serve certificates do not
+/// consume the full deadline. Our own epoch store failing to save or persist a record does fail
+/// startup (see [`collect_epoch_records`]).
 pub async fn sync_epoch_records_to_tip(
     consensus_chain: &ConsensusChain,
     primary_handle: &PrimaryNetworkHandle,
     consensus_bus: &ConsensusBusApp,
     node_shutdown: Noticer,
-) {
+) -> eyre::Result<()> {
     drive_epoch_record_sync(
         || async { primary_handle.inner_handle().established_peer_count().await.unwrap_or(0) },
         |epoch| collect_epoch_records(epoch, consensus_chain, primary_handle, consensus_bus),
@@ -67,22 +111,26 @@ pub async fn sync_epoch_records_to_tip(
         },
         node_shutdown,
     )
-    .await;
+    .await
 }
 
 /// Drive startup collection with independently bounded passes and a process-wide stop condition.
 ///
 /// `progress` returns the first epoch without a certificate, so a capped pass continues only when
-/// it extended the certified prefix. Separate scheduling from transport to exercise repair,
-/// stalled peers, and shutdown deterministically.
+/// it extended the certified prefix. A pass that no peer answered waits
+/// [`STARTUP_SYNC_RETRY_BACKOFF`] and resets the quiescence comparison, until
+/// [`STARTUP_SYNC_UNANSWERED_BUDGET`] of silence makes such passes count. A pass that fails (our
+/// own store failing) ends the sync with its error. Separate scheduling from transport to exercise
+/// repair, stalled peers, unanswered requests, and shutdown deterministically.
 async fn drive_epoch_record_sync<Peers, Collect, Progress>(
     peer_count: impl FnMut() -> Peers,
     collect: impl FnMut(Epoch) -> Collect,
     progress: impl FnMut() -> Progress,
     shutdown: impl Future<Output = ()>,
-) where
+) -> eyre::Result<()>
+where
     Peers: Future<Output = usize>,
-    Collect: Future<Output = Epoch>,
+    Collect: Future<Output = eyre::Result<CollectedPass>>,
     Progress: Future<Output = Epoch>,
 {
     let sync = async {
@@ -95,48 +143,126 @@ async fn drive_epoch_record_sync<Peers, Collect, Progress>(
         .for_each(|_| tokio::time::sleep(STARTUP_PEER_POLL_INTERVAL))
         .await;
 
-        futures::stream::unfold(
-            StartupSyncState { last_epoch: 0, previous_pass: None, collect, progress },
+        futures::stream::try_unfold(
+            StartupSyncState {
+                last_epoch: 0,
+                previous_pass: None,
+                unanswered_since: None,
+                collect,
+                progress,
+            },
             |mut state| async move {
                 let before = (state.progress)().await;
                 let collected = tokio::select! {
                     biased;
                     _ = tokio::time::sleep(STARTUP_SYNC_PASS_TIMEOUT) => None,
-                    epoch = (state.collect)(state.last_epoch) => Some(epoch),
+                    pass = (state.collect)(state.last_epoch) => Some(pass?),
                 };
+                // Only a pass that ended on a peer's answer says where the network's records end,
+                // until no peer has answered for the whole unanswered budget: then the silence is
+                // the answer, as it is at genesis and in a whole-network restart.
                 // A backward step repairs an anchor; only equality establishes quiescence.
-                let quiescent = collected.is_some_and(|epoch| state.previous_pass == Some(epoch));
+                let unanswered = collected.is_some_and(|pass| !pass.definitive);
+                let now = tokio::time::Instant::now();
+                let since = state.unanswered_since;
+                let budget_spent = unanswered
+                    && since.is_some_and(|since| {
+                        now.duration_since(since) >= STARTUP_SYNC_UNANSWERED_BUDGET
+                    });
+                state.unanswered_since = unanswered.then(|| since.unwrap_or(now));
+                if budget_spent && state.previous_pass.is_none() {
+                    info!(
+                        target: "epoch-manager",
+                        budget = ?STARTUP_SYNC_UNANSWERED_BUDGET,
+                        "no peer answered the startup epoch record requests for the whole budget; \
+                         taking the local records as the newest (the peers may be starting too)",
+                    );
+                }
+                let definitive =
+                    collected.filter(|pass| pass.definitive || budget_spent).map(|pass| pass.epoch);
+                let quiescent = definitive.is_some_and(|epoch| state.previous_pass == Some(epoch));
                 let after = (state.progress)().await;
                 let stalled = collected.is_none() && after == before;
-                state.last_epoch = collected.unwrap_or_else(|| after.saturating_sub(1));
-                state.previous_pass = collected;
-                // Keep the outer deadline and shutdown responsive for immediately ready passes.
-                tokio::task::yield_now().await;
-                (!quiescent && !stalled).then_some(((), state))
+                state.last_epoch =
+                    collected.map_or_else(|| after.saturating_sub(1), |pass| pass.epoch);
+                state.previous_pass = definitive;
+                if unanswered && !budget_spent {
+                    // no peer answered: ask again shortly, inside the outer deadline
+                    tokio::time::sleep(STARTUP_SYNC_RETRY_BACKOFF).await;
+                } else {
+                    // Keep the outer deadline and shutdown responsive for immediately ready passes.
+                    tokio::task::yield_now().await;
+                }
+                Ok((!quiescent && !stalled).then_some(((), state)))
             },
         )
-        .for_each(|()| ready(()))
-        .await;
+        .try_for_each(|()| ready(Ok(())))
+        .await
     };
     tokio::select! {
         biased;
-        _ = shutdown => {},
+        _ = shutdown => Ok(()),
         _ = tokio::time::sleep(STARTUP_SYNC_TIMEOUT) => {
             info!(target: "epoch-manager", "startup epoch record sync reached its deadline");
+            Ok(())
         },
-        _ = sync => {},
+        result = sync => result,
     }
 }
 
+/// The node's count of epoch records that contradict its own execution (`EpochMetrics` in
+/// `tn-node`, `tn_epoch_final_state_mismatches_total` in Prometheus). Every count stops the node.
+const FINAL_STATE_MISMATCHES: &str = "tn_epoch.final_state_mismatches_total";
+
+/// Split a failed save of a downloaded epoch record ([`EpochDbError::stop_on_local_failure`]):
+/// our own store failing is returned, so the collection fails and the node stops; a refused
+/// record, which a peer can send, is only logged, and the caller asks again later.
+///
+/// A certified record (it passed `validate_downloaded_record`) refused because this node holds a
+/// different record for the epoch (`ConflictingRecord`) is returned too: the stored record is this
+/// node's own uncertified one, built from its execution (the collector skips epochs whose record
+/// is already certified), so this node's execution diverged from the one a quorum certified. It is
+/// counted in `tn_epoch_final_state_mismatches_total` and the node stops, as a committee validator
+/// does at the epoch vote: an observer or a node outside the committee would otherwise run on, and
+/// serve, a chain no quorum certified. A restart stops again, as the collector asks again.
+fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
+    if matches!(e, EpochDbError::ConflictingRecord { .. }) {
+        ::metrics::counter!(FINAL_STATE_MISMATCHES).increment(1);
+        error!(
+            target: "epoch-manager",
+            epoch,
+            e = %e,
+            "a certified epoch record from peers conflicts with this node's own record for the \
+             epoch: this node's execution diverged from the certified chain, stopping the node",
+        );
+        return Err(eyre::Report::new(e).wrap_err(format!(
+            "epoch {epoch}: a quorum certified an epoch record other than the one this node built \
+             from its own execution, so this node's execution diverged - stopping the node rather \
+             than run on a chain no quorum certified (do NOT delete chain-data: keep the datadir to \
+             find the first block that differs)"
+        )));
+    }
+    e.stop_on_local_failure(format!("failed to save epoch record/cert for epoch {epoch}"))
+}
+
 /// Asks peers for records from last_epoch to requested_epoch.
-/// Returns the Epoch that was last retrieved.
+/// Returns the Epoch that was last retrieved, and whether the pass ended on a peer's answer (see
+/// [`CollectedPass`]).
+///
+/// Fails when our own epoch store fails to save or persist, or when a certified record conflicts
+/// with this node's own (see [`stop_on_local_failure`]); a peer's invalid or otherwise refused
+/// record is logged and asked for again on a later pass. Each
+/// certified record stored is published on [`ConsensusBusApp::certified_record_epoch`], so an
+/// active validator still running an epoch the network already closed leaves it to catch up.
 async fn collect_epoch_records(
     last_epoch: Epoch,
     consensus_chain: &ConsensusChain,
     primary_handle: &PrimaryNetworkHandle,
     consensus_bus: &ConsensusBusApp,
-) -> Epoch {
+) -> eyre::Result<CollectedPass> {
     let mut result_epoch = last_epoch;
+    // the last failed request decides; a record that ends the pass early is a peer's answer
+    let mut definitive = true;
     // Track the highest final_consensus seen across all downloaded epoch records.
     // We emit a single state-sync notification at the end rather than one per epoch,
     // to avoid flooding peers with concurrent request_consensus calls during catch-up.
@@ -152,7 +278,9 @@ async fn collect_epoch_records(
             let hash = rec.final_consensus.hash;
             // Don't know the output bytes so use 0.  If we could get them (already have the output)
             // we won't need them...
-            if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
+            // A certified record may also replace a gossip pin the record proves impossible
+            // (issue #1771).
+            if consensus_bus.publish_certified_consensus_num_hash(epoch, number, hash) {
                 debug!(
                     target: "epoch-manager",
                     "epoch record sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
@@ -178,14 +306,14 @@ async fn collect_epoch_records(
                         // Capture final_consensus before save consumes epoch_rec.
                         let final_consensus = epoch_rec.final_consensus;
                         if let Err(e) = consensus_chain.epochs().save(epoch_rec, cert).await {
-                            error!(
-                                target: "epoch-manager",
-                                ?e,
-                                "failed to save epoch record/cert for epoch {epoch}",
-                            );
-                            return epoch.saturating_sub(1);
+                            stop_on_local_failure(e, epoch)?;
+                            return Ok(CollectedPass {
+                                epoch: epoch.saturating_sub(1),
+                                definitive: true,
+                            });
                         }
                         result_epoch = epoch;
+                        consensus_bus.set_certified_record_epoch_if_newer(epoch);
                         info!(
                             target: "epoch-manager",
                             "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
@@ -213,20 +341,30 @@ async fn collect_epoch_records(
                             ?cert_valid,
                             "got an invalid epoch record, epoch {epoch}",
                         );
-                        return epoch.saturating_sub(1);
+                        return Ok(CollectedPass {
+                            epoch: epoch.saturating_sub(1),
+                            definitive: true,
+                        });
                     }
                     EpochRecordValidation::NoAnchor => {
                         // We are missing the previous epoch record (or the genesis committee), so
                         // this record cannot be anchored. Reduce last_epoch by one and retry once
                         // the anchor is available.
-                        return epoch.saturating_sub(1);
+                        return Ok(CollectedPass {
+                            epoch: epoch.saturating_sub(1),
+                            definitive: true,
+                        });
                     }
                 }
             }
             Err(err) => {
-                // We delibrately go past the latest epoch so this is expected to happen.
+                // We delibrately go past the latest epoch so this is expected to happen. Only a
+                // peer saying it does not hold the epoch shows the end of the records; any other
+                // failure means no peer answered (see `request_epoch_cert`).
+                definitive = matches!(err, NetworkError::RPCError(_));
                 info!(
                     target: "epoch-manager",
+                    definitive,
                     "failed to retrieve epoch from a peer {epoch}: {err}",
                 );
             }
@@ -235,33 +373,35 @@ async fn collect_epoch_records(
             break;
         }
     }
-    if let Err(e) = consensus_chain.epochs().persist().await {
-        error!(
-            target: "epoch-manager",
-            ?e,
-            "failed to persist downloaded epoch record/certs",
-        );
-    }
+    // A persist writes only our own files, so any failure is local.
+    consensus_chain
+        .epochs()
+        .persist()
+        .await
+        .wrap_err("failed to persist downloaded epoch record/certs")?;
     // Emit a single state-sync notification with the highest epoch's final consensus.
     // This unblocks nodes that missed a ConsensusResult gossip message due to a timing
     // gap (e.g. gossip arrived before the epoch record was available). We do this once
     // at the end rather than per-epoch to avoid flooding peers with concurrent requests.
+    // The certified publish also replaces a gossip pin that the certified record proves
+    // impossible, so a node pinned by bogus f+1 signatures heals here (issue #1771).
     if let Some((epoch, number, hash)) = best_final_consensus {
         // Don't know the output bytes so use 0.  If we could get them (already have the output) we
         // won't need them...
-        if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
+        if consensus_bus.publish_certified_consensus_num_hash(epoch, number, hash) {
             info!(
                 target: "epoch-manager",
                 "updating last published consensus num hash up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
             );
         }
     }
-    result_epoch
+    Ok(CollectedPass { epoch: result_epoch, definitive })
 }
 
 /// Spawn a long running task to collect missing epoch records.
 ///
-/// Most likely because a node is syncing.
+/// Most likely because a node is syncing. Our own epoch store failing to save or persist ends
+/// this critical task with the error, so the node exits (see [`collect_epoch_records`]).
 pub async fn spawn_epoch_record_collector(
     consensus_chain: ConsensusChain,
     primary_handle: PrimaryNetworkHandle,
@@ -278,16 +418,23 @@ pub async fn spawn_epoch_record_collector(
         // is cheap for nodes that are fully caught up.
         let mut last_epoch: Epoch = 0;
         loop {
-            let requested_epoch = *epoch_rx.borrow_and_update();
-            if requested_epoch >= last_epoch {
-                last_epoch = collect_epoch_records(
-                    last_epoch,
-                    &consensus_chain,
-                    &primary_handle,
-                    &consensus_bus,
-                )
-                .await;
-            }
+            // Every wake-up runs a pass, whether the requested epoch moved or the retry timer
+            // fired. The pass starts at the last certified epoch, so on a caught-up node it costs
+            // a few store reads and one peer request, and it republishes each certified record it
+            // walks over. That republish is the heal for a last-published watch pinned by f+1
+            // gossip signatures (issues #1771 and #1796), so it must not wait on a requested epoch
+            // that can sit below the cursor. An unanswered pass needs no special handling here:
+            // the retry timer below asks again. The borrow clears the change flag.
+            let _ = epoch_rx.borrow_and_update();
+            last_epoch = collect_epoch_records(
+                last_epoch,
+                &consensus_chain,
+                &primary_handle,
+                &consensus_bus,
+            )
+            .await
+            .map_err(|e| TaskError::from_message(format!("{e:#}")))?
+            .epoch;
             // Wait until the watch is updated or a retry timer fires.
             // The retry timer ensures that a failed collection attempt (e.g. peers not yet
             // connected at startup) is re-attempted automatically without requiring a new
@@ -349,12 +496,23 @@ mod tests {
     }
 
     /// Spawn a mock peer network serving `(record, cert)` pairs by epoch.
-    /// Requests for epochs not in `served` drop the reply channel so the
-    /// collector sees the request fail (as when no peer has the record).
+    /// Requests for epochs not in `served` get the reply a peer sends when it does not hold the
+    /// record, as at the network's tip.
     fn mock_epoch_record_network(
         served: HashMap<Epoch, (EpochRecord, EpochCertificate)>,
         peer: BlsPublicKey,
         established_peers: usize,
+    ) -> PrimaryNetworkHandle {
+        mock_epoch_record_network_with(served, peer, established_peers, true)
+    }
+
+    /// [`mock_epoch_record_network`], where `answer_unserved == false` drops the reply channel of a
+    /// request for an epoch not in `served`, as a peer between epochs drops inbound requests.
+    fn mock_epoch_record_network_with(
+        served: HashMap<Epoch, (EpochRecord, EpochCertificate)>,
+        peer: BlsPublicKey,
+        established_peers: usize,
+        answer_unserved: bool,
     ) -> PrimaryNetworkHandle {
         let (tx, mut rx) = mpsc::channel(100);
         tokio::spawn(async move {
@@ -372,6 +530,11 @@ mod tests {
                                 record: record.clone(),
                                 certificate: certificate.clone(),
                             },
+                        }));
+                    } else if answer_unserved {
+                        let _ = reply.send(Ok(NetworkResponseMessage {
+                            peer,
+                            result: PrimaryResponse::unavailable_epoch_record(Some(epoch), None),
                         }));
                     }
                 }
@@ -433,9 +596,16 @@ mod tests {
         let handle = mock_epoch_record_network(served, keys[0], 1);
         let consensus_bus = ConsensusBus::new();
 
-        let collected =
-            collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app()).await;
-        assert_eq!(collected, 2, "collector should fetch through the ejection epoch");
+        let collected = collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app())
+            .await
+            .expect("no local store failure");
+        assert_eq!(
+            collected,
+            CollectedPass { epoch: 2, definitive: true },
+            "collector should fetch through the ejection epoch"
+        );
+        // the epoch manager is woken with the newest certified record stored
+        assert_eq!(*consensus_bus.app().certified_record_epoch().borrow(), Some(2));
 
         // Both records validated (parent link + ejection tolerance + shrunken
         // quorum together) and were saved with their certs.
@@ -490,12 +660,195 @@ mod tests {
         let handle = mock_epoch_record_network(served, keys[0], 1);
         let consensus_bus = ConsensusBus::new();
 
-        let collected =
-            collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app()).await;
-        assert_eq!(collected, 0, "collector must stop at the invalid record");
+        let collected = collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app())
+            .await
+            .expect("an invalid peer record is not a local failure");
+        assert_eq!(
+            collected,
+            CollectedPass { epoch: 0, definitive: true },
+            "collector must stop at the invalid record"
+        );
 
         // The rejected record was never saved.
         assert!(consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
+    }
+
+    /// A certified record from peers that conflicts with our own uncertified record is refused by
+    /// the store (`ConflictingRecord`): our execution diverged from the one a quorum certified, so
+    /// the collection fails, which stops the node, and on every pass after a restart too. Our
+    /// record stays.
+    #[tokio::test]
+    async fn test_collect_epoch_records_stops_on_a_record_conflicting_with_our_own() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(4).expect("4 > 0"))
+            .build();
+        let auths: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<BlsPublicKey> = auths.iter().map(|a| a.primary_public_key()).collect();
+        let signers: Vec<&BlsKeypair> = auths.iter().map(|a| a.keypair()).collect();
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .expect("consensus chain");
+
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            ..Default::default()
+        };
+        let cert0 = make_cert(&rec0, &signers, &[0, 1, 2]);
+        consensus_chain.epochs().save(rec0.clone(), cert0).await.expect("save rec0");
+        // Our own epoch 1 record, still uncertified.
+        let ours = EpochRecord {
+            epoch: 1,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        consensus_chain.epochs().save_record(ours.clone()).await.expect("save our record");
+
+        // The peer's epoch 1 record anchors and verifies but is not ours.
+        let mut theirs = ours.clone();
+        theirs.final_state.number = 7;
+        let cert = make_cert(&theirs, &signers, &[0, 1, 2]);
+        let handle = mock_epoch_record_network(HashMap::from([(1, (theirs, cert))]), keys[0], 1);
+        let consensus_bus = ConsensusBus::new();
+
+        for _ in 0..2 {
+            let err = collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app())
+                .await
+                .expect_err("a certified record conflicting with ours stops the collector");
+            assert!(format!("{err:#}").contains("epoch 1"), "unexpected error: {err:#}");
+        }
+        assert_eq!(
+            consensus_chain.epochs().get_epoch_by_number(1).await,
+            Some((ours, None)),
+            "our record stays, uncertified",
+        );
+    }
+
+    /// A pass ending on a peer's "not held" reply is definitive; a pass ending on a dropped request
+    /// is not, wherever the cursor stopped (issue #1792).
+    #[tokio::test]
+    async fn test_collect_epoch_records_tells_a_dropped_request_from_an_answer() -> eyre::Result<()>
+    {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authorities: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<_> =
+            authorities.iter().map(|authority| authority.primary_public_key()).collect();
+        let signers: Vec<_> = authorities.iter().map(|authority| authority.keypair()).collect();
+        let peer = keys.first().copied().ok_or_else(|| eyre::eyre!("empty committee fixture"))?;
+        let record0 = EpochRecord {
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            ..Default::default()
+        };
+        let record1 = EpochRecord {
+            epoch: 1,
+            parent_hash: record0.digest(),
+            committee: keys.clone(),
+            next_committee: keys,
+            ..Default::default()
+        };
+        let cert0 = make_cert(&record0, &signers, &[0, 1, 2]);
+        let cert1 = make_cert(&record1, &signers, &[0, 1, 2]);
+        let served = HashMap::from([(1, (record1, cert1))]);
+        let bus = ConsensusBus::new();
+        for (answer_unserved, definitive) in [(false, false), (true, true)] {
+            let directory = tempfile::TempDir::new()?;
+            let chain =
+                ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee())
+                    .await?;
+            chain.epochs().save(record0.clone(), cert0.clone()).await?;
+            let handle = mock_epoch_record_network_with(served.clone(), peer, 1, answer_unserved);
+            let collected = collect_epoch_records(0, &chain, &handle, bus.app()).await?;
+            assert_eq!(collected, CollectedPass { epoch: 1, definitive }, "{answer_unserved}");
+        }
+        Ok(())
+    }
+
+    /// Our own epoch store failing ends collection with an error, which fails startup sync and
+    /// ends the critical "Epoch Record Collector". The store here is closed (a dead actor,
+    /// so the persist fails `SendFailed`): nothing a peer sends can cause that.
+    #[tokio::test]
+    async fn test_collect_epoch_records_stops_on_a_failed_store() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let peer = fixture
+            .authorities()
+            .next()
+            .map(|authority| authority.primary_public_key())
+            .ok_or_else(|| eyre::eyre!("empty committee fixture"))?;
+        let directory = tempfile::TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(directory.path().to_owned(), fixture.committee()).await?;
+        chain.clone().close().await;
+        let handle = mock_epoch_record_network(HashMap::new(), peer, 1);
+        let bus = ConsensusBus::new();
+
+        let Err(err) = collect_epoch_records(0, &chain, &handle, bus.app()).await else {
+            panic!("a failed epoch store must end collection with an error");
+        };
+        assert!(format!("{err:#}").contains("failed to persist"), "unexpected error: {err:#}");
+
+        let shutdown = tn_types::ShutdownNotifier::new();
+        let Err(err) =
+            sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await
+        else {
+            panic!("a failed epoch store must fail startup sync");
+        };
+        assert!(format!("{err:#}").contains("failed to persist"), "unexpected error: {err:#}");
+
+        let mut task_manager = tn_types::TaskManager::default();
+        spawn_epoch_record_collector(
+            chain.clone(),
+            handle,
+            bus.app().clone(),
+            task_manager.get_spawner(),
+            shutdown.subscribe(),
+        )
+        .await?;
+        let ended =
+            tokio::time::timeout(Duration::from_secs(5), task_manager.until_task_ends(shutdown))
+                .await?;
+        let Err(tn_types::TaskJoinError::CriticalExitError(name, err)) = ended else {
+            panic!("expected the record collector's error, got {ended:?}");
+        };
+        assert_eq!(name, "Epoch Record Collector");
+        assert!(err.to_string().contains("failed to persist"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    /// The split behind a downloaded record's save: our own store failing is returned (the node
+    /// stops), and so is a certified record that conflicts with this node's own, counted as a
+    /// final-state mismatch; any other refused record, which a peer can send, is only logged.
+    #[test]
+    fn test_only_local_store_failures_and_conflicts_stop_collection() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let digest = EpochRecord::default().digest();
+        ::metrics::with_local_recorder(&recorder, || {
+            let conflict =
+                EpochDbError::ConflictingRecord { epoch: 1, stored: digest, offered: digest };
+            let err = stop_on_local_failure(conflict, 1).expect_err("a conflict stops the node");
+            assert!(format!("{err:#}").contains("diverged"), "unexpected error: {err:#}");
+            let mismatch = EpochDbError::CertificateMismatch { record: digest, certified: digest };
+            assert!(stop_on_local_failure(mismatch, 1).is_ok());
+            let err = stop_on_local_failure(EpochDbError::SendFailed, 1)
+                .expect_err("a dead epoch store is local");
+            assert!(format!("{err:#}").contains("epoch 1"), "unexpected error: {err:#}");
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let (_, _, _, value) = snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == FINAL_STATE_MISMATCHES)
+            .expect("the conflict is counted");
+        assert!(matches!(value, DebugValue::Counter(1)), "{value:?}");
     }
 
     /// The public gate replaces the dummy anchor and saves a peer's certified epoch chain.
@@ -532,7 +885,7 @@ mod tests {
         );
         let bus = ConsensusBus::new();
         let shutdown = tn_types::ShutdownNotifier::new();
-        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await;
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await?;
         assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(1));
         assert!(!chain.epochs().contains_dummy_epoch0().await);
         assert_eq!(chain.epochs().get_epoch_by_number(1).await, Some((record1, Some(cert1))));
@@ -558,7 +911,7 @@ mod tests {
         let handle = mock_epoch_record_network(HashMap::from([(0, (record, cert))]), peer, 0);
         let bus = ConsensusBus::new();
         let shutdown = tn_types::ShutdownNotifier::new();
-        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await;
+        sync_epoch_records_to_tip(&chain, &handle, bus.app(), shutdown.subscribe()).await?;
         assert_eq!(chain.epochs().latest_record().await.map(|record| record.epoch), Some(0));
         assert!(chain.epochs().contains_dummy_epoch0().await);
         Ok(())

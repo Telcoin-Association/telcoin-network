@@ -11,20 +11,25 @@ use engine::TnBuilder;
 use manager::EpochManager;
 use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBusApp;
-use tn_rpc::{EngineToPrimary, RpcNodeInfo};
+use tn_rpc::{ConsensusStorageError, EngineToPrimary, RpcAdmissionSnapshot, RpcNodeInfo};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
 };
 use tokio::task::JoinHandle;
 
+mod admission_rpc;
 pub mod engine;
 mod error;
 mod health;
 mod manager;
 mod metrics;
+mod network_dial;
+mod network_readiness;
 pub mod primary;
 pub mod worker;
+pub use admission_rpc::AdmissionSnapshotSource;
+pub use health::{HealthcheckBind, HealthcheckBindError};
 pub use manager::{
     build_epoch_record, catchup_accumulator, read_base_fees_for_entered_epoch,
     sync_num_workers_from_chain, EpochBaseFees, ExecStateExporter, ExportOutcome,
@@ -48,12 +53,32 @@ pub fn launch_node<P>(
 where
     P: TelcoinDirs + Clone + 'static,
 {
-    let consensus_db = manager::open_consensus_db(&tn_datadir);
-
     // run the node
     // Note this is the "entry task" for the node and the caller needs to wait on the JoinHandle
     // then exit.
     tokio::spawn(async move {
+        // Refuse to run a second writer against this datadir, and hold the PID lockfile for the
+        // node's whole lifetime: it is released on the clean-shutdown path below, and on any early
+        // error or panic via the guard's `Drop`. The CLI takes it before it opens the execution
+        // engine's database (whose own lock only coordinates concurrent users, it does not
+        // exclude a second node) and hands it over in the builder; any other caller has it taken
+        // here, still before consensus storage is touched (its open is fail-fast and would
+        // otherwise panic on a datadir another node holds before this clear error is reached). A
+        // crashed holder never blocks a restart: the kernel releases its `flock` when the process
+        // exits. This is TN-owned and does not depend on the execution engine's own lock.
+        let mut builder = builder;
+        let _pid_lock = match builder.take_pid_lock() {
+            Some(lock) => lock,
+            None => match tn_config::PidLock::acquire(&tn_datadir) {
+                Ok(lock) => lock,
+                Err(err) => {
+                    tracing::error!("Error running node (datadir already locked): {err}");
+                    return Err(err);
+                }
+            },
+        };
+        let consensus_db = manager::open_consensus_db(&tn_datadir);
+
         // create the epoch manager
         let mut epoch_manager =
             match EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await {
@@ -67,6 +92,12 @@ where
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");
         }
+        // Async-close consensus storage so its background-thread joins don't block this tokio
+        // worker on `Drop` (the runtime is still alive here, inside `block_on`). `run()` has
+        // already persisted and awaited task shutdown, so `epoch_manager` normally holds
+        // the last reference; if a winding-down RPC clone briefly outlives it, `shutdown()`
+        // bounds the wait and then force-seals rather than leaving the pack unsealed.
+        epoch_manager.shutdown().await;
         result
     })
 }
@@ -80,6 +111,8 @@ pub struct EngineToPrimaryRpc {
     consensus_chain: ConsensusChain,
     /// Static node info to provide clients.
     node_info: RpcNodeInfo,
+    /// The node's swarm admission snapshots, shared by every RPC server.
+    admission: AdmissionSnapshotSource,
 }
 
 impl EngineToPrimaryRpc {
@@ -87,8 +120,9 @@ impl EngineToPrimaryRpc {
         consensus_bus: ConsensusBusApp,
         consensus_chain: ConsensusChain,
         node_info: RpcNodeInfo,
+        admission: AdmissionSnapshotSource,
     ) -> Self {
-        Self { consensus_bus, consensus_chain, node_info }
+        Self { consensus_bus, consensus_chain, node_info, admission }
     }
 
     /// Retrieve the consensus header by number.
@@ -134,22 +168,19 @@ impl EngineToPrimary for EngineToPrimaryRpc {
         &self,
         epoch: Epoch,
         digest: ConsensusHeaderDigest,
-    ) -> Option<ConsensusHeader> {
-        match self.consensus_chain.consensus_header_by_digest(epoch, digest).await {
-            Ok(header) => header,
-            Err(e) => {
-                // an unreadable pack is a hard error in storage, but rpc callers only learn
-                // "not found"; the warn keeps the storage failure visible to operators
-                tracing::warn!(
-                    target: "engine",
-                    ?e,
-                    epoch,
-                    ?digest,
-                    "consensus header lookup failed"
-                );
-                None
-            }
-        }
+    ) -> Result<Option<ConsensusHeader>, ConsensusStorageError> {
+        self.consensus_chain.consensus_header_by_digest(epoch, digest).await.map_err(|e| {
+            // rpc callers only learn that the lookup failed, never why; the warn is where
+            // operators see the storage error
+            tracing::warn!(
+                target: "engine",
+                ?e,
+                epoch,
+                ?digest,
+                "consensus header lookup failed"
+            );
+            ConsensusStorageError
+        })
     }
 
     fn node_info(&self) -> &tn_rpc::RpcNodeInfo {
@@ -158,6 +189,10 @@ impl EngineToPrimary for EngineToPrimaryRpc {
 
     fn node_mode(&self) -> tn_types::NodeMode {
         self.consensus_bus.current_node_mode().into()
+    }
+
+    async fn admission_snapshot(&self) -> Option<RpcAdmissionSnapshot> {
+        self.admission.snapshot().await
     }
 }
 

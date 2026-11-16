@@ -35,6 +35,12 @@ tn-config = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tn-metrics = { workspace = true }
+tn-storage = { workspace = true }
+jsonrpsee = { workspace = true }
+libc = "0.2"
 
 [features]
 default = []

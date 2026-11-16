@@ -22,6 +22,7 @@ tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-node-record = { workspace = true }
 futures = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -40,8 +41,10 @@ metrics = { workspace = true }
 reth-metrics = { workspace = true }
 
 [dev-dependencies]
+serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 metrics-util = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 eyre = { workspace = true }
@@ -50,6 +53,10 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-config = { workspace = true, features = ["test-utils"] }
+
+[features]
+default = []
+test-utils = []
 
 [lints]
 workspace = true

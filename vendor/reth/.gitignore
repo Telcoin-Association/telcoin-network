@@ -1,0 +1,7 @@
+# Lockfile and build output of the nested reth workspace, created when cargo runs inside
+# vendor/reth (tn/cargo.sh seeds the lockfile from the TN root Cargo.lock each run).
+/Cargo.lock
+/target/
+
+# Python bytecode from running tn/vendor.py
+__pycache__/

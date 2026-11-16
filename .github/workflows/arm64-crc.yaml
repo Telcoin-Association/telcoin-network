@@ -1,0 +1,109 @@
+# The execution engine's tests on an arm64 runner: tn-lmdb and its reth adapter, tn-lmdb-reth.
+# crates/tn-lmdb/src/crc.rs (a copy of crates/storage/src/archive/crc.rs) takes a PMULL
+# carry-less-multiply folding path on little-endian aarch64 with the `aes` feature, and its unit
+# tests compare that path with crc32fast. The test lanes in pr.yaml run on `ubuntu-latest`
+# (x86_64), where that path is not compiled, so this is the only run of the kernel in CI, and the
+# only CI run of the engine's page, mmap and file code on aarch64 Linux.
+#
+# The job first checks that the two CRC files hold the same code, so the run covers the
+# tn-storage copy too (building tn-storage would add reth-libmdbx and the rest of its
+# dependencies to a cold build).
+#
+# Not a required check: `CI Success` stays the only one, and this job is not in its needs
+# list (.github/ACTIONS.md, "aarch64 CRC kernel"). A red run here still shows on the pull
+# request. No dependency cache: tn-lmdb and its test dependencies build from cold in about a
+# minute, and a cache for a second architecture would eat quota the queue's entries need.
+name: arm64 CRC kernel
+
+on:
+  pull_request:
+    paths:
+      - "crates/tn-lmdb/**"
+      - "crates/tn-lmdb-reth/**"
+      - "crates/storage/src/archive/crc.rs"
+      - "rust-toolchain.toml"
+      - "Cargo.lock"
+      - ".github/workflows/arm64-crc.yaml"
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+    paths:
+      - "crates/tn-lmdb/**"
+      - "crates/tn-lmdb-reth/**"
+      - "crates/storage/src/archive/crc.rs"
+      - "rust-toolchain.toml"
+      - "Cargo.lock"
+      - ".github/workflows/arm64-crc.yaml"
+
+# Cancel superseded runs on a pull request, never on a merge group (pr.yaml says why).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.merge_group.head_ref || github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Reads the repository and runs tests: a read-only token and no secrets.
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  crc-tests:
+    name: arm64 CRC kernel
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      # No submodule: tn-lmdb and its dependencies are all in the workspace tree.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check the two CRC files hold the same code
+        # Drops the lines the copies may differ in (crates/tn-lmdb/src/crc.rs's module docs say
+        # which): every comment line, and the `allow(dead_code)` and `#[inline]` attribute lines.
+        # Everything else, the unit tests included, must match line for line.
+        run: |
+          set -euo pipefail
+          code() {
+            grep -vE '^[[:space:]]*//' "$1" |
+              grep -vxE '[[:space:]]*#\[(cfg_attr\(not\(test\), allow\(dead_code\)\)|inline)\]'
+          }
+          # Each copy's code goes to a file first: a grep failing inside `<(...)` would leave
+          # its side empty without failing the step.
+          code crates/storage/src/archive/crc.rs >"$RUNNER_TEMP/archive-crc.rs"
+          code crates/tn-lmdb/src/crc.rs >"$RUNNER_TEMP/tn-lmdb-crc.rs"
+          diff -u "$RUNNER_TEMP/archive-crc.rs" "$RUNNER_TEMP/tn-lmdb-crc.rs"
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest
+
+      # The CRC dispatch takes the PMULL folding path only where the `aes` feature, which carries
+      # PMULL, is detected (crates/tn-lmdb/src/crc.rs); without it the tests compare crc32fast
+      # with itself.
+      - name: Confirm the runner is aarch64 with PMULL
+        run: |
+          set -euo pipefail
+          uname -m
+          [[ "$(uname -m)" == "aarch64" ]]
+          features=$(grep -m1 '^Features' /proc/cpuinfo)
+          echo "$features"
+          grep -qw pmull <<<"$features"
+
+      - name: Run tn-lmdb's and tn-lmdb-reth's tests
+        # Their whole suites, the CRC kernel's tests included: the kernel is the one code path
+        # that differs by architecture, but the engine's page, mmap and file code and the
+        # adapter's cursors also run on aarch64 Linux nowhere else in CI.
+        run: cargo nextest run --locked -p tn-lmdb -p tn-lmdb-reth

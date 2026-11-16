@@ -14,6 +14,9 @@ The `setup_validator.sh` script is used to facilitate all the necessary commands
 A committee service generates genesis and distributes the `committee.yaml`, `genesis.yaml`, and `parameters.yaml` files.
 Finally, validator services are launched to start the network.
 
+Each validator binds its health and metrics listeners to its own compose-network address (`10.10.0.2N:8080`, `10.10.0.2N:9101`); neither is published to the host.
+`compose.observability.yaml` is an overlay that adds a Prometheus collector on that network (`docker compose -f compose.yaml -f compose.observability.yaml up`); its UI is published on host loopback only, at `127.0.0.1:9090`.
+
 RPCs can be reached at:
 
 - validator 1: 127.0.0.1:8545
@@ -94,36 +97,51 @@ GOV_KEY=0xYOUR_GOVERNANCE_PRIVATE_KEY
 
 # Address for the new validator
 NEW_VALIDATOR=0xNEW_VALIDATOR_ADDRESS
+
+# Passphrase that encrypts the new validator's BLS key
+export TN_BLS_PASSPHRASE='YOUR_STRONG_PASSPHRASE'
 ```
+
+Pick a strong value for `TN_BLS_PASSPHRASE`. `keytool generate` and `node` read it by default (`--bls-passphrase-source env`) and exit with "passphrase is required" when it is unset, and `node` needs the same value that encrypted the key. Run the steps below in this shell. If the node runs in a container, pass the variable through the container's environment, as `compose.yaml` does for its services.
 
 ### Step 1: Generate keys for the new validator
 
 ```bash
+# Encrypts the BLS key with TN_BLS_PASSPHRASE from Setup
 target/release/telcoin-network keytool generate validator \
     --datadir ./new-validator \
     --address $NEW_VALIDATOR
 ```
 
-This creates `./new-validator/node-info.yaml` containing the BLS public key and proof of possession.
+This creates `./new-validator/node-info.yaml` containing the BLS public key and proof of possession, and `./new-validator/node-keys/bls.kw`, the BLS key encrypted with `TN_BLS_PASSPHRASE`.
 
 ### Step 2: Export staking calldata
 
 ```bash
 # Human-readable output (inspect the values)
-target/release/telcoin-network keytool export-staking-args \
+target/release/telcoin-network --bls-passphrase-source no-passphrase \
+    keytool export-staking-args \
     --node-info ./new-validator/node-info.yaml
 
-# Raw calldata for use with cast
-STAKE_CALLDATA=$(target/release/telcoin-network keytool export-staking-args \
+# Raw calldata for use with cast (-q keeps log lines out of the capture)
+STAKE_CALLDATA=$(target/release/telcoin-network -q --bls-passphrase-source no-passphrase \
+    keytool export-staking-args \
     --node-info ./new-validator/node-info.yaml \
     --calldata)
 ```
 
+`export-staking-args` never reads the BLS key, but the binary requires a passphrase source for every keytool command except `set-rpc`, hence `--bls-passphrase-source no-passphrase`, which lets these commands run whether or not `TN_BLS_PASSPHRASE` is set.
+
 ### Step 3: Query the required stake amount
 
+`stake()` checks the value against the stake version of the current epoch. Read the version, then that version's config:
+
 ```bash
+STAKE_VERSION=$(cast call $REGISTRY "getCurrentStakeVersion()(uint8)" --rpc-url $RPC)
+
 cast call $REGISTRY \
-    "getCurrentStakeConfig()(uint256,uint256,uint256,uint32)" \
+    "stakeConfig(uint8)(uint256,uint256,uint256,uint32)" \
+    $STAKE_VERSION \
     --rpc-url $RPC
 ```
 
@@ -165,7 +183,7 @@ The validator calls `stake()` with BLS key arguments and sends the exact stake a
 ```bash
 # NEW_VAL_KEY is the private key for $NEW_VALIDATOR
 cast send $REGISTRY \
-    $STAKE_CALLDATA \
+    "$STAKE_CALLDATA" \
     --value $STAKE_AMOUNT \
     --private-key $NEW_VAL_KEY \
     --rpc-url $RPC
@@ -182,7 +200,7 @@ cast send $REGISTRY \
     --rpc-url $RPC
 ```
 
-The validator enters `PendingActivation` and joins the committee at the next epoch transition.
+The validator enters `PendingActivation` and becomes `Active` at the next epoch transition. The earliest committee it can be selected for starts two epochs after that.
 
 ### Step 8: Start the new validator node
 
@@ -194,6 +212,7 @@ cp ./local-validators/genesis/genesis.yaml ./new-validator/genesis/
 cp ./local-validators/genesis/committee.yaml ./new-validator/genesis/
 cp ./local-validators/parameters.yaml ./new-validator/
 
+# Decrypts the BLS key with TN_BLS_PASSPHRASE from Setup (the value used in Step 1)
 # Instance 6 avoids port conflicts (1-4 = validators, 5 = observer)
 target/release/telcoin-network node \
     --datadir ./new-validator \

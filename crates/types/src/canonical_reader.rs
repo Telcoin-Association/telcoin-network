@@ -23,4 +23,12 @@ pub trait CanonicalExecutionReader: Send + Sync {
     /// one at `number`, so a caller comparing it against an expected hash can treat a mismatch as
     /// a genuine fork and `None` as "not confirmed".
     fn canonical_execution_hash(&self, number: BlockNumber) -> Option<BlockHash>;
+
+    /// Return the earliest block this database can attest, when it has such a floor.
+    ///
+    /// A snapshot-restored datadir holds only scaffold headers below its restored-state floor, so
+    /// [`Self::canonical_execution_hash`] answers `None` for every lower height. A caller must
+    /// not read that `None` as a fork: below the floor this node can neither confirm nor refute a
+    /// block. `None` for a datadir that executed from genesis.
+    fn restored_state_floor(&self) -> Option<BlockNumber>;
 }

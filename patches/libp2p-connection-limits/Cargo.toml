@@ -1,0 +1,25 @@
+[package]
+name = "libp2p-connection-limits"
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.88.0"
+description = "Connection limits for libp2p."
+license = "MIT"
+repository = "https://github.com/libp2p/rust-libp2p"
+keywords = ["peer-to-peer", "libp2p", "networking"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+libp2p-core = "0.44.0"
+libp2p-identity = { version = "0.3.0", features = ["peerid"] }
+libp2p-swarm = "0.48.0"
+
+[lints.clippy]
+dbg_macro = "warn"
+manual_let_else = "warn"
+type_complexity = "allow"
+unnecessary_wraps = "warn"
+used_underscore_binding = "warn"
+
+[lints.rust]
+unreachable_pub = "warn"

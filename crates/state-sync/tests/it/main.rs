@@ -6,7 +6,7 @@
 
 #![allow(unused_crate_dependencies)]
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use tempfile::TempDir;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils_committee::CommitteeFixture;
@@ -26,8 +26,9 @@ async fn test_sync_save_consensus() {
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     // Create certificates for a subdag
-    let genesis: BTreeSet<_> = fixture.genesis().collect();
-    let (_, headers) = fixture.headers_round(0, &genesis);
+    // Round-1 headers with no payload: the outputs carry no batches, so their sub-dags declare
+    // none (a saved output carries every batch its sub-dag declares).
+    let headers = fixture.headers();
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
     let leader = certificates.last().cloned().unwrap();
 
@@ -47,13 +48,14 @@ async fn test_sync_save_consensus() {
         ConsensusOutput::new(sub_dag, B256::ZERO.into(), 1, false, VecDeque::new(), vec![]);
 
     // Save consensus using state_sync
-    state_sync::save_consensus(
+    let written = state_sync::save_consensus(
         output,
         &mut consensus_chain,
         &tn_primary::PrimaryMetrics::default(),
     )
     .await
     .unwrap();
+    assert!(written.bytes > 0, "the output is written to the current pack");
 
     // Verify the consensus was saved
     let saved = consensus_chain.consensus_header_by_number(1).await.unwrap();
@@ -79,8 +81,9 @@ async fn test_sync_parent_hash_chain() {
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     // Create certificates
-    let genesis: BTreeSet<_> = fixture.genesis().collect();
-    let (_, headers) = fixture.headers_round(0, &genesis);
+    // Round-1 headers with no payload: the outputs carry no batches, so their sub-dags declare
+    // none (a saved output carries every batch its sub-dag declares).
+    let headers = fixture.headers();
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
 
     let mut parent_hash: ConsensusHeaderDigest = B256::ZERO.into();
@@ -143,8 +146,9 @@ async fn test_sync_lookup_by_hash() {
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
-    let genesis: BTreeSet<_> = fixture.genesis().collect();
-    let (_, headers) = fixture.headers_round(0, &genesis);
+    // Round-1 headers with no payload: the outputs carry no batches, so their sub-dags declare
+    // none (a saved output carries every batch its sub-dag declares).
+    let headers = fixture.headers();
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
     let leader = certificates.last().cloned().unwrap();
 
@@ -184,8 +188,9 @@ async fn test_digest_determinism() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
 
-    let genesis: BTreeSet<_> = fixture.genesis().collect();
-    let (_, headers) = fixture.headers_round(0, &genesis);
+    // Round-1 headers with no payload: the outputs carry no batches, so their sub-dags declare
+    // none (a saved output carries every batch its sub-dag declares).
+    let headers = fixture.headers();
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
     let leader = certificates.last().cloned().unwrap();
 
@@ -217,8 +222,9 @@ async fn test_digest_collision_resistance() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
 
-    let genesis: BTreeSet<_> = fixture.genesis().collect();
-    let (_, headers) = fixture.headers_round(0, &genesis);
+    // Round-1 headers with no payload: the outputs carry no batches, so their sub-dags declare
+    // none (a saved output carries every batch its sub-dag declares).
+    let headers = fixture.headers();
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
     let leader = certificates.last().cloned().unwrap();
 
@@ -262,8 +268,9 @@ async fn test_digest_mismatch_detection() {
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
-    let genesis: BTreeSet<_> = fixture.genesis().collect();
-    let (_, headers) = fixture.headers_round(0, &genesis);
+    // Round-1 headers with no payload: the outputs carry no batches, so their sub-dags declare
+    // none (a saved output carries every batch its sub-dag declares).
+    let headers = fixture.headers();
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
     let leader = certificates.last().cloned().unwrap();
 

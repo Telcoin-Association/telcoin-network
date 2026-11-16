@@ -2,7 +2,9 @@
 //!
 //! This module owns the path from certified consensus output to the canonical chain:
 //! executing a worker batch's payload into a block
-//! ([`RethEnv::build_block_from_batch_payload`]), committing a round's blocks to the
+//! ([`RethEnv::build_block_from_batch_payload`], or, with the signers recovered ahead of
+//! time by [`RethEnv::recover_output_signers`],
+//! [`RethEnv::build_block_from_recovered_payload`]), committing a round's blocks to the
 //! database ([`RethEnv::finish_executing_output`]), and updating the in-memory
 //! finalized/safe watches ([`RethEnv::finalize_block`]). Consensus output is the ONLY
 //! source of canonical blocks: there is no fork choice and no reorg path, and every
@@ -17,7 +19,14 @@
 //! database transaction with the current block's deltas layered over the overlay.
 //! This bypasses (does not fix upstream) reth's per-block re-merge/copy/re-sort of
 //! every in-memory ancestor - see `build_block_from_batch_payload` for the honest
-//! cost bound. All other state reads still resolve through reth's memory overlay.
+//! cost bound. The storage roots of the accounts with changed storage run on parallel tasks
+//! beside the account walk, a block with many changed accounts splits the walk itself by first
+//! nibble, and a hot contract's storage root is split the same way (`output_overlay/parallel.rs`,
+//! `output_overlay/account_split.rs`, `output_overlay/storage_split.rs`; `TN_PARALLEL_STATE_ROOT=0`
+//! turns all off, `TN_PARALLEL_ACCOUNT_WALK=0` and `TN_PARALLEL_STORAGE_WALK=0` each split). All
+//! other state reads go through the cross-block execution cache (`exec_cache.rs`: values at the
+//! parent block, kept across blocks and outputs; `TN_EXEC_CACHE=0` turns it off) and, on a miss,
+//! reth's memory overlay.
 //!
 //! # Deliberate transaction drops (fork safety)
 //!
@@ -55,10 +64,19 @@
 //! in-memory only (the finalized/safe watches plus pruning persisted blocks from
 //! the in-memory state); its database half happens inside the atomic commit above.
 
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
-use alloy::primitives::FixedBytes;
-use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+use alloy::primitives::{BlockNumber, FixedBytes};
+use rayon::iter::{
+    IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
+};
 use reth_chain_state::{ComputedTrieData, ExecutedBlock, NewCanonicalChain};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_evm::{
@@ -67,26 +85,120 @@ use reth_evm::{
 };
 use reth_provider::{
     BlockExecutionOutput, CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
-    DatabaseProviderFactory as _, StateProviderFactory as _,
+    DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory as _,
+    StaticFileProviderFactory as _, StaticFileSegment,
 };
-use reth_revm::{cached::CachedReads, database::StateProviderDatabase, State};
+use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::BundleState, State};
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use tn_types::{
-    deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned,
+    deconstruct_nonce, Batch, ConsensusNumHash, ConsensusOutput, EngineUpdate, Recovered, Round,
+    SealedHeader, TransactionSigned, B256,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     error::{TnRethError, TnRethResult},
-    metrics::{record_invalid_tx_skipped, InvalidTxSkipReason, RETH_METRICS},
+    metrics::{
+        record_invalid_tx_skipped, record_tx_body_inline_rows, InvalidTxSkipReason, RETH_METRICS,
+    },
     payload::TNPayload,
     TNPrimitives,
 };
 
 use super::{
+    exec_cache::{CachedStateProvider, ExecutionCache},
     output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
     RethEnv,
 };
+
+/// A payload executed and finished by `RethEnv::execute_payload`, not yet sealed into an
+/// [`ExecutedBlock`].
+struct ExecutedPayload {
+    /// The block, its execution result and its state and trie deltas.
+    outcome: BlockBuilderOutcome<TNPrimitives>,
+    /// The block's bundle: the state persistence writes and the cache takes.
+    bundle: BundleState,
+    /// When `finish` returned: the start of the overlay-extend stage.
+    finish_ended: Instant,
+    /// The attempt's laps so far: `evm`, `root`, and in `finish` the part of `builder.finish`
+    /// outside the root (`seal_executed_payload` adds the rest).
+    timings: BlockBuildTimings,
+    /// The batch positions of the transactions this attempt kept (see
+    /// [`BuiltBlock::tx_positions`]).
+    tx_positions: Option<Arc<[u32]>>,
+}
+
+/// One batch's transactions after signer recovery: an entry of
+/// [`RethEnv::recover_output_signers`], and what [`RethEnv::build_block_from_recovered_payload`]
+/// builds a block from.
+///
+/// The transactions are those whose signer recovered, in batch order. The positions, when
+/// present, are each transaction's index in its batch, one per transaction and strictly
+/// increasing (the unrecoverable ones are missing). They are present only when the batch hashes to
+/// the digest its block's header names (`ommers_hash`), the condition for storing the block's
+/// transactions by position.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveredBatch {
+    /// The transactions whose signer recovered, in batch order.
+    txs: Vec<Recovered<TransactionSigned>>,
+    /// `positions[k]` is the index of `txs[k]` in the batch; `None` when the batch does not hash
+    /// to its digest, or none was checked.
+    positions: Option<Vec<u32>>,
+}
+
+impl RecoveredBatch {
+    /// The transactions whose signer recovered, in batch order.
+    pub fn txs(&self) -> &[Recovered<TransactionSigned>] {
+        &self.txs
+    }
+
+    /// Each transaction's index in its batch, when the batch hashes to its digest.
+    pub fn positions(&self) -> Option<&[u32]> {
+        self.positions.as_deref()
+    }
+
+    /// The number of recovered transactions.
+    pub fn len(&self) -> usize {
+        self.txs.len()
+    }
+
+    /// Whether no transaction recovered.
+    pub fn is_empty(&self) -> bool {
+        self.txs.is_empty()
+    }
+}
+
+#[cfg(test)]
+impl RecoveredBatch {
+    /// TEST-ONLY: `txs` at batch `positions` (one each, strictly increasing), as
+    /// [`RethEnv::recover_output_signers`] returns a batch that hashes to its digest.
+    pub(crate) fn positioned(txs: Vec<Recovered<TransactionSigned>>, positions: Vec<u32>) -> Self {
+        assert_eq!(txs.len(), positions.len(), "one position per transaction");
+        Self { txs, positions: Some(positions) }
+    }
+}
+
+impl From<Vec<Recovered<TransactionSigned>>> for RecoveredBatch {
+    /// Transactions recovered without a batch digest check, so without positions: the block built
+    /// from them stores its transactions inline.
+    fn from(txs: Vec<Recovered<TransactionSigned>>) -> Self {
+        Self { txs, positions: None }
+    }
+}
+
+/// A block built by [`RethEnv::build_block_from_recovered_payload`].
+#[derive(Debug)]
+pub struct BuiltBlock {
+    /// The block, its execution output and its trie deltas.
+    pub block: ExecutedBlock,
+    /// The wall time of the build's phases.
+    pub timings: BlockBuildTimings,
+    /// The batch position of each of the block's transactions, in block order (strictly
+    /// increasing: a block holds its batch's transactions minus the dropped ones), to persist with
+    /// the block ([`RethEnv::persist_executed_output`]). `None` when the batch had no positions
+    /// ([`RecoveredBatch::positions`]): the block's transactions are stored inline.
+    pub tx_positions: Option<Arc<[u32]>>,
+}
 
 impl RethEnv {
     /// Construct a canonical block from a worker's block that reached consensus.
@@ -118,7 +230,7 @@ impl RethEnv {
     /// cursors: current block's sorted deltas over the accumulated overlay over the
     /// database, prefix sets from the current block only (see
     /// [`OutputTrieOverlay::layered_root_with_updates`]). All other provider reads
-    /// still resolve through reth's memory overlay, unchanged.
+    /// go through the cross-block execution cache, then reth's memory overlay on a miss.
     ///
     /// For `N` blocks with at most `M` delta entries each, sorting remains
     /// `O(M log M)` per block. Equal-level sorted runs compact with cumulative
@@ -131,17 +243,234 @@ impl RethEnv {
     /// Callers that persist every block before building the next (tests, e2e helpers)
     /// pass a fresh empty overlay per block: the database then already holds the
     /// parent state, so the empty overlay is exact.
+    ///
+    /// # Stale cache hits
+    ///
+    /// When a checked hit of the execution cache differs from the parent state
+    /// (`env/exec_cache.rs`, "Checks"), the attempt is discarded before it touches
+    /// `overlay`, the whole cache is dropped, and the block is built once more without a
+    /// cache, from the same recovered transactions, so the returned block is the one a node
+    /// without the cache builds. That rebuild reads no cache, so it cannot see a stale hit; one
+    /// would be a bug and fails the build. The rebuilt block's stage timings and invalid
+    /// transaction skips are recorded a second time; signer recovery runs once. Blocks built
+    /// before it are not checked again (`env/exec_cache.rs`, "Checks").
+    ///
+    /// # Callers
+    ///
+    /// The engine never calls this: it recovers signers with [`Self::recover_output_signers`]
+    /// and builds through [`Self::build_block_from_recovered_payload`]. Every remaining caller of
+    /// this and [`Self::build_block_from_batch_payload_timed`] is a test, a `#[cfg(test)]` module
+    /// or a `test-utils` helper. Both are kept as the differential oracle for the recovered path:
+    /// they recover each batch themselves, so a test can compare their blocks with the recovered
+    /// build's.
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
         overlay: &mut OutputTrieOverlay,
     ) -> TnRethResult<ExecutedBlock> {
+        self.build_block_from_batch_payload_timed(payload, transactions, overlay)
+            .map(|(block, _timings)| block)
+    }
+
+    /// [`Self::build_block_from_batch_payload`], also returning the wall time of each build
+    /// phase as [`BlockBuildTimings`].
+    ///
+    /// The block is the one the untimed call builds: the laps only read the clock between
+    /// phases, and the root lap is read off the state-root provider wrapper after `finish`
+    /// returns. The signers are recovered first, exactly as [`Self::recover_output_signers`]
+    /// recovers one batch, and the recovered transactions go through the build that
+    /// [`Self::build_block_from_recovered_payload`] runs, so both entry points share one build,
+    /// the execution cache included. Only the caller's `overlay` carries over from one block of
+    /// an output to the next.
+    ///
+    /// Like the untimed call, this has no production caller: tests keep it as the differential
+    /// oracle for the recovered path (see the callers note on
+    /// [`Self::build_block_from_batch_payload`]).
+    pub fn build_block_from_batch_payload_timed(
+        &self,
+        payload: TNPayload,
+        transactions: &Vec<Vec<u8>>,
+        overlay: &mut OutputTrieOverlay,
+    ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
+        // observability only: the recover lap; the recovered build times the other phases
+        let stamp = Instant::now();
+        let (recovered, _positions) = recover_batch_signers(transactions, payload.batch_digest);
+        record_unrecoverable(transactions.len(), recovered.len());
+        let recover = stamp.elapsed();
+
+        let built = self.build_recovered_block(payload, &recovered.into(), overlay)?;
+        Ok((built.block, BlockBuildTimings { recover, ..built.timings }))
+    }
+
+    /// Recover the signer of every transaction in `output`, one [`RecoveredBatch`] per batch.
+    ///
+    /// The outer `Vec` follows [`ConsensusOutput::flatten_batches`] order (certificates in
+    /// output order, then each certificate's batches), so entry `i` holds the transactions of
+    /// the block built from batch `i`; a single flat list would shift transactions across
+    /// blocks. Each entry keeps its batch's transaction order.
+    ///
+    /// Each entry carries its transactions' batch positions when the batch hashes to the output's
+    /// digest for it (`get_batch_digest(i)`, which the block's header names as `ommers_hash`), and
+    /// none otherwise: the positions name transactions of the batch with that digest, so they are
+    /// stored only where the digest finds the batch they came from. The digest (blake3 over the
+    /// batch's encoding) is the other half of a `rayon::join` with the batch's signer recovery, so
+    /// an idle pool thread hashes while the transactions recover instead of after them. A mismatch
+    /// occurs on adiri's duplicate-batch epochs, where the digest list is longer than the batches
+    /// and so pairs block `i` with another batch's digest; there the block's transactions are
+    /// stored inline.
+    ///
+    /// The drop semantics are those of the block build: a transaction whose signer cannot be
+    /// recovered is logged at error (with its batch digest and byte length, never the bytes),
+    /// counted in `tn_reth.unrecoverable_txs_dropped_total` and left out, because a certified
+    /// sub-DAG is fixed and erroring would halt every honest node on the same bytes (issue
+    /// #933). Every node drops the same transactions from the same certified bytes, so the
+    /// blocks built from the result through [`Self::build_block_from_recovered_payload`] equal
+    /// those [`Self::build_block_from_batch_payload`] builds from the bytes.
+    ///
+    /// Batches and the transactions within each batch are recovered in parallel on the global
+    /// rayon pool. The engine calls this on a blocking job when an output enters its queue, so
+    /// the work overlaps the previous output's execution.
+    pub fn recover_output_signers(output: &ConsensusOutput) -> Vec<RecoveredBatch> {
+        // the flattened order without the index pairs: certificate order, then batch order
+        let batches: Vec<&Batch> =
+            output.batches().iter().flat_map(|cert| cert.batches.iter()).collect();
+        let recovered: Vec<RecoveredBatch> = batches
+            .par_iter()
+            .enumerate()
+            .map(|(batch_index, batch)| {
+                // a digest deque shorter than the batches fails the engine's own length check
+                // later; here the missing digest only labels the error line of a dropped
+                // transaction, and the batch gets no positions
+                let digest = output.get_batch_digest(batch_index);
+                // join, not sequence: the second closure is the first job thieves take, so the
+                // hash runs beside the recovery rather than as a serial tail after it
+                let ((txs, positions), named) = rayon::join(
+                    || recover_batch_signers(&batch.transactions, digest.unwrap_or_default()),
+                    || digest.is_some_and(|digest| batch.digest() == digest),
+                );
+                RecoveredBatch { txs, positions: named.then_some(positions) }
+            })
+            .collect();
+
+        // counted once per output, after the parallel phase (see `record_unrecoverable`)
+        record_unrecoverable(
+            batches.iter().map(|batch| batch.transactions.len()).sum(),
+            recovered.iter().map(RecoveredBatch::len).sum(),
+        );
+        recovered
+    }
+
+    /// Construct a canonical block from a batch whose signers are already recovered.
+    ///
+    /// `recovered` is the batch's entry of [`Self::recover_output_signers`]: the transactions
+    /// that survived signer recovery, in batch order. The build is the one
+    /// [`Self::build_block_from_batch_payload`] runs after its own recovery (see its docs for
+    /// the drop semantics, the state-root path and stale cache hits), so the same recovered
+    /// transactions build the same block. The build borrows `recovered`: each attempt clones a
+    /// transaction into the block builder, because a stale cache hit executes the block twice.
+    /// The returned timings' `recover` lap is zero: no recovery runs here.
+    ///
+    /// When `recovered` has positions, the returned [`BuiltBlock::tx_positions`] are those of the
+    /// transactions the block kept (an `InvalidTx` skip drops its position), taken from the final
+    /// attempt. The positions never reach the block: it is the block the same transactions build
+    /// without them.
+    ///
+    /// `scope` is the consensus output's [`OutputBuildScope`]: the block's state root layers over
+    /// its trie overlay, and a successful build leaves it describing the returned block's
+    /// post-state, ready for the next block of the output. After an error the scope no longer
+    /// matches any block the caller will build next: drop it.
+    ///
+    /// # Errors
+    ///
+    /// [`TnRethError::ScopeParentMismatch`] when the scope was advanced before and the payload's
+    /// parent is not the block it was advanced to; nothing is built or advanced. Otherwise the
+    /// errors of the build itself.
+    pub fn build_block_from_recovered_payload(
+        &self,
+        payload: TNPayload,
+        recovered: RecoveredBatch,
+        scope: &mut OutputBuildScope,
+    ) -> TnRethResult<BuiltBlock> {
+        scope.check_parent(payload.parent_header.hash())?;
+        let OutputBuildScope { overlay, tip } = scope;
+        let built = self.build_recovered_block(payload, &recovered, overlay)?;
+        *tip = Some(built.block.recovered_block.hash());
+        Ok(built)
+    }
+
+    /// The block build behind every entry point: execute `recovered` on the parent state read
+    /// through the execution cache, root it over `overlay`, then extend `overlay` with the built
+    /// block and check the cache in at it. On a stale cache hit the attempt is discarded and the
+    /// block built once more without a cache (see "Stale cache hits" on
+    /// [`Self::build_block_from_batch_payload`]); the returned laps and kept positions are the
+    /// final attempt's.
+    ///
+    /// `overlay` is not extended on an error: every fallible step runs before the seal.
+    fn build_recovered_block(
+        &self,
+        payload: TNPayload,
+        recovered: &RecoveredBatch,
+        overlay: &mut OutputTrieOverlay,
+    ) -> TnRethResult<BuiltBlock> {
+        let parent_hash = payload.parent_header.hash();
+        trace!(target: "engine::dump", parent_header = ?payload.parent_header, "retrieving state for next block");
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(parent_hash)?;
+        // Cross-block read cache (`env/exec_cache.rs`): the saved cache when it is anchored at
+        // this block's parent, else an empty one. Checked out for the whole build and checked in
+        // only at the end of a successful one, so any error below drops it (its code table
+        // kept). The state root keeps the plain provider: it reads the trie, not values.
+        let exec_cache = self.check_out_execution_cache(parent_hash);
+        let cached_provider = CachedStateProvider::new(&state_provider, exec_cache.as_ref());
+        let executed = self.execute_payload(
+            payload.clone(),
+            recovered,
+            &state_provider,
+            &cached_provider,
+            overlay,
+        );
+        if !cached_provider.served_stale() {
+            return match executed {
+                Ok(executed) => Ok(self.seal_executed_payload(executed, overlay, exec_cache)),
+                Err(err) => {
+                    // a failed attempt says nothing against `keccak256(code) -> code`
+                    if let Some(cache) = exec_cache {
+                        self.keep_execution_cache_code(cache);
+                    }
+                    Err(err)
+                }
+            };
+        }
+
+        // A checked hit was stale, so other hits of this attempt may have been too: whatever it
+        // returned (block or error) is discarded, and the cache with it.
+        self.drop_stale_execution_cache(exec_cache);
+        error!(target: "engine", %parent_hash, "execution cache dropped after a stale hit: building the block again without it");
+        let uncached_provider = CachedStateProvider::new(&state_provider, None);
+        let executed =
+            self.execute_payload(payload, recovered, &state_provider, &uncached_provider, overlay)?;
+        if uncached_provider.served_stale() {
+            return Err(TnRethError::ExecutionCacheStaleOnRebuild(parent_hash));
+        }
+        Ok(self.seal_executed_payload(executed, overlay, None))
+    }
+
+    /// Execute `recovered` on `payload`'s parent state and finish the block: the body of
+    /// [`Self::build_recovered_block`] up to the state root. Reads go through
+    /// `exec_provider` (over `state_provider`, the parent state); the root runs over
+    /// `state_provider` and `overlay`. Besides the returned value it changes only the stage
+    /// metrics, the skip counters and the execution cache's fills.
+    fn execute_payload(
+        &self,
+        payload: TNPayload,
+        recovered: &RecoveredBatch,
+        state_provider: &StateProviderBox,
+        exec_provider: &CachedStateProvider<'_, &StateProviderBox>,
+        overlay: &OutputTrieOverlay,
+    ) -> TnRethResult<ExecutedPayload> {
         let parent_header = payload.parent_header.clone();
-        debug!(target: "engine", ?parent_header, "retrieving state for next block");
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(parent_header.hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        let state = StateProviderDatabase::new(exec_provider);
+        // per attempt, so a rebuild after a stale hit starts from nothing cached
         let mut cached_reads = CachedReads::default();
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
@@ -154,9 +483,12 @@ impl RethEnv {
             "building new payload"
         );
 
-        // copy in case of error
-        let batch_digest = payload.batch_digest;
+        // observability only: each `lap` closes one phase of the returned timings
+        let mut stamp = Instant::now();
 
+        // Stage timings (`RethEnvMetrics::block_*_seconds`). Execute, finish and overlay extend
+        // run back to back, so each boundary is one `Instant` shared by the stages either side.
+        let execute_started = stamp;
         let mut builder =
             self.inner.evm_config.builder_for_next_block(&mut db, &parent_header, payload)?;
 
@@ -164,53 +496,19 @@ impl RethEnv {
             warn!(target: "engine", %err, "failed to apply pre-execution changes");
         })?;
 
-        // Phase 1: Recover all transactions (ECDSA ecrecover) in parallel via rayon.
-        // Always use par_iter — the slight overhead on small batches is negligible
-        // compared to the savings on large ones, and avoids an extra code path.
-        //
-        // A transaction whose signer cannot be recovered cannot be executed, but a
-        // certified sub-DAG is fixed and identical on every honest node, so returning
-        // an error here would deterministically halt (and, on restart-replay,
-        // crash-loop) the whole network on a single undecodable transaction. Instead
-        // drop the unrecoverable transactions and continue, mirroring the `InvalidTx`
-        // tolerance of the execute phase below: every node drops the same
-        // transactions from the same certified bytes, so the resulting block stays
-        // deterministic (issue #933). The primary defense is validating batches before
-        // they can be certified; this only bounds the blast radius if one ever is.
-        let recovered_txs = transactions
-            .par_iter()
-            .filter_map(|tx_bytes| {
-                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
-                    .inspect_err(|e| {
-                        error!(
-                            target: "engine",
-                            batch=?batch_digest,
-                            ?tx_bytes,
-                            "failed to recover signer, dropping transaction: {e}"
-                        )
-                    })
-                    .ok()
-            })
-            .collect::<Vec<_>>();
+        // The batch positions of the transactions the block keeps, when the batch has them. Local
+        // to the attempt: a rebuild after a stale cache hit runs this loop again from nothing.
+        let positions = recovered.positions();
+        let mut kept_positions = Vec::with_capacity(positions.map_or(0, <[u32]>::len));
 
-        // Recovery failures are the signal that a batch carrying undecodable transaction bytes
-        // was certified, so make them alertable instead of log-only. Count once, after the
-        // parallel phase: incrementing inside the rayon closure would contend a single atomic on
-        // every transaction, and the batch width that sets the cost of that contention is
-        // attacker-chosen. The difference is exact because `filter_map` is the only thing above
-        // that removes elements. Unconditional, including the overwhelmingly common zero: one
-        // relaxed atomic add per block is free next to executing the block, and a guard here
-        // would leave the series unregistered on a healthy node.
-        let unrecoverable = transactions.len().saturating_sub(recovered_txs.len());
-        RETH_METRICS
-            .unrecoverable_txs_dropped_total
-            .increment(u64::try_from(unrecoverable).unwrap_or(u64::MAX));
-
-        // Phase 2: Execute recovered transactions sequentially.
-        for recovered in recovered_txs {
+        // Execute the recovered transactions sequentially, in batch order. Each is cloned into
+        // the builder: a rebuild after a stale cache hit executes the same transactions again.
+        for (index, tx) in recovered.txs().iter().enumerate() {
             // forks are impossible
-            match builder.execute_transaction(recovered.clone()) {
-                Ok(_gas_used) => (),
+            match builder.execute_transaction(tx.clone()) {
+                Ok(_gas_used) => {
+                    kept_positions.extend(positions.and_then(|all| all.get(index).copied()))
+                }
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
                     ..
@@ -218,7 +516,7 @@ impl RethEnv {
                     // allow transaction errors (ie - duplicates)
                     //
                     // it's possible that another worker's batch included this transaction
-                    debug!(target: "engine", %error, tx_hash = ?recovered.hash(), "skipping invalid transaction");
+                    debug!(target: "engine", %error, tx_hash = ?tx.tx_hash(), "skipping invalid transaction");
                     // expected in normal operation - see the reason docs, this is not an alert
                     record_invalid_tx_skipped(InvalidTxSkipReason::classify(error.as_ref()));
                     continue;
@@ -227,21 +525,58 @@ impl RethEnv {
                 Err(err) => return Err(err.into()),
             }
         }
+        let evm = lap(&mut stamp);
 
-        // Scope the wrapper so its borrows of the overlay are dropped before the
-        // overlay is extended below (`Arc::make_mut` must not see a live borrow).
-        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } = {
+        let finish_started = stamp;
+        RETH_METRICS.block_execute_seconds.record(finish_started.duration_since(execute_started));
+
+        // Scope the wrapper so its borrow of the overlay ends here; the caller extends the
+        // overlay in `seal_executed_payload` (`Arc::make_mut` must not see a live borrow).
+        // `finish` runs the state root through the wrapper, which times it; the root lap is
+        // read off the wrapper before it drops and taken out of the finish lap below.
+        let (outcome, root) = {
             let root_provider = OverlayRootStateProvider::new(
-                &state_provider,
+                state_provider,
                 overlay,
                 &self.inner.blockchain_provider,
+                parent_header.number + 1,
             );
-            builder.finish(&root_provider)?
+            let outcome = builder.finish(&root_provider)?;
+            (outcome, root_provider.root_elapsed())
         };
+        let finish_ended = Instant::now();
+        RETH_METRICS.block_finish_seconds.record(finish_ended.duration_since(finish_started));
+        let finish = finish_ended.saturating_duration_since(finish_started).saturating_sub(root);
+        Ok(ExecutedPayload {
+            outcome,
+            bundle: db.take_bundle(),
+            finish_ended,
+            timings: BlockBuildTimings { recover: Duration::ZERO, evm, root, finish },
+            tx_positions: positions.map(|_| kept_positions.into()),
+        })
+    }
+
+    /// Seal an [`ExecutedPayload`] into the block: sort its deltas, extend `overlay` with them
+    /// and check `exec_cache` in with its bundle. Returns the block, the attempt's laps (the seal
+    /// added to the finish lap) and its kept positions.
+    fn seal_executed_payload(
+        &self,
+        executed: ExecutedPayload,
+        overlay: &mut OutputTrieOverlay,
+        exec_cache: Option<ExecutionCache>,
+    ) -> BuiltBlock {
+        let ExecutedPayload {
+            outcome: BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates },
+            bundle,
+            finish_ended,
+            timings,
+            tx_positions,
+        } = executed;
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
         let block_execution_output =
-            BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
+            BlockExecutionOutput { result: execution_result, state: bundle };
+        let block_hash = block.hash();
         let (sorted_hashed_state, sorted_trie_updates) =
             rayon::join(|| hashed_state.into_sorted(), || trie_updates.into_sorted());
         let computed_trie_data = ComputedTrieData::without_trie_input(
@@ -253,13 +588,19 @@ impl RethEnv {
         // (#1301). One linear merge pass; the `Arc`s are shared with the block's
         // `ComputedTrieData`, so nothing is recomputed.
         overlay.extend_from_block(&computed_trie_data);
-        let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
+        RETH_METRICS.block_overlay_extend_seconds.record(finish_ended.elapsed());
+        // The bundle the cache takes is the one persistence writes (`save_blocks` reads
+        // `execution_output.state`); last step, after everything fallible.
+        if let Some(cache) = exec_cache {
+            self.check_in_execution_cache(cache, block_hash, &block_execution_output.state);
+        }
+        let block = ExecutedBlock::new(
             Arc::new(block),
             Arc::new(block_execution_output),
             computed_trie_data,
         );
-
-        Ok(res)
+        let finish = timings.finish.saturating_add(finish_ended.elapsed());
+        BuiltBlock { block, timings: BlockBuildTimings { finish, ..timings }, tx_positions }
     }
 
     /// Finalize the block (header) executed from consensus output in memory.
@@ -313,7 +654,47 @@ impl RethEnv {
     /// Post-commit reporting lives in [`Self::announce_executed_output`] so the commit
     /// boundary is a function boundary rather than an error-classification exercise
     /// (issue #1090).
-    pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
+    ///
+    /// # Observability
+    ///
+    /// A successful commit logs one `persisted output` debug line (target `engine`) with the
+    /// block range, what was written and the per-phase wall time (`open_ms`, `save_blocks_ms`,
+    /// `markers_ms`, `commit_ms`), and records four series (see [`record_persisted_output`]):
+    /// the histograms `tn_reth.persist_save_blocks_seconds` and `tn_reth.persist_commit_seconds`
+    /// and the counters `tn_reth.persisted_accounts_total` and
+    /// `tn_reth.persisted_storage_slots_total`. A failed attempt records nothing.
+    ///
+    /// # Transaction positions
+    ///
+    /// `tx_positions` is empty, or holds one entry per block: `tx_positions[i]` is
+    /// [`BuiltBlock::tx_positions`] of `blocks[i]`. A datadir that stores transactions by position
+    /// writes, for a block with positions, each transaction's position in its batch instead of the
+    /// transaction; any other block stores its transactions inline. A datadir that stores them
+    /// inline ignores the positions. Any other length fails the call before anything is written.
+    /// They are an argument, not state: a retry with the same blocks and positions writes the same
+    /// rows.
+    ///
+    /// In a datadir that stores transactions by position, a successful persist counts the
+    /// transactions of blocks without positions in `tn_reth.tx_body_inline_rows_total` and warns
+    /// once per process, naming the first such block and why it has none: no positions at all
+    /// (empty `tx_positions`), or `None` for the block, which the engine gives a block whose batch
+    /// does not hash to its `ommers_hash` ([`Self::recover_output_signers`]).
+    pub fn persist_executed_output(
+        &self,
+        blocks: &[ExecutedBlock],
+        tx_positions: &[Option<Arc<[u32]>>],
+    ) -> TnRethResult<()> {
+        // The cache is anchored at the last built block, whose state the failed commit did not
+        // make durable; the blocks are rebuilt or the node stops, so start the next build empty.
+        self.persist_blocks(blocks, tx_positions).inspect_err(|_| self.clear_execution_cache())
+    }
+
+    /// The body of [`Self::persist_executed_output`], with its error contract.
+    fn persist_blocks(
+        &self,
+        blocks: &[ExecutedBlock],
+        tx_positions: &[Option<Arc<[u32]>>],
+    ) -> TnRethResult<()> {
         #[cfg(any(feature = "test-utils", test))]
         self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(any(feature = "test-utils", test))]
@@ -326,9 +707,20 @@ impl RethEnv {
             "storing range of blocks",
         );
 
+        // observability only: each `lap` closes one phase of the `persisted output` line
+        let mut stamp = Instant::now();
+
         // insert blocks to db
         let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
-        provider_rw.save_blocks(blocks.to_vec(), reth_provider::SaveBlocksMode::Full)?;
+        let open = lap(&mut stamp);
+        #[cfg(any(feature = "test-utils", test))]
+        self.record_saved_tx_positions(tx_positions);
+        provider_rw.save_blocks_with_tx_positions(
+            blocks.to_vec(),
+            reth_provider::SaveBlocksMode::Full,
+            tx_positions,
+        )?;
+        let save_blocks = lap(&mut stamp);
         // advance the finalized/safe markers in the same transaction as the blocks: every
         // canonical block comes from committed consensus output, so the last saved block is
         // final by construction, and the single commit leaves no crash window where the
@@ -338,11 +730,62 @@ impl RethEnv {
             provider_rw.save_finalized_block_number(last_number)?;
             provider_rw.save_safe_block_number(last_number)?;
         }
+        let markers = lap(&mut stamp);
         #[cfg(any(feature = "test-utils", test))]
         self.consume_injected_late_persist_fault()?;
 
         provider_rw.commit()?;
+        let commit = lap(&mut stamp);
+
+        record_persisted_output(blocks, PersistPhases { open, save_blocks, markers, commit });
+        if self.inner.blockchain_provider.static_file_provider().tx_pointer_jars(TX_SEGMENT) {
+            if let Some(inline) = InlineTxRows::of(blocks, tx_positions) {
+                inline.record();
+            }
+        }
         Ok(())
+    }
+
+    /// Install the receiver of the batches each successful persist stored by position
+    /// ([`PersistedBatchSink`]), once. A second install is an error.
+    pub fn set_persisted_batch_sink(&self, sink: Arc<dyn PersistedBatchSink>) -> TnRethResult<()> {
+        self.inner
+            .persisted_batch_sink
+            .set(sink)
+            .map_err(|_| TnRethError::PersistedBatchSinkAlreadySet)
+    }
+
+    /// Hand the batches whose transactions a just-persisted output stored by position to the
+    /// env's own decoded-batch cache fill ([`TxBodyCacheFill`](super::tx_bodies::TxBodyCacheFill),
+    /// in a datadir that stores transactions by position once its batches have a source), then
+    /// to the installed [`PersistedBatchSink`], if any.
+    ///
+    /// The engine calls it once per output, after [`Self::persist_executed_output`] returned `Ok`
+    /// and before the output is announced, with the output and the `tx_positions` it persisted:
+    /// `tx_positions[i]` belongs to the block built from the output's `i`-th flattened batch. With
+    /// neither receiver, or no block stored by position, it does nothing. Otherwise its cost here
+    /// is one `Arc` clone of the output and a pass over its batch list per receiver: they copy the
+    /// batches off this thread.
+    pub fn cache_persisted_batches(
+        &self,
+        output: &ConsensusOutput,
+        tx_positions: &[Option<Arc<[u32]>>],
+    ) {
+        let fill = self.inner.tx_body_cache_fill.get();
+        let sink = self.inner.persisted_batch_sink.get();
+        if fill.is_none() && sink.is_none() {
+            return;
+        }
+        let batches = PersistedBatches::new(output, tx_positions);
+        if batches.is_empty() {
+            return;
+        }
+        if let Some(fill) = fill {
+            fill.batches_persisted(batches.clone());
+        }
+        if let Some(sink) = sink {
+            sink.batches_persisted(batches);
+        }
     }
 
     /// Announce a durably committed round of consensus output: report the new tip over
@@ -412,13 +855,14 @@ impl RethEnv {
     /// [`Self::announce_executed_output`] (post-commit reporting). Callers that must
     /// distinguish the commit boundary (to compensate or retry only the durable
     /// write, as the engine's `execute_consensus_output` does) call the two halves
-    /// directly.
+    /// directly. The persist is given no transaction positions, so every transaction is stored
+    /// inline.
     pub fn finish_executing_output(
         &self,
         blocks: Vec<ExecutedBlock>,
         engine_update: Option<(Round, ConsensusNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
     ) -> TnRethResult<()> {
-        self.persist_executed_output(&blocks)?;
+        self.persist_executed_output(&blocks, &[])?;
         self.announce_executed_output(blocks, engine_update)
     }
 
@@ -495,5 +939,901 @@ impl RethEnv {
     #[cfg(any(feature = "test-utils", test))]
     pub fn persist_attempt_count(&self) -> u32 {
         self.inner.persist_attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// TEST-ONLY: the transaction positions the last [`SAVED_TX_POSITIONS_KEPT`] persist attempts
+    /// handed to the block writer (`save_blocks_with_tx_positions`), oldest first, one entry per
+    /// attempt that reached it: the rows the writer stores by position, as it received them. An
+    /// attempt failed by an injected pre-commit fault never reaches the writer and adds nothing.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn saved_tx_positions(&self) -> Vec<Vec<Option<Arc<[u32]>>>> {
+        self.inner.saved_tx_positions.lock().iter().cloned().collect()
+    }
+
+    /// TEST-ONLY: keep `tx_positions` as the newest entry of [`Self::saved_tx_positions`].
+    #[cfg(any(feature = "test-utils", test))]
+    fn record_saved_tx_positions(&self, tx_positions: &[Option<Arc<[u32]>>]) {
+        let mut saved = self.inner.saved_tx_positions.lock();
+        if saved.len() == SAVED_TX_POSITIONS_KEPT {
+            saved.pop_front();
+        }
+        saved.push_back(tx_positions.to_vec());
+    }
+
+    /// BENCH-ONLY: the static files' sync timings since the last call, per segment and phase
+    /// (data, offsets and `.csoff` syncs and the `.conf` freeze, which `save_blocks` runs in
+    /// each segment's thread, and the index update in the commit), and starts a new period
+    /// (vendored TN-0119). Call it after each [`Self::persist_executed_output`] for that
+    /// persist's split. Timings are this environment's own; no other provider adds to them.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn take_static_file_sync_stats(&self) -> reth_provider::providers::StaticFileSyncStats {
+        use reth_provider::StaticFileProviderFactory as _;
+        self.inner.blockchain_provider.static_file_provider().take_sync_stats()
+    }
+}
+
+/// How many persist attempts' positions [`RethEnv::saved_tx_positions`] keeps: enough for a test
+/// to read one output's attempts, bounded so a long run in a `test-utils` build does not grow.
+#[cfg(any(feature = "test-utils", test))]
+pub const SAVED_TX_POSITIONS_KEPT: usize = 16;
+
+/// The static-file segment whose rows store transactions, inline or by batch position.
+const TX_SEGMENT: StaticFileSegment = StaticFileSegment::Transactions;
+
+/// `tn_reth.persist_save_blocks_seconds`: `save_blocks` time per successful persist.
+const PERSIST_SAVE_BLOCKS_SECONDS: &str = "tn_reth.persist_save_blocks_seconds";
+/// `tn_reth.persist_commit_seconds`: database commit time per successful persist.
+const PERSIST_COMMIT_SECONDS: &str = "tn_reth.persist_commit_seconds";
+/// `tn_reth.persisted_accounts_total`: changed accounts written, summed per block.
+const PERSISTED_ACCOUNTS_TOTAL: &str = "tn_reth.persisted_accounts_total";
+/// `tn_reth.persisted_storage_slots_total`: changed storage slots written, summed per block.
+const PERSISTED_STORAGE_SLOTS_TOTAL: &str = "tn_reth.persisted_storage_slots_total";
+
+/// The build state one consensus output's blocks share: the trie overlay their state roots layer
+/// over, and the block the output was last advanced to.
+///
+/// The engine creates one scope per consensus output, before its first block, and passes it to
+/// [`RethEnv::build_block_from_recovered_payload`] for each block of the output in order. A
+/// successful build extends the overlay with the built block's deltas and moves the tip to it;
+/// the scope is dropped with the output. State reads do not live here: they go through the
+/// cross-block execution cache (`exec_cache.rs`), which outlives the output and checks its own
+/// anchor.
+///
+/// # Errors
+///
+/// A failed build advances neither half, so the scope still describes the failed block's
+/// parent, which the caller will not build on again. Drop it: the engine aborts the whole output
+/// on any build error.
+///
+/// The scope remembers the block it was last advanced to and refuses a payload on any other
+/// parent ([`TnRethError::ScopeParentMismatch`]), so a scope kept past its output or reused on
+/// another branch fails closed instead of layering the root over a different state.
+#[derive(Debug, Default)]
+pub struct OutputBuildScope {
+    /// The output's accumulated trie overlay (see [`OutputTrieOverlay`]).
+    overlay: OutputTrieOverlay,
+    /// The hash of the block the scope was last advanced to: the only parent it builds on.
+    /// `None` until the first block of the output is built.
+    tip: Option<B256>,
+}
+
+impl OutputBuildScope {
+    /// An empty scope for the first block of an output: no overlay (the database holds the
+    /// parent state).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fail closed unless `parent` is the block the scope was last advanced to (any parent
+    /// passes before the first build).
+    fn check_parent(&self, parent: B256) -> TnRethResult<()> {
+        match self.tip {
+            Some(expected) if expected != parent => {
+                Err(TnRethError::ScopeParentMismatch { expected, got: parent })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Wall time of the phases of one [`RethEnv::build_block_from_batch_payload_timed`] call.
+///
+/// The four laps are disjoint; opening the parent state provider and checking the execution
+/// cache out fall outside all of them, and so does an attempt discarded after a stale cache hit
+/// (the laps are the final attempt's). Observability only: nothing here feeds block contents.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlockBuildTimings {
+    /// Parallel signer recovery of the batch's transactions; zero from
+    /// [`RethEnv::build_block_from_recovered_payload`], which takes recovered signers.
+    pub recover: Duration,
+    /// Builder setup, the pre-execution system calls and the sequential transaction loop.
+    pub evm: Duration,
+    /// The layered state root inside `builder.finish`, including the read-only database
+    /// transaction it opens.
+    pub root: Duration,
+    /// The rest of `builder.finish` (closing system calls, bundle merge, hashed post-state and
+    /// block assembly), plus the bundle take, the delta sorts, the overlay extend and the
+    /// execution cache's check-in.
+    pub finish: Duration,
+}
+
+/// Wall time of each phase of one successful [`RethEnv::persist_executed_output`] call.
+#[derive(Debug, Clone, Copy)]
+struct PersistPhases {
+    /// Opening the read-write database provider.
+    open: Duration,
+    /// `save_blocks` (database writes plus the static-file appends).
+    save_blocks: Duration,
+    /// Writing the finalized and safe block-number markers.
+    markers: Duration,
+    /// Committing the database transaction.
+    commit: Duration,
+}
+
+/// What one [`RethEnv::persist_executed_output`] call wrote, summed over its blocks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PersistedCounts {
+    /// Transactions in the persisted blocks.
+    txs: usize,
+    /// Receipts in the persisted blocks.
+    receipts: usize,
+    /// Accounts in each block's bundle state (an account changed in two blocks counts twice).
+    accounts: usize,
+    /// Storage slots in each block's bundle state, summed the same way.
+    storage_slots: usize,
+}
+
+impl PersistedCounts {
+    /// Count what `blocks` carry into the database.
+    ///
+    /// Summing map lengths is independent of `HashMap` iteration order; this feeds only logs and
+    /// metrics, never block contents.
+    fn of(blocks: &[ExecutedBlock]) -> Self {
+        blocks.iter().fold(Self::default(), |counts, block| {
+            let bundle = &block.execution_output.state;
+            Self {
+                txs: counts.txs + block.recovered_block.transaction_count(),
+                receipts: counts.receipts + block.execution_output.result.receipts.len(),
+                accounts: counts.accounts + bundle.state.len(),
+                storage_slots: counts.storage_slots
+                    + bundle.state.values().map(|account| account.storage.len()).sum::<usize>(),
+            }
+        })
+    }
+}
+
+/// Log and record one successful persist of `blocks`.
+///
+/// The series use per-call `metrics::histogram!`/`counter!` macros rather than handles on
+/// `RethEnvMetrics`: a persist runs about once per consensus output (~1/s), so resolving the
+/// handle per call is cheap, and the macros bind to whichever recorder is current, which keeps
+/// the unit test independent of test ordering (see the `metrics` module docs).
+fn record_persisted_output(blocks: &[ExecutedBlock], phases: PersistPhases) {
+    let counts = PersistedCounts::of(blocks);
+    ::metrics::histogram!(PERSIST_SAVE_BLOCKS_SECONDS).record(phases.save_blocks);
+    ::metrics::histogram!(PERSIST_COMMIT_SECONDS).record(phases.commit);
+    ::metrics::counter!(PERSISTED_ACCOUNTS_TOTAL)
+        .increment(u64::try_from(counts.accounts).unwrap_or(u64::MAX));
+    ::metrics::counter!(PERSISTED_STORAGE_SLOTS_TOTAL)
+        .increment(u64::try_from(counts.storage_slots).unwrap_or(u64::MAX));
+    debug!(
+        target: "engine",
+        first = blocks.first().map(|block| block.recovered_block.number).unwrap_or_default(),
+        last = blocks.last().map(|block| block.recovered_block.number).unwrap_or_default(),
+        blocks = blocks.len(),
+        txs = counts.txs,
+        receipts = counts.receipts,
+        accounts = counts.accounts,
+        storage_slots = counts.storage_slots,
+        open_ms = duration_ms(phases.open),
+        save_blocks_ms = duration_ms(phases.save_blocks),
+        markers_ms = duration_ms(phases.markers),
+        commit_ms = duration_ms(phases.commit),
+        "persisted output"
+    );
+}
+
+/// The transactions one persist stored inline in a datadir that stores them by position: those
+/// of the blocks with transactions but no positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InlineTxRows {
+    /// Transactions stored inline.
+    rows: u64,
+    /// The first block that stored its transactions inline.
+    first_block: BlockNumber,
+    /// Why that block had no positions.
+    reason: InlineReason,
+}
+
+/// Why a block with transactions was persisted without positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineReason {
+    /// The persist was given no positions for any block.
+    NoPositions,
+    /// The block's entry is `None`: its batch does not hash to its `ommers_hash`.
+    DigestMismatch,
+}
+
+impl InlineReason {
+    /// The reason in the warning's words.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::NoPositions => "the persist was given no transaction positions",
+            Self::DigestMismatch => "its batch does not hash to the block's ommers_hash",
+        }
+    }
+}
+
+/// Set by the first [`InlineTxRows::record`]: the warning is logged once per process.
+static INLINE_TX_ROWS_WARNED: AtomicBool = AtomicBool::new(false);
+
+impl InlineTxRows {
+    /// What a persist of `blocks` with `tx_positions` (see [`RethEnv::persist_executed_output`])
+    /// stores inline, in a datadir that stores transactions by position; `None` when every block
+    /// with transactions has positions.
+    fn of(blocks: &[ExecutedBlock], tx_positions: &[Option<Arc<[u32]>>]) -> Option<Self> {
+        let reason = if tx_positions.is_empty() {
+            InlineReason::NoPositions
+        } else {
+            InlineReason::DigestMismatch
+        };
+        let mut inline: Option<Self> = None;
+        for (index, block) in blocks.iter().enumerate() {
+            let txs = block.recovered_block.transaction_count();
+            if txs == 0 || tx_positions.get(index).is_some_and(Option::is_some) {
+                continue;
+            }
+            let rows = u64::try_from(txs).unwrap_or(u64::MAX);
+            let first_block = block.recovered_block.number;
+            inline = Some(match inline {
+                Some(seen) => Self { rows: seen.rows.saturating_add(rows), ..seen },
+                None => Self { rows, first_block, reason },
+            });
+        }
+        inline
+    }
+
+    /// Count the rows in `tn_reth.tx_body_inline_rows_total` and warn on the first call in the
+    /// process. Expected zero in production, except on adiri's duplicate-batch epochs.
+    fn record(self) {
+        record_tx_body_inline_rows(self.rows);
+        if !INLINE_TX_ROWS_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                target: "engine",
+                block = self.first_block,
+                rows = self.rows,
+                reason = self.reason.describe(),
+                "transactions stored inline in a datadir that stores them by batch position (logged once; counted in tn_reth.tx_body_inline_rows_total)"
+            );
+        }
+    }
+}
+
+/// The batches of one persisted consensus output whose transactions its blocks store by position:
+/// what [`RethEnv::cache_persisted_batches`] hands a [`PersistedBatchSink`].
+#[derive(Debug, Clone)]
+pub struct PersistedBatches {
+    /// The output (a clone shares its batches through an `Arc`: no bytes are copied).
+    output: ConsensusOutput,
+    /// Each such batch's digest and place in the output (certificate index, then batch index in
+    /// the certificate), in block order, one entry per digest.
+    batches: Vec<(B256, usize, usize)>,
+}
+
+impl PersistedBatches {
+    /// The batches of `output` whose blocks were persisted with `tx_positions`:
+    /// `tx_positions[i]` belongs to the block built from the output's `i`-th batch in
+    /// [`ConsensusOutput::flatten_batches`] order. A batch counts when its block has positions and
+    /// at least one transaction. A batch committed twice in the output (two blocks under one
+    /// digest) counts once.
+    pub fn new(output: &ConsensusOutput, tx_positions: &[Option<Arc<[u32]>>]) -> Self {
+        let mut seen = HashSet::new();
+        let batches = output
+            .flatten_batches()
+            .into_iter()
+            .zip(tx_positions)
+            .enumerate()
+            .filter(|(_, (_, positions))| positions.as_ref().is_some_and(|p| !p.is_empty()))
+            .filter_map(|(index, ((cert, batch), _))| {
+                let digest = output.get_batch_digest(index)?;
+                seen.insert(digest).then_some((digest, cert, batch))
+            })
+            .collect();
+        Self { output: output.clone(), batches }
+    }
+
+    /// Whether no batch counts.
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// How many batches count.
+    pub fn len(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// The consensus output the batches belong to.
+    pub fn output(&self) -> &ConsensusOutput {
+        &self.output
+    }
+
+    /// Each batch with its digest (the `ommers_hash` of its block), in block order.
+    pub fn iter(&self) -> impl Iterator<Item = (B256, &Batch)> + '_ {
+        self.batches
+            .iter()
+            .map(|&(digest, cert, batch)| (digest, &self.output.batches()[cert].batches[batch]))
+    }
+}
+
+/// Receives the batches whose transactions each successful persist stored by position, to fill
+/// the decoded-batch cache that resolves those rows (installed with
+/// [`RethEnv::set_persisted_batch_sink`]; with none installed nothing is handed over).
+pub trait PersistedBatchSink: Send + Sync + std::fmt::Debug {
+    /// Take `batches`, whose blocks' commit has just returned.
+    ///
+    /// Called on the engine's execution thread, after the persist and before the output is
+    /// announced, so it must return at once: copying the batches belongs on a blocking task. A
+    /// read that comes before the copy lands is the resolver's to serve from the consensus pack.
+    fn batches_persisted(&self, batches: PersistedBatches);
+}
+
+/// Recover the signers of one batch's transactions in parallel, dropping the unrecoverable ones.
+///
+/// A transaction whose signer cannot be recovered cannot be executed, but a certified sub-DAG
+/// is fixed and identical on every honest node, so returning an error here would
+/// deterministically halt (and, on restart-replay, crash-loop) the whole network on a single
+/// undecodable transaction. Instead the unrecoverable transactions are dropped, mirroring the
+/// `InvalidTx` tolerance of the execute phase: every node drops the same transactions from the
+/// same certified bytes, so the resulting block stays deterministic (issue #933). The primary
+/// defense is validating batches before they can be certified; this only bounds the blast
+/// radius if one ever is. Always `par_iter`: the overhead on small batches is negligible next
+/// to the savings on large ones, and it avoids an extra code path.
+///
+/// The error line carries the batch digest and the transaction's byte length; the bytes
+/// themselves are attacker-chosen and up to a batch in size, so they are never logged. The
+/// caller counts the drops with [`record_unrecoverable`].
+///
+/// Returns the recovered transactions in batch order and, beside them, each one's index in the
+/// batch (strictly increasing; a dropped transaction leaves a gap). A decoded batch holds at most
+/// `MAX_TXS_PER_BATCH` (1,000,000) transactions, so every index fits a `u32`; one that did not
+/// (only a batch built in memory could hold one) would read `u32::MAX`, which the block writer
+/// refuses as out of order rather than store a wrong position.
+///
+/// Every call records one sample in `RethEnvMetrics::block_signer_recovery_seconds`: one per
+/// batch, and so one per block built from a batch, on both the bytes build and
+/// [`RethEnv::recover_output_signers`] (where the batches of one output recover concurrently).
+fn recover_batch_signers(
+    transactions: &Vec<Vec<u8>>,
+    batch_digest: B256,
+) -> (Vec<Recovered<TransactionSigned>>, Vec<u32>) {
+    let started = Instant::now();
+    let (recovered, positions) = transactions
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, tx_bytes)| {
+            reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                .inspect_err(|e| {
+                    error!(
+                        target: "engine",
+                        batch = ?batch_digest,
+                        tx_len = tx_bytes.len(),
+                        "failed to recover signer, dropping transaction: {e}"
+                    )
+                })
+                .ok()
+                .map(|tx| (tx, u32::try_from(index).unwrap_or(u32::MAX)))
+        })
+        .unzip();
+    RETH_METRICS.block_signer_recovery_seconds.record(started.elapsed());
+    (recovered, positions)
+}
+
+/// Count the transactions signer recovery dropped: `handed` went in, `recovered` came out.
+///
+/// Recovery failures are the signal that a batch carrying undecodable transaction bytes was
+/// certified, so they are alertable instead of log-only. Callers count once, after the parallel
+/// phase: incrementing inside the rayon closure would contend a single atomic on every
+/// transaction, and the batch width that sets the cost of that contention is attacker-chosen.
+/// The difference is exact because `filter_map` is the only thing in
+/// [`recover_batch_signers`] that removes elements. Unconditional, including the
+/// overwhelmingly common zero: one relaxed atomic add is free next to executing the
+/// transactions, and a guard would leave the series unregistered on a healthy node.
+fn record_unrecoverable(handed: usize, recovered: usize) {
+    RETH_METRICS
+        .unrecoverable_txs_dropped_total
+        .increment(u64::try_from(handed.saturating_sub(recovered)).unwrap_or(u64::MAX));
+}
+
+/// Return the time since `stamp` and move `stamp` to now, so consecutive calls time
+/// consecutive phases.
+fn lap(stamp: &mut Instant) -> Duration {
+    let now = Instant::now();
+    let elapsed = now.saturating_duration_since(*stamp);
+    *stamp = now;
+    elapsed
+}
+
+/// Whole milliseconds in `elapsed`, saturating at `u64::MAX`.
+fn duration_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        test_utils::{
+            batch_with_transactions, consensus_output_for_tests,
+            execute_payload_and_update_canonical_chain, seeded_genesis_from_random_batches,
+            TransactionFactory,
+        },
+        RethChainSpec,
+    };
+    use alloy::primitives::{Address, U256};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use reth_revm::{db::BundleState, state::AccountInfo};
+    use tempfile::TempDir;
+    use tn_types::{
+        test_chain_spec_arc, test_genesis, Bytes, CertifiedBatch, ConsensusHeader, TaskManager,
+    };
+
+    /// Bytes that do not decode as an EIP-2718 transaction, so their signer cannot be recovered.
+    const UNDECODABLE_TX: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
+
+    /// One output's transaction positions, one entry per block.
+    type OutputTxPositions = Vec<Option<Arc<[u32]>>>;
+
+    /// Consensus output `number` with one certificate carrying `batches`, listed under `digests`.
+    fn output_with(number: u64, batches: Vec<Batch>, digests: Vec<B256>) -> ConsensusOutput {
+        let base = consensus_output_for_tests(number as u32, 0, number, false);
+        ConsensusOutput::new(
+            base.sub_dag().clone(),
+            ConsensusHeader::default().digest(),
+            number,
+            false,
+            digests.into(),
+            vec![CertifiedBatch { address: Address::ZERO, batches }],
+        )
+    }
+
+    /// A temp chain whose genesis funds the senders of `batches`, storing transactions inline: no
+    /// pointer jars, and no cache fill installed.
+    fn funded_inline_env(batches: &[&Batch]) -> eyre::Result<(RethEnv, TempDir, TaskManager)> {
+        let (genesis, ..) = seeded_genesis_from_random_batches(test_genesis(), batches.to_vec());
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("tx positions");
+        let format = crate::DatadirFormat {
+            layout: crate::env::genesis::temp_chain_new_datadir_layout()?,
+            tx_bodies: crate::TxBodies::Inline,
+        };
+        let env =
+            RethEnv::new_for_temp_chain_with_format(chain, tmp_dir.path(), &task_manager, format)?;
+        Ok((env, tmp_dir, task_manager))
+    }
+
+    /// Build `output`'s blocks on `parent` as the engine does (recovered signers, one block per
+    /// batch under the output's digest for it, chained in memory) and return them with their
+    /// transactions' batch positions.
+    fn build_output(
+        env: &RethEnv,
+        mut parent: SealedHeader,
+        output: &ConsensusOutput,
+    ) -> eyre::Result<(Vec<ExecutedBlock>, OutputTxPositions)> {
+        let mut scope = OutputBuildScope::new();
+        let cims = env.canonical_in_memory_state();
+        let (mut blocks, mut positions) = (Vec::new(), Vec::new());
+        for (index, recovered) in RethEnv::recover_output_signers(output).into_iter().enumerate() {
+            let digest = output.get_batch_digest(index).unwrap_or_default();
+            let payload = TNPayload::new_for_test_with(
+                parent.clone(),
+                output,
+                Address::repeat_byte(0xbe),
+                digest,
+                digest,
+            );
+            let built = env.build_block_from_recovered_payload(payload, recovered, &mut scope)?;
+            parent = built.block.recovered_block.clone_sealed_header();
+            cims.update_chain(NewCanonicalChain::Commit { new: vec![built.block.clone()] });
+            cims.set_canonical_head(parent.clone());
+            blocks.push(built.block);
+            positions.push(built.tx_positions);
+        }
+        Ok((blocks, positions))
+    }
+
+    /// The value of the counter `name` in `recorder`'s snapshot, zero when it is not registered.
+    fn counter(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| match value {
+                DebugValue::Counter(count) if key.key().name() == name => Some(count),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// `recover_output_signers` keeps each recovered transaction's index in its batch, so an
+    /// unrecoverable transaction at position 2 leaves a gap, and gives positions only to a batch
+    /// that hashes to the output's digest for it: not to a batch listed under another batch's
+    /// digest, nor to one past the end of a short digest list.
+    #[test]
+    fn test_recovered_positions_skip_drops_and_need_the_batch_digest() {
+        let chain = test_chain_spec_arc();
+        let mut named = batch_with_transactions(chain.clone(), 4, 0);
+        named.transactions.insert(2, UNDECODABLE_TX.to_vec());
+        let misnamed = batch_with_transactions(chain.clone(), 2, 0);
+        let unnamed = batch_with_transactions(chain, 1, 0);
+        // the second batch is listed under the first one's digest; the third has none
+        let digests = vec![named.digest(), named.digest()];
+        let output = output_with(1, vec![named, misnamed, unnamed], digests);
+
+        let recovered = RethEnv::recover_output_signers(&output);
+        assert_eq!(recovered.iter().map(RecoveredBatch::len).collect::<Vec<_>>(), [4, 2, 1]);
+        assert_eq!(recovered[0].positions(), Some(&[0, 1, 3, 4][..]), "a gap at the drop");
+        assert_eq!(recovered[1].positions(), None, "listed under another batch's digest");
+        assert_eq!(recovered[2].positions(), None, "no digest listed");
+    }
+
+    /// A persist counts the transactions of the blocks it got no positions for in
+    /// `tn_reth.tx_body_inline_rows_total`, but only in a datadir that stores transactions by
+    /// position. The pointer policy is switched on after genesis (the layout marker that sets it
+    /// at creation is not part of this test), so the jar stays untagged and the count is the
+    /// TN-side bookkeeping alone. Storage v1 has no pointer jars, so there nothing counts.
+    #[tokio::test]
+    async fn test_inline_rows_counted_only_in_a_pointer_datadir() -> eyre::Result<()> {
+        let chain = test_chain_spec_arc();
+        let [x, y, z, w] = [3, 2, 1, 2].map(|txs| batch_with_transactions(chain.clone(), txs, 0));
+        let (env, _tmp_dir, _task_manager) = funded_inline_env(&[&x, &y, &z, &w])?;
+        let static_files = env.inner.blockchain_provider.static_file_provider();
+        let mut parent = env.canonical_tip();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let mut persist = |output: ConsensusOutput| -> eyre::Result<Vec<ExecutedBlock>> {
+            let (blocks, positions) = build_output(&env, parent.clone(), &output)?;
+            ::metrics::with_local_recorder(&recorder, || {
+                env.persist_executed_output(&blocks, &positions)
+            })?;
+            parent = blocks.last().expect("a block").recovered_block.clone_sealed_header();
+            env.finalize_block(parent.clone())?;
+            Ok(blocks)
+        };
+
+        // an inline datadir: a block without positions counts nothing
+        persist(output_with(1, vec![x], vec![B256::repeat_byte(1)]))?;
+        assert_eq!(counter(&snapshotter, "tn_reth.tx_body_inline_rows_total"), 0);
+
+        static_files.set_tx_pointer_jars(true);
+        let pointer = static_files.tx_pointer_jars(TX_SEGMENT);
+        // a misaligned output: each block's header names the other batch, so both are inline
+        let digests = vec![z.digest(), y.digest()];
+        let misaligned = persist(output_with(2, vec![y, z], digests))?;
+        // an aligned output: stored by position, nothing counted
+        let digests = vec![w.digest()];
+        persist(output_with(3, vec![w], digests))?;
+
+        assert_eq!(
+            counter(&snapshotter, "tn_reth.tx_body_inline_rows_total"),
+            if pointer { 3 } else { 0 },
+            "the misaligned output's three transactions, in a pointer datadir only"
+        );
+        assert_eq!(INLINE_TX_ROWS_WARNED.load(Ordering::Relaxed), pointer, "warned once");
+        let positions = |p: &[u32]| Some(Arc::<[u32]>::from(p));
+        assert_eq!(
+            env.saved_tx_positions(),
+            [vec![None], vec![None, None], vec![positions(&[0, 1])]],
+            "what the block writer received"
+        );
+
+        // the bookkeeping behind the count: the first block without positions, and why
+        let (first, second) =
+            (misaligned[0].recovered_block.number, misaligned[1].recovered_block.number);
+        assert_eq!(
+            InlineTxRows::of(&misaligned, &[]),
+            Some(InlineTxRows { rows: 3, first_block: first, reason: InlineReason::NoPositions })
+        );
+        assert_eq!(
+            InlineTxRows::of(&misaligned, &[None, None]),
+            Some(InlineTxRows {
+                rows: 3,
+                first_block: first,
+                reason: InlineReason::DigestMismatch
+            })
+        );
+        assert_eq!(
+            InlineTxRows::of(&misaligned, &[positions(&[0, 1]), None]),
+            Some(InlineTxRows {
+                rows: 1,
+                first_block: second,
+                reason: InlineReason::DigestMismatch
+            })
+        );
+        assert_eq!(InlineTxRows::of(&misaligned, &[positions(&[0, 1]), positions(&[0])]), None);
+        assert_eq!(InlineTxRows::of(&[ExecutedBlock::default()], &[None]), None, "no rows");
+        Ok(())
+    }
+
+    /// Records each hand-over, digests and batches.
+    #[derive(Debug, Default)]
+    struct RecordingSink(parking_lot::Mutex<Vec<Vec<(B256, Batch)>>>);
+
+    impl PersistedBatchSink for RecordingSink {
+        fn batches_persisted(&self, batches: PersistedBatches) {
+            self.0.lock().push(batches.iter().map(|(d, batch)| (d, batch.clone())).collect());
+        }
+    }
+
+    /// `cache_persisted_batches` hands the installed sink each batch whose block was stored by
+    /// position with at least one transaction, in block order and once per digest (a batch
+    /// committed twice is one entry), and nothing when no batch qualifies or no sink is
+    /// installed. A second sink is refused.
+    #[tokio::test]
+    async fn test_cache_persisted_batches_hands_over_each_positioned_batch_once() -> eyre::Result<()>
+    {
+        let chain = test_chain_spec_arc();
+        let [a, b, c, d] = [1, 2, 1, 2].map(|txs| batch_with_transactions(chain.clone(), txs, 0));
+        let digests = [&a, &a, &b, &c, &d].map(Batch::digest).to_vec();
+        let output = output_with(1, vec![a.clone(), a.clone(), b, c, d.clone()], digests);
+        let positions = |p: &[u32]| Some(Arc::<[u32]>::from(p));
+        // a twice (both blocks by position), b by position with no transaction kept, c without
+        // positions, d by position
+        let tx_positions =
+            [positions(&[0]), positions(&[0]), positions(&[]), None, positions(&[0, 1])];
+
+        let (env, _tmp_dir, _task_manager) = funded_inline_env(&[])?;
+        env.cache_persisted_batches(&output, &tx_positions); // no sink: nothing to do
+        let sink = Arc::new(RecordingSink::default());
+        env.set_persisted_batch_sink(sink.clone())?;
+        assert!(matches!(
+            env.set_persisted_batch_sink(Arc::new(RecordingSink::default())),
+            Err(TnRethError::PersistedBatchSinkAlreadySet)
+        ));
+
+        env.cache_persisted_batches(&output, &tx_positions);
+        env.cache_persisted_batches(&output, &[None, None, None, None, None]);
+        env.cache_persisted_batches(&output, &[]);
+        assert_eq!(*sink.0.lock(), [vec![(a.digest(), a), (d.digest(), d)]], "one hand-over");
+        Ok(())
+    }
+
+    /// One block's account reverts, in the shape `BundleState::new` takes.
+    type AccountReverts = Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>;
+
+    /// A block whose bundle changes `accounts` accounts with `slots_each` storage slots apiece,
+    /// carrying `receipts` receipts.
+    fn block_with_state(accounts: u8, slots_each: u8, receipts: usize) -> ExecutedBlock {
+        let state = (0..accounts).map(|a| {
+            let storage = (0..slots_each)
+                .map(|slot| (U256::from(slot), (U256::ZERO, U256::from(1u8))))
+                .collect();
+            (Address::with_last_byte(a), None, Some(AccountInfo::default()), storage)
+        });
+        let mut block = ExecutedBlock::default();
+        let mut output = (*block.execution_output).clone();
+        output.state = BundleState::new(state, Vec::<AccountReverts>::new(), Vec::new());
+        output.result.receipts = vec![Default::default(); receipts];
+        block.execution_output = Arc::new(output);
+        block
+    }
+
+    /// Counts sum the bundle accounts, their storage slots and the receipts across blocks.
+    #[test]
+    fn test_persisted_counts_sum_over_blocks() {
+        let blocks =
+            [block_with_state(2, 3, 4), block_with_state(1, 1, 0), ExecutedBlock::default()];
+        assert_eq!(
+            PersistedCounts::of(&blocks),
+            PersistedCounts { txs: 0, receipts: 4, accounts: 3, storage_slots: 7 }
+        );
+        assert_eq!(PersistedCounts::of(&[]), PersistedCounts::default());
+    }
+
+    /// A recorded persist registers both phase histograms and both write counters.
+    #[test]
+    fn test_record_persisted_output_metrics() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let blocks = [block_with_state(2, 3, 1), block_with_state(1, 2, 1)];
+
+        ::metrics::with_local_recorder(&recorder, || {
+            record_persisted_output(
+                &blocks,
+                PersistPhases {
+                    open: Duration::from_millis(1),
+                    save_blocks: Duration::from_millis(250),
+                    markers: Duration::from_millis(2),
+                    commit: Duration::from_millis(500),
+                },
+            );
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let find = |name: &str| {
+            snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == name)
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("metric {name} not registered"))
+        };
+        assert!(matches!(
+            find(PERSIST_SAVE_BLOCKS_SECONDS),
+            DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.25
+        ));
+        assert!(matches!(
+            find(PERSIST_COMMIT_SECONDS),
+            DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.5
+        ));
+        assert!(matches!(find(PERSISTED_ACCOUNTS_TOTAL), DebugValue::Counter(3)));
+        assert!(matches!(find(PERSISTED_STORAGE_SLOTS_TOTAL), DebugValue::Counter(8)));
+    }
+
+    /// A scope builds only on the block it was last advanced to; before its first build any
+    /// parent passes.
+    #[test]
+    fn test_scope_builds_only_on_its_tip() {
+        let (first, second) = (B256::with_last_byte(1), B256::with_last_byte(2));
+        let mut scope = OutputBuildScope::new();
+        assert!(scope.check_parent(first).is_ok(), "a fresh scope takes any parent");
+        scope.tip = Some(second);
+        assert!(scope.check_parent(second).is_ok(), "the tip is the next parent");
+        assert!(matches!(
+            scope.check_parent(first),
+            Err(TnRethError::ScopeParentMismatch { expected, got })
+                if expected == second && got == first
+        ));
+    }
+
+    /// Consecutive laps time consecutive phases and advance the stamp.
+    #[test]
+    fn test_lap_advances_stamp() {
+        let start = Instant::now();
+        let mut stamp = start;
+        let first = lap(&mut stamp);
+        assert!(stamp >= start);
+        assert_eq!(stamp.saturating_duration_since(start), first);
+        assert_eq!(duration_ms(Duration::from_micros(2_500)), 2);
+    }
+
+    /// `take_static_file_sync_stats` reports one persist's static-file syncs: under storage v1
+    /// the headers, transactions and receipts segments each sync their data and offsets (one span
+    /// of the files' syncs, which run at once), freeze their `.conf` and update the index exactly
+    /// once, and a second take is empty. The first
+    /// persist only warms up: opening a segment's writer runs its heal, which updates the index.
+    #[tokio::test]
+    async fn test_persist_reports_static_file_sync_stats() -> eyre::Result<()> {
+        use reth_provider::StaticFileSegment;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("static file sync stats");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let output1 = consensus_output_for_tests(2, 0, 1, false);
+        let payload1 = TNPayload::new_for_test(chain.sealed_genesis_header(), &output1);
+        let block1 = execute_payload_and_update_canonical_chain(&env, payload1, vec![])?;
+        let _ = env.take_static_file_sync_stats();
+
+        let output2 = consensus_output_for_tests(2, 0, 2, false);
+        let payload2 =
+            TNPayload::new_for_test(block1.recovered_block.clone_sealed_header(), &output2);
+        execute_payload_and_update_canonical_chain(&env, payload2, vec![])?;
+        let stats = env.take_static_file_sync_stats();
+        for segment in [
+            StaticFileSegment::Headers,
+            StaticFileSegment::Transactions,
+            StaticFileSegment::Receipts,
+        ] {
+            let s = stats.segment(segment);
+            for (phase, calls) in [
+                ("data", s.data_sync.calls),
+                ("offsets", s.offsets_sync.calls),
+                ("files", s.files_sync.calls),
+                ("conf", s.conf_freeze.calls),
+                ("update_index", s.update_index.calls),
+            ] {
+                assert_eq!(calls, 1, "{segment:?} {phase}");
+            }
+        }
+        assert!(env.take_static_file_sync_stats().is_empty(), "a take drains the stats");
+        Ok(())
+    }
+
+    /// Every block `build_block_from_batch_payload` builds records exactly one sample in each
+    /// `RethEnvMetrics::block_*_seconds` histogram, and the stages nested in finish fit inside it.
+    ///
+    /// The histograms record through the `RETH_METRICS` static, whose handles bind to the
+    /// recorder current when it is first forced. `RethEnv::new` forces it, so the environment is
+    /// built inside this test's local recorder scope, and every later sample lands in that
+    /// recorder whichever thread records it. nextest runs each test in its own process, so
+    /// nothing has forced the static before; in a single-process `cargo test` run something may
+    /// have, and the test then fails on the absent series rather than on a wrong count.
+    #[tokio::test]
+    async fn test_block_build_records_one_timing_sample_per_stage() -> eyre::Result<()> {
+        const BLOCKS: usize = 3;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("block timing metrics");
+        let mut factory = TransactionFactory::new();
+        let recipient = Address::from_slice(&[0xcc; 20]);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || -> eyre::Result<()> {
+            let reth_env =
+                RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+            let mut parent = chain.sealed_genesis_header();
+            for index in 1..=BLOCKS as u64 {
+                // two transfers per block, so signer recovery and the transaction loop do work
+                let transactions = (0..2)
+                    .map(|_| {
+                        factory.create_eip1559_encoded(
+                            chain.clone(),
+                            None,
+                            100,
+                            Some(recipient),
+                            U256::from(1_000_000),
+                            Bytes::new(),
+                        )
+                    })
+                    .collect();
+                let output = consensus_output_for_tests(2, 0, index, false);
+                let payload = TNPayload::new_for_test(parent, &output);
+                let block =
+                    execute_payload_and_update_canonical_chain(&reth_env, payload, transactions)?;
+                assert_eq!(block.recovered_block.body().transactions.len(), 2);
+                parent = block.recovered_block.clone_sealed_header();
+            }
+            Ok(())
+        })?;
+
+        // one snapshot: taking it drains the samples it reads
+        let snapshot = snapshotter.snapshot().into_vec();
+        let samples = |name: &str| -> Vec<f64> {
+            let (.., value) =
+                snapshot.iter().find(|(key, ..)| key.key().name() == name).unwrap_or_else(|| {
+                    panic!(
+                        "{name} is not registered with this test's recorder: `RETH_METRICS` was \
+                         forced before the test (run it under nextest, one process per test)"
+                    )
+                });
+            match value {
+                DebugValue::Histogram(values) => values.iter().map(|v| v.into_inner()).collect(),
+                other => panic!("{name} must be a histogram, got {other:?}"),
+            }
+        };
+        let names = [
+            "tn_reth.block_execute_seconds",
+            "tn_reth.block_signer_recovery_seconds",
+            "tn_reth.block_finish_seconds",
+            "tn_reth.block_hashed_state_seconds",
+            "tn_reth.block_state_root_seconds",
+            "tn_reth.block_overlay_extend_seconds",
+        ];
+        let [execute, recovery, finish, hashed_state, state_root, overlay_extend] =
+            names.map(samples);
+
+        for (name, values) in names.iter().zip([
+            &execute,
+            &recovery,
+            &finish,
+            &hashed_state,
+            &state_root,
+            &overlay_extend,
+        ]) {
+            assert_eq!(values.len(), BLOCKS, "{name} must record one sample per block: {values:?}");
+            assert!(values.iter().all(|v| *v > 0.0), "{name} must time real work: {values:?}");
+        }
+        // every histogram records its blocks in build order, so index `i` is block `i + 1` in all
+        // signer recovery runs ahead of execute (`recover_batch_signers`), so only finish nests
+        for block in 0..BLOCKS {
+            assert!(
+                finish[block] >= hashed_state[block] + state_root[block],
+                "hashing and the state root run one after the other inside finish: {finish:?} vs \
+                 {hashed_state:?} + {state_root:?}"
+            );
+        }
+        Ok(())
     }
 }

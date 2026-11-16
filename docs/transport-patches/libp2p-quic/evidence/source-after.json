@@ -1,0 +1,238 @@
+{
+  "full_summary_sha256": "9196fec9bbe0a79ffe015742efff5f673f6acc1c6c87ed3e244635a1fa3691c7",
+  "node": {
+    "adiri": {
+      "lockfile_sha256": "7f4d386a9061baf826da3b0cff35dba4a4bc78b2074842797661a9e66e94319b",
+      "packages": [
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#aws-lc-rs@1.18.1",
+          "name": "aws-lc-rs",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.18.1"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#aws-lc-sys@0.45.0",
+          "name": "aws-lc-sys",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.45.0"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-core@0.44.0",
+          "name": "libp2p-core",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.44.0"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-identity@0.2.13",
+          "name": "libp2p-identity",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.2.13"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-identity@0.3.0",
+          "name": "libp2p-identity",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.3.0"
+        },
+        {
+          "id": "path+file://$NODE/patches/libp2p-quic#0.14.0",
+          "name": "libp2p-quic",
+          "source": null,
+          "version": "0.14.0"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-tls@0.7.0",
+          "name": "libp2p-tls",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.7.0"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#quinn@0.11.9",
+          "name": "quinn",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.11.9"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.18",
+          "name": "quinn-proto",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.11.18"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14",
+          "name": "ring",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.17.14"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#rustls@0.23.45",
+          "name": "rustls",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.23.45"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#rustls-webpki@0.103.15",
+          "name": "rustls-webpki",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.103.15"
+        }
+      ],
+      "release_feature_tree": [
+        "aws-lc-rs v1.18.1|aws-lc-sys,prebuilt-nasm",
+        "aws-lc-sys v0.45.0|prebuilt-nasm",
+        "libp2p-core v0.44.0|serde",
+        "libp2p-identity v0.2.13|ed25519,peerid,secp256k1",
+        "libp2p-identity v0.3.0|ed25519,peerid,rand,serde",
+        "libp2p-quic v0.14.0 ($NODE/patches/libp2p-quic)|tokio",
+        "libp2p-tls v0.7.0|",
+        "quinn v0.11.9|aws-lc-rs,futures-io,runtime-tokio,rustls-aws-lc-rs",
+        "quinn-proto v0.11.18|aws-lc-rs,bloom,log,ring,rustls-aws-lc-rs",
+        "ring v0.17.14|alloc,default,dev_urandom_fallback,std",
+        "rustls v0.23.45|aws-lc-rs,aws_lc_rs,log,logging,prefer-post-quantum,ring,std,tls12",
+        "rustls-webpki v0.103.15|alloc,aws-lc-rs,default,ring,std"
+      ]
+    },
+    "default": {
+      "lockfile_sha256": "7f4d386a9061baf826da3b0cff35dba4a4bc78b2074842797661a9e66e94319b",
+      "packages": [
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#aws-lc-rs@1.18.1",
+          "name": "aws-lc-rs",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.18.1"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#aws-lc-sys@0.45.0",
+          "name": "aws-lc-sys",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.45.0"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-core@0.44.0",
+          "name": "libp2p-core",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.44.0"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-identity@0.2.13",
+          "name": "libp2p-identity",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.2.13"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-identity@0.3.0",
+          "name": "libp2p-identity",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.3.0"
+        },
+        {
+          "id": "path+file://$NODE/patches/libp2p-quic#0.14.0",
+          "name": "libp2p-quic",
+          "source": null,
+          "version": "0.14.0"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-tls@0.7.0",
+          "name": "libp2p-tls",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.7.0"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#quinn@0.11.9",
+          "name": "quinn",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.11.9"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.18",
+          "name": "quinn-proto",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.11.18"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14",
+          "name": "ring",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.17.14"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#rustls@0.23.45",
+          "name": "rustls",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.23.45"
+        },
+        {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#rustls-webpki@0.103.15",
+          "name": "rustls-webpki",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.103.15"
+        }
+      ],
+      "release_feature_tree": [
+        "aws-lc-rs v1.18.1|aws-lc-sys,prebuilt-nasm",
+        "aws-lc-sys v0.45.0|prebuilt-nasm",
+        "libp2p-core v0.44.0|serde",
+        "libp2p-identity v0.2.13|ed25519,peerid,secp256k1",
+        "libp2p-identity v0.3.0|ed25519,peerid,rand,serde",
+        "libp2p-quic v0.14.0 ($NODE/patches/libp2p-quic)|tokio",
+        "libp2p-tls v0.7.0|",
+        "quinn v0.11.9|aws-lc-rs,futures-io,runtime-tokio,rustls-aws-lc-rs",
+        "quinn-proto v0.11.18|aws-lc-rs,bloom,log,ring,rustls-aws-lc-rs",
+        "ring v0.17.14|alloc,default,dev_urandom_fallback,std",
+        "rustls v0.23.45|aws-lc-rs,aws_lc_rs,log,logging,prefer-post-quantum,ring,std,tls12",
+        "rustls-webpki v0.103.15|alloc,aws-lc-rs,default,ring,std"
+      ]
+    }
+  },
+  "provenance": {
+    "registry_archive_sha256": "4f78ca359466657b380e469fe8c04df2f4447d1430838e6c3cef4a1c51ccb2ee",
+    "upstream_base_revision": "7171dce2f90c05ba7892d4ba926abb1881db27c7",
+    "upstream_diff_sha256": "70bcf353a43adf946424c40b663fe02e871a1b0b6ad346c2f19ecfbb5c92973c",
+    "vendored_files": {
+      "CHANGELOG.md": "ec9c42468c4c30d2514a6d78441611888fbc29f2ad148fa7dab49644db95eefc",
+      "Cargo.toml": "06427459bb2204548838c3b82c9066b5e989656951833749c046627f64177272",
+      "src/config.rs": "987a9e2e316efc0ff5d2c4948b587b3dcf8601f3443fb18ccfc9de646953375e",
+      "src/connection.rs": "007266c5491d3e2155f996ab31c255eaa94fcb284459f9ced30b40520068fa2b",
+      "src/connection/connecting.rs": "f23d4309ef22599bff3ef7de414e38fbfb62e1c2ea8fe1337e632833ed6e701e",
+      "src/connection/stream.rs": "381e9faefc20b82238bb40fa9f46d43111b2687af5c767e29d9ec48cfd2d01a0",
+      "src/hole_punching.rs": "0fd5efe2eb146d402127aae2b8958783c3a666cb5d2f05c23a22c77bbd053ceb",
+      "src/incoming.rs": "7935bf1a0e78943f02fd661534869580812d7374f4972c0db27c8f30f98bf50d",
+      "src/lib.rs": "67c080ba1e0da4f60f85167b4e32cb394a7d14be0d19d63a634a62c0a785f1be",
+      "src/provider.rs": "7a13653e3996ce0771267bcaee04c0465bb80f50a9c6a0572fcd9e423a3bd4b2",
+      "src/provider/tokio.rs": "5e1cc55e6fb3e8045676cad73830bc5715fb0b7212f6f80843c82a87d80dbfb3",
+      "src/transport.rs": "a51dda8513fc1de7bddd11f6dab6cec88f6ebfcd9957a6c31171b59e42732ebe",
+      "tests/smoke.rs": "bd891d3cba6d0efea978b1f84bc6eb1379d975b0668bafd0f3681e3feaca71bf"
+    },
+    "vendored_tree_sha256": "51fa07a9f61861af00723b4b96f8e68deece21a021b5cee870903ebf669d5f26"
+  },
+  "recorded_at": "2026-09-30",
+  "retained_output_hashes": {
+    "comparison-adiri-features.json": "fc594993ef7a5da23011b51e163cbfc274cff6a8e3d33a5e25ad3a0f78e2b7aa",
+    "comparison-adiri-features.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "comparison-adiri-features.stdout": "dac95c13b4a6c62888a2ed09ecec3ca1c238b3753eb3267489ce9f22b55d1aec",
+    "comparison-adiri-metadata.json": "c8b8c5f88214de765e9b8847f1069cc95a72631cae558cfa2aa1732b5fd81052",
+    "comparison-adiri-metadata.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "comparison-adiri-metadata.stdout": "a526a6ff50898f70bb7c8173dc361a3c6823f8e4dfd32941ab4358375812cb21",
+    "comparison-default-features.json": "62e903628efa61fb4ec98db776531a728fd4afe1d3e605ac7d0b093d30c677e4",
+    "comparison-default-features.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "comparison-default-features.stdout": "4098765833bda15e0b26b7da6c71e46ad84ec1858968c4038be1f4fe0f797a83",
+    "comparison-default-metadata.json": "345487faccd8d505dcf09db70e36b42df6c88f46ae9648c176aa032aa98c8b78",
+    "comparison-default-metadata.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "comparison-default-metadata.stdout": "f4320d1c4cf7eef2cf8eaf3bb9848e41942b41e9e4e1d8d7d2f9d309de93234b",
+    "node-adiri-features.json": "cb0681cb877d6be863224523b77706cc1b66f92ceed8eeb33f2ddcbc8fd842c6",
+    "node-adiri-features.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "node-adiri-features.stdout": "44c1fc5316f12104296a265a1f23132b1a37a0082cf77424e1012d189863917f",
+    "node-adiri-metadata.json": "3ca12bfa2affe4a8f8d01a122555022ab9606ad064c9ec33d6a2664d5489abee",
+    "node-adiri-metadata.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "node-adiri-metadata.stdout": "cd05e09cd72decf167bea22cb5949187f458f104388c2338049b4cbbd06bea90",
+    "node-default-features.json": "eafd452bae17f6bcc2b762da8be4460012b34e13ac21ad26046b16660b9219a6",
+    "node-default-features.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "node-default-features.stdout": "52992f501434d3c2603a3b0fcb960634805be58fd80917817401c877c7f855be",
+    "node-default-metadata.json": "41f4d22423d0d486a9ddc195c78c8aa62638413e0acea3b1b5b09ce572c3a120",
+    "node-default-metadata.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "node-default-metadata.stdout": "b2628f316802f0162f874b1e6e9f470360b088be1b4b809ac99ea1bf86709276",
+    "summary.json": "9196fec9bbe0a79ffe015742efff5f673f6acc1c6c87ed3e244635a1fa3691c7"
+  },
+  "source_override_comparison": "only libp2p-quic source identity differs",
+  "status": "passed"
+}

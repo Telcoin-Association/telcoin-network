@@ -1,0 +1,34 @@
+[package]
+name = "reth-tracing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "tracing helpers"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+
+# obs
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "json"] }
+tracing-appender.workspace = true
+tracing-journald.workspace = true
+tracing-logfmt.workspace = true
+tracing-samply.workspace = true
+tracing-tracy = { workspace = true, optional = true }
+tracy-client = { workspace = true, optional = true, features = ["demangle"] }
+
+# misc
+clap = { workspace = true, features = ["derive"] }
+eyre.workspace = true
+rolling-file.workspace = true
+
+[features]
+# TN(TN-0029): no `otlp`/`otlp-logs` features and no reth-tracing-otlp; see layers.rs.
+tracy = ["tracing-tracy", "tracy-client"]

@@ -1,0 +1,196 @@
+use crate::primitives::alloy_primitives::{BlockNumber, StorageKey, StorageValue};
+use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
+use core::ops::{Deref, DerefMut};
+use reth_primitives_traits::Account;
+use reth_storage_api::{AccountReader, BlockHashReader, BytecodeReader, StateProvider};
+use reth_storage_errors::provider::{ProviderError, ProviderResult};
+use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
+
+/// A helper trait responsible for providing state necessary for EVM execution.
+///
+/// This serves as the data layer for [`Database`].
+pub trait EvmStateProvider {
+    /// Get basic account information.
+    ///
+    /// Returns [`None`] if the account doesn't exist.
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>>;
+
+    /// Get the hash of the block with the given number. Returns [`None`] if no block with this
+    /// number exists.
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>>;
+
+    /// Get account code by hash.
+    fn bytecode_by_hash(
+        &self,
+        code_hash: &B256,
+    ) -> ProviderResult<Option<reth_primitives_traits::Bytecode>>;
+
+    /// Get storage of the given account.
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>>;
+}
+
+// Blanket implementation of EvmStateProvider for any type that implements StateProvider.
+impl<T: StateProvider> EvmStateProvider for T {
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        <T as AccountReader>::basic_account(self, address)
+    }
+
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        <T as BlockHashReader>::block_hash(self, number)
+    }
+
+    fn bytecode_by_hash(
+        &self,
+        code_hash: &B256,
+    ) -> ProviderResult<Option<reth_primitives_traits::Bytecode>> {
+        <T as BytecodeReader>::bytecode_by_hash(self, code_hash)
+    }
+
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>> {
+        <T as StateProvider>::storage(self, account, storage_key)
+    }
+}
+
+/// A [Database] and [`DatabaseRef`] implementation that uses [`EvmStateProvider`] as the underlying
+/// data source.
+#[derive(Clone)]
+pub struct StateProviderDatabase<DB>(pub DB);
+
+impl<DB> StateProviderDatabase<DB> {
+    /// Create new State with generic `StateProvider`.
+    pub const fn new(db: DB) -> Self {
+        Self(db)
+    }
+
+    /// Consume State and return inner `StateProvider`.
+    pub fn into_inner(self) -> DB {
+        self.0
+    }
+}
+
+impl<DB> core::fmt::Debug for StateProviderDatabase<DB> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StateProviderDatabase").finish_non_exhaustive()
+    }
+}
+
+impl<DB> AsRef<DB> for StateProviderDatabase<DB> {
+    fn as_ref(&self) -> &DB {
+        self
+    }
+}
+
+impl<DB> Deref for StateProviderDatabase<DB> {
+    type Target = DB;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<DB> DerefMut for StateProviderDatabase<DB> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<DB: EvmStateProvider> Database for StateProviderDatabase<DB> {
+    type Error = ProviderError;
+
+    /// Retrieves basic account information for a given address.
+    ///
+    /// Returns `Ok` with `Some(AccountInfo)` if the account exists,
+    /// `None` if it doesn't, or an error if encountered.
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.basic_ref(address)
+    }
+
+    /// Retrieves the bytecode associated with a given code hash.
+    ///
+    /// Returns `Ok` with the bytecode if found, or the default bytecode otherwise.
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.code_by_hash_ref(code_hash)
+    }
+
+    /// Retrieves the storage value at a specific index for a given address.
+    ///
+    /// Returns `Ok` with the storage value, or the default value if not found.
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.storage_ref(address, index)
+    }
+
+    /// Retrieves the block hash for a given block number.
+    ///
+    /// Returns `Ok` with the block hash if found, or the default hash otherwise.
+    /// Note: It safely casts the `number` to `u64`.
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.block_hash_ref(number)
+    }
+}
+
+impl<DB: EvmStateProvider> DatabaseRef for StateProviderDatabase<DB> {
+    type Error = <Self as Database>::Error;
+
+    /// Retrieves basic account information for a given address.
+    ///
+    /// Returns `Ok` with `Some(AccountInfo)` if the account exists,
+    /// `None` if it doesn't, or an error if encountered.
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        Ok(self.basic_account(&address)?.map(Into::into))
+    }
+
+    /// Retrieves the bytecode associated with a given code hash.
+    ///
+    /// Returns `Ok` with the bytecode if found. TN(TN-0082): a row missing for any code hash
+    /// but the empty code's is an error, not empty code. A node whose database
+    /// lost the row would otherwise run every call to that contract as a no-op and commit a
+    /// root the other validators do not; the block fails instead.
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        match self.bytecode_by_hash(&code_hash)? {
+            Some(code) => Ok(code.0),
+            None if code_hash == KECCAK256_EMPTY => Ok(Bytecode::default()),
+            None => Err(ProviderError::BytecodeNotFound(code_hash)),
+        }
+    }
+
+    /// Retrieves the storage value at a specific index for a given address.
+    ///
+    /// Returns `Ok` with the storage value, or the default value if not found.
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        Ok(self.0.storage(address, B256::new(index.to_be_bytes()))?.unwrap_or_default())
+    }
+
+    /// Retrieves the block hash for a given block number.
+    ///
+    /// Returns `Ok` with the block hash if found, or the default hash otherwise.
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        // Get the block hash or default hash with an attempt to convert U256 block number to u64
+        Ok(self.0.block_hash(number)?.unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::b256;
+    use reth_storage_api::noop::NoopProvider;
+
+    /// TN(TN-0082): a missing bytecode row is an error, except for the empty code's hash.
+    #[test]
+    fn missing_bytecode_is_an_error_except_for_the_empty_code() {
+        let db = StateProviderDatabase::new(NoopProvider::default());
+        assert_eq!(db.code_by_hash_ref(KECCAK256_EMPTY).unwrap(), Bytecode::default());
+        let hash = b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        assert!(
+            matches!(db.code_by_hash_ref(hash), Err(ProviderError::BytecodeNotFound(h)) if h == hash)
+        );
+    }
+}

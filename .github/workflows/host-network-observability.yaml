@@ -1,0 +1,175 @@
+name: Host network observability
+
+# Validates the Prometheus rules, their unit tests, the Grafana dashboard and
+# the observability compose profile, then runs the controlled host scenarios
+# of docs/src/getting-started/host-network-observability.md on a Linux runner.
+# Not a required check: the CI Success job in pr.yaml stays the single gate.
+
+on:
+  pull_request:
+    paths:
+      - etc/prometheus/**
+      - etc/grafana/**
+      - etc/host-metrics/**
+      - etc/compose.yaml
+      - .github/workflows/host-network-observability.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-network-observability-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PROMETHEUS_IMAGE: prom/prometheus:v3.15.0
+  NODE_EXPORTER_IMAGE: prom/node-exporter:v1.12.1
+
+jobs:
+  artifacts:
+    name: Validate rule and dashboard artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the rule file
+        run: docker run --rm -v "$PWD/etc/prometheus:/p:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check rules /p/rules/telcoin-host-network.rules.yaml
+      - name: Run the rule unit tests
+        run: docker run --rm -v "$PWD/etc/prometheus:/p:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" test rules /p/rules/telcoin-host-network.test.yaml
+      - name: Check the Prometheus configuration
+        run: docker run --rm -v "$PWD/etc/prometheus:/p:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check config /p/prometheus.yaml
+      - name: Parse the dashboard and the provisioning files
+        run: |
+          jq empty etc/grafana/telcoin-node-metrics.json
+          python3 -I -c 'import sys, yaml; [yaml.safe_load(open(p)) for p in sys.argv[1:]]' \
+            etc/grafana/provisioning/datasources/prometheus.yaml \
+            etc/grafana/provisioning/dashboards/telcoin.yaml
+      - name: Validate the observability compose profile
+        run: docker compose -f etc/compose.yaml --profile observability config -q
+
+  host-scenarios:
+    name: Controlled host scenarios
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install nftables and netcat
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables netcat-openbsd
+      - name: Check the collector script syntax
+        run: bash -n etc/host-metrics/tn-host-network.sh
+      - name: Firewall drops are counted and conntrack is tracked
+        run: |
+          sudo nft add table inet tn_ci
+          sudo nft add counter inet tn_ci tn_drop_udp_probe
+          sudo nft add chain inet tn_ci input '{ type filter hook input priority 0; }'
+          sudo nft add rule inet tn_ci input udp dport 49599 counter name tn_drop_udp_probe drop
+          # decoys: a chain and a comment that only carry the word notrack leave the mode tracked
+          sudo nft add chain inet tn_ci notrack_decoy
+          sudo nft add rule inet tn_ci notrack_decoy counter comment '"notrack decoy"'
+          for i in $(seq 1 50); do echo probe > /dev/udp/127.0.0.1/49599; done
+          sudo bash etc/host-metrics/tn-host-network.sh > tracked.prom
+          cat tracked.prom
+          python3 -I - tracked.prom <<'EOF'
+          import sys
+          lines = open(sys.argv[1]).read().splitlines()
+          def value(name):
+              hits = [line.split()[-1] for line in lines if line.startswith(name + " ")]
+              assert hits, f"{name} is missing"
+              return float(hits[0])
+          assert value('tn_host_firewall_collector_available') == 1
+          assert value('tn_host_firewall_rule_packets_total{rule="drop_udp_probe"}') >= 50
+          assert value('tn_host_firewall_rules_truncated') == 0
+          assert value('tn_host_conntrack_mode{mode="tracked"}') == 1
+          assert value('tn_host_conntrack_mode{mode="notrack"}') == 0
+          assert value('tn_host_udp_rmem_max_bytes') > 0
+          EOF
+      - name: A notrack rule changes the conntrack mode
+        run: |
+          # notrack works only before conntrack (-200): a prerouting chain at priority raw (-300)
+          sudo nft add chain inet tn_ci prerouting '{ type filter hook prerouting priority raw; }'
+          sudo nft add rule inet tn_ci prerouting udp dport 49599 notrack
+          sudo bash etc/host-metrics/tn-host-network.sh > notrack.prom
+          cat notrack.prom
+          python3 -I - notrack.prom <<'EOF'
+          import sys
+          lines = open(sys.argv[1]).read().splitlines()
+          def value(name):
+              hits = [line.split()[-1] for line in lines if line.startswith(name + " ")]
+              assert hits, f"{name} is missing"
+              return float(hits[0])
+          assert value('tn_host_conntrack_mode{mode="notrack"}') == 1
+          assert value('tn_host_conntrack_mode{mode="tracked"}') == 0
+          assert value('tn_host_conntrack_mode{mode="unsupported"}') == 0
+          EOF
+      - name: node_exporter labels the textfile with its full path
+        run: |
+          textfile_dir=$(mktemp -d)
+          cp tracked.prom "$textfile_dir/tn_host_network.prom"
+          chmod -R a+rX "$textfile_dir"
+          docker run -d --name tn-node-exporter -p 127.0.0.1:9100:9100 -v "$textfile_dir:/textfile:ro" "$NODE_EXPORTER_IMAGE" --collector.textfile.directory=/textfile
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:9100/metrics > node-exporter.txt && break; sleep 1; done
+          python3 -I - node-exporter.txt <<'EOF'
+          import re, sys
+          lines = open(sys.argv[1]).read().splitlines()
+          labels = [m.group(1) for m in (re.match(r'node_textfile_mtime_seconds\{file="([^"]*)"\}', line) for line in lines) if m]
+          print(f"node_textfile_mtime_seconds file labels: {labels}")
+          assert "/textfile/tn_host_network.prom" in labels, "node_exporter must report the full textfile path"
+          assert any(re.fullmatch(r"(.*/)?tn_host_network[.]prom", label) for label in labels), "the rule regex must match the label"
+          EOF
+          docker rm -f tn-node-exporter > /dev/null
+      - name: UDP receive buffer pressure raises RcvbufErrors
+        run: |
+          rcvbuf_errors() {
+            awk '$1 == "Udp:" { if (!header) { for (i = 1; i <= NF; i++) if ($i == "RcvbufErrors") col = i; header = 1 } else print $col }' /proc/net/snmp
+          }
+          echo "RMEM_MAX_ORIGINAL=$(cat /proc/sys/net/core/rmem_max)" >> "$GITHUB_ENV"
+          echo "RMEM_DEFAULT_ORIGINAL=$(cat /proc/sys/net/core/rmem_default)" >> "$GITHUB_ENV"
+          sudo sysctl -w net.core.rmem_max=2304 net.core.rmem_default=2304
+          before=$(rcvbuf_errors)
+          (nc -u -l 49598 | sleep 60) > /dev/null 2>&1 &
+          sleep 1
+          python3 -I -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); [s.sendto(b"x" * 1000, ("127.0.0.1", 49598)) for _ in range(300)]'
+          sleep 1
+          after=$(rcvbuf_errors)
+          echo "Udp RcvbufErrors before=$before after=$after"
+          kill %1 2> /dev/null || true
+          test "$after" -gt "$before"
+      - name: Conntrack occupancy reaches the alert threshold
+        run: |
+          echo "CONNTRACK_MAX_ORIGINAL=$(cat /proc/sys/net/netfilter/nf_conntrack_max)" >> "$GITHUB_ENV"
+          sudo nft add rule inet tn_ci input udp dport 49597 ct state new counter accept
+          sudo sysctl -w net.netfilter.nf_conntrack_max=64
+          # A full table drops each new flow on the output hook and the sender gets EPERM.
+          # That is the condition under test, so the sender counts the drops instead of failing.
+          python3 -I - <<'EOF'
+          import errno, socket, time
+          sockets = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(100)]
+          def open_flow(sock):
+              try:
+                  sock.sendto(b"flow", ("127.0.0.1", 49597))
+                  return "accepted"
+              except OSError as err:
+                  if err.errno != errno.EPERM:
+                      raise
+                  return "dropped"
+          outcomes = [open_flow(sock) for sock in sockets]
+          print(f"flows accepted={outcomes.count('accepted')} dropped={outcomes.count('dropped')}")
+          time.sleep(1)
+          EOF
+          count=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
+          echo "nf_conntrack_count=$count of 64"
+          test "$count" -ge 51
+      - name: Restore kernel settings and remove the test ruleset
+        if: always()
+        run: |
+          if [ -n "${CONNTRACK_MAX_ORIGINAL:-}" ]; then sudo sysctl -w net.netfilter.nf_conntrack_max="$CONNTRACK_MAX_ORIGINAL"; fi
+          if [ -n "${RMEM_MAX_ORIGINAL:-}" ]; then sudo sysctl -w net.core.rmem_max="$RMEM_MAX_ORIGINAL" net.core.rmem_default="$RMEM_DEFAULT_ORIGINAL"; fi
+          sudo nft delete table inet tn_ci || true
+          docker rm -f tn-node-exporter > /dev/null 2>&1 || true
+      - name: Check the collector output with promtool
+        run: |
+          docker run --rm -i --entrypoint promtool "$PROMETHEUS_IMAGE" check metrics < tracked.prom
+          docker run --rm -i --entrypoint promtool "$PROMETHEUS_IMAGE" check metrics < notrack.prom

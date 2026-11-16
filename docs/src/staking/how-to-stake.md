@@ -5,7 +5,7 @@
 Becoming an active validator requires three on-chain transactions:
 
 1. **Governance Approval** - Governance issues a ConsensusNFT to whitelist operator's validator address.
-2. **Stake** - Operator submits uncompressed BLS public key, uncompressed proof of possession, and stake amount.
+2. **Stake** - Operator submits the compressed BLS public key (96 bytes), the compressed proof of possession (48 bytes), and the stake amount.
 3. **Activate** - Once the node is synced, operator submits an activation transaction to become eligible for inclusion in future committees at the next epoch boundary.
 
 ### Prerequisites
@@ -17,7 +17,7 @@ Size the validator host from [Hardware Requirements](../getting-started/hardware
 #### Network Requirements
 
 * Static public IP address
-* Open UDP ports for P2P communication (default: primary and worker ports)
+* Open UDP ports for P2P communication: the primary and worker ports you pass at key generation (49590 and 49594 by convention; the node has no default ports)
 * Reliable, low-latency internet connection
 
 #### Software Requirements
@@ -94,11 +94,10 @@ function stake(
 **Parameters:**
 
 * `blsPubkey` - The compressed BLS public key (96 bytes)
-* `proofOfPossession` - Struct containing:
-  * `uncompressedPubkey` - Your uncompressed BLS public key (192 bytes)
-  * `uncompressedSignature` - BLS signature proving ownership of the secret key
+* `proofOfPossession` - Struct with one field:
+  * `signature` - The compressed proof of possession (48 bytes), which binds the BLS key to the validator address
 
-**Value:** Send the exact stake amount required by the current stake configuration. 1M TEL for initial mainnet launch.
+**Value:** Send exactly the `stakeAmount` of the current epoch's stake version. Read the version with `getCurrentStakeVersion()`, then its config with `stakeConfig(uint8)`. On the Adiri testnet the amount is 1,000,000 TEL today.
 
 #### Reading Your Keys
 
@@ -109,23 +108,37 @@ bls_public_key: <compressed-96-byte-key>
 proof_of_possession: <signature>
 ```
 
+The file stores both values in base58. `keytool export-staking-args` reads them and prints the two `stake()` arguments in hex, or the complete transaction calldata with `--calldata`. It reads only `node-info.yaml` and never the BLS key, but the binary still requires a passphrase source for every keytool command except `set-rpc`: with the default `env` source and no `TN_BLS_PASSPHRASE` it exits with "passphrase is required". Pass `--bls-passphrase-source no-passphrase`. `keytool` also writes log lines to stdout, so add the global `-q` flag when capturing its output in a variable.
+
 #### Example Using Cast
 
 ```bash
-# Read current stake amount from contract
+# Read the current epoch's stake version
 cast call 0x07E17e17E17e17E17e17E17E17E17e17e17E17e1 \
-  "getCurrentStakeConfig()" \
+  "getCurrentStakeVersion()(uint8)" \
   --rpc-url <RPC_URL>
+
+# Read that version's config; the first value is the stake amount in wei
+cast call 0x07E17e17E17e17E17e17E17E17E17e17e17E17e1 \
+  "stakeConfig(uint8)(uint256,uint256,uint256,uint32)" \
+  <STAKE_VERSION> \
+  --rpc-url <RPC_URL>
+
+# Build the stake(bytes,(bytes)) calldata from node-info.yaml
+CALLDATA=$(telcoin-network -q --bls-passphrase-source no-passphrase \
+  keytool export-staking-args \
+  --node-info /path/to/node/data/node-info.yaml \
+  --calldata)
 
 # Submit stake transaction
 cast send 0x07E17e17E17e17E17e17E17E17E17e17e17E17e1 \
-  "stake(bytes,(bytes,bytes))" \
-  <BLS_PUBKEY_COMPRESSED> \
-  "(<UNCOMPRESSED_PUBKEY>,<UNCOMPRESSED_SIGNATURE>)" \
+  "$CALLDATA" \
   --value <STAKE_AMOUNT> \
   --trezor \
   --rpc-url <RPC_URL>
 ```
+
+Do not read the amount from `getCurrentStakeConfig()`. It returns the newest config governance has written, and in an epoch where governance writes a new version, that config only takes effect at the next epoch. `stake()` checks the value against the current epoch's version.
 
 After staking, the validator's status changes to `Staked`.
 
@@ -136,8 +149,11 @@ Start the validator node and wait for it to sync with the network. This step can
 ```bash
 telcoin-network node \
   --datadir /path/to/node/data \
+  --chain adiri \
   --http
 ```
+
+`--chain adiri` loads the Adiri testnet genesis built into the binary. Build the binary with the `adiri` feature: without it, the node refuses to start on the Adiri chain (chain ID 2017).
 
 **Passphrase options:**
 
@@ -212,7 +228,8 @@ function delegateStake(
     bytes calldata blsPubkey,
     ProofOfPossession memory proofOfPossession,
     address validatorAddress,
-    bytes calldata validatorEIP712Signature
+    bytes calldata validatorEIP712Signature,
+    uint256 deadline
 ) external payable
 ```
 
@@ -220,6 +237,7 @@ function delegateStake(
 
 * `validatorAddress` - The address that owns the ConsensusNFT
 * `validatorEIP712Signature` - EIP-712 signature from the validator authorizing the delegation
+* `deadline` - Unix timestamp after which the signature is rejected with `DelegationExpired`
 
 #### Obtaining the Delegation Digest
 
@@ -229,11 +247,12 @@ The validator must sign an EIP-712 typed data message. Get the digest to sign:
 function delegationDigest(
     bytes memory blsPubkey,
     address validatorAddress,
-    address delegator
+    address delegator,
+    uint256 deadline
 ) external view returns (bytes32)
 ```
 
-The validator signs this digest, and the delegator includes the signature when calling `delegateStake`.
+The validator signs this digest, and the delegator includes the signature and the same `deadline` when calling `delegateStake`. The digest also covers the current epoch's stake version and the validator's delegation nonce, so the signature stops working if either changes before `delegateStake` runs. A validator can revoke a signature it has given by calling `increaseNonce()`.
 
 **Note:** Governance-initiated delegations (where `msg.sender` is the contract owner) do not require the validator's EIP-712 signature.
 
@@ -254,12 +273,16 @@ Your status changes to `PendingExit`. The protocol will automatically exit you o
 
 #### Unstake
 
-After exiting and waiting one full epoch, reclaim your stake and rewards:
+The validator address or its delegator can call `unstake`. The registry accepts it in two cases:
+
+* the validator is `Staked` (it staked but never activated), or
+* the validator is `Exited` and at least one epoch has passed since its exit epoch (`currentEpoch >= exitEpoch + 1`).
 
 ```bash
 cast send 0x07E17e17E17e17E17e17E17E17E17e17e17E17e1 \
-  "unstake(address)" \
+  "unstake(address,bool)" \
   <VALIDATOR_ADDRESS> \
+  false \
   --trezor \
   --rpc-url <RPC_URL>
 ```
@@ -268,6 +291,12 @@ This returns your initial stake plus any accrued rewards to either:
 
 * The validator address (if self-staked)
 * The delegator address (if delegated staking was used)
+
+If the recipient rejects the transfer, the amount is credited instead, and the recipient withdraws it with `claimRefund()`.
+
+The second argument is `acceptRewardShortfall`. With `false`, the call reverts if the Issuance contract cannot cover the accrued rewards. With `true`, rewards are paid up to the Issuance balance and the unpaid rewards are forfeited; the stake portion is not reduced by the reward shortfall. (A validator slashed below its stake amount gets back only its remaining balance either way.)
+
+Unstaking retires the validator address for good: governance cannot issue it a ConsensusNFT again.
 
 #### Claim Rewards Without Exiting
 
@@ -306,14 +335,14 @@ cast call 0x07E17e17E17e17E17e17E17E17E17e17e17E17e1 \
 
 | Error                      | Cause                               | Solution                                            |
 | -------------------------- | ----------------------------------- | --------------------------------------------------- |
-| `RequiresConsensusNFT`     | Address not whitelisted             | Request governance approval first                   |
+| `InvalidTokenId`           | Address holds no ConsensusNFT: not whitelisted yet, or already retired | Request governance approval first; a retired address cannot be whitelisted again |
 | `InvalidStatus`            | Wrong validator state for operation | Check current status with `getValidator()`          |
-| `InvalidStakeAmount`       | Incorrect stake value sent          | Query `getCurrentStakeConfig()` for required amount |
-| `InvalidProofOfPossession` | BLS signature verification failed   | Regenerate keys and ensure correct address          |
-| `DuplicateBLSPubkey`       | BLS key already registered          | Generate new keys with `--force` flag               |
+| `InvalidStakeAmount`       | Incorrect stake value sent          | Send `stakeAmount` from `stakeConfig(getCurrentStakeVersion())` |
+| `InvalidProofOfPossession` | BLS signature verification failed   | The proof was usually signed for a different address. Re-sign it for the staking address with `keytool generate pop --address <ADDRESS>`, then export the staking arguments again |
+| `DuplicateBLSPubkey`       | BLS key already registered          | If this address already staked with this key, the earlier stake succeeded; check `getValidator()`. Otherwise: a registered key is never released, not even after unstaking. Generate a new validator's keys in a new datadir, and never overwrite the keys of a validator that has staked |
 
 #### Key Management
 
-* **Lost passphrase:** BLS keys cannot be recovered without the passphrase. Generate new keys.
-* **Regenerating keys:** Use `--force` flag to overwrite existing keys (old keys will be lost).
+* **Lost passphrase:** BLS keys cannot be recovered without the passphrase. Before staking, generate new keys. After staking, the registered key cannot be replaced: exit and unstake from the validator address, then onboard a new validator address with new keys.
+* **Regenerating keys:** Never run `keytool generate validator --force` for a validator that has staked. The registry binds the BLS key to that validator for good and has no way to replace it, so `--force` overwrites the only key that can sign for the validator. If the proof of possession names the wrong address, re-sign it with `keytool generate pop --address <ADDRESS>` instead. It keeps every key and changes only `execution_address` and `proof_of_possession`, but it writes the whole `node-info.yaml` again, so a legacy `worker:` map is saved as a `workers:` list. It signs with the BLS key, so run it with `--datadir` set to the node's data directory and the passphrase source that decrypts the key. The `--bls-passphrase-source no-passphrase` used for `export-staking-args` above fails for an encrypted key.
 * **Backing up keys:** Securely backup the contents of your data directory, especially the encrypted key files.

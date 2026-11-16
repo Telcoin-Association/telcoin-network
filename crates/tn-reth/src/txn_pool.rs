@@ -28,14 +28,13 @@
 //!   equivalent — passes `pending_block_blob_fee: Some(u128::MAX)`, pricing all blob transactions
 //!   out of the pending set.
 
+use crate::metrics::{
+    record_retired_pool_txns_dropped, record_retired_pool_txns_moved, HandoffDropReason,
+};
 use alloy::primitives::{keccak256, map::AddressSet, B256};
 use futures::{future::OptionFuture, stream, Stream, StreamExt as _};
-use reth::transaction_pool::{
-    blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
-    TransactionValidationTaskExecutor,
-};
 use reth_chainspec::ChainSpec;
-use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
+use reth_node_core::{cli::config::RethTransactionPoolConfig, node_config::NodeConfig};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
@@ -44,24 +43,26 @@ use reth_provider::{
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
+    blobstore::DiskFileBlobStore,
     error::{
         Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
         PoolError, PoolTransactionError,
     },
-    AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
-    PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
-    TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
+    AddedTransactionOutcome, BestTransactions, BlockInfo as RethBlockInfo, CanonicalStateUpdate,
+    EthPooledTransaction, EthTransactionPool, PoolSize, PoolTransaction, PoolUpdateKind,
+    TransactionEvents, TransactionOrigin, TransactionPool as _, TransactionPoolExt as _,
+    TransactionValidationTaskExecutor, ValidPoolTransaction,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     pin::pin,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use tn_types::{
     gas_accumulator::BaseFeeContainer, min_batch_size, Address, BlockBody, BlsPublicKey,
-    EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError, TaskSpawner,
-    TransactionSigned, TxHash, U256,
+    Decodable2718 as _, EnvKzgSettings, Recovered, SealedBlock, SealedHeader, TaskError,
+    TaskSpawner, TransactionSigned, TxHash, U256,
 };
 use tokio::{task::JoinError, time::MissedTickBehavior};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, IntervalStream};
@@ -571,11 +572,12 @@ impl WorkerTxPool {
         stream::iter(ready)
             .for_each(|(hash, bytes)| async move {
                 let provider = self.1.clone();
-                let included = tokio::task::spawn_blocking(move || provider.transaction_by_hash(hash))
+                // inclusion needs only the hash index: never read or decode the body
+                let included = tokio::task::spawn_blocking(move || provider.transaction_id(hash))
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| {
-                        result.map(|transaction| transaction.is_some()).map_err(|error| error.to_string())
+                        result.map(|id| id.is_some()).map_err(|error| error.to_string())
                     });
                 if included.as_ref().is_ok_and(|included| *included) {
                     self.pending_forwards().remove(&hash);
@@ -812,6 +814,51 @@ impl WorkerTxPool {
         self.0.queued_transactions()
     }
 
+    /// Subscribe to admissions in every subpool, including transactions that cannot propagate.
+    ///
+    /// Retired workers subscribe before draining so in-flight admissions also reach an active
+    /// worker, and the batch builder wakes on them. Include private and parked transactions
+    /// regardless of their propagation policy.
+    pub fn admitted_transactions(&self) -> impl Stream<Item = ()> + Send + 'static {
+        tokio_stream::wrappers::ReceiverStream::new(
+            self.0
+                .new_transactions_listener_for(reth_transaction_pool::TransactionListenerKind::All),
+        )
+        .map(|_| ())
+    }
+
+    /// Move pending and parked transactions to an active worker under its normal admission rules.
+    ///
+    /// Preserve each transaction's origin. A transaction the destination already holds, including
+    /// an `AlreadyImported` result, is complete and is not logged. Validation or capacity refusals
+    /// are discarded, counted by [`HandoffDropReason`] and summarized in one `warn!` per pass;
+    /// the detail for each refusal is at `debug`. Remove from this pool only after the destination
+    /// has handled the transaction, so cancelling a handoff cannot lose it. Callers must stop this
+    /// worker's producers and keep relaying late admissions until regrowth.
+    pub(crate) async fn migrate_transactions_to(&self, destination: &Self) -> HandoffSummary {
+        let summary = stream::iter(self.0.all_transactions())
+            .fold(HandoffSummary::default(), |summary, transaction| async move {
+                let hash = *transaction.hash();
+                let outcome = if destination.get(&hash).is_some() {
+                    HandoffOutcome::AlreadyPresent
+                } else {
+                    destination
+                        .0
+                        .add_transaction(transaction.origin, transaction.transaction.clone())
+                        .await
+                        .map_or_else(
+                            |error| HandoffOutcome::from_error(&error),
+                            |_| HandoffOutcome::Moved,
+                        )
+                };
+                self.0.remove_transaction(hash);
+                summary.record(outcome)
+            })
+            .await;
+        summary.report();
+        summary
+    }
+
     /// This method is called when a canonical state update is received.
     ///
     /// Collect account changes and mined hashes on the blocking executor, borrowing the tip
@@ -940,7 +987,14 @@ impl WorkerTxPool {
 
 impl TxPool for WorkerTxPool {
     fn best_transactions(&self) -> BestTxns {
-        BestTxns { inner: self.0.best_transactions() }
+        let mut inner = self.0.best_transactions();
+        // A build packs the pending set as of this call. Left on, the iterator also pulls
+        // transactions admitted during the build from a bounded broadcast channel and drops
+        // what it missed when it lags; a sender's nonce N can then be dropped while N+1 is
+        // yielded as independent, and the builder, which does not execute, would pack N+1
+        // without N. The next build sees the newcomers anyway.
+        inner.no_updates();
+        BestTxns { inner }
     }
 
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
@@ -1113,6 +1167,30 @@ pub fn recover_signed_transaction(tx: &[u8]) -> TnRethResult<TransactionSigned> 
     Ok(recovered.into_inner())
 }
 
+/// Decode bytes into a signed transaction without signer recovery.
+///
+/// The decode rules and errors match [`recover_signed_transaction`]. Empty input fails, and
+/// trailing bytes fail. This function does not check the signature. Call
+/// [`verify_transaction_signature`] before you trust the transaction.
+pub fn decode_signed_transaction(tx: &[u8]) -> TnRethResult<TransactionSigned> {
+    if tx.is_empty() {
+        Err(crate::EthApiError::EmptyRawTransactionData.into())
+    } else {
+        TransactionSigned::decode_2718_exact(tx)
+            .map_err(|_| crate::EthApiError::FailedToDecodeSignedTransaction.into())
+    }
+}
+
+/// Verify the signature of a signed transaction by signer recovery.
+///
+/// The recovery applies the EIP-2 rule for the `s` value. This function discards the recovered
+/// signer. A bad signature returns the same error as [`recover_signed_transaction`].
+pub fn verify_transaction_signature(tx: &TransactionSigned) -> TnRethResult<()> {
+    tx.recover_signer()
+        .map(|_| ())
+        .map_err(|_| crate::EthApiError::InvalidTransactionSignature.into())
+}
+
 /// Recover a pooled transaction.
 pub fn recover_pooled_transaction(
     tx: &[u8],
@@ -1124,6 +1202,74 @@ pub fn recover_pooled_transaction(
 
 #[cfg(test)]
 mod config_tests;
+
+/// What happened to one retired-worker transaction in a handoff pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffOutcome {
+    /// The active worker accepted the transaction.
+    Moved,
+    /// The active worker already held the transaction.
+    AlreadyPresent,
+    /// The active worker refused the transaction, and the handoff discarded it.
+    Refused(HandoffDropReason),
+}
+
+impl HandoffOutcome {
+    /// Classify a failed insertion, and log the detail of a real refusal at `debug`.
+    ///
+    /// `AlreadyImported` means the destination holds the transaction, so the handoff is complete.
+    fn from_error(error: &PoolError) -> Self {
+        HandoffDropReason::from_kind(&error.kind).map_or(Self::AlreadyPresent, |reason| {
+            debug!(target: "tn::execution", hash = ?error.hash, ?error,
+                "active worker refused a retired worker transaction; discarding");
+            Self::Refused(reason)
+        })
+    }
+}
+
+/// The result of one pass of [`WorkerTxPool::migrate_transactions_to`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct HandoffSummary {
+    /// Transactions the active worker accepted.
+    moved: u64,
+    /// Transactions the active worker already held.
+    already_present: u64,
+    /// Transactions the active worker refused, by reason.
+    refused: BTreeMap<HandoffDropReason, u64>,
+}
+
+impl HandoffSummary {
+    /// Add one transaction's outcome to the pass totals.
+    fn record(self, outcome: HandoffOutcome) -> Self {
+        match outcome {
+            HandoffOutcome::Moved => Self { moved: self.moved.saturating_add(1), ..self },
+            HandoffOutcome::AlreadyPresent => {
+                Self { already_present: self.already_present.saturating_add(1), ..self }
+            }
+            HandoffOutcome::Refused(reason) => {
+                let count = self.refused.get(&reason).map_or(1, |count| count.saturating_add(1));
+                Self {
+                    refused: self.refused.into_iter().chain([(reason, count)]).collect(),
+                    ..self
+                }
+            }
+        }
+    }
+
+    /// Record the pass on the handoff counters, and log one `warn!` when the pass refused any
+    /// transaction.
+    fn report(&self) {
+        record_retired_pool_txns_moved(self.moved);
+        self.refused
+            .iter()
+            .for_each(|(reason, count)| record_retired_pool_txns_dropped(*reason, *count));
+        if !self.refused.is_empty() {
+            warn!(target: "tn::execution", moved = self.moved,
+                already_present = self.already_present, refused = ?self.refused,
+                "active worker refused retired worker transactions; discarding");
+        }
+    }
+}
 
 #[cfg(test)]
 mod canonical_update_tests;
@@ -1155,15 +1301,20 @@ mod tests {
         tmp_dir: &TempDir,
         task_manager: &TaskManager,
     ) -> (Arc<RethChainSpec>, RethEnv, WorkerTxPool) {
-        let genesis = test_genesis().extend_accounts([(
-            tx_factory.address(),
-            GenesisAccount::default().with_balance(U256::MAX),
-        )]);
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let chain = funded_chain_for_test(tx_factory);
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), task_manager, None).unwrap();
         let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).unwrap();
         (chain, reth_env, pool)
+    }
+
+    /// A chain whose genesis funds the factory's sender.
+    fn funded_chain_for_test(tx_factory: &TransactionFactory) -> Arc<RethChainSpec> {
+        let genesis = test_genesis().extend_accounts([(
+            tx_factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX),
+        )]);
+        Arc::new(genesis.into())
     }
 
     /// A real canonical notification retires retained forwarding state independently of pool
@@ -1237,6 +1388,69 @@ mod tests {
         Ok(())
     }
 
+    /// The forwarded-inclusion check reads only the hash index, never a transaction body. Every
+    /// value of the persisted block's `Transactions` jar is damaged (storage v2: each carries a
+    /// CRC-32), so a body read fails its checksum while the hash index still answers; the
+    /// included transaction retires its retained record instead of being retried or requeued.
+    #[cfg(not(feature = "mdbx"))]
+    #[tokio::test]
+    async fn forwarded_inclusion_check_reads_no_transaction_body() -> eyre::Result<()> {
+        use crate::StorageLayout;
+        use reth_provider::{StaticFileProviderFactory as _, StaticFileSegment};
+        use std::io::Write as _;
+
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let chain = funded_chain_for_test(&factory);
+        let reth_env = RethEnv::new_for_temp_chain_with_layout(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            StorageLayout::V2,
+        )?;
+        let pool = reth_env.init_txn_pool_without_maintenance(BaseFeeContainer::default())?;
+        let tx = factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let encoded = tx.encoded_2718();
+        let hash = *tx.hash();
+        assert_eq!(pool.admit_forwards(vec![encoded.clone()]), Some(vec![encoded.clone()]));
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        // persisted and pruned from the in-memory chain: both reads below go to storage
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![encoded])?;
+
+        let static_files = pool.1.static_file_provider();
+        let segment = StaticFileSegment::Transactions;
+        let path = static_files
+            .directory()
+            .join(segment.filename(&static_files.find_fixed_range(segment, 0)));
+        let damaged: Vec<u8> = std::fs::read(&path)?.into_iter().map(|byte| byte ^ 0x01).collect();
+        std::fs::OpenOptions::new().write(true).open(&path)?.write_all(&damaged)?;
+        let err = pool.1.transaction_by_hash(hash).expect_err("the body read must fail");
+        assert!(err.to_string().contains("fails its checksum"), "{err}");
+        assert!(pool.1.transaction_id(hash)?.is_some(), "the hash index must still answer");
+
+        pool.pending_forwards().defer(&hash);
+        (1_u8..=3).for_each(|output| {
+            pool.pending_forwards().committed(u64::from(output), B256::repeat_byte(output), []);
+        });
+        pool.retry_forwarded(Instant::now() + REQUEUE_GRACE, 1).await;
+        assert_eq!(
+            pool.pending_forwards().ready(Instant::now() + FORWARD_PENDING_LIFETIME, 1),
+            (vec![], 0),
+            "an included transaction must retire its retained record",
+        );
+        assert!(pool.get(&hash).is_none(), "an included transaction must not return to the pool");
+        Ok(())
+    }
+
     #[test]
     fn test_recover_raw_transaction_preserves_signer() {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
@@ -1291,6 +1505,166 @@ mod tests {
         assert!(pool.get(&hash).is_some());
     }
 
+    /// A retired worker hands off pending, base-fee-parked and nonce-queued transactions once.
+    #[tokio::test]
+    async fn retired_pool_migrates_every_subpool_and_deduplicates() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, env, source) = funded_pool_for_test(&factory, &tmp_dir, &tasks);
+        source.set_epoch_base_fee(100);
+        let destination = env.init_txn_pool(BaseFeeContainer::default())?;
+        destination.set_epoch_base_fee(150);
+        let pending = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            200,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let pending_hash = *pending.hash();
+        source
+            .add_transaction_local(
+                EthPooledTransaction::try_from_consensus(pending)
+                    .map_err(|_| eyre::eyre!("expected an EIP1559 pool transaction"))?,
+            )
+            .await?;
+        let parked = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            50,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let parked_hash = *parked.hash();
+        source.add_recovered_transaction_external(parked).await?;
+        factory.set_nonce(4);
+        let queued = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain,
+            None,
+            200,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let queued_hash = *queued.hash();
+        source.add_recovered_transaction_external(queued.clone()).await?;
+        destination.add_recovered_transaction_external(queued).await?;
+        assert_eq!(source.pool_size().pending, 1);
+        assert_eq!(source.pool_size().basefee, 1);
+        assert_eq!(source.pool_size().queued, 1);
+
+        assert_eq!(
+            source.migrate_transactions_to(&destination).await,
+            HandoffSummary { moved: 2, already_present: 1, refused: BTreeMap::new() }
+        );
+        assert_eq!(source.migrate_transactions_to(&destination).await, HandoffSummary::default());
+        assert_eq!(source.0.all_transactions().count(), 0);
+        assert_eq!(destination.0.all_transactions().count(), 3);
+        assert!(destination.get(&pending_hash).is_some());
+        assert!(destination.get(&parked_hash).is_some());
+        assert!(destination.get(&queued_hash).is_some());
+        assert_eq!(
+            destination.get(&pending_hash).map(|transaction| transaction.origin),
+            Some(TransactionOrigin::Local)
+        );
+        assert_eq!(destination.pool_size().pending, 1);
+        assert_eq!(destination.pool_size().basefee, 1);
+        assert_eq!(destination.pool_size().queued, 1);
+        assert_eq!(destination.block_info().pending_basefee, 150);
+        Ok(())
+    }
+
+    /// Destination refusal discards the retired copy without replacing an active transaction.
+    #[tokio::test]
+    async fn retired_pool_discards_refused_transactions() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, env, source) = funded_pool_for_test(&factory, &tmp_dir, &tasks);
+        let destination = env.init_txn_pool(BaseFeeContainer::default())?;
+        let retired = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let retired_hash = *retired.hash();
+        source.add_recovered_transaction_external(retired).await?;
+        factory.set_nonce(0);
+        let active = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain,
+            None,
+            14,
+            Some(Address::ZERO),
+            U256::from(200),
+            Bytes::new(),
+        ))?;
+        let active_hash = *active.hash();
+        destination.add_recovered_transaction_external(active).await?;
+
+        assert_eq!(
+            source.migrate_transactions_to(&destination).await,
+            HandoffSummary {
+                moved: 0,
+                already_present: 0,
+                refused: BTreeMap::from([(HandoffDropReason::ReplacementUnderpriced, 1)]),
+            }
+        );
+        assert_eq!(source.0.all_transactions().count(), 0);
+        assert!(destination.get(&retired_hash).is_none());
+        assert!(destination.get(&active_hash).is_some());
+        assert_eq!(destination.0.all_transactions().count(), 1);
+        Ok(())
+    }
+
+    /// Handoff observes non-propagating admissions and preserves their private origin.
+    #[tokio::test]
+    async fn retired_pool_observes_non_propagating_admissions() -> eyre::Result<()> {
+        use futures::StreamExt as _;
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        let (chain, env, source) = funded_pool_for_test(&factory, &tmp_dir, &tasks);
+        let destination = env.init_txn_pool(BaseFeeContainer::default())?;
+        let mut admissions = pin!(source.admitted_transactions());
+        let recovered = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain,
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        ))?;
+        let hash = *recovered.hash();
+        source
+            .0
+            .add_transaction(
+                TransactionOrigin::Private,
+                EthPooledTransaction::try_from_consensus(recovered)
+                    .map_err(|_| eyre::eyre!("expected an EIP1559 pool transaction"))?,
+            )
+            .await?;
+        assert!(source.get(&hash).is_some_and(|transaction| !transaction.propagate));
+        tokio::time::timeout(Duration::from_secs(5), admissions.next())
+            .await?
+            .ok_or_else(|| eyre::eyre!("all-admissions listener closed"))?;
+        assert_eq!(
+            source.migrate_transactions_to(&destination).await,
+            HandoffSummary { moved: 1, ..HandoffSummary::default() }
+        );
+        assert!(source.get(&hash).is_none());
+        assert_eq!(
+            destination.get(&hash).map(|transaction| transaction.origin),
+            Some(TransactionOrigin::Private)
+        );
+        Ok(())
+    }
+
     /// The DoS fix for issue #1159: the pool refuses EIP-4844 (blob) transactions at
     /// admission. The sender is funded at genesis and the blob's KZG proof is valid, so the
     /// only remaining reason for rejection is the `.no_eip4844()` type gate in
@@ -1313,6 +1687,36 @@ mod tests {
         assert_eq!(s.pending, 0);
         assert_eq!(s.blob, 0);
         assert_eq!(s.queued, 0);
+    }
+
+    /// A build sees the pending set as of its start: a transaction admitted after the iterator
+    /// was created, even a child of one it holds, is left to the next build.
+    #[tokio::test]
+    async fn best_transactions_ignore_admissions_after_the_build_started() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new_random();
+        let (chain, _reth_env, pool) = funded_pool_for_test(&factory, &tmp_dir, &task_manager);
+        let tx = |factory: &mut TransactionFactory| {
+            factory.create_eip1559(
+                chain.clone(),
+                Some(21_000),
+                7,
+                Some(Address::ZERO),
+                U256::from(100),
+                Bytes::new(),
+            )
+        };
+        pool.add_raw_transaction_external(tx(&mut factory)).await.unwrap();
+
+        let mut best = pool.best_transactions();
+        pool.add_raw_transaction_external(tx(&mut factory)).await.unwrap();
+        assert_eq!(pool.pool_size().pending, 2, "the child of a pending transaction is pending");
+
+        let nonces: Vec<u64> = best.by_ref().map(|tx| tx.nonce()).collect();
+        assert_eq!(nonces, vec![0], "only the transaction pending at the start is packed");
+        let nonces: Vec<u64> = pool.best_transactions().map(|tx| tx.nonce()).collect();
+        assert_eq!(nonces, vec![0, 1], "the next build packs both");
     }
 
     /// The pool refuses EIP-7702 (set-code) transactions at admission. Prague is active at
@@ -1637,7 +2041,8 @@ mod tests {
         let task_manager = TaskManager::default();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         // 1,000 wei cap: a 21,000-gas transfer at 7 wei/gas costs at most 147,000 wei.
-        let rpc_args = reth::args::RpcServerArgs { rpc_tx_fee_cap: 1_000, ..Default::default() };
+        let rpc_args =
+            reth_node_core::args::RpcServerArgs { rpc_tx_fee_cap: 1_000, ..Default::default() };
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
             chain.clone(),
             tmp_dir.path(),

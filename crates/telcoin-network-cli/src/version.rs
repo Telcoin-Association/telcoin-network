@@ -21,7 +21,9 @@ pub(crate) const SHORT_VERSION: &str = {
 /// - The latest version from Cargo.toml
 /// - The long SHA of the latest commit.
 /// - The build datetime
-/// - The build features
+/// - The build features (this crate's: a feature set on tn-reth alone does not show here)
+/// - The engine reth's database runs on, read from tn-reth's build (`tn-lmdb`, or `MDBX` with its
+///   `mdbx` feature, however the feature was spelled on the command line)
 ///
 /// # Example:
 ///
@@ -36,6 +38,7 @@ pub(crate) const LONG_VERSION: &str = {
     const BUILD_TIMESTAMP: &str = env!("VERGEN_BUILD_TIMESTAMP");
     const CARGO_FEATURES: &str = env!("VERGEN_CARGO_FEATURES");
     const PROFILE: &str = build_profile_name();
+    const RETH_DATABASE: &str = tn_reth::BACKEND;
 
     const_str::concat!(
         "Version: ",
@@ -51,7 +54,10 @@ pub(crate) const LONG_VERSION: &str = {
         CARGO_FEATURES,
         "\n",
         "Build Profile: ",
-        PROFILE
+        PROFILE,
+        "\n",
+        "Reth Database: ",
+        RETH_DATABASE
     )
 };
 
@@ -84,5 +90,22 @@ mod tests {
     fn assert_extradata_less_32bytes() {
         let extradata = default_extradata();
         assert!(extradata.len() <= 32, "extradata must be less than 32 bytes: {extradata}")
+    }
+
+    /// The `--version` "Build Features" line lists `faucet` exactly when this crate was built
+    /// with its `faucet` feature (directly, or through `adiri`, which implies it), and such a
+    /// build compiles the faucet mint into tn-reth.
+    #[test]
+    fn long_version_lists_faucet_feature() {
+        let features = LONG_VERSION
+            .lines()
+            .find_map(|line| line.strip_prefix("Build Features: "))
+            .expect("long version has a Build Features line");
+        let listed = features.split(',').any(|feature| feature.trim() == "faucet");
+        assert_eq!(listed, cfg!(feature = "faucet"), "Build Features: {features}");
+        assert!(
+            !listed || tn_reth::FAUCET_ENABLED,
+            "faucet listed but tn-reth was built without it"
+        );
     }
 }

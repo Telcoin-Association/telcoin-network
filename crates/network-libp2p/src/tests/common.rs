@@ -1,33 +1,15 @@
 //! Fixtures used in multiple tests.
 
-use crate::{peers::GLOBAL_SCORE_CONFIG, PeerExchangeMap, TNMessage};
+use crate::{PeerExchangeMap, ServiceClass, TNMessage};
 use libp2p::Multiaddr;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{Arc, Once},
-};
-use tn_config::ScoreConfig;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tn_types::{BlockHash, Certificate, Header, HeaderDigest, SealedBatch, Vote};
 
 /// Default heartbeat for tests.
 #[allow(dead_code)] // used in network_tests.rs
 pub(crate) const TEST_HEARTBEAT_INTERVAL: u64 = 1;
-
-// ensure `init_peer_score_config` is only set once
-static INIT: Once = Once::new();
-
-// allow dead code due to compile warning that this fn is never used
-// but it is used in `all_peers` and `banned_peers`
-/// Initialize without error for unit tests.
-#[allow(dead_code)]
-pub(crate) fn ensure_score_config(config: Option<ScoreConfig>) {
-    INIT.call_once(|| {
-        // ignore result
-        let _ = GLOBAL_SCORE_CONFIG.set(Arc::new(config.unwrap_or_default()));
-    });
-}
 
 // impl TNMessage trait for types
 impl TNMessage for TestWorkerRequest {
@@ -46,6 +28,15 @@ impl TNMessage for TestWorkerResponse {
 impl TNMessage for TestPrimaryRequest {
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
         None
+    }
+
+    fn service_class(&self) -> ServiceClass {
+        match self {
+            Self::Vote { .. } => ServiceClass::Vote,
+            Self::MissingCertificates(_) => ServiceClass::CertificateSync,
+            Self::NewCertificate { .. } => ServiceClass::Other,
+            Self::EpochRecord { .. } => ServiceClass::EpochRecord,
+        }
     }
 }
 impl TNMessage for TestPrimaryResponse {
@@ -84,8 +75,18 @@ pub(super) enum TestWorkerResponse {
 /// Requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) enum TestPrimaryRequest {
-    NewCertificate { certificate: Certificate },
-    Vote { header: Header, parents: Vec<Certificate> },
+    NewCertificate {
+        certificate: Certificate,
+    },
+    Vote {
+        header: Header,
+        parents: Vec<Certificate>,
+    },
+    MissingCertificates(Vec<HeaderDigest>),
+    /// An epoch record request for the given epoch (test stand-in for the `EpochRecord` class).
+    EpochRecord {
+        epoch: u64,
+    },
 }
 
 /// Response to primary requests.
@@ -94,6 +95,8 @@ pub(super) enum TestPrimaryResponse {
     Vote(Vote),
     MissingCertificates(Vec<Certificate>),
     MissingParents(Vec<HeaderDigest>),
+    /// The epoch record answer that echoes the requested epoch.
+    EpochRecord(u64),
 }
 
 impl From<PeerExchangeMap> for TestWorkerRequest {

@@ -129,7 +129,10 @@ impl MissingCertFetcher for MockFetcher {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+// Paused clock: the fixed waits in this test prove an absence, so they keep their
+// simulated length but cost no wall time. Signature checks run in `spawn_blocking`,
+// which holds off auto-advance.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_fetch_certificates_basic() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();
@@ -560,7 +563,7 @@ async fn test_timeout_scenario() {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
     let round1_certificates: Vec<_> =
-        round1_headers.iter().map(|h| fixture.certificate(&h)).collect();
+        round1_headers.iter().map(|h| fixture.certificate(h)).collect();
 
     // Create round 2 certificates that depend on round 1 (which are missing)
     let round1_parents: BTreeSet<_> = round1_certificates.iter().map(|c| c.digest()).collect();
@@ -569,7 +572,7 @@ async fn test_timeout_scenario() {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
     let mut round2_certificates: Vec<_> =
-        round2_headers.iter().map(|h| fixture.certificate(&h)).collect();
+        round2_headers.iter().map(|h| fixture.certificate(h)).collect();
 
     // trigger fetch by processing a round 2 certificate (which needs round 1 parents)
     let result =
@@ -717,7 +720,10 @@ async fn test_gc_round_update_during_fetch() {
         .unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
+// Paused clock: the fixed waits in this test prove an absence, so they keep their
+// simulated length but cost no wall time. Signature checks run in `spawn_blocking`,
+// which holds off auto-advance.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_network_failure_keeps_trying() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();
@@ -755,7 +761,7 @@ async fn test_network_failure_keeps_trying() {
     for (digest, worker_id) in round2_headers.iter().flat_map(|h| h.payload().iter()) {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
-    let mut round2_certs: Vec<_> = round2_headers.iter().map(|h| fixture.certificate(&h)).collect();
+    let mut round2_certs: Vec<_> = round2_headers.iter().map(|h| fixture.certificate(h)).collect();
 
     // trigger fetch
     let result = synchronizer.process_peer_certificate(round2_certs.get_mut(0).unwrap()).await;
@@ -786,7 +792,10 @@ async fn test_network_failure_keeps_trying() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
+// Paused clock: the fixed waits in this test prove an absence, so they keep their
+// simulated length but cost no wall time. Signature checks run in `spawn_blocking`,
+// which holds off auto-advance.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_partial_response_handling_rejects_invalid_cert() {
     init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
@@ -865,10 +874,13 @@ async fn test_partial_response_handling_rejects_invalid_cert() {
     // allow time for writes to db
     sleep(Duration::from_secs(2)).await;
     // NOTE: the cert manager will reject - not fetcher
-    verify_certificates_not_in_store(&certificate_store, &vec![bad_cert]);
+    verify_certificates_not_in_store(&certificate_store, &[bad_cert]);
 }
 
-#[tokio::test(flavor = "current_thread")]
+// Paused clock: the fixed waits in this test prove an absence, so they keep their
+// simulated length but cost no wall time. Signature checks run in `spawn_blocking`,
+// which holds off auto-advance.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_bad_cert_in_fetch_rejects_all() {
     init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();

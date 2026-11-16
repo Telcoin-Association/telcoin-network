@@ -59,6 +59,11 @@ bs58 = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 url = { workspace = true }
+zeroize = { workspace = true }
+
+# `strncmp`/`strlen` for scrubbing the BLS passphrase from the process environment block
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }
@@ -67,6 +72,13 @@ tn-config = { workspace = true, features = ["test-utils"]}
 tempfile = { workspace = true }
 rand = { workspace = true }
 roaring = { workspace = true }
+crc32fast = "1.5.0"
+
+# `EILSEQ` for the non-UTF-8 bootstrap-peers test, which ends early on a filesystem that refuses
+# the name (APFS). Kept apart from the Linux-only runtime dependency above: the passphrase scrub
+# is Linux-gated, so a `cfg(unix)` runtime dependency would be unused on macOS.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
 
 [build-dependencies]
 vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
@@ -79,6 +91,12 @@ workspace = true
 # Purely additive: it must never change how the secure paths behave.
 test-utils = ["tn-config/test-utils"]
 # Adiri testnet: propagate to the node graph + this crate's directly-gated fork logic.
-adiri = ["tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-types/adiri"]
-# Opt back in to reth's RocksDB storage backend: propagate to the node graph.
-rocksdb = ["tn-node/rocksdb", "tn-reth/rocksdb"]
+# `tn-reth/adiri` already compiles in the faucet mint, so `faucet` is listed here too and the
+# `--version` "Build Features" line names it.
+adiri = ["faucet", "tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-types/adiri"]
+# Faucet build (devnet): the instant, role-gated TEL mint in tn-reth. Declared on this crate
+# because vergen reads this crate's features for the `--version` "Build Features" line.
+faucet = ["tn-node/faucet", "tn-reth/faucet"]
+# Run the reth execution database on MDBX, the legacy backend, instead of the default tn-lmdb:
+# propagate to the node graph.
+mdbx = ["tn-node/mdbx", "tn-reth/mdbx"]

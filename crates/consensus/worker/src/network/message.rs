@@ -2,7 +2,7 @@
 
 use crate::network::error::WorkerNetworkError;
 use serde::{Deserialize, Serialize};
-use tn_network_libp2p::{PeerExchangeMap, TNMessage};
+use tn_network_libp2p::{PeerExchangeMap, ServiceClass, TNMessage};
 use tn_types::{BlockHash, Epoch, SealedBatch};
 
 /// Worker messages on the gossip network.
@@ -22,6 +22,15 @@ impl TNMessage for WorkerRequest {
             _ => None,
         }
     }
+
+    /// `ReportBatch` is the 2f+1 quorum-ack request, so it is critical on worker swarms.
+    /// `PeerExchange` is discovery work.
+    fn service_class(&self) -> ServiceClass {
+        match self {
+            Self::ReportBatch { .. } => ServiceClass::Batch,
+            Self::PeerExchange { .. } => ServiceClass::Other,
+        }
+    }
 }
 
 impl TNMessage for WorkerResponse {
@@ -34,6 +43,9 @@ impl TNMessage for WorkerResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerRequest {
     /// Send a new batch to a peer.
+    ///
+    /// This is the 2f+1 quorum-ack request for the batch: the reporting worker waits for a quorum
+    /// of acks. Its service class is [`ServiceClass::Batch`], which is critical on worker swarms.
     ReportBatch {
         /// The sealed batch that this worker is reporting.
         sealed_batch: SealedBatch,
@@ -111,7 +123,9 @@ impl WorkerResponse {
             | WorkerNetworkError::DBInsert(_)
             | WorkerNetworkError::DBCommit(_)
             | WorkerNetworkError::DBRead(_)
-            | WorkerNetworkError::StdIo(_) => {
+            | WorkerNetworkError::StdIo(_)
+            // the reporter is at its uncommitted-batch bound; commits free it (issue #1794)
+            | WorkerNetworkError::ReporterOverQuota { .. } => {
                 Self::RecoverableError(WorkerRPCError(error.to_string()))
             }
             // permanent rejections - an identical request would be rejected the
@@ -120,6 +134,7 @@ impl WorkerResponse {
             WorkerNetworkError::Bcs(_)
             | WorkerNetworkError::BatchValidation(_)
             | WorkerNetworkError::NonCommitteeBatch
+            | WorkerNetworkError::RejectedBatchRepeat(_)
             | WorkerNetworkError::InvalidRequest(_)
             | WorkerNetworkError::InvalidTopic
             | WorkerNetworkError::TooManyBatches { .. }
@@ -152,7 +167,25 @@ impl From<PeerExchangeMap> for WorkerResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerNetworkError, WorkerResponse};
+    use super::{WorkerNetworkError, WorkerRequest, WorkerResponse};
+    use tn_network_libp2p::{PeerExchangeMap, ServiceClass, TNMessage};
+    use tn_types::{Batch, BlockHash, SealedBatch};
+
+    /// A reported batch has the batch class.
+    #[test]
+    fn report_batch_is_batch_class() {
+        let request = WorkerRequest::ReportBatch {
+            sealed_batch: SealedBatch::new(Batch::default(), BlockHash::default()),
+        };
+        assert_eq!(request.service_class(), ServiceClass::Batch);
+    }
+
+    /// Peer exchange is answered inline and has the other class.
+    #[test]
+    fn peer_exchange_is_other_class() {
+        let request = WorkerRequest::PeerExchange { peers: PeerExchangeMap::default() };
+        assert_eq!(request.service_class(), ServiceClass::Other);
+    }
 
     /// A transient, responder-side condition is reported as recoverable so the
     /// requester retries instead of treating the peer as having rejected the
@@ -160,6 +193,21 @@ mod tests {
     #[test]
     fn transient_internal_error_is_recoverable() {
         let err = WorkerNetworkError::Internal("failed to write to batch store".to_string());
+        assert!(matches!(
+            WorkerResponse::into_error_ref(&err),
+            WorkerResponse::RecoverableError(_)
+        ));
+    }
+
+    /// A reporter at its bound of uncommitted stored batches is a transient condition
+    /// (commits free the bound), so the requester must retry instead of treating the
+    /// refusal as a rejection (issue #1794).
+    #[test]
+    fn reporter_over_quota_is_recoverable() {
+        let err = WorkerNetworkError::ReporterOverQuota {
+            peer: Box::new(tn_types::BlsPublicKey::default()),
+            digest: tn_types::B256::ZERO,
+        };
         assert!(matches!(
             WorkerResponse::into_error_ref(&err),
             WorkerResponse::RecoverableError(_)

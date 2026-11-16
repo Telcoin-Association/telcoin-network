@@ -1,23 +1,39 @@
 //! Module for managing network peers.
 
+mod admission;
 mod all_peers;
 mod banned;
 mod behavior;
 mod cache;
 mod manager;
 mod peer;
+mod penalty;
+mod policy;
+mod public_share;
 mod score;
 mod status;
+mod tracked;
 mod types;
+pub use admission::{AdmissionFallback, AdmissionStatus, CommitteeUpdate};
+pub(crate) use behavior::PeerAdmissionDenied;
 pub(crate) use manager::{PeerManager, PutRecordRate};
-pub(crate) use types::PeerEvent;
-pub use types::{PeerExchangeMap, Penalty};
+pub use penalty::LoadPenalty;
+pub(crate) use penalty::Severity;
+pub(crate) use public_share::PublicConnectionShare;
+pub use tracked::{EntrySource, SwarmAdmissionSnapshot, TrackedEntry, TrackedSlot};
+pub(crate) use types::{LookupClass, PeerEvent, PenaltyOutcome, MAX_PEER_EXCHANGE_MESSAGE_SIZE};
+pub use types::{
+    PeerExchangeKey, PeerExchangeMap, Penalty, MAX_PEER_EXCHANGE_ADDRS_PER_PEER,
+    MAX_PEER_EXCHANGE_ENTRIES,
+};
 
 // visibility for tests
 #[cfg(test)]
 pub(crate) use peer::MAX_MULTIADDRS_PER_PEER;
+
+/// The public share refusal, named by the peer manager tests.
 #[cfg(test)]
-pub(crate) use score::GLOBAL_SCORE_CONFIG;
+pub(crate) use public_share::PublicShareExceeded;
 
 /// Shared production thresholds used by the consensus call-site regression tests.
 #[cfg(test)]

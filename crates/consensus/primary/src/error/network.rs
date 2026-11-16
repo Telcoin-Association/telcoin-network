@@ -136,9 +136,22 @@ impl PrimaryNetworkError {
             | PrimaryNetworkError::ConsensusChainError(_) => false,
         }
     }
+
+    /// Whether this fault puts a resolved author's gossip on the local cooldown (#1772).
+    ///
+    /// True for every author content fault whose penalty is `Fatal`: a forged certificate
+    /// aggregate, a forged epoch vote, [`Self::Decode`] and [`Self::InvalidTopic`]. Also true for
+    /// [`Self::UnknownConsensusHeaderCert`], a consensus result with a bad signature. Its penalty
+    /// stays `Mild` because `crates/network-libp2p/src/peers/penalty.md` pins it.
+    pub(crate) fn strikes_gossip_author(&self) -> bool {
+        self.is_author_content_fault()
+            && (matches!(self, Self::UnknownConsensusHeaderCert(_))
+                || matches!(Option::<Penalty>::from(self), Some(Penalty::Fatal)))
+    }
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
+    /// Map primary network failures to attributable peer penalties.
     fn from(val: &PrimaryNetworkError) -> Self {
         //
         // explicitly match every error type to ensure penalties are updated with changes
@@ -210,26 +223,22 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
 fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
-        HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => Some(Penalty::Mild),
+        HeaderError::SyncBatches(_) => Some(Penalty::Mild),
+        // These checks depend on local round, clock, or epoch-record state. Reject the header
+        // without scoring its author: a restart, clock skew, or divergent local anchor must
+        // not isolate peers needed for recovery. Cryptographic and structural checks still run.
+        HeaderError::TooNew { .. }
+        | HeaderError::TooOld { .. }
+        | HeaderError::InvalidTimestamp { .. }
+        | HeaderError::InvalidSeedSignature => None,
         // medium
-        HeaderError::InvalidParents
-        | HeaderError::WrongNumberOfParents(_, _)
-        | HeaderError::TooOld { .. } => Some(Penalty::Medium),
+        HeaderError::InvalidParents | HeaderError::WrongNumberOfParents(_, _) => {
+            Some(Penalty::Medium)
+        }
         // severe
-        //
-        // `InvalidSeedSignature` is severe rather than fatal because it has a reachable honest
-        // cause. The seed message is anchored to the verifier's local `prior_epoch_record`, which
-        // comes from a locally-built, first-write-wins `EpochRecord` store. A node whose record
-        // diverged signs an anchor no peer accepts and rejects every honest peer's header, so a
-        // fatal penalty would make the ban mutual, total and non-self-healing: neither side can
-        // ever repair the record from the other once both have banned. A severe penalty still
-        // suppresses a genuinely bad signer while leaving the divergent node a path back.
-        HeaderError::InvalidTimestamp { .. }
-        | HeaderError::InvalidParentRound
-        | HeaderError::InvalidSeedSignature => Some(Penalty::Severe),
+        HeaderError::InvalidParentRound => Some(Penalty::Severe),
         // fatal
-        HeaderError::AlreadyVotedForLaterRound { .. }
-        | HeaderError::AlreadyVoted(_, _)
+        HeaderError::AlreadyVoted(_, _)
         | HeaderError::DuplicateParents
         | HeaderError::TooManyParents(_, _)
         | HeaderError::TooManyBatches(_, _)
@@ -256,12 +265,77 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidEpoch { .. }
         | HeaderError::NotCommitteeMember
         | HeaderError::ClosedWatchChannel => None,
+        // ignore (stale request, not a fault)
+        //
+        // This node already decided on a later header from the same author, so the request is
+        // stale. An honest proposer sends one vote request per round, and the requests it queued
+        // while this node was unreachable all arrive on reconnect, in any order. Refusing the
+        // stale header is enough. A fatal penalty here banned every committee peer of a
+        // restarted validator. The error carries rounds but no epoch, so a different header for
+        // the same round cannot be told apart from a stale request of an earlier epoch.
+        HeaderError::AlreadyVotedForLaterRound { .. } => None,
+        // ignore (this voter's own catch-up, not the requester's fault)
+        //
+        // the refusal describes the voter's state, never the header, so the requester is left
+        // free to retry and earns the vote once this node has caught up
+        HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. } => None,
+        // ignore (this voter's restored datadir, not the requester's fault)
+        //
+        // a snapshot-restored voter cannot check a block below its floor; the requester's header
+        // may be valid, and the voters with the full history decide it
+        HeaderError::BelowRestoreFloor { .. } => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vote requests that an honest author queued while this node was down arrive together on
+    /// reconnect, and every one older than the first answered fails as
+    /// `AlreadyVotedForLaterRound`. A penalty that bans for this bans the whole committee.
+    #[test]
+    fn stale_vote_request_is_not_penalized() {
+        let stale = PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+            theirs: 8,
+            ours: 14,
+        });
+        assert!(Option::<Penalty>::from(&stale).is_none());
+    }
+
+    /// Honest round skew after a restart must not accumulate penalties against committee peers.
+    #[test]
+    fn round_skew_is_not_penalized() {
+        [
+            HeaderError::TooNew { digest: Default::default(), header_round: 100, max_round: 50 },
+            HeaderError::TooOld { digest: Default::default(), header_round: 1, max_round: 100 },
+        ]
+        .into_iter()
+        .for_each(|error| {
+            assert!(Option::<Penalty>::from(&PrimaryNetworkError::InvalidHeader(error)).is_none());
+        });
+    }
+
+    /// A clock or epoch-anchor mismatch rejects a vote without excluding its author.
+    #[test]
+    fn local_state_mismatches_are_not_penalized() {
+        [
+            HeaderError::InvalidTimestamp {
+                created: Default::default(),
+                received: Default::default(),
+            },
+            HeaderError::InvalidSeedSignature,
+        ]
+        .into_iter()
+        .for_each(|error| {
+            assert!(Option::<Penalty>::from(&PrimaryNetworkError::InvalidHeader(error)).is_none());
+        });
+        assert_eq!(
+            penalty_from_header_error(&HeaderError::InvalidParentRound),
+            Some(Penalty::Severe)
+        );
+        assert_eq!(penalty_from_header_error(&HeaderError::DuplicateParents), Some(Penalty::Fatal));
+    }
 
     /// Finding 2 (#819): faults determined by the gossip envelope's content — a malformed payload
     /// (`Decode`) or a wrong declared topic (`InvalidTopic`) — are the message author's, so the
@@ -366,5 +440,75 @@ mod tests {
         assert!(!relayer_fault.is_author_content_fault());
         assert!(author_penalty(&relayer_fault).is_none());
         assert!(matches!(Option::<Penalty>::from(&relayer_fault), Some(Penalty::Medium)));
+    }
+
+    /// The strike class is every author content fault with a fatal penalty, plus a consensus
+    /// result with a bad signature. A mild certificate fault, a forged epoch digest, a
+    /// non-committee signer and a fault with no penalty strike no one (#1772).
+    #[test]
+    fn strike_class_is_fatal_author_faults_and_forged_consensus_results() {
+        let cert_fault = |e: CertificateError| {
+            PrimaryNetworkError::Certificate(CertManagerError::Certificate(e))
+        };
+        // strike
+        assert!(cert_fault(CertificateError::InvalidSignature).strikes_gossip_author());
+        assert!(
+            PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor).strikes_gossip_author()
+        );
+        assert!(PrimaryNetworkError::UnknownConsensusHeaderCert(ConsensusHeaderDigest::default())
+            .strikes_gossip_author());
+        // no strike
+        assert!(!cert_fault(CertificateError::TooOld(tn_types::HeaderDigest::default(), 1, 2))
+            .strikes_gossip_author());
+        assert!(!PrimaryNetworkError::InvalidEpochVote(
+            0,
+            EpochDigest::default(),
+            EpochDigest::default()
+        )
+        .strikes_gossip_author());
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(7);
+        let signer = *tn_types::BlsKeypair::generate(&mut rng).public();
+        assert!(!PrimaryNetworkError::PeerNotInCommittee(Box::new(signer)).strikes_gossip_author());
+        assert!(!PrimaryNetworkError::UnknownConsensusOutput(0).strikes_gossip_author());
+    }
+
+    /// A voter that refuses because of its own catch-up state says nothing about the header: the
+    /// refusal carries no penalty and answers the requester with a retryable response, so the
+    /// requester asks again instead of giving up on this voter for the header.
+    #[test]
+    fn local_catch_up_refusals_are_recoverable_and_not_penalized() {
+        use crate::network::PrimaryResponse;
+
+        let assert_recoverable_without_penalty = |error: HeaderError| {
+            assert_eq!(penalty_from_header_error(&error), None, "{error} must carry no penalty");
+            let error = PrimaryNetworkError::InvalidHeader(error);
+            assert!(Option::<Penalty>::from(&error).is_none(), "{error} must carry no penalty");
+            assert!(
+                matches!(
+                    PrimaryResponse::into_error_ref(&error),
+                    PrimaryResponse::RecoverableError(_)
+                ),
+                "{error} must answer the requester with a retryable response"
+            );
+        };
+        assert_recoverable_without_penalty(HeaderError::NotActiveCvv);
+        assert_recoverable_without_penalty(HeaderError::ExecutionBehind {
+            header_block: 12,
+            local_block: 9,
+        });
+    }
+
+    /// A snapshot-restored voter can never check a header's block below its floor: the refusal
+    /// carries no penalty, and it is final (not retryable), so the requester stops asking this
+    /// voter for the header.
+    #[test]
+    fn below_restore_floor_refusal_is_final_and_not_penalized() {
+        use crate::network::PrimaryResponse;
+
+        let error = HeaderError::BelowRestoreFloor { header_block: 50, floor: 100 };
+        assert_eq!(penalty_from_header_error(&error), None);
+        let error = PrimaryNetworkError::InvalidHeader(error);
+        assert!(Option::<Penalty>::from(&error).is_none());
+        assert!(matches!(PrimaryResponse::into_error_ref(&error), PrimaryResponse::Error(_)));
     }
 }

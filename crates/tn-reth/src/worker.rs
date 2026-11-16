@@ -1,94 +1,99 @@
 //! RPC-facing network shim and per-worker execution components.
 //!
 //! Inspired by reth_node_ethereum crate. TN does not run reth's devp2p networking, but reth's
-//! RPC builder needs `NetworkInfo`/`Peers` implementations to serve the `net`, `web3`, and
+//! RPC builder needs `NetworkInfo`/`PeersInfo` implementations to serve the `net`, `web3`, and
 //! `eth` namespaces. [`WorkerNetwork`] is that shim: it answers with the chain id, a
 //! status headed at the canonical tip, and a peer count that a background task refreshes every 15
-//! seconds by polling the worker's libp2p network handle. Everything reth-specific (peer
-//! management, ENR/node records, the admin namespace) is a deliberate no-op. The chain spec is held
-//! behind an `Arc`, so cloning the shim is cheap.
+//! seconds by polling the worker's libp2p network handle. The reth-specific node record and ENR
+//! are deliberate no-ops. The chain spec is held behind an `Arc`, so cloning the shim is cheap.
 //!
-//! [`WorkerComponents`] bundles what the node keeps per worker: the RPC modules and active handle,
+//! [`WorkerComponents`] bundles what the node keeps per worker: the retained RPC handle,
 //! the worker's transaction pool, and the [`WorkerNetwork`] (retained so its peer-count task can be
 //! respawned when the epoch rolls over).
 
-use crate::{error::TnRethResult, ChainSpec, RethEnv, RpcServer, WorkerTxPool};
+use crate::{ChainSpec, RethEnv, WorkerTxPool};
+use enr::secp256k1::SecretKey;
+use futures::{FutureExt as _, StreamExt as _};
+use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
 use parking_lot::RwLock;
-use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_discv4::DEFAULT_DISCOVERY_PORT;
-use reth_eth_wire::DisconnectReason;
-use reth_network_api::{
-    EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers,
-    PeersInfo, Reputation, ReputationChangeKind,
-};
+use reth_network_api::{EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeersInfo};
 use reth_network_peers::{Enr, NodeRecord, PeerId as RethPeerId};
+use reth_rpc_builder::RpcServerHandle;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
-use tn_types::{WorkerId, MIN_PROTOCOL_BASE_FEE};
+use tn_types::MIN_PROTOCOL_BASE_FEE;
 use tn_worker::WorkerNetworkHandle;
 
 /// Execution components on a per-worker basis.
 #[derive(Debug)]
 pub struct WorkerComponents {
-    /// The running RPC handle, absent while this worker is outside the committee.
-    rpc_handle: Option<RpcServerHandle>,
-    /// Built RPC modules retained for reactivation over the same transaction pool.
-    rpc_server: RpcServer,
+    /// The RPC listeners retained across worker-count changes until process shutdown.
+    rpc_handle: RpcServerHandle,
     /// The worker's transaction pool.
     pool: WorkerTxPool,
+    /// Relay late admissions to worker 0 while this worker has no batch builder.
+    pool_handoff: Option<tokio::task::JoinHandle<()>>,
     /// Keep the WorkerNetwork around so we can update it's task(s).
     network: WorkerNetwork,
 }
 
 impl WorkerComponents {
     /// Create a new instance of [Self].
-    pub fn new(
-        rpc_handle: RpcServerHandle,
-        rpc_server: RpcServer,
-        pool: WorkerTxPool,
-        network: WorkerNetwork,
-    ) -> Self {
-        Self { rpc_handle: Some(rpc_handle), rpc_server, pool, network }
+    pub fn new(rpc_handle: RpcServerHandle, pool: WorkerTxPool, network: WorkerNetwork) -> Self {
+        Self { rpc_handle, pool, pool_handoff: None, network }
     }
 
     /// Return the RPC handle only while this worker is active.
     pub fn rpc_handle(&self) -> Option<&RpcServerHandle> {
-        self.rpc_handle.as_ref()
+        self.network.rpc_admission.is_active().then_some(&self.rpc_handle)
     }
 
-    /// Stop accepting transactions while retaining the pool for a later reactivation.
+    /// Close admission and hand all admitted transactions to an active worker.
     ///
-    /// A removed worker has no batch builder. Keep its shim unavailable and align its stored
-    /// fee with the accumulator's fallback for a removed slot, including canonical updates.
-    pub fn deactivate(&mut self) {
+    /// A removed worker has no batch builder. Close admission before updating its shim and fee.
+    /// Keep its listeners bound: jsonrpsee's graceful stop can retain a listener indefinitely
+    /// while an unfinished HTTP request drains, preventing a fixed-port reactivation (#1505).
+    /// Read-only RPC queries remain available while transaction submissions are rejected.
+    ///
+    /// Subscribe to admissions before the gate closes, because a submission that passed the gate
+    /// can still land after it. A spawned relay drains the pool once and then hands every late
+    /// admission to `destination`, so the caller never waits on the pool size. A relay still alive
+    /// from an earlier epoch keeps running. The empty pool survives for reactivation. Parked
+    /// transactions are migrated under the destination fee, even if the removed slot's fallback
+    /// fee promotes them locally.
+    pub fn deactivate(&mut self, destination: &WorkerTxPool) {
+        let relay_needed = self.pool_handoff.as_ref().is_none_or(|task| task.is_finished());
+        let admissions = relay_needed.then(|| self.pool.admitted_transactions());
+        self.network.rpc_admission.set_state(WorkerRpcState::Inactive);
         self.network.set_syncing(true);
         self.pool.set_epoch_base_fee(MIN_PROTOCOL_BASE_FEE);
-        self.rpc_handle.take().into_iter().for_each(|handle| {
-            let _ = handle.stop().inspect_err(|error| {
-                tracing::warn!(target: "tn::execution", ?error, "worker RPC already stopped");
-            });
+        admissions.into_iter().for_each(|admissions| {
+            let pool = self.pool.clone();
+            let destination = destination.clone();
+            self.pool_handoff = Some(tokio::spawn(async move {
+                pool.migrate_transactions_to(&destination).await;
+                admissions
+                    .for_each(|()| pool.migrate_transactions_to(&destination).map(drop))
+                    .await;
+            }));
         });
     }
 
-    /// Refresh the pool's epoch fee before reopening a stopped worker's RPC listeners.
+    /// Refresh the pool's epoch fee before reopening transaction admission.
     ///
-    /// Running listeners are reused. The retained modules keep existing transactions in the
-    /// same pool, and the per-query fee handle resolves the reactivated accumulator slot.
-    pub async fn restart_rpc(
-        &mut self,
-        reth_env: &RethEnv,
-        worker_id: WorkerId,
-        base_fee: u64,
-    ) -> TnRethResult<()> {
+    /// Listeners and modules stay attached to the same pool and endpoints across removals.
+    /// Reactivation never binds a socket and cannot depend on a client's connection lifetime.
+    /// Stop the retired-pool relay first; transactions already handed off remain with the active
+    /// worker. A move in flight completes or is dropped whole, and the source copy is removed only
+    /// after the destination holds it, so the abort can neither lose nor duplicate a transaction.
+    pub fn reactivate(&mut self, base_fee: u64) {
+        self.pool_handoff.take().into_iter().for_each(|task| task.abort());
         self.pool.set_epoch_base_fee(base_fee);
-        if self.rpc_handle.is_none() {
-            self.rpc_handle = Some(reth_env.start_rpc(&self.rpc_server, worker_id).await?);
-        }
-        Ok(())
+        self.network.rpc_admission.set_state(WorkerRpcState::Active);
     }
 
     /// Return a reference to the worker's transaction pool.
@@ -102,10 +107,16 @@ impl WorkerComponents {
     }
 }
 
+impl Drop for WorkerComponents {
+    /// Stop the relay when the retained worker components leave the node.
+    fn drop(&mut self) {
+        self.pool_handoff.take().into_iter().for_each(|task| task.abort());
+    }
+}
+
 /// A type that implements traits used by Reth for it's RPC.
 /// Traits are filled out to provide data for net, web3 and eth namespaces when available.
-/// Much of these traits are NO-OPS are not used, they support the admin namespace for
-/// instance which TN does not use or support.
+/// The node record and ENR are no-ops: they only identify a devp2p node, which TN does not run.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct WorkerNetwork {
@@ -117,8 +128,48 @@ pub struct WorkerNetwork {
     version: &'static str,
     /// Consensus catch-up state backing `eth_syncing` (issue #1231).
     sync_flags: Arc<RwLock<SyncFlags>>,
+    /// Transaction admission shared with every transport's submission handlers.
+    rpc_admission: WorkerRpcAdmission,
     /// Execution env backing the `network_status` head; `None` only in tests (issue #1231).
     reth_env: Option<RethEnv>,
+}
+
+/// Whether a worker is accepting RPC transaction submissions for the current committee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerRpcState {
+    /// The worker belongs to the committee and accepts transactions.
+    Active,
+    /// The worker was removed and has no batch builder.
+    Inactive,
+}
+
+/// Shared admission gate for a worker's retained RPC listeners.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerRpcAdmission(Arc<RwLock<WorkerRpcState>>);
+
+impl Default for WorkerRpcAdmission {
+    fn default() -> Self {
+        Self(Arc::new(RwLock::new(WorkerRpcState::Active)))
+    }
+}
+
+impl WorkerRpcAdmission {
+    /// Publish a committee activation or removal to the RPC handlers.
+    pub(crate) fn set_state(&self, state: WorkerRpcState) {
+        *self.0.write() = state;
+    }
+
+    /// Return whether this worker is accepting transactions.
+    fn is_active(&self) -> bool {
+        *self.0.read() == WorkerRpcState::Active
+    }
+
+    /// Reject submissions to an inactive worker before decoding or delegating to reth.
+    pub(crate) fn ensure_active(&self) -> RpcResult<()> {
+        self.is_active()
+            .then_some(())
+            .ok_or_else(|| ErrorObjectOwned::owned(-32000, "worker is inactive", None::<()>))
+    }
 }
 
 /// Sync flags backing the shim's `eth_syncing` answers.
@@ -142,6 +193,11 @@ impl Default for SyncFlags {
 }
 
 impl WorkerNetwork {
+    /// Return the admission gate captured by this worker's submission handlers.
+    pub(crate) fn rpc_admission(&self) -> WorkerRpcAdmission {
+        self.rpc_admission.clone()
+    }
+
     /// Create an RPC network shim that reports syncing until the node publishes its mode.
     ///
     /// Peer tracking starts separately through [`Self::respawn_peer_count`] when the worker's
@@ -152,6 +208,7 @@ impl WorkerNetwork {
             peer_count: Arc::new(RwLock::new(0)),
             version,
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+            rpc_admission: WorkerRpcAdmission::default(),
             reth_env: Some(reth_env),
         }
     }
@@ -167,6 +224,7 @@ impl WorkerNetwork {
             peer_count: Arc::new(RwLock::new(0)),
             version: "test",
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+            rpc_admission: WorkerRpcAdmission::default(),
             reth_env: None,
         }
     }
@@ -204,10 +262,14 @@ impl WorkerNetwork {
     }
 }
 
+/// reth's default devp2p discovery port (`reth_discv4::DEFAULT_DISCOVERY_PORT`), reported by the
+/// `net_` stubs below. TN runs no devp2p network, so nothing listens on it.
+const DEVP2P_DEFAULT_PORT: u16 = 30303;
+
 impl NetworkInfo for WorkerNetwork {
     // TN Unused
     fn local_addr(&self) -> SocketAddr {
-        (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_DISCOVERY_PORT).into()
+        (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEVP2P_DEFAULT_PORT).into()
     }
 
     #[allow(deprecated, reason = "EthProtocolInfo::difficulty is deprecated")]
@@ -269,64 +331,6 @@ impl PeersInfo for WorkerNetwork {
     }
 }
 
-// These appear to support Reth's admin namespace- TN does not use this.
-impl Peers for WorkerNetwork {
-    fn add_trusted_peer_id(&self, _peer: RethPeerId) {}
-
-    fn add_peer_kind(
-        &self,
-        _peer: RethPeerId,
-        _kind: PeerKind,
-        _tcp_addr: SocketAddr,
-        _udp_addr: Option<SocketAddr>,
-    ) {
-    }
-
-    async fn get_peers_by_kind(&self, _kind: PeerKind) -> Result<Vec<PeerInfo>, NetworkError> {
-        Ok(vec![])
-    }
-
-    async fn get_all_peers(&self) -> Result<Vec<PeerInfo>, NetworkError> {
-        Ok(vec![])
-    }
-
-    async fn get_peer_by_id(&self, _peer_id: RethPeerId) -> Result<Option<PeerInfo>, NetworkError> {
-        Ok(None)
-    }
-
-    async fn get_peers_by_id(
-        &self,
-        _peer_id: Vec<RethPeerId>,
-    ) -> Result<Vec<PeerInfo>, NetworkError> {
-        Ok(vec![])
-    }
-
-    fn remove_peer(&self, _peer: RethPeerId, _kind: PeerKind) {}
-
-    fn disconnect_peer(&self, _peer: RethPeerId) {}
-
-    fn disconnect_peer_with_reason(&self, _peer: RethPeerId, _reason: DisconnectReason) {}
-
-    fn reputation_change(&self, _peer_id: RethPeerId, _kind: ReputationChangeKind) {}
-
-    async fn reputation_by_id(
-        &self,
-        _peer_id: RethPeerId,
-    ) -> Result<Option<Reputation>, NetworkError> {
-        Ok(None)
-    }
-
-    fn connect_peer_kind(
-        &self,
-        _peer: RethPeerId,
-        _kind: PeerKind,
-        _tcp_addr: SocketAddr,
-        _udp_addr: Option<SocketAddr>,
-    ) {
-        // unimplemented!
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +344,7 @@ mod tests {
             peer_count: Arc::new(RwLock::new(0)),
             version: "test",
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+            rpc_admission: WorkerRpcAdmission::default(),
             reth_env: None,
         }
     }

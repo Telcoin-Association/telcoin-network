@@ -1,37 +1,88 @@
 //! Manage peer connection status and reputation.
 
 use super::{
+    admission::{AdmissionPolicy, AdmissionStatus},
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
-    score::init_peer_score_config,
+    public_share::PublicConnectionShare,
     status::NewConnectionStatus,
-    types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
+    tracked::{
+        EntrySource, SwarmAdmissionSnapshot, TrackedEntry, TrackedKeys, TrackedSlot,
+        MAX_TRACKED_KEYS,
+    },
+    types::{ConnectionDirection, ConnectionType, DialRequest, LookupClass, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
 };
 use crate::{
+    diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
     error::NetworkError,
     metrics::PeerManagerMetrics,
     peers::status::ConnectionStatus,
     send_or_log_error,
-    types::{NetworkInfo, NetworkResult, RpcInfo},
+    source_admission::{AdmissionError, SourceAdmissionBudget, SourceConnections},
+    types::{CommitteeRpcSnapshot, NetworkInfo, NetworkResult, RpcInfo},
 };
-use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{
+    core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
+    PeerId,
+};
 use rand::seq::IteratorRandom as _;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::IpAddr,
+    sync::Arc,
     task::Context,
     time::Duration,
 };
-use tn_config::PeerConfig;
-use tn_types::BlsPublicKey;
+use tn_config::{AdmissionConfig, AdmissionMode, PeerConfig};
+use tn_types::{now, BlsPublicKey, P2pNode};
 use tokio::{sync::oneshot, time::Instant};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace};
 
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
+
+#[cfg(test)]
+#[path = "../tests/admission.rs"]
+mod admission_tests;
+
+#[cfg(test)]
+#[path = "../tests/listen_failure.rs"]
+mod listen_failure_tests;
+
+#[cfg(test)]
+#[path = "../tests/tracked_keys.rs"]
+mod tracked_keys_tests;
+
+/// Initial delay and polling resolution for configured hub reconnects.
+const TRUSTED_RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Maximum delay during a hub outage, independent of unrelated connected peers.
+const TRUSTED_RETRY_MAX: Duration = Duration::from_secs(60);
+/// Maximum delay between kad lookups for one configured hub whose record stays unresolved.
+const TRUSTED_LOOKUP_MAX: Duration = Duration::from_secs(30 * 60);
+/// Initial delay between kad lookups for one tracked key whose record stays unresolved.
+const TRACKED_LOOKUP_INITIAL: Duration = Duration::from_secs(30);
+/// Maximum delay between kad lookups for one tracked key whose record stays unresolved.
+const TRACKED_LOOKUP_MAX: Duration = Duration::from_secs(30 * 60);
+/// Maximum tracked keys looked up per heartbeat, so a cold start spreads its queries over ticks.
+const TRACKED_LOOKUPS_PER_HEARTBEAT: usize = 16;
+
+/// One bounded reconnect schedule per configured hub in this swarm.
+#[derive(Debug)]
+struct TrustedDial {
+    /// The operator's expected identity and address, never replaced by discovery.
+    info: NetworkInfo,
+    /// Earliest time a disconnected peer may be retried.
+    next_attempt: Instant,
+    /// Exponential delay for the next failed attempt.
+    backoff: Duration,
+    /// Earliest time the next kad lookup for an unresolved record may start.
+    lookup_next: Instant,
+    /// Exponential delay between kad lookups while the record stays unresolved.
+    lookup_backoff: Duration,
+}
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -55,14 +106,18 @@ const MAX_RATE_WINDOWS: usize = 1024;
 /// node (`libp2p-kad::jobs::PutRecordJob::poll`), one iterative query per record, each
 /// fanning out to the `replication_factor` (20) closest peers. The count one target sees
 /// from one source per tick is therefore
-///
-///     N * min(1, replication_factor / R)
+/// ```text
+///  N * min(1, replication_factor / R)
+/// ```
 ///
 /// where `N` is the source's stored-record count (~one row per node seen, capped by
 /// `MemoryStoreConfig::max_records` = 1024) and `R` is the peer set the source's lookup
 /// reaches. With healthy routing (`R >= replication_factor`) this is ~20 and Poisson
 /// distributed; when a source's reach is small (bootstrap, partition heal, post-restart)
 /// it degrades toward `N`.
+///
+/// This node disables that job (`configure_record_jobs`), but peers on earlier releases
+/// still run it, so the bound keeps the upstream fan-in.
 pub(crate) const MAX_PUT_RECORDS_PER_WINDOW: usize = 30;
 
 /// Maximum records in an honest source's store, hence its replication fan-in per tick.
@@ -86,6 +141,24 @@ pub(crate) const PUT_RECORD_PENALTY_THRESHOLD: usize = 2 * KAD_MAX_STORED_RECORD
 /// through the existing disconnect and ban paths without waiting for another window.
 pub(crate) const PUT_RECORD_DISCONNECT_THRESHOLD: usize = 8 * PUT_RECORD_PENALTY_THRESHOLD;
 
+/// Tokens per second that refill the inbound kad `PutRecord` budget shared by untrusted
+/// sources.
+///
+/// Honest steady fan-in is about 30 target peers times 20 replicated records per hour, less
+/// than 0.2 records per second. Two per second is ten times that, and costs at most about
+/// 2 ms of BLS verify work per second on the network task.
+const PUT_RECORD_BUDGET_REFILL_PER_SEC: u32 = 2;
+
+/// Capacity of the inbound kad `PutRecord` budget shared by untrusted sources.
+///
+/// Covers a restart: each target peer pushes its own record on connect, then record exchange
+/// follows. Without this budget, [`MAX_RATE_WINDOWS`] sources at
+/// [`MAX_PUT_RECORDS_PER_WINDOW`] per [`PUT_RECORD_RATE_WINDOW`] permit 512 verifies per
+/// second, and 61,440 at one aligned window boundary. With it, untrusted sources together
+/// get at most [`PUT_RECORD_BUDGET_REFILL_PER_SEC`] verifies per second and this many at one
+/// instant.
+const PUT_RECORD_BUDGET_BURST: u32 = 120;
+
 /// Per-source inbound kad `PutRecord` rate window.
 struct PutRecordWindow {
     /// Records counted from the source in the current window.
@@ -96,12 +169,50 @@ struct PutRecordWindow {
     penalized: bool,
 }
 
+/// Token bucket for the inbound kad `PutRecord` verifies that all untrusted sources share.
+///
+/// Refills [`PUT_RECORD_BUDGET_REFILL_PER_SEC`] tokens per whole elapsed second, up to
+/// [`PUT_RECORD_BUDGET_BURST`]. Each record that passes its per-source window takes one token.
+struct PutRecordBudget {
+    /// Verifies available now.
+    tokens: u32,
+    /// When tokens were last credited; a partial second carries over to the next refill.
+    last_refill: Instant,
+}
+
+impl PutRecordBudget {
+    /// A full budget as of `now`.
+    fn new(now: Instant) -> Self {
+        Self { tokens: PUT_RECORD_BUDGET_BURST, last_refill: now }
+    }
+
+    /// Credit the tokens earned since the last refill, then take one if any are left.
+    ///
+    /// Returns whether a token was taken.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let secs = now.saturating_duration_since(self.last_refill).as_secs();
+        let refill =
+            u32::try_from(secs.saturating_mul(u64::from(PUT_RECORD_BUDGET_REFILL_PER_SEC)))
+                .unwrap_or(u32::MAX);
+        let tokens = self.tokens.saturating_add(refill).min(PUT_RECORD_BUDGET_BURST);
+        self.last_refill = if tokens == PUT_RECORD_BUDGET_BURST {
+            now
+        } else {
+            self.last_refill.checked_add(Duration::from_secs(secs)).unwrap_or(now)
+        };
+        let taken = tokens > 0;
+        self.tokens = tokens.saturating_sub(u32::from(taken));
+        taken
+    }
+}
+
 /// Outcome of recording an inbound kad `PutRecord` against the per-source window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PutRecordRate {
     /// Under the shed threshold: process the record.
     Allowed,
-    /// Per-source budget or tracking capacity exhausted: drop without penalizing the source.
+    /// Per-source budget, shared budget, or tracking capacity exhausted: drop without
+    /// penalizing the source.
     Shed,
     /// First crossing of the penalty threshold, or any message past the repeated-penalty
     /// ceiling: drop the record and penalize the source.
@@ -139,10 +250,28 @@ pub(crate) struct PeerManager {
     /// scored. Primary and each worker run separate swarms with distinct
     /// keypairs, so each `PeerManager` holds exactly one local id.
     local_peer_id: PeerId,
+    /// Local authenticated BLS identity for resolved-record accounting.
+    local_bls_key: Option<BlsPublicKey>,
+    /// Epoch-versioned connection policy and renewable lease.
+    admission_policy: AdmissionPolicy,
+    /// Age after which a cached window record is queried again on an accepted window update.
+    /// A live owner re-signs its record every publication interval, so an older binding can
+    /// belong to a retired network key. `None` disables the re-query.
+    record_max_age: Option<Duration>,
+    /// Explicit trusted/bootstrap grants, separate from pinned dial hints and reputation.
+    admission_operator_peers: HashMap<BlsPublicKey, PeerId>,
     /// Config
     config: PeerConfig,
+    /// Leases owned by this swarm using optional process-wide source accounting.
+    source_connections: SourceConnections,
+    /// Established-connection share of the peers without privilege, one slot per connection.
+    public_share: PublicConnectionShare,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
+    /// A single timer shared by all configured hub reconnects, dropped with the swarm.
+    trusted_retry: Option<tokio::time::Interval>,
+    /// Persistent reconnect state, bounded by the operator's configured hubs.
+    trusted_dials: HashMap<BlsPublicKey, TrustedDial>,
     /// All peers for the manager.
     peers: AllPeers,
     /// The validated read-model of kad discovery: resolves a committee member's
@@ -166,9 +295,36 @@ pub(crate) struct PeerManager {
     /// signed record bytes.
     ///
     /// Bounded to pinned operator peers plus the tracked committee slots
-    /// ([`Self::prune_known_peers`]); kad-sourced updates are timestamp-monotonic
-    /// ([`Self::kad_record_is_stale`]), mirroring the store-side `is_newer_record` rule.
+    /// ([`Self::prune_known_peers`]); ordinary kad-sourced updates remain timestamp-monotonic,
+    /// while clamped values allow bounded repair under the shared local freshness policy.
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
+    /// Keys restored from the persisted kad store at startup, until the first
+    /// [`Self::prune_known_peers`] settles them.
+    ///
+    /// A restored record is cached and bound like a discovered one before any committee is
+    /// known, whatever class retained its row in the previous run. The first prune unbinds every
+    /// restored key it drops whose peer has not been dialed or connected since, so a row only the
+    /// tracked class held leaves no binding behind. Bounded by the persisted rows and emptied by
+    /// that prune.
+    restored_peers: HashSet<BlsPublicKey>,
+    /// Admission metadata bounded to the same keys as the known-peer cache.
+    known_timestamps: HashMap<BlsPublicKey, crate::freshness::RecordTimestamp>,
+    /// Scheduled and eligible validator keys, with records retained for export only.
+    ///
+    /// Kept apart from `known_peers` on purpose: a record there creates a peer-id binding that
+    /// decides request delivery and gossip attribution. A tracked record binds nothing and never
+    /// reaches the peer store, scoring, pruning, or the admission inputs. A key that leaves every
+    /// committee slot while still tracked moves its learned record here
+    /// ([`Self::prune_known_peers`]); nothing moves the other way.
+    tracked: TrackedKeys,
+    /// BLS keys configured as bootstrap peers, labelled for the admission snapshot.
+    ///
+    /// Bounded by node configuration and never cleared.
+    bootstrap_keys: HashSet<BlsPublicKey>,
+    /// BLS keys configured as trusted hubs or trusted peers, labelled for the admission snapshot.
+    ///
+    /// Bounded by node configuration and never cleared.
+    trusted_keys: HashSet<BlsPublicKey>,
     /// BLS keys whose `known_peers` entry is pinned and never evicted by committee rotation.
     ///
     /// Populated only by the operator-provisioned insertion paths — trusted/bootstrap/explicit
@@ -191,12 +347,25 @@ pub(crate) struct PeerManager {
     /// [`Self::record_unlearned`]. Without this distinction a pinned stub would satisfy every
     /// "is the record known?" check, and a node that missed the peer's one-shot record push
     /// would never ask kad again. The same set scopes the timestamp-staleness exemption in
-    /// [`Self::kad_record_is_stale`]: only a stub's locally stamped timestamp is ignored, so a
+    /// [`Self::kad_timestamp_is_stale`]: only a stub's locally stamped timestamp is ignored, so a
     /// learned record under a pinned key still enjoys monotonicity against replayed older ones.
     ///
     /// Always a subset of `known_peers` (pruned alongside it). Today also a subset of
     /// `pinned_peers`, since every stub writer pins.
     stub_records: HashSet<BlsPublicKey>,
+    /// Operator-owned launch bindings and addresses, fixed for this swarm's lifetime.
+    ///
+    /// Membership is chain-derived. Signed records can refresh RPC endpoints, but changing a
+    /// launch identity or address requires a coordinated inventory update and restart.
+    committee_peers: BTreeMap<BlsPublicKey, tn_types::P2pNode>,
+    /// Addresses of the latest signed record cached for a `committee_peers` key, as signed,
+    /// before the launch address replaced them in `known_peers`.
+    ///
+    /// Read only by the admission snapshot, which reports both address lists. Keys are a subset
+    /// of `committee_peers`, so the map is bounded by the launch inventory. A config stub for the
+    /// key also passes through the replacement, so an entry describes a signed record only while
+    /// the key is not in `stub_records`.
+    launch_record_addrs: HashMap<BlsPublicKey, Vec<Multiaddr>>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
@@ -225,6 +394,11 @@ pub(crate) struct PeerManager {
     /// These peers are not connected and reserved for dial attempts at heartbeat intervals if
     /// connections drop.
     discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Whether this node's own BLS key sits in the current committee slot.
+    ///
+    /// Recomputed from the local BLS key on every committee update. A member expects every other
+    /// member; a non-member exports an expected committee peer count of 0.
+    local_in_current_committee: bool,
     /// Per-source inbound kad `PutRecord` rate windows.
     ///
     /// Bounds the expensive BLS verify plus kad store write in `process_kad_put_request` to
@@ -233,6 +407,14 @@ pub(crate) struct PeerManager {
     /// task that also relays consensus gossip (GHSA-f6rq-62rr-4h9g). Entries survive
     /// disconnects, expire on heartbeat, and never exceed [`MAX_RATE_WINDOWS`].
     put_record_windows: HashMap<PeerId, PutRecordWindow>,
+    /// Inbound kad `PutRecord` verify budget that all untrusted sources share.
+    ///
+    /// The per-source windows alone let [`MAX_RATE_WINDOWS`] sources together reach 512
+    /// verifies per second, and 61,440 at one aligned window boundary. This budget limits
+    /// untrusted sources together to [`PUT_RECORD_BUDGET_REFILL_PER_SEC`] per second and
+    /// [`PUT_RECORD_BUDGET_BURST`] at one instant. Validator, operator, and bootstrap sources
+    /// are exempt, so committee record traffic never waits on it.
+    put_record_budget: PutRecordBudget,
     /// Per-provider sliding windows bounding the inbound `AddProvider` write rate.
     ///
     /// `process_kad_add_provider` (consensus.rs) does a row read, BCS decode,
@@ -250,6 +432,346 @@ pub(crate) struct PeerManager {
 }
 
 impl PeerManager {
+    /// Configure admission and bind this swarm's authenticated local identity.
+    pub(crate) fn configure_admission(&mut self, config: AdmissionConfig, local: BlsPublicKey) {
+        self.local_bls_key = Some(local);
+        self.admission_policy.configure(config);
+    }
+
+    /// Query cached window records older than `max_age` again on each accepted window update.
+    pub(crate) fn configure_record_max_age(&mut self, max_age: Duration) {
+        self.record_max_age = Some(max_age);
+    }
+
+    /// Return admission observations separately from connected counts and consensus readiness.
+    pub(crate) fn admission_status(&self) -> AdmissionStatus {
+        self.evaluate_admission().0
+    }
+
+    /// Resolve the bounded committee and operator maps using this swarm's network identities.
+    fn evaluate_admission(&self) -> (AdmissionStatus, HashSet<PeerId>) {
+        self.admission_policy.evaluate(
+            &self.known_peers,
+            &self.stub_records,
+            &self.admission_operator_peers,
+            self.local_bls_key,
+            self.local_peer_id,
+            |peer| self.is_connected(peer),
+        )
+    }
+
+    /// Build this swarm's admission snapshot from a single admission evaluation.
+    ///
+    /// Lists every key in a committee slot, the scheduled or eligible set, or the trusted or
+    /// bootstrap configuration, except this swarm's own identity, sorted by key bytes. Committee
+    /// slots come from the accepted window, or from the swarm's committee slots before a window
+    /// is accepted. Each key reports the record or binding that [`Self::snapshot_record`]
+    /// selects. `admitted` restates the admission predicate: the key is in the accepted window
+    /// or holds an operator grant, and the identity admission resolves for it is authorized.
+    /// A key held only as scheduled or eligible is neither, so a forged record claiming an
+    /// authorized peer id for it is still not admitted.
+    pub(crate) fn admission_snapshot(&self) -> SwarmAdmissionSnapshot {
+        let (status, authorized) = self.evaluate_admission();
+        let accepted = self.admission_policy.window();
+        let window = accepted.unwrap_or_else(|| self.peers.committee_slots());
+        // the chain order is the slot order of every entry, and the map sorts keys by bytes
+        let slots = [TrackedSlot::Previous, TrackedSlot::Current, TrackedSlot::Next]
+            .into_iter()
+            .zip(window)
+            .chain([
+                (TrackedSlot::Scheduled, self.tracked.scheduled()),
+                (TrackedSlot::Eligible, self.tracked.eligible()),
+                (TrackedSlot::Trusted, &self.trusted_keys),
+                (TrackedSlot::Bootstrap, &self.bootstrap_keys),
+            ])
+            .flat_map(|(slot, keys)| keys.iter().map(move |key| (*key, slot)))
+            .filter(|(key, _)| Some(*key) != self.local_bls_key)
+            .fold(BTreeMap::<BlsPublicKey, Vec<TrackedSlot>>::new(), |mut slots, (key, slot)| {
+                slots.entry(key).or_default().push(slot);
+                slots
+            });
+        let entries = slots
+            .into_iter()
+            .map(|(bls_key, slots)| {
+                let (info, source, signed) = self.snapshot_record(&bls_key, window);
+                let peer_id = info.map(|info| PeerId::from(info.pubkey.clone()));
+                let multiaddrs = info.map(|info| info.multiaddrs.clone()).unwrap_or_default();
+                let record_multiaddrs = self
+                    .launch_record_addrs
+                    .get(&bls_key)
+                    .filter(|record| {
+                        source == EntrySource::Stub && signed && **record != multiaddrs
+                    })
+                    .cloned();
+                let granted = accepted.is_some_and(|committees| {
+                    committees.iter().any(|keys| keys.contains(&bls_key))
+                }) || self.admission_operator_peers.contains_key(&bls_key);
+                // admission resolves a granted key through its `known_peers` entry, then its
+                // operator binding, never through a tracked record
+                let identity = self
+                    .known_peers
+                    .get(&bls_key)
+                    .map(|info| PeerId::from(info.pubkey.clone()))
+                    .or_else(|| self.admission_operator_peers.get(&bls_key).copied());
+                TrackedEntry {
+                    bls_pubkey: bls_key,
+                    slots,
+                    peer_id,
+                    network_pubkey: info.map(|info| info.pubkey.clone()),
+                    multiaddrs,
+                    record_multiaddrs,
+                    record_timestamp: info.filter(|_| signed).map(|info| info.timestamp),
+                    source,
+                    admitted: granted && identity.is_some_and(|peer| authorized.contains(&peer)),
+                }
+            })
+            .collect();
+        SwarmAdmissionSnapshot {
+            network: self.metrics.network().to_owned(),
+            tracked_epoch: self.tracked.epoch(),
+            status,
+            entries,
+        }
+    }
+
+    /// Select the record or binding the admission snapshot reports for `bls_key`.
+    ///
+    /// A key in a committee slot of `window`, a committee member, or a pinned key (trusted,
+    /// bootstrap, explicit, and launch peers all pin) reads `known_peers`, the cache admission
+    /// itself resolves from: a `committee_peers` key is a launch stub, another config stub is a
+    /// configured binding, and any other entry a signed record. Every other key, and such a key
+    /// with no `known_peers` entry, reads its tracked record: a key that has just moved from the
+    /// eligible set into a slot keeps that record until its committee lookup lands. A key with
+    /// neither is unresolved. Returns the entry, its source, and whether the entry is a signed
+    /// record rather than a configured binding.
+    fn snapshot_record(
+        &self,
+        bls_key: &BlsPublicKey,
+        window: [&HashSet<BlsPublicKey>; 3],
+    ) -> (Option<&NetworkInfo>, EntrySource, bool) {
+        let cached = window.iter().any(|keys| keys.contains(bls_key))
+            || self.peers.is_committee_member(bls_key)
+            || self.pinned_peers.contains(bls_key);
+        let stub = self.stub_records.contains(bls_key);
+        match self.known_peers.get(bls_key).filter(|_| cached) {
+            Some(info) if self.committee_peers.contains_key(bls_key) => {
+                (Some(info), EntrySource::Stub, !stub)
+            }
+            Some(info) if stub => (Some(info), EntrySource::Config, false),
+            Some(info) => (Some(info), EntrySource::Record, true),
+            None => match self.tracked.record(bls_key) {
+                Some(info) => (Some(info), EntrySource::Record, true),
+                None => (None, EntrySource::Unresolved, false),
+            },
+        }
+    }
+
+    /// Apply one predicate to every connection direction, including unknown pending identities.
+    /// Closed rejects an unknown pending identity; authenticated establishment always rechecks.
+    /// Each Closed denial is counted by `direction`.
+    pub(super) fn check_admission(
+        &self,
+        peer: Option<&PeerId>,
+        direction: crate::metrics::ConnectionDirection,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let (status, authorized) = self.evaluate_admission();
+        if status.effective() != AdmissionMode::Closed
+            || peer.is_some_and(|id| authorized.contains(id))
+        {
+            Ok(())
+        } else {
+            self.metrics.record_closed_admission_denied(direction);
+            Err(libp2p::swarm::ConnectionDenied::new(
+                super::behavior::PeerAdmissionDenied::ClosedAdmission,
+            ))
+        }
+    }
+
+    /// A verified Closed grant bypasses discovery targets, never finite transport budgets.
+    pub(super) fn admission_is_privileged(&self, peer: &PeerId) -> bool {
+        let (status, authorized) = self.evaluate_admission();
+        status.effective() == AdmissionMode::Closed && authorized.contains(peer)
+    }
+
+    /// Under effective Closed, return the authorized set that bounds discovery dials.
+    /// Return `None` when the effective mode admits any peer. Evaluate once per pass.
+    fn admission_dial_scope(&self) -> Option<HashSet<PeerId>> {
+        let (status, authorized) = self.evaluate_admission();
+        (status.effective() == AdmissionMode::Closed).then_some(authorized)
+    }
+
+    /// Unversioned compatibility updates must not enable a Closed policy.
+    pub(crate) fn invalidate_admission(&mut self) {
+        self.admission_policy.invalidate();
+    }
+
+    /// Atomically update authoritative membership and admission at an epoch revision.
+    /// Old and contradictory updates fall back without replacing the accepted membership.
+    /// An accepted epoch-start update always applies the committee update, as the unversioned
+    /// update did, so a same-epoch re-entry keeps its side effects. An accepted renewal applies
+    /// it only when membership changed. Return `true` when the committee update was applied.
+    pub(crate) fn update_committees_at(
+        &mut self,
+        update: super::CommitteeUpdate,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> bool {
+        let status = self.admission_status();
+        let membership_changed = status.epoch() != Some(epoch)
+            || status.fallback() == Some(super::AdmissionFallback::Missing);
+        let apply = match update {
+            super::CommitteeUpdate::EpochStart => true,
+            super::CommitteeUpdate::Renewal => membership_changed,
+        };
+        let accepted =
+            self.admission_policy.update(epoch, previous.clone(), current.clone(), next.clone());
+        if accepted {
+            if status.configured() != AdmissionMode::Open {
+                // Retry the complete window on every accepted update, renewals included. Cold
+                // starts also need retiring identities before Closed can protect boundary traffic.
+                // Outdated cached records are queried again, so a rotated network key is learned
+                // from an authorized peer.
+                let window = previous
+                    .iter()
+                    .chain(&current)
+                    .chain(&next)
+                    .filter(|key| Some(**key) != self.local_bls_key)
+                    .copied()
+                    .collect();
+                self.trigger_window_lookups(&window);
+            }
+            if apply {
+                self.update_committees(previous, current, next);
+            }
+        }
+        self.reconcile_admission();
+        accepted && apply
+    }
+
+    /// Revoke live connections outside a recovered Closed window without reputation penalties.
+    fn reconcile_admission(&mut self) {
+        let (status, authorized) = self.evaluate_admission();
+        self.metrics.set_admission(&status);
+        if status.effective() == AdmissionMode::Closed {
+            let revoked: Vec<_> =
+                self.peers.connected_peer_ids().filter(|peer| !authorized.contains(peer)).collect();
+            revoked.into_iter().for_each(|peer| {
+                // Revocation is local policy, not misbehavior. It never marks the disconnect as
+                // banned, even when the peer shares an IP that was banned after it connected.
+                // A reputation-banned peer is already disconnecting and is not listed here.
+                let action = self.peers.update_connection_status(
+                    &peer,
+                    NewConnectionStatus::Disconnecting { banned: false },
+                );
+                self.events.push_back(PeerEvent::DisconnectPeer(peer));
+                // Ordinary disconnect actions impose a temporary ban. Admission revocation
+                // preserves existing ban ownership and creates no new ban or PX penalty.
+                match action {
+                    PeerAction::Ban(_) | PeerAction::Unban(_) => {
+                        self.apply_peer_action(peer, action)
+                    }
+                    PeerAction::NoAction
+                    | PeerAction::Disconnect
+                    | PeerAction::DisconnectWithPX => {}
+                }
+            });
+        }
+    }
+
+    /// Install a shared budget before any swarm is polled.
+    pub(crate) fn set_source_budget(&mut self, budget: Option<SourceAdmissionBudget>) {
+        self.source_connections.set_budget(budget);
+    }
+
+    /// Forward swarm lifecycle events to the connection lease owner.
+    pub(crate) fn on_source_swarm_event(&mut self, event: &libp2p::swarm::FromSwarm<'_>) {
+        self.source_connections.on_swarm_event(event);
+    }
+
+    /// Install the public connection share that matches the swarm's established-connection
+    /// bounds.
+    ///
+    /// `ConsensusNetwork::new` calls this once at startup, ahead of the first poll of the swarm,
+    /// so no slot is held yet and replacing the whole share (with empty maps) is correct.
+    pub(crate) fn configure_public_share(&mut self, share: PublicConnectionShare) {
+        self.public_share = share;
+    }
+
+    /// Whether a peer is exempt from the distinct-peer gate and from the public connection share.
+    ///
+    /// Privileged peers are the important peers (members of the previous, current and next
+    /// committees, and trusted operator peers) and the peers that an effective Closed admission
+    /// policy authorizes. Under Open admission, privilege is the committee plus the trusted
+    /// operator peers. Bootstrap peers hold no share privilege: they are dial targets of this
+    /// node, and the heartbeat prune frees public slots above the peer target.
+    pub(super) fn peer_is_privileged(&self, peer: &PeerId) -> bool {
+        self.peer_is_important(peer) || self.admission_is_privileged(peer)
+    }
+
+    /// Take a public share slot when a peer without privilege completes an established
+    /// connection.
+    ///
+    /// A privileged peer (see [`Self::peer_is_privileged`]) takes no slot and is never refused
+    /// here. A refusal logs at debug level and carries `PeerAdmissionDenied::PublicShare`, so an
+    /// inbound refusal reaches the inbound denial metrics under its reason. The slot is freed by
+    /// [`Self::release_public_connection`].
+    pub(crate) fn reserve_public_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        if self.peer_is_privileged(&peer) {
+            Ok(())
+        } else {
+            self.public_share.reserve(connection_id, peer).map_err(|exceeded| {
+                debug!(
+                    target: "peer-manager",
+                    ?peer,
+                    held = self.public_share.held(),
+                    held_by_peer = self.public_share.held_by(&peer),
+                    %exceeded,
+                    "public connection share refused connection"
+                );
+                libp2p::swarm::ConnectionDenied::new(
+                    super::behavior::PeerAdmissionDenied::PublicShare(exceeded),
+                )
+            })
+        }
+    }
+
+    /// Free the public share slot of one connection; an id without a slot frees nothing.
+    pub(crate) fn release_public_connection(&mut self, connection_id: ConnectionId) {
+        self.public_share.release(connection_id);
+    }
+
+    /// Reserve source occupancy at the authenticated established-connection boundary.
+    ///
+    /// Every denial is counted and logged. The importance signal is computed here so that
+    /// a later protected-capacity policy can use it; today important peers are only
+    /// logged at a higher level.
+    pub(crate) fn reserve_source(
+        &mut self,
+        connection: ConnectionId,
+        peer: PeerId,
+        address: &Multiaddr,
+        direction: crate::metrics::ConnectionDirection,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let important = self.peer_is_important(&peer);
+        self.source_connections.reserve(connection, peer, address).map_err(|error| {
+            self.metrics.record_source_admission_denied(direction, error);
+            if matches!(error, AdmissionError::Poisoned) {
+                bounded_error!(PeerAdmission, target: "peer-manager", %error, "source admission accounting poisoned");
+            } else if important {
+                bounded_warn!(PeerAdmission, target: "peer-manager", ?peer, direction = direction.label(), %error, "source budget refused important peer");
+            } else {
+                debug!(target: "peer-manager", ?peer, direction = direction.label(), %error, "source budget refused connection");
+            }
+            libp2p::swarm::ConnectionDenied::new(error)
+        })
+    }
+
     /// Create a new instance of Self.
     pub(crate) fn new(
         local_peer_id: PeerId,
@@ -263,38 +785,190 @@ impl PeerManager {
             config.dial_timeout,
             config.max_banned_peers,
             config.max_disconnected_peers,
+            Arc::new(config.score_config),
         );
         let temporarily_banned = BannedPeerCache::new(
             config.excess_peers_reconnection_timeout,
             config.max_temporarily_banned_peers,
         );
 
-        // initialize global score config
-        init_peer_score_config(config.score_config);
-
         Self {
             local_peer_id,
+            local_bls_key: None,
+            admission_policy: Default::default(),
+            record_max_age: None,
+            admission_operator_peers: Default::default(),
             config: *config,
+            source_connections: SourceConnections::default(),
+            public_share: PublicConnectionShare::of(
+                crate::consensus::MAX_ESTABLISHED_CONNECTIONS,
+                crate::consensus::MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
+            ),
             heartbeat,
+            trusted_retry: None,
+            trusted_dials: HashMap::new(),
             peers,
             known_peers: Default::default(),
+            restored_peers: Default::default(),
+            known_timestamps: Default::default(),
+            tracked: Default::default(),
+            bootstrap_keys: Default::default(),
+            trusted_keys: Default::default(),
             pinned_peers: Default::default(),
             stub_records: Default::default(),
+            committee_peers: Default::default(),
+            launch_record_addrs: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
             discovery_peers: Default::default(),
+            local_in_current_committee: false,
             put_record_windows: Default::default(),
+            put_record_budget: PutRecordBudget::new(Instant::now()),
             add_provider_windows: Default::default(),
             metrics,
         }
     }
 
+    /// Install configured hubs once and start process-lifetime reconnect scheduling.
+    ///
+    /// Repeated installation cannot create duplicate dials or forgive an existing ban.
+    /// Seeded launch bindings remain authoritative for identities and dial addresses.
+    /// Hubs start at the configured default score, like ordinary peers, rather than the maximum:
+    /// operator trust protects retention and exempts load penalties, but protocol faults still
+    /// need to reach the normal disconnect and ban thresholds.
+    pub(crate) fn add_trusted_peers(
+        &mut self,
+        peers: std::collections::BTreeMap<BlsPublicKey, P2pNode>,
+    ) {
+        let lookup_initial = self.heartbeat.period();
+        let launch_peers = &self.committee_peers;
+        peers.into_iter().filter(|(bls, endpoint)| {
+            let compatible = launch_peers.iter().all(|(key, peer)| {
+                (*key != *bls || peer.network_key == endpoint.network_key)
+                    && (peer.network_key != endpoint.network_key || *key == *bls)
+            });
+            if !compatible {
+                bounded_warn!(PeerState, target: "peer-manager", ?bls, "ignoring trusted hub that contradicts launch inventory");
+            }
+            compatible
+        }).for_each(|(bls, endpoint)| {
+            self.trusted_keys.insert(bls);
+            self.trusted_dials.entry(bls).or_insert_with(|| {
+                let info = NetworkInfo {
+                    pubkey: endpoint.network_key,
+                    multiaddrs: vec![launch_peers
+                        .get(&bls)
+                        .map(|peer| peer.network_address.clone())
+                        .unwrap_or(endpoint.network_address)],
+                    timestamp: tn_types::now(),
+                    rpc: endpoint.rpc,
+                };
+                self.peers.retain_operator_peer(bls, info.pubkey.clone(), info.multiaddrs.clone());
+                self.pinned_peers.insert(bls);
+                // Configured hubs are operator grants under closed connection admission.
+                self.admission_operator_peers.insert(bls, info.pubkey.clone().into());
+                // Keep a restored or learned record that matches the configured binding, so a
+                // committee hub still resolves its BLS identity. The config wins a conflict.
+                let matches = self.known_peers.get(&bls).map(|known| known.pubkey == info.pubkey);
+                if matches == Some(false) {
+                    bounded_warn!(PeerState,
+                        target: "peer-manager",
+                        ?bls,
+                        "known record conflicts with the trusted_nodes binding, using the configured binding"
+                    );
+                }
+                if matches != Some(true) {
+                    self.stub_records.insert(bls);
+                    self.known_peers.insert(bls, info.clone());
+                }
+                let now = Instant::now();
+                TrustedDial {
+                    info,
+                    next_attempt: now,
+                    backoff: TRUSTED_RETRY_INITIAL,
+                    lookup_next: now,
+                    lookup_backoff: lookup_initial,
+                }
+            });
+        });
+        if !self.trusted_dials.is_empty() {
+            self.trusted_retry.get_or_insert_with(|| {
+                let mut timer = tokio::time::interval(TRUSTED_RETRY_INITIAL);
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                timer
+            });
+            self.retry_trusted_peers();
+        }
+    }
+
+    /// Schedule due hub dials without depending on discovery or the population target.
+    fn retry_trusted_peers(&mut self) {
+        let now = Instant::now();
+        let peers = &self.peers;
+        let queued = &self.dial_requests;
+        let local_id = self.local_peer_id;
+        let dials: Vec<_> = self
+            .trusted_dials
+            .iter_mut()
+            .filter_map(|(bls, dial)| {
+                let id: PeerId = dial.info.pubkey.clone().into();
+                let status = peers.get_peer(&id).map(|peer| peer.connection_status());
+                if id == local_id
+                    || status
+                        .is_some_and(|status| matches!(status, ConnectionStatus::Connected { .. }))
+                {
+                    dial.backoff = TRUSTED_RETRY_INITIAL;
+                    dial.next_attempt = now + TRUSTED_RETRY_INITIAL;
+                    None
+                } else if now >= dial.next_attempt
+                    && !queued.iter().any(|request| request.peer_id == id)
+                    && status.is_none_or(|status| {
+                        matches!(
+                            status,
+                            ConnectionStatus::Disconnected { .. } | ConnectionStatus::Unknown
+                        )
+                    })
+                {
+                    dial.next_attempt = now + dial.backoff;
+                    dial.backoff = dial.backoff.saturating_mul(2).min(TRUSTED_RETRY_MAX);
+                    Some((*bls, id, dial.info.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        dials.into_iter().for_each(|(bls, id, info)| {
+            self.peers.retain_operator_peer(bls, info.pubkey, info.multiaddrs.clone());
+            self.dial_peer(id, info.multiaddrs, None);
+        });
+    }
+
     /// Explicitly add a "trusted" peer and dial it.
     ///
-    /// These peers are considered "trusted" and do not receive penalties.
+    /// These peers retain connections under population pressure and bypass load scoring.
+    /// Protocol and cryptographic violations remain eligible for penalties and bans.
     /// This does not unban ips and should only be called during initialization.
     pub(crate) fn add_trusted_peer_and_dial(
+        &mut self,
+        bls_key: BlsPublicKey,
+        mut info: NetworkInfo,
+        reply: oneshot::Sender<NetworkResult<()>>,
+    ) {
+        if !self.launch_binding_matches(bls_key, &info) {
+            let _ = reply.send(Err(NetworkError::ProtocolError(format!(
+                "trusted peer {bls_key} contradicts the launch inventory"
+            ))));
+        } else {
+            self.committee_peers.get(&bls_key).iter().for_each(|peer| {
+                info.multiaddrs = vec![peer.network_address.clone()];
+            });
+            self.add_matching_trusted_peer_and_dial(bls_key, info, reply);
+        }
+    }
+
+    /// Install trust and dial only after checking the fixed launch binding.
+    fn add_matching_trusted_peer_and_dial(
         &mut self,
         bls_key: BlsPublicKey,
         info: NetworkInfo,
@@ -302,11 +976,13 @@ impl PeerManager {
     ) {
         let peer_id: PeerId = info.pubkey.clone().into();
         let multiaddr = info.multiaddrs.clone();
+        self.admission_operator_peers.insert(bls_key, peer_id);
+        self.trusted_keys.insert(bls_key);
         self.peers.add_trusted_peer(bls_key, info.pubkey.clone());
 
         // remove from temporary banned and warn if peer was banned
         if self.temporarily_banned.remove(&peer_id) {
-            warn!(target: "peer-manager", ?peer_id, "removed trusted peer from temporarily banned list");
+            bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "removed trusted peer from temporarily banned list");
         }
         // trusted peers are operator-provisioned; pin so committee rotation never evicts them.
         // the entry is a config stub until the peer's own signed record replaces it
@@ -341,7 +1017,7 @@ impl PeerManager {
                 ConnectionStatus::Banned { .. } => {
                     // report error - dial banned peer
                     let error = NetworkError::DialBannedPeer(format!("Peer {peer_id} is banned"));
-                    warn!(target: "peer-manager", ?error, "invalid dial request");
+                    bounded_warn!(PeerState, target: "peer-manager", ?error, "invalid dial request");
                     if let Some(reply) = reply {
                         send_or_log_error!(
                             reply,
@@ -442,9 +1118,21 @@ impl PeerManager {
         }
     }
 
-    /// Returns a boolean indicating if the next instant in the heartbeat interval was reached.
+    /// Poll retry timers and refresh unresolved configured identities on each heartbeat.
+    ///
+    /// Return whether regular peer maintenance is due.
     pub(super) fn heartbeat_ready(&mut self, cx: &mut Context<'_>) -> bool {
-        self.heartbeat.poll_tick(cx).is_ready()
+        if self.trusted_retry.as_mut().is_some_and(|timer| timer.poll_tick(cx).is_ready()) {
+            self.retry_trusted_peers();
+        }
+        let ready = self.heartbeat.poll_tick(cx).is_ready();
+        if ready {
+            // Retry configured hubs whose record is still unresolved, inside each hub's lookup
+            // backoff. Bootstrap entries are looked up only through committee discovery.
+            self.trigger_trusted_lookups(None);
+            self.trigger_tracked_lookups();
+        }
+        ready
     }
 
     /// Heartbeat maintenance.
@@ -452,8 +1140,10 @@ impl PeerManager {
     /// The manager runs routine maintenance to decay penalties for peers. This method
     /// is routine and can not further penalize peers.
     pub(super) fn heartbeat(&mut self) {
+        self.reconcile_admission();
         // update peers
-        let actions = self.peers.heartbeat_maintenance();
+        let actions =
+            self.peers.heartbeat_maintenance(self.config.excess_peers_reconnection_timeout);
         for (peer_id, action) in actions {
             self.apply_peer_action(peer_id, action);
         }
@@ -475,6 +1165,8 @@ impl PeerManager {
             self.discovery_peers.len(),
             banned_count,
         );
+        self.record_committee_connectivity();
+        self.record_tracked_resolution();
 
         // enforce connection limits
         self.prune_connected_peers();
@@ -565,9 +1257,9 @@ impl PeerManager {
     ///
     /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
     /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
-    /// work.)
-    pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
-        self.peers.is_peer_validator(peer_id)
+    /// work.) A configuration hint must first be confirmed by a verified signed node record.
+    pub(crate) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
+        self.peer_to_bls(peer_id).is_some() && self.peers.is_peer_validator(peer_id)
     }
 
     /// Returns a boolean if the peer is connected.
@@ -575,6 +1267,11 @@ impl PeerManager {
         self.peers.get_peer(peer_id).is_some_and(|peer| {
             matches!(peer.connection_status(), ConnectionStatus::Connected { .. })
         })
+    }
+
+    /// Returns a boolean if the peer table has an entry for the peer.
+    pub(super) fn is_tracked_peer(&self, peer_id: &PeerId) -> bool {
+        self.peers.get_peer(peer_id).is_some()
     }
 
     /// Whether `peer_id` is this swarm's own identity.
@@ -616,6 +1313,11 @@ impl PeerManager {
     pub(crate) fn connected_or_dialing_peers(&self) -> Vec<PeerId> {
         trace!(target: "peer-manager", "all peers:\n{:?}", self.peers);
         self.peers.connected_or_dialing_peers()
+    }
+
+    /// Return `true` if `bls_key` belongs to a member of the current committee.
+    pub(crate) fn is_current_committee_member(&self, bls_key: &BlsPublicKey) -> bool {
+        self.peers.current_committee().contains(bls_key)
     }
 
     /// Record an inbound `AddProvider` from `provider` and report whether it
@@ -664,8 +1366,9 @@ impl PeerManager {
             debug!(target: "peer-manager", ?peer_id, "skipping penalty for local peer id");
             return;
         }
-        self.metrics.record_penalty(&penalty);
+        let outcome = self.peers.penalty_outcome(&peer_id, penalty);
         let action = self.peers.process_penalty(&peer_id, penalty);
+        self.metrics.record_penalty(&penalty, outcome);
 
         debug!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
         self.apply_peer_action(peer_id, action);
@@ -728,7 +1431,7 @@ impl PeerManager {
     ) -> bool {
         if self.peers.peer_banned(peer_id) {
             // log error if the peer is banned
-            error!(target: "peer-manager", ?peer_id, "connected with banned peer");
+            bounded_error!(PeerState, target: "peer-manager", ?peer_id, "connected with banned peer");
             return false;
         }
 
@@ -755,6 +1458,17 @@ impl PeerManager {
             }
         }
 
+        self.trusted_dials
+            .values_mut()
+            .filter(|dial| PeerId::from(dial.info.pubkey.clone()) == *peer_id)
+            .for_each(|dial| {
+                dial.backoff = TRUSTED_RETRY_INITIAL;
+                dial.next_attempt = Instant::now() + TRUSTED_RETRY_INITIAL;
+            });
+        // A replacement connection can resolve a hub whose initial record push was interrupted.
+        // Only this peer's own key is queried, and only when it is a configured hub with an
+        // unresolved record and an elapsed lookup backoff.
+        self.trigger_trusted_lookups(Some(peer_id));
         true
     }
 
@@ -798,15 +1512,12 @@ impl PeerManager {
             return;
         }
 
-        // filter peers that are validators
+        // Retention protection does not exempt any peer from protocol bans or resource budgets.
         let ready_to_prune = connected_peers
             .iter()
-            .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
-                    Some(*peer_id)
-                } else {
-                    None
-                }
+            .filter(|(peer_id, _)| !self.admission_is_privileged(peer_id))
+            .filter_map(|(peer_id, _)| {
+                (!self.peer_policy(peer_id).protects_retention()).then_some(*peer_id)
             })
             .collect::<Vec<_>>();
 
@@ -853,6 +1564,7 @@ impl PeerManager {
             // slots; the per-entry eligibility pass still visits each codec-bounded entry
             let peers_to_take = max_discovery_peers - current_count;
             let mut rng = rand::rng();
+            let scope = self.admission_dial_scope();
             let peers = peers
                 .into_iter()
                 .filter_map(|(_, (net_key, addrs))| {
@@ -860,7 +1572,7 @@ impl PeerManager {
                         PeerInfo { peer_id: net_key.into(), addrs: addrs.into_iter().collect() };
 
                     // filter out ineligible peers
-                    if self.eligible_for_discovery(&info) {
+                    if self.eligible_for_discovery(&info, scope.as_ref()) {
                         debug!(target: "peer-manager", ?info, "peer exchange eligible");
                         Some(info)
                     } else {
@@ -890,10 +1602,22 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
-    /// Bool indicating if the peer is operator-allowlisted or a validator.
+    /// Derive independent privileges from live committee membership and operator configuration.
+    ///
+    /// Bootstrap and explicitly configured discovery peers gain admission eligibility alone.
+    /// Operator allowlisting remains sticky; committee privileges expire with the last slot.
+    pub(super) fn peer_policy(&self, peer_id: &PeerId) -> super::policy::PeerPolicy {
+        let policy = self.peers.peer_policy(peer_id);
+        self.peer_to_bls(peer_id)
+            .filter(|key| self.pinned_peers.contains(key))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap))
+    }
+
+    /// Whether retention policy protects this peer from population pruning and mesh treatment.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
-        self.is_peer_validator(peer_id)
-            || self.peers.get_peer(peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
+        let policy = self.peer_policy(peer_id);
+        trace!(target: "peer-manager", ?peer_id, admission=?policy.admission(), ?policy, "peer privileges");
+        policy.protects_retention()
     }
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.
@@ -919,6 +1643,18 @@ impl PeerManager {
     ) {
         self.trigger_missing_authorities(&current);
         self.trigger_missing_authorities(&next);
+        // restore the record of any slot member that was evicted while its cached record stayed,
+        // so the membership pass below binds and trusts it again (issue #1649)
+        let evicted: HashSet<BlsPublicKey> = previous
+            .iter()
+            .chain(&current)
+            .chain(&next)
+            .filter(|bls_key| {
+                self.known_peers.contains_key(*bls_key) && !self.peers.has_confirmed_record(bls_key)
+            })
+            .copied()
+            .collect();
+        evicted.into_iter().for_each(|bls_key| self.upsert_cached(bls_key));
         // forgive manager-level temporary bans for any already-known members across all three slots
         self.forgive_temporarily_banned(&previous);
         self.forgive_temporarily_banned(&current);
@@ -929,6 +1665,15 @@ impl PeerManager {
         // neither pinned nor a current committee member so rotated-out members and stale discovered
         // records cannot accumulate across epochs (issue #827).
         self.prune_known_peers();
+        // membership comes from the local BLS key, so rotating into or out of the committee updates
+        // the expected peer count on the same update that installs the new slots
+        self.local_in_current_committee = self
+            .local_bls_key
+            .as_ref()
+            .is_some_and(|key| self.peers.current_committee().contains(key));
+        self.record_committee_connectivity();
+        // the new slots decide where tracked keys resolve, and the prune may have demoted records
+        self.record_tracked_resolution();
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,
@@ -942,6 +1687,79 @@ impl PeerManager {
         self.apply_unban_actions(unban_actions);
     }
 
+    /// Replace the scheduled and eligible keys this swarm tracks for export.
+    ///
+    /// An update for an epoch older than the held one is ignored; a repeat of the held epoch
+    /// replaces it. Keys the update no longer lists lose their retained record and their lookup
+    /// schedule. Past [`MAX_TRACKED_KEYS`] distinct keys the excess is left out with a bounded
+    /// warning. Tracking admits nothing: membership, scoring, and the admission inputs come only
+    /// from the committee update. Lookups for newly tracked keys start on the next heartbeat.
+    ///
+    /// Returns whether the update was accepted, that is, not ignored for an older epoch.
+    pub(crate) fn update_tracked_keys(
+        &mut self,
+        epoch: u64,
+        scheduled: HashSet<BlsPublicKey>,
+        eligible: HashSet<BlsPublicKey>,
+    ) -> bool {
+        let left_out = self.tracked.update(epoch, scheduled, eligible);
+        match left_out {
+            None => {
+                debug!(target: "peer-manager", epoch, "ignoring tracked keys for an older epoch")
+            }
+            Some(0) => trace!(target: "peer-manager", epoch, "tracked keys updated"),
+            Some(left_out) => {
+                bounded_warn!(Command, target: "peer-manager", epoch, left_out, max = MAX_TRACKED_KEYS, "tracked key limit reached, keys left out");
+            }
+        }
+        self.record_tracked_resolution();
+        left_out.is_some()
+    }
+
+    /// Every key of the accepted tracked sets once, scheduled keys first.
+    ///
+    /// These are the sets [`Self::update_tracked_keys`] holds after its epoch rule and its
+    /// [`MAX_TRACKED_KEYS`] cap, so a store that follows them never tracks a key this swarm left
+    /// out. The local key is included when a publication lists it.
+    pub(crate) fn tracked_keys(&self) -> impl Iterator<Item = &BlsPublicKey> {
+        self.tracked.keys()
+    }
+
+    /// Write the committee connectivity gauges from the current committee slot.
+    ///
+    /// A member expects every other member (`size - 1`); a non-member expects 0, so the committee
+    /// alerts, which require expected above 0, skip it. Size and connected are written for every
+    /// node, and all three gauges stay zero until a committee is known.
+    fn record_committee_connectivity(&self) {
+        let (size, connected) = self.peers.current_committee_connectivity();
+        let expected = if self.local_in_current_committee { size.saturating_sub(1) } else { 0 };
+        self.metrics.set_committee_connectivity(size, expected, connected);
+    }
+
+    /// Write the tracked-key gauges: per tracked slot, the keys other than this swarm's own and
+    /// how many of them lack a signed record, plus the count of retained tracked records.
+    ///
+    /// Each key resolves where the admission snapshot reads it ([`Self::snapshot_record`]), so a
+    /// configured binding counts as unresolved, as it does for the committee resolution gauges.
+    /// Called on tracked changes, committee updates, and the heartbeat, never per swarm poll.
+    fn record_tracked_resolution(&self) {
+        let window = self.admission_policy.window().unwrap_or_else(|| self.peers.committee_slots());
+        [("scheduled", self.tracked.scheduled()), ("eligible", self.tracked.eligible())]
+            .into_iter()
+            .for_each(|(slot, keys)| {
+                let required = keys.iter().filter(|key| Some(**key) != self.local_bls_key);
+                let expected = required.clone().count();
+                let unresolved = required
+                    .filter(|key| {
+                        let (_, _, signed) = self.snapshot_record(key, window);
+                        !signed
+                    })
+                    .count();
+                self.metrics.set_tracked_resolution(slot, expected, unresolved);
+            });
+        self.metrics.set_tracked_records(self.tracked.record_count());
+    }
+
     /// Drop cached network info for peers no longer worth tracking, bounding `known_peers`.
     ///
     /// Run after every committee rotation. An entry survives only if it is pinned (an
@@ -950,7 +1768,33 @@ impl PeerManager {
     /// accumulate across epochs. `known_peers` is thereby bounded by the operator-configured set
     /// plus the three committee slots. Evicting a still-relevant peer only forces a fresh kad
     /// lookup if it becomes a committee member again, which is the intended discovery flow.
+    ///
+    /// An evicted key that is still tracked keeps its learned record in the tracked map, under
+    /// the same freshness rule as any other tracked record; a config stub is not a record and is
+    /// never moved. A tracked record is never promoted back into this cache.
+    ///
+    /// The first prune after startup also drops the peer-store record, and with it the peer-id
+    /// binding, of every restored key it evicts whose peer has not been dialed or connected
+    /// since ([`Self::add_restored_peer`]). A peer that has connected keeps its record for the
+    /// ordinary peer pruning.
     fn prune_known_peers(&mut self) {
+        let observed = now();
+        let demoted: Vec<_> = self
+            .known_peers
+            .iter()
+            .filter(|(bls_key, _)| {
+                !self.pinned_peers.contains(*bls_key)
+                    && !self.peers.is_committee_member(bls_key)
+                    && !self.stub_records.contains(*bls_key)
+                    && self.is_tracked_key(bls_key)
+            })
+            .map(|(bls_key, info)| {
+                let timestamp = self.known_timestamps.get(bls_key).copied().unwrap_or_else(|| {
+                    crate::freshness::RecordTimestamp::legacy(info.timestamp, observed)
+                });
+                (*bls_key, info.clone(), timestamp)
+            })
+            .collect();
         let pinned = &self.pinned_peers;
         let peers = &self.peers;
         self.known_peers
@@ -958,6 +1802,16 @@ impl PeerManager {
         // keep the stub set a subset of `known_peers`; a no-op while every stub is pinned
         let known = &self.known_peers;
         self.stub_records.retain(|bls_key| known.contains_key(bls_key));
+        self.known_timestamps.retain(|bls_key, _| known.contains_key(bls_key));
+        for bls_key in std::mem::take(&mut self.restored_peers) {
+            if !self.known_peers.contains_key(&bls_key) {
+                self.peers.evict_unconnected(bls_key);
+            }
+        }
+        // the committee update running this prune refreshes the tracked gauges once afterwards
+        demoted.into_iter().for_each(|(bls_key, info, timestamp)| {
+            self.retain_tracked(bls_key, info, timestamp, observed);
+        });
     }
 
     /// Lift any already-known committee members out of the manager's temporary-ban cache.
@@ -970,7 +1824,7 @@ impl PeerManager {
         for bls_key in committee {
             if let Some((peer_id, _)) = self.auth_to_peer(*bls_key) {
                 if self.temporarily_banned.remove(&peer_id) {
-                    warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
                 }
             }
         }
@@ -984,6 +1838,125 @@ impl PeerManager {
         if !missing.is_empty() {
             self.events.push_back(PeerEvent::MissingAuthorities(missing));
         }
+    }
+
+    /// Emit a [`PeerEvent::MissingAuthorities`] for window keys with no learned record or with
+    /// an outdated cached record. A Closed swarm cannot learn a rotated network key by
+    /// connection, so this lookup is its automatic path to the new binding.
+    fn trigger_window_lookups(&mut self, window: &HashSet<BlsPublicKey>) {
+        let observed = now();
+        let lookups: Vec<BlsPublicKey> = window
+            .iter()
+            .filter(|key| self.record_unlearned(key) || self.record_outdated(key, observed))
+            .copied()
+            .collect();
+        if !lookups.is_empty() {
+            self.events.push_back(PeerEvent::MissingAuthorities(lookups));
+        }
+    }
+
+    /// Whether the cached record for `bls_key` was signed more than the record age limit ago.
+    fn record_outdated(&self, bls_key: &BlsPublicKey, observed: tn_types::TimestampSec) -> bool {
+        self.known_peers
+            .get(bls_key)
+            .is_some_and(|info| self.signed_past_max_age(info.timestamp, observed))
+    }
+
+    /// Whether a record signed at `signed` is older than the record age limit at `observed`.
+    ///
+    /// Without a configured limit no record ages.
+    fn signed_past_max_age(
+        &self,
+        signed: tn_types::TimestampSec,
+        observed: tn_types::TimestampSec,
+    ) -> bool {
+        self.record_max_age
+            .is_some_and(|max_age| observed.saturating_sub(signed) > max_age.as_secs())
+    }
+
+    /// Emit a [`PeerEvent::MissingAuthorities`] for configured hubs whose record is unresolved
+    /// and whose lookup backoff has elapsed.
+    ///
+    /// Only `trusted_dials` keys are queried, never bootstrap entries outside the committee.
+    /// `connected` limits the lookup to that peer's own key. Each lookup doubles the hub's delay,
+    /// from the heartbeat interval up to [`TRUSTED_LOOKUP_MAX`], so a key that never resolves (a
+    /// hub offline past the record TTL, or a conflicting `trusted_nodes` binding) has a bounded
+    /// lookup rate, and so does the conflict `warn!`. The delay resets once the record resolves.
+    fn trigger_trusted_lookups(&mut self, connected: Option<&PeerId>) {
+        let now = Instant::now();
+        let initial = self.heartbeat.period();
+        let unresolved: HashSet<BlsPublicKey> =
+            self.trusted_dials.keys().filter(|bls| self.record_unlearned(bls)).copied().collect();
+        let missing: Vec<BlsPublicKey> = self
+            .trusted_dials
+            .iter_mut()
+            .filter(|(_, dial)| {
+                connected.is_none_or(|peer_id| PeerId::from(dial.info.pubkey.clone()) == *peer_id)
+            })
+            .filter_map(|(bls, dial)| {
+                if !unresolved.contains(bls) {
+                    dial.lookup_backoff = initial;
+                    dial.lookup_next = now;
+                    return None;
+                }
+                if now < dial.lookup_next {
+                    return None;
+                }
+                dial.lookup_next = now + dial.lookup_backoff;
+                dial.lookup_backoff = dial.lookup_backoff.saturating_mul(2).min(TRUSTED_LOOKUP_MAX);
+                Some(*bls)
+            })
+            .collect();
+        if !missing.is_empty() {
+            self.events.push_back(PeerEvent::MissingAuthorities(missing));
+        }
+    }
+
+    /// Emit a [`PeerEvent::MissingRecords`] of [`LookupClass::Tracked`] for tracked keys whose
+    /// record is missing or outdated and whose lookup is due.
+    ///
+    /// At most [`TRACKED_LOOKUPS_PER_HEARTBEAT`] keys are queried per call. Each key backs off
+    /// from [`TRACKED_LOOKUP_INITIAL`], doubling up to [`TRACKED_LOOKUP_MAX`], while it stays
+    /// unresolved, so a key that never resolves costs at most one query per maximum delay. The
+    /// schedule resets once the key no longer needs a lookup.
+    fn trigger_tracked_lookups(&mut self) {
+        let observed = now();
+        let wanted: HashSet<BlsPublicKey> = self
+            .tracked
+            .keys()
+            .filter(|bls_key| self.tracked_lookup_wanted(bls_key, observed))
+            .copied()
+            .collect();
+        let due = self.tracked.due_lookups(
+            &wanted,
+            Instant::now(),
+            TRACKED_LOOKUPS_PER_HEARTBEAT,
+            TRACKED_LOOKUP_INITIAL,
+            TRACKED_LOOKUP_MAX,
+        );
+        if !due.is_empty() {
+            trace!(target: "peer-manager", ?due, "requesting tracked kad records");
+            self.events.push_back(PeerEvent::MissingRecords(due, LookupClass::Tracked));
+        }
+    }
+
+    /// Whether a tracked key needs a kad lookup: it has no retained record, or only one signed
+    /// longer ago than the record age limit that also governs window records.
+    ///
+    /// A key in a committee slot or pinned is resolved into `known_peers` by the committee and
+    /// hub lookups, so it is never queried as a tracked key.
+    fn tracked_lookup_wanted(
+        &self,
+        bls_key: &BlsPublicKey,
+        observed: tn_types::TimestampSec,
+    ) -> bool {
+        self.is_tracked_key(bls_key)
+            && !self.peers.is_committee_member(bls_key)
+            && !self.pinned_peers.contains(bls_key)
+            && self
+                .tracked
+                .record(bls_key)
+                .is_none_or(|info| self.signed_past_max_age(info.timestamp, observed))
     }
 
     /// Whether no network-learned record is cached for `bls_key` — either nothing is cached at
@@ -1006,7 +1979,7 @@ impl PeerManager {
     /// entries survive committee rotation (see [`Self::prune_known_peers`]). Records restored
     /// from local persistence at startup do NOT use this method precisely because they must not
     /// pin — they go through [`Self::add_restored_peer`]. The attacker-reachable kad discovery
-    /// path must instead use [`Self::add_discovered_peer`], which is bounded to committee
+    /// path instead uses [`Self::add_discovered_peer_with_timestamp`], bounded to committee
     /// membership. The entry is marked as a config stub so discovery still chases the peer's own
     /// signed record.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
@@ -1023,8 +1996,37 @@ impl PeerManager {
     /// attacker-fillable store entries into permanently pinned `known_peers` entries, so restored
     /// entries are deliberately NOT pinned — they survive only until the first
     /// [`Self::update_committees`] prunes non-members, restoring the issue #827 committee bound.
+    ///
+    /// Caching a restored record also binds its peer id in the peer store. The store persists
+    /// rows for tracked keys too, which must never be bound, so the key is remembered and that
+    /// first prune removes the binding of every evicted key whose peer has not been dialed or
+    /// connected since startup.
     pub(crate) fn add_restored_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.cache_known_peer(bls_key, info);
+        self.restored_peers.insert(bls_key);
+    }
+
+    /// Restore a persisted admission ceiling without resetting it to the startup clock.
+    pub(crate) fn restore_record_timestamp(
+        &mut self,
+        bls_key: BlsPublicKey,
+        timestamp: crate::freshness::RecordTimestamp,
+    ) {
+        if self.known_peers.contains_key(&bls_key) {
+            self.known_timestamps.insert(bls_key, timestamp);
+        }
+    }
+
+    /// Reuse an admitted record's metadata while excluding locally provisioned stubs.
+    pub(crate) fn record_timestamp(
+        &self,
+        bls_key: &BlsPublicKey,
+        signed: tn_types::TimestampSec,
+    ) -> Option<crate::freshness::RecordTimestamp> {
+        self.known_timestamps
+            .get(bls_key)
+            .copied()
+            .filter(|timestamp| !self.stub_records.contains(bls_key) && timestamp.matches(signed))
     }
 
     /// Add an operator-configured bootstrap peer: always pin it, but never overwrite an existing
@@ -1040,6 +2042,8 @@ impl PeerManager {
     /// actually inserts is marked as a stub: a learned record that was already cached stays
     /// learned.
     pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.admission_operator_peers.insert(bls_key, info.pubkey.clone().into());
+        self.bootstrap_keys.insert(bls_key);
         self.pinned_peers.insert(bls_key);
         if !self.known_peers.contains_key(&bls_key) {
             self.cache_known_peer(bls_key, info);
@@ -1047,39 +2051,198 @@ impl PeerManager {
         }
     }
 
-    /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.
+    /// Atomically validate and seed a swarm's local launch bindings.
+    ///
+    /// Matching entries use the launch address. Unrelated bootstrap/trusted entries survive.
+    /// Only operator-provisioned data can fail the batch: a contradictory inventory, or a
+    /// configured bootstrap/trusted stub that contradicts it. Such a failure inserts nothing.
+    ///
+    /// A cached record that is not a stub was restored from the kad store or learned from the
+    /// network, and any peer can fill that store. A contradictory record of that kind is dropped
+    /// with a warning and never stops startup. The kad store row stays in place:
+    /// [`Self::cache_known_peer`] rejects it against the inventory from here on, and the next
+    /// restart drops it again. The seeding upserts re-key the peer store, so no identity binding
+    /// of a dropped record survives.
+    ///
+    /// A learned record that already carries the launch binding is kept, as in
+    /// [`Self::add_bootstrap_peer`]: it is pinned and takes the launch address, but keeps its
+    /// signed timestamp, its RPC info and its learned status. Seeding provides dial hints only;
+    /// membership still comes from the committee update command.
+    pub(crate) fn seed_committee_peers(
+        &mut self,
+        peers: BTreeMap<BlsPublicKey, tn_types::P2pNode>,
+    ) -> NetworkResult<()> {
+        peers.iter().try_for_each(|(key, peer)| {
+            let peer_id = PeerId::from(peer.network_key.clone());
+            let invalid = |reason: String| {
+                NetworkError::ProtocolError(format!(
+                    "committee_peers: BLS key {key}, network identity {peer_id}: {reason}"
+                ))
+            };
+            let reseeded = self.committee_peers.get(key).is_some_and(|configured| {
+                configured.network_key != peer.network_key
+                    || configured.network_address != peer.network_address
+            });
+            let bad_address = peer.network_address.is_empty()
+                || peer.network_address.iter().any(
+                    |protocol| matches!(protocol, Protocol::P2p(address_id) if address_id != peer_id),
+                );
+            let shared = peers
+                .iter()
+                .chain(self.committee_peers.iter())
+                .find(|(other_key, other)| {
+                    *other_key != key && other.network_key == peer.network_key
+                })
+                .map(|(other_key, _)| *other_key);
+            let configured = self
+                .known_peers
+                .iter()
+                .find(|(known_key, known)| {
+                    self.stub_records.contains(*known_key)
+                        && Self::contradicts_launch_binding(known_key, known, key, peer)
+                })
+                .map(|(known_key, _)| *known_key);
+            match () {
+                () if reseeded => Err(invalid(
+                    "the inventory already seeded another network key or address".to_owned(),
+                )),
+                () if bad_address => Err(invalid(
+                    "the address is empty or its /p2p component names another identity".to_owned(),
+                )),
+                () => shared
+                    .map(|other| format!("the inventory also assigns it to BLS key {other}"))
+                    .or_else(|| {
+                        configured.map(|other| {
+                            format!("a configured bootstrap/trusted entry for {other} contradicts it")
+                        })
+                    })
+                    .map_or(Ok(()), |reason| Err(invalid(reason))),
+            }
+        })?;
+        // every hard failure is ruled out; what still contradicts the inventory is peer-fillable
+        // cache (restored or learned), so drop it instead of failing startup
+        let dropped: Vec<(BlsPublicKey, BlsPublicKey, PeerId)> = self
+            .known_peers
+            .iter()
+            .filter(|(known_key, _)| !self.stub_records.contains(*known_key))
+            .filter_map(|(known_key, known)| {
+                peers
+                    .iter()
+                    .find(|(key, peer)| {
+                        Self::contradicts_launch_binding(known_key, known, key, peer)
+                    })
+                    .map(|(key, _)| (*known_key, *key, PeerId::from(known.pubkey.clone())))
+            })
+            .collect();
+        dropped.into_iter().for_each(|(cached_key, inventory_key, cached_id)| {
+            bounded_warn!(PeerState,
+                target: "peer-manager",
+                ?inventory_key,
+                ?cached_key,
+                ?cached_id,
+                "dropping cached peer record that contradicts committee_peers"
+            );
+            self.known_peers.remove(&cached_key);
+        });
+        self.committee_peers.extend(peers.clone());
+        peers.into_iter().for_each(|(key, peer)| {
+            self.trusted_dials.get_mut(&key).iter_mut().for_each(|dial| {
+                dial.info.multiaddrs = vec![peer.network_address.clone()];
+            });
+            if self.record_unlearned(&key) {
+                self.add_known_peer(
+                    key,
+                    NetworkInfo {
+                        pubkey: peer.network_key,
+                        multiaddrs: vec![peer.network_address],
+                        timestamp: tn_types::now(),
+                        rpc: peer.rpc,
+                    },
+                );
+            } else {
+                // a learned record with the launch binding: pin it and re-cache it so the launch
+                // address applies, without discarding its signed timestamp and rpc
+                self.pinned_peers.insert(key);
+                self.known_peers
+                    .remove(&key)
+                    .into_iter()
+                    .for_each(|known| self.cache_known_peer(key, known));
+            }
+        });
+        Ok(())
+    }
+
+    /// Whether a cached record contradicts a launch binding in either direction: the same BLS
+    /// key under another network key, or another BLS key under the same network key.
+    fn contradicts_launch_binding(
+        known_key: &BlsPublicKey,
+        known: &NetworkInfo,
+        key: &BlsPublicKey,
+        peer: &tn_types::P2pNode,
+    ) -> bool {
+        (known_key == key) != (known.pubkey == peer.network_key)
+    }
+
+    /// Add a peer learned from the DHT for a committee member, an operator-pinned key, or a
+    /// scheduled or eligible key.
     ///
     /// Unlike [`Self::add_known_peer`], this path is reachable by any remote peer: a
     /// signature-valid kad record only proves the publisher owns the network key it advertises,
     /// not that the advertised [`BlsPublicKey`] belongs to any committee. Caching every such
     /// record would let a peer grow `known_peers` without bound by publishing records for endless
-    /// fresh keys (issue #827). `known_peers` exists solely to resolve committee members' network
-    /// info, so a record whose key is in no tracked committee slot is dropped: it is either stale
-    /// (a member that already rotated out) or forged, and is never read. Legitimate discovery is
-    /// unaffected because kad lookups are only ever triggered for current/next committee members
-    /// whose info is missing (see [`Self::trigger_missing_authorities`]).
+    /// fresh keys (issue #827). A record takes one of three branches. A member of a committee slot
+    /// or an operator-pinned key is cached in `known_peers`, bounded by the window and by local
+    /// configuration. A scheduled or eligible key is retained for export only, through
+    /// [`Self::retain_tracked`], which binds no identity and is bounded by [`MAX_TRACKED_KEYS`].
+    /// Any other key is dropped. Kad lookups are triggered for window members, for the upcoming
+    /// committees the epoch manager prefetches through [`Self::find_authorities`], for tracked
+    /// keys (see [`Self::trigger_tracked_lookups`]), and for configured trusted hubs (see
+    /// [`Self::trigger_trusted_lookups`]), so an indirect lookup can confirm a hub's identity
+    /// after its first connection was interrupted before the signed record arrived.
+    #[cfg(test)]
     pub(crate) fn add_discovered_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
-        if !self.peers.is_committee_member(&bls_key) {
+        let timestamp = crate::freshness::RecordTimestamp::admit(info.timestamp, now());
+        self.add_discovered_peer_with_timestamp(bls_key, info, timestamp);
+    }
+
+    /// Promote a query winner while preserving the ceiling fixed when its result arrived.
+    ///
+    /// A key outside every committee slot and the pinned set is retained only when it is tracked,
+    /// through [`Self::retain_tracked`], which binds no identity.
+    pub(crate) fn add_discovered_peer_with_timestamp(
+        &mut self,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+        timestamp: crate::freshness::RecordTimestamp,
+    ) {
+        let cacheable =
+            self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key);
+        if !cacheable && self.is_tracked_key(&bls_key) {
+            if self.retain_tracked(bls_key, info, timestamp, now()) {
+                self.record_tracked_resolution();
+            }
+        } else if !cacheable {
             trace!(
                 target: "peer-manager",
                 ?bls_key,
-                "dropping discovered peer record for non-committee key"
+                "dropping discovered peer record for unconfigured non-committee key"
             );
-            return;
-        }
-        if self.kad_record_is_stale(&bls_key, &info) {
+        } else if self.kad_timestamp_is_stale(&bls_key, timestamp, now()) {
             trace!(
                 target: "peer-manager",
                 ?bls_key,
                 "dropping stale discovered peer record"
             );
-            return;
+            // a query result has no connection source, so the dropped record's own network key
+            // stands in for it and must match the cached record
+            self.rebind_from_cache(bls_key, info.pubkey.into());
+        } else {
+            self.cache_known_peer_with_timestamp(bls_key, info, timestamp);
         }
-        self.cache_known_peer(bls_key, info);
     }
 
     /// Record an inbound kad `PutRecord` from `source` and classify it against the
-    /// per-source rate.
+    /// per-source rate and the budget that untrusted sources share.
     ///
     /// Counts one message per call in a [`PUT_RECORD_RATE_WINDOW`] tumbling window. A source
     /// past [`MAX_PUT_RECORDS_PER_WINDOW`] has its records shed before the expensive
@@ -1087,9 +2250,17 @@ impl PeerManager {
     /// [`PUT_RECORD_PENALTY_THRESHOLD`] is flagged for a penalty, once per window below
     /// [`PUT_RECORD_DISCONNECT_THRESHOLD`] and on every message above that ceiling.
     /// Untracked sources are shed without a penalty when [`MAX_RATE_WINDOWS`] is full.
+    /// A record under the per-source limit then takes one token from [`PutRecordBudget`];
+    /// when that budget is empty, the record is shed without a penalty. Validator, operator,
+    /// and bootstrap sources are exempt from that budget, but not from the per-source window.
     /// The local node's own id is never limited, and live budgets survive disconnects.
-    /// Shed and flood outcomes each bump the rate-limit metric.
+    /// Shed, flood, and budget outcomes each bump the rate-limit metric.
     pub(crate) fn put_record_rate_limited(&mut self, source: PeerId) -> PutRecordRate {
+        self.put_record_rate_limited_at(source, Instant::now())
+    }
+
+    /// [`Self::put_record_rate_limited`] at an explicit `now`.
+    fn put_record_rate_limited_at(&mut self, source: PeerId, now: Instant) -> PutRecordRate {
         if self.is_local_peer(&source) {
             PutRecordRate::Allowed
         } else if self.put_record_windows.len() >= MAX_RATE_WINDOWS
@@ -1098,7 +2269,6 @@ impl PeerManager {
             self.metrics.record_put_record_rate_limited(&PutRecordRate::Shed);
             PutRecordRate::Shed
         } else {
-            let now = Instant::now();
             let window = self.put_record_windows.entry(source).or_insert(PutRecordWindow {
                 count: 0,
                 started: now,
@@ -1121,15 +2291,35 @@ impl PeerManager {
                 }
                 () => PutRecordRate::Shed,
             };
-            self.metrics.record_put_record_rate_limited(&rate);
-            rate
+            match rate {
+                PutRecordRate::Allowed => self.put_record_budget_rate(&source, now),
+                PutRecordRate::Shed | PutRecordRate::Flooding => {
+                    self.metrics.record_put_record_rate_limited(&rate);
+                    rate
+                }
+            }
+        }
+    }
+
+    /// Take one token from the shared inbound `PutRecord` budget unless `source` is exempt.
+    ///
+    /// An exempt source never spends a token. An empty budget sheds the record without a
+    /// penalty and bumps the `budget` rate-limit metric.
+    fn put_record_budget_rate(&mut self, source: &PeerId, now: Instant) -> PutRecordRate {
+        if self.peer_policy(source).exempts_shared_record_budget()
+            || self.put_record_budget.try_take(now)
+        {
+            PutRecordRate::Allowed
+        } else {
+            self.metrics.record_put_record_budget_shed();
+            PutRecordRate::Shed
         }
     }
 
     /// Admit a peer record pushed to us over the peer's own authenticated connection (a kad PUT
     /// whose `source` is the sending peer).
     ///
-    /// A committee member is cached in `known_peers` exactly as via [`Self::add_discovered_peer`].
+    /// A committee member is cached exactly as via [`Self::add_discovered_peer_with_timestamp`].
     ///
     /// A pinned peer (operator-provisioned trusted/bootstrap/explicit) is admitted the same way
     /// even while it sits in no committee slot. The pinned set is bounded by node configuration,
@@ -1138,7 +2328,7 @@ impl PeerManager {
     /// pushes its record once, on first connect, which lands before the epoch loop has seeded
     /// this swarm's committee slots. Gating on membership alone would discard that push, and the
     /// config stub would then satisfy every re-discovery trigger until the next kad republish.
-    /// The stub exemption in [`Self::kad_record_is_stale`] lets the real record replace the
+    /// The stub exemption in [`Self::kad_timestamp_is_stale`] lets the real record replace the
     /// stub; once it has, the usual timestamp monotonicity guards the learned record.
     ///
     /// A non-committee, unpinned peer that advertises its OWN record - the authenticated kad-put
@@ -1151,40 +2341,72 @@ impl PeerManager {
     /// and keeps the issue #827 bound against unbounded record injection intact. A relayed record
     /// (`source` != the advertised identity) cannot confirm an identity the sender does not
     /// control and is dropped, so this never lets a peer displace another peer's identity.
-    pub(crate) fn add_self_advertised_peer(
+    ///
+    /// For a tracked key outside the committee cache, the record, own or relayed, is also offered
+    /// to [`Self::retain_tracked`]. That retention binds nothing, so the identity handling above
+    /// is the same whether or not the key is tracked.
+    pub(crate) fn add_self_advertised_peer_with_timestamp(
         &mut self,
         source: PeerId,
         bls_key: BlsPublicKey,
         info: NetworkInfo,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
     ) {
         let advertised: PeerId = info.pubkey.clone().into();
-        if self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key) {
-            if self.kad_record_is_stale(&bls_key, &info) {
+        let cacheable =
+            self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key);
+        if !cacheable
+            && self.is_tracked_key(&bls_key)
+            && self.retain_tracked(bls_key, info.clone(), timestamp, observed)
+        {
+            self.record_tracked_resolution();
+        }
+        match () {
+            () if cacheable && self.kad_timestamp_is_stale(&bls_key, timestamp, observed) => {
                 trace!(
                     target: "peer-manager",
                     ?bls_key,
                     ?source,
                     "dropping stale self-advertised record for committee member"
                 );
-                return;
+                self.rebind_from_cache(bls_key, source);
             }
-            self.cache_known_peer(bls_key, info);
-        } else if source == advertised {
-            trace!(
-                target: "peer-manager",
-                ?bls_key,
-                ?source,
-                "confirming self-advertised connected peer identity"
-            );
-            self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
-        } else {
-            trace!(
-                target: "peer-manager",
-                ?bls_key,
-                ?source,
-                "dropping non-committee relayed peer record"
-            );
+            () if cacheable => self.cache_known_peer_with_timestamp(bls_key, info, timestamp),
+            () if source == advertised
+                && self.trusted_binding_matches(bls_key, &info)
+                && !self.committee_peers.values().any(|peer| peer.network_key == info.pubkey) =>
+            {
+                trace!(
+                    target: "peer-manager",
+                    ?bls_key,
+                    ?source,
+                    "confirming self-advertised connected peer identity"
+                );
+                self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
+            }
+            () => {
+                trace!(
+                    target: "peer-manager",
+                    ?bls_key,
+                    ?source,
+                    "dropping non-committee relayed peer record"
+                );
+            }
         }
+    }
+
+    /// Admit a verified test advertisement under the ordinary local clock policy.
+    #[cfg(test)]
+    pub(crate) fn add_self_advertised_peer(
+        &mut self,
+        source: PeerId,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+    ) {
+        let observed = now();
+        let timestamp = crate::freshness::RecordTimestamp::admit(info.timestamp, observed);
+        self.add_self_advertised_peer_with_timestamp(source, bls_key, info, timestamp, observed);
     }
 
     /// Number of distinct multiaddrs currently retained for `peer_id`, if it is tracked.
@@ -1193,12 +2415,18 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
     }
 
-    /// Check whether a kad-sourced record's timestamp fails to advance the cached entry.
+    /// Refill the shared inbound `PutRecord` budget to its burst.
+    #[cfg(test)]
+    pub(crate) fn refill_put_record_budget(&mut self) {
+        self.put_record_budget = PutRecordBudget::new(Instant::now());
+    }
+
+    /// Check whether a kad-sourced record fails the shared local freshness policy.
     ///
-    /// Mirrors the store-side `is_newer_record` monotonicity check (consensus.rs) so kad-sourced
-    /// updates can never regress a fresher `known_peers` entry — `get_record` query results reach
+    /// Mirrors the store-side freshness check so kad-sourced ordinary records never regress
+    /// a fresher `known_peers` entry. Clamped entries permit bounded repair. Query results reach
     /// the cache without passing through the store, so the store-side check alone cannot protect
-    /// it. EQUAL timestamps keep the existing entry (benign replay churn — the same rule as the
+    /// it. Equal signed timestamps keep the existing entry (the same rule as the
     /// store side). Operator-provisioned paths bypass this guard structurally: they all stamp
     /// `timestamp: now()` when building the [`NetworkInfo`] (the `AddTrustedPeerAndDial` /
     /// `AddExplicitPeer` / `AddBootstrapPeers` handlers in consensus.rs), and
@@ -1214,12 +2442,60 @@ impl PeerManager {
     /// so a relayed or replayed older record cannot regress it. Keying the exemption on
     /// `pinned_peers` instead would leave every operator-provisioned validator open to that
     /// regression for the life of the process, because pins are never cleared.
-    fn kad_record_is_stale(&self, bls_key: &BlsPublicKey, info: &NetworkInfo) -> bool {
+    fn kad_timestamp_is_stale(
+        &self,
+        bls_key: &BlsPublicKey,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+    ) -> bool {
         !self.stub_records.contains(bls_key)
+            && self.known_peers.get(bls_key).is_some_and(|existing| {
+                let cached = self.known_timestamps.get(bls_key).copied().unwrap_or_else(|| {
+                    crate::freshness::RecordTimestamp::legacy(existing.timestamp, observed)
+                });
+                !timestamp.supersedes(cached, observed)
+            })
+    }
+
+    /// Restore the evicted `Confirmed` record of `bls_key` from its cached record when a refreshed
+    /// copy of that record is dropped as stale or identical (issue #1649).
+    ///
+    /// The cache path skips a dropped record, so without this a member whose record was evicted
+    /// keeps its `known_peers` entry but no `bls_by_peer_id` binding, and loses its validator
+    /// identity at this node until it signs a newer record. The binding is restored only when
+    /// `source` is unbound, the cached entry is a network-learned record (not a stub), and the
+    /// cached network key derives `source`. A sender can therefore only restore the binding the
+    /// cache already holds, never bind a key to another peer id. The cached record and its
+    /// timestamp are not changed, so freshness ordering is unchanged. Committee membership is
+    /// then applied as on the cache path.
+    fn rebind_from_cache(&mut self, bls_key: BlsPublicKey, source: PeerId) {
+        let restore = self.peers.bls_for_peer(&source).is_none()
+            && !self.stub_records.contains(&bls_key)
             && self
                 .known_peers
-                .get(bls_key)
-                .is_some_and(|existing| existing.timestamp >= info.timestamp)
+                .get(&bls_key)
+                .is_some_and(|info| PeerId::from(info.pubkey.clone()) == source);
+        if restore {
+            trace!(target: "peer-manager", ?bls_key, ?source, "re-binding peer from cached record");
+            self.upsert_cached(bls_key);
+            let unban_actions = self.peers.apply_membership_if_committee(bls_key);
+            self.apply_unban_actions(unban_actions);
+        }
+    }
+
+    /// Re-insert the `Confirmed` record of `bls_key` into the peer store from its `known_peers`
+    /// entry.
+    ///
+    /// Leaves `known_peers`, `stub_records` and `known_timestamps` unchanged. A no-op when nothing
+    /// is cached for `bls_key`.
+    fn upsert_cached(&mut self, bls_key: BlsPublicKey) {
+        let cached = self
+            .known_peers
+            .get(&bls_key)
+            .map(|info| (info.pubkey.clone(), info.multiaddrs.clone()));
+        cached.into_iter().for_each(|(pubkey, multiaddrs)| {
+            self.peers.upsert_peer(bls_key, pubkey, multiaddrs);
+        });
     }
 
     /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
@@ -1229,25 +2505,109 @@ impl PeerManager {
     /// pinned or admitted at all. Every record reaching this point is treated as network-learned
     /// (kad discovery, a self-advertised push, or a restore from persistence), so any stub mark
     /// for the key is cleared; the operator-provisioned callers re-mark their entry afterwards.
-    fn cache_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
+    fn cache_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        let timestamp = crate::freshness::RecordTimestamp::admit(info.timestamp, now());
+        self.cache_known_peer_with_timestamp(bls_key, info, timestamp);
+    }
+
+    /// Reject both directions of a learned binding that contradicts a configured hub.
+    fn trusted_binding_matches(&self, bls_key: BlsPublicKey, info: &NetworkInfo) -> bool {
+        self.trusted_dials.iter().all(|(expected_bls, dial)| {
+            (*expected_bls != bls_key || dial.info.pubkey == info.pubkey)
+                && (dial.info.pubkey != info.pubkey || *expected_bls == bls_key)
+        })
+    }
+
+    /// Update identity, addresses and RPC info together with their local ordering metadata.
+    fn cache_known_peer_with_timestamp(
+        &mut self,
+        bls_key: BlsPublicKey,
+        mut info: NetworkInfo,
+        timestamp: crate::freshness::RecordTimestamp,
+    ) {
+        if !self.trusted_binding_matches(bls_key, &info) {
+            bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "ignoring record that contradicts configured hub identity");
+        } else if !self.launch_binding_matches(bls_key, &info) {
+            bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "rejecting record that contradicts launch inventory");
+        } else {
+            if let Some(peer) = self.committee_peers.get(&bls_key) {
+                let signed =
+                    std::mem::replace(&mut info.multiaddrs, vec![peer.network_address.clone()]);
+                self.launch_record_addrs.insert(bls_key, signed);
+            }
+            self.cache_compatible_peer_with_timestamp(bls_key, info, timestamp);
+        }
+    }
+
+    /// Check both directions of a launch BLS/network binding before mutating peer identity.
+    fn launch_binding_matches(&self, bls_key: BlsPublicKey, info: &NetworkInfo) -> bool {
+        self.committee_peers.get(&bls_key).is_none_or(|peer| peer.network_key == info.pubkey)
+            && !self
+                .committee_peers
+                .iter()
+                .any(|(key, peer)| *key != bls_key && peer.network_key == info.pubkey)
+    }
+
+    /// Whether `bls_key` is scheduled or eligible and is not this swarm's own key.
+    fn is_tracked_key(&self, bls_key: &BlsPublicKey) -> bool {
+        Some(*bls_key) != self.local_bls_key && self.tracked.contains(bls_key)
+    }
+
+    /// Retain a verified record of a tracked key for export, outside the committee cache.
+    ///
+    /// The caller has checked that the key is tracked. A record that contradicts a configured hub
+    /// or a launch binding, in either direction, is refused as on the committee cache path, and a
+    /// record that does not supersede the held one is dropped. Nothing here touches the peer
+    /// store, `known_peers`, or [`Self::peer_to_bls`]. Returns whether the record was kept.
+    fn retain_tracked(
+        &mut self,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+    ) -> bool {
+        if !self.trusted_binding_matches(bls_key, &info) {
+            bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "ignoring tracked record that contradicts configured hub identity");
+            false
+        } else if !self.launch_binding_matches(bls_key, &info) {
+            bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "ignoring tracked record that contradicts launch inventory");
+            false
+        } else if self.tracked.retain(bls_key, info, timestamp, observed) {
+            trace!(target: "peer-manager", ?bls_key, "retaining tracked peer record");
+            true
+        } else {
+            trace!(target: "peer-manager", ?bls_key, "dropping stale tracked peer record");
+            false
+        }
+    }
+
+    /// Cache a compatible binding together with its original local ordering metadata.
+    fn cache_compatible_peer_with_timestamp(
+        &mut self,
+        bls_key: BlsPublicKey,
+        mut info: NetworkInfo,
+        timestamp: crate::freshness::RecordTimestamp,
+    ) {
         // signature verification proves authenticity but not scheme correctness; drop a
         // malformed advertised endpoint so only well-formed RPC info is ever cached in
         // `known_peers`. the rest of the (signed, authentic) record is still usable.
-        if let Some(rpc) = &info.rpc {
-            if let Err(err) = rpc.validate() {
-                warn!(
-                    target: "peer-manager",
-                    ?err,
-                    ?bls_key,
-                    "dropping malformed advertised RPC endpoint from peer record"
-                );
-                info.rpc = None;
-            }
-        }
+        info.rpc = info.rpc.filter(|rpc| {
+            rpc.validate()
+                .inspect_err(|err| {
+                    bounded_warn!(PeerRecord,
+                        target: "peer-manager",
+                        ?err,
+                        ?bls_key,
+                        "dropping malformed advertised RPC endpoint from peer record"
+                    );
+                })
+                .is_ok()
+        });
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info);
         self.stub_records.remove(&bls_key);
+        self.known_timestamps.insert(bls_key, timestamp);
         // if this newly-discovered peer belongs to a tracked committee, unban/trust it now
         // (closing the trust window) instead of waiting for the next epoch's `update_committees`.
         // `upsert_peer` just re-keyed it onto its `Confirmed` identity, so the trust pass can
@@ -1295,6 +2655,28 @@ impl PeerManager {
             .collect()
     }
 
+    /// Snapshot membership and learned advertisements without racing committee rotation.
+    pub(crate) fn committee_rpc_snapshot(&mut self) -> CommitteeRpcSnapshot {
+        let advertisements = self.current_committee_rpcs();
+        let rpcs =
+            advertisements.iter().filter(|(key, _)| !self.record_unlearned(key)).cloned().collect();
+        CommitteeRpcSnapshot::new(self.peers.current_committee().clone(), rpcs, advertisements)
+    }
+
+    /// Observe required remote identities in each slot using the resolution consumer's state.
+    /// Self is excluded from both counts because it never needs remote discovery.
+    pub(crate) fn observe_committee_resolution(&self, local_key: BlsPublicKey) {
+        ["previous", "current", "next"].into_iter().zip(self.peers.committee_slots()).for_each(
+            |(slot, members)| {
+                let required = members.iter().filter(|key| **key != local_key);
+                let expected = required.clone().count();
+                let unresolved = required.filter(|key| self.record_unlearned(key)).count();
+                self.metrics.set_committee_resolution(slot, expected, unresolved);
+            },
+        );
+        self.metrics.mark_committee_observed();
+    }
+
     /// Find the peer id for an authority.
     pub(crate) fn auth_to_peer(&self, bls_key: BlsPublicKey) -> Option<(PeerId, Vec<Multiaddr>)> {
         if let Some(NetworkInfo { pubkey, multiaddrs, .. }) = self.known_peers.get(&bls_key) {
@@ -1305,11 +2687,11 @@ impl PeerManager {
         }
     }
 
-    /// Find the BlsPublicKey for a known PeerId.
+    /// Find the verified BlsPublicKey binding for a known PeerId.
     ///
-    /// Backed by the peer store's `Confirmed`-identity index, populated for connected/known peers.
+    /// Configuration stubs remain dial hints until a verified signed record confirms the binding.
     pub(crate) fn peer_to_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
-        self.peers.bls_for_peer(peer_id)
+        self.peers.bls_for_peer(peer_id).filter(|bls| !self.stub_records.contains(bls))
     }
 
     /// Visibility helper for behavior to evaluate pending outbound connection attempts.
@@ -1355,7 +2737,8 @@ impl PeerManager {
     /// - it has at least one valid ip address (ipv4/ipv6)
     /// - none of its ip addresses are banned
     /// - it can be dialed (not connected/dialing/banned)
-    fn eligible_for_discovery(&self, info: &PeerInfo) -> bool {
+    /// - under effective Closed, it is in the authorized `scope`
+    fn eligible_for_discovery(&self, info: &PeerInfo, scope: Option<&HashSet<PeerId>>) -> bool {
         // never add our own identity to the discovery feed; a self entry (learned
         // via kad closest-peers or peer exchange) would otherwise be selected for
         // a self-dial during the heartbeat.
@@ -1372,6 +2755,7 @@ impl PeerManager {
             && info.addrs.len() <= MAX_MULTIADDRS_PER_PEER
             && self.has_valid_unbanned_ips(&info.addrs)
             && self.peers.can_dial(&info.peer_id)
+            && scope.is_none_or(|authorized| authorized.contains(&info.peer_id))
     }
 
     /// Process newly discovered peers for potential dial attempts.
@@ -1386,7 +2770,8 @@ impl PeerManager {
     /// heartbeat prune it mirrors. [`Self::process_peer_exchange`] stays fill-to-spare-capacity
     /// only, which keeps kad-discovered peers prioritized over exchange peers.
     pub(crate) fn process_peers_for_discovery(&mut self, mut peers: Vec<PeerInfo>) {
-        peers.retain(|peer| self.eligible_for_discovery(peer));
+        let scope = self.admission_dial_scope();
+        peers.retain(|peer| self.eligible_for_discovery(peer, scope.as_ref()));
         trace!(target: "peer-manager", ?peers, "adding eligible peers to discovery map");
         self.discovery_peers.extend(peers.into_iter().map(|info| (info.peer_id, info.addrs)));
 
@@ -1407,9 +2792,10 @@ impl PeerManager {
     fn discovery_heartbeat(&mut self) {
         // take discovery peers and filter ineligble peers
         let mut discovery_peers = std::mem::take(&mut self.discovery_peers);
+        let scope = self.admission_dial_scope();
         discovery_peers.retain(|peer_id, addrs| {
             let peer_info = PeerInfo { peer_id: *peer_id, addrs: addrs.clone() };
-            self.eligible_for_discovery(&peer_info)
+            self.eligible_for_discovery(&peer_info, scope.as_ref())
         });
 
         // calculate dial attempts needed for target connection limits

@@ -79,7 +79,7 @@ fi
 # Refuse to attest content that is behind main.
 #
 # This matters more, not less, now that main uses a merge queue. The queue re-runs fmt,
-# clippy and the two test lanes against `main + PR`, so a stale branch is caught there for
+# clippy and the three test lanes against `main + PR`, so a stale branch is caught there for
 # everything CI can afford to run. What the queue can NOT re-run is the e2e suite below --
 # it is the reason this script exists, and it only ever executes here, against whatever
 # this branch happens to be based on. Attesting a branch that is behind main therefore
@@ -108,19 +108,36 @@ fi
 # nothing, so it runs first and fails fast)
 ./etc/archive-mode-guard.sh
 
-# guard against rocksdb re-entering the default feature graph (resolves the graph, compiles
+# guard against rocksdb coming back anywhere (reads Cargo.lock and the manifests, compiles
 # nothing). The merge queue runs this too; until it ran here as well, the queue enforced a
 # check the attested run had never made.
 ./etc/rocksdb-gate.sh
 
-# fmt, clippy and both unit-test lanes. These live in etc/ci-lanes.sh because
-# .github/workflows/pr.yaml runs the very same file, on `pull_request` and again on
-# `merge_group` against main + this PR. One definition, so the queue cannot end up
+# fmt, clippy and the three test lanes CI runs (ci-lanes.sh's `test-mdbx` is run by hand). These
+# live in etc/ci-lanes.sh because .github/workflows/pr.yaml runs the very same file, on
+# `pull_request` and again on `merge_group` against main + this PR. One definition, so the queue cannot end up
 # enforcing something narrower than what gets attested here.
 ./etc/ci-lanes.sh fmt
 ./etc/ci-lanes.sh clippy
 ./etc/ci-lanes.sh test-default
 ./etc/ci-lanes.sh test-adiri
+./etc/ci-lanes.sh test-vendor-reth
+
+# The engine's and the adapter's heavy test variants (`#[ignore = "heavy: run with --release"]`:
+# the random workloads at size, the crash matrices, the differential test against MDBX at 2000
+# scripts, the crash test that kills a child inside a commit; about 12 minutes). No merge-queue
+# lane runs them (CI runs nextest in debug), so they run here, before the e2e suites. The
+# benchmark and the stamp probe guard nothing and are skipped, as the crates' CLAUDE.md say.
+cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --skip stamp_probe
+cargo test --release -p tn-lmdb-reth -- --ignored --skip tn_lmdb_reth_vs_mdbx --skip tn_lmdb_vs_mdbx
+
+# The vendored reth's own invariants: every TN change to the copy is named by a ledger entry,
+# the copy matches the upstream pin plus the ledger, and the manifests stay inside the carried
+# crate set. They need the upstream clone (~/.cache/tn-vendor/reth, cloned on first use), which
+# CI does not have; the attested run makes the claim the ledger otherwise only asserts.
+python3 -I vendor/reth/tn/vendor.py status > /dev/null
+python3 -I vendor/reth/tn/vendor.py ledger
+python3 -I vendor/reth/tn/vendor.py check
 
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.
@@ -141,6 +158,22 @@ esac
 cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$E2E_TARGET_ROOT"
 TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
     cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
+
+# The reth database migration and rebuild suites (`reth_db_migration`, `resync`): a committee
+# starts on the MDBX build, and a validator moves onto the default (tn-lmdb) build in place, which
+# migrates its reth database and keeps storage layout v1; `resync` then rebuilds it from genesis in
+# layout v2 and compares it with a validator still on MDBX. Both skip without an MDBX previous
+# binary (TN_BIN_PATH_PREV, with the TN_E2E_TN_LMDB_BIN marker), which the run above does not set,
+# so they run here through their make targets: those build the MDBX e2e binary (`mdbx-e2e/` under
+# the same target root) and pass both, so each lane has one definition.
+# The rolling-upgrade suite (`make test-upgrade`) is not run here: its previous binary is a build
+# of the release the network runs (`make build-e2e-bin-prev TN_PREV_REF=v0.17.0-adiri`), which this
+# script does not build. Run it by hand against that release before a change to the execution path
+# ships (vendor/reth/CLAUDE.md, "Fork safety"). Its passing does not make a rolling adiri upgrade
+# safe: TN-0140 changes the state root of a trie shape its workload does not build, so adiri
+# validators upgrade all at once (crates/tn-reth/README.md, "Upgrade every validator together").
+make test-e2e-reth-migration
+make test-e2e-resync
 
 echo "all checks passed - submitting attestation on-chain..."
 
@@ -174,7 +207,8 @@ echo "Contract state update initiated with commit hash: ${COMMIT_HASH}"
 echo "Script took ${SECONDS}s to complete"
 echo
 echo "This attestation satisfies the 'verify-on-chain' lane on the pull request. Attesting"
-echo "changes nothing on GitHub, so re-run that lane on this sha yourself: request a review"
-echo "on the PR, or re-run the failed job. Do not push -- a new sha needs a new attestation."
-echo "When the PR is queued, the merge queue re-runs fmt, clippy and both test lanes against"
+echo "changes nothing on GitHub, so re-run that lane on this sha yourself: open the failed"
+echo "run in the Actions tab and choose 'Re-run failed jobs' ('gh run rerun <run> --failed'"
+echo "needs a token with actions: write). Do not push -- a new sha needs a new attestation."
+echo "When the PR is queued, the merge queue re-runs fmt, clippy and the test lanes against"
 echo "main + this PR; expect that second run and do not force-push while it is queued."

@@ -1,10 +1,14 @@
 //! State sync tests for primaries.
 
 use crate::{network::MissingCertificatesRequest, state_sync::CertificateCollector};
+use assert_matches::assert_matches;
+use futures::StreamExt as _;
 use std::{collections::BTreeSet, num::NonZeroUsize};
 use tn_storage::{mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
-use tn_types::{AuthorityIdentifier, Certificate, Hash as _, SignatureVerificationState};
+use tn_types::{
+    AuthorityIdentifier, BlsSignature, Certificate, Hash as _, SignatureVerificationState,
+};
 
 #[test]
 fn test_certificate_iterator() {
@@ -112,5 +116,97 @@ fn test_certificate_iterator() {
             collector.map(|cert| cert.expect("cert recovered correctly").round()).collect();
 
         assert_eq!(missing, expected_rounds);
+    }
+}
+
+/// The responder serves a stored certificate whose aggregate signature a fetch took on trust only
+/// once that signature verifies, and stores the check; a copy whose signature fails is never
+/// served, and a later request leaves it out again without a second check.
+#[tokio::test]
+async fn test_verified_stream_serves_only_checked_signatures() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let primary = fixture.authorities().next().expect("primary in committee fixture");
+    let consensus_config = primary.consensus_config();
+    let store = consensus_config.node_storage().clone();
+
+    // one round-1 certificate per authority: directly verified, indirect with a valid signature,
+    // indirect with a corrupted signature, and one more indirect with a valid signature
+    let genesis: BTreeSet<_> =
+        Certificate::genesis(&fixture.committee()).iter().map(|cert| cert.digest()).collect();
+    let (_, headers) = fixture.headers_round(0, &genesis);
+    let certificates: Vec<Certificate> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, header)| {
+            let mut cert = fixture.certificate(header);
+            let valid = cert.aggregated_signature().expect("fixture certificates are signed");
+            cert.set_signature_verification_state(match i {
+                0 => SignatureVerificationState::VerifiedDirectly(valid),
+                2 => SignatureVerificationState::VerifiedIndirectly(BlsSignature::default()),
+                _ => SignatureVerificationState::VerifiedIndirectly(valid),
+            });
+            store.write(cert.clone()).expect("write certificate");
+            cert
+        })
+        .collect();
+    let corrupted = certificates[2].clone();
+
+    let authorities: Vec<AuthorityIdentifier> =
+        certificates.iter().map(|cert| cert.origin().clone()).collect();
+    let serve = || async {
+        let req = MissingCertificatesRequest::default()
+            .set_bounds(0, authorities.iter().map(|a| (a.clone(), BTreeSet::new())).collect())
+            .expect("bounds within range");
+        let collector = CertificateCollector::new(
+            req.exclusive_lower_bound,
+            req.skip_rounds,
+            consensus_config.clone(),
+        )
+        .expect("certificate collector process valid request");
+        collector
+            .into_verified_stream()
+            .map(|cert| cert.expect("certificate served"))
+            .collect::<Vec<_>>()
+            .await
+    };
+
+    for request in ["first request", "second request"] {
+        let served = serve().await;
+        let expected: BTreeSet<_> = certificates
+            .iter()
+            .map(|cert| cert.digest())
+            .filter(|digest| *digest != corrupted.digest())
+            .collect();
+        assert_eq!(
+            served.iter().map(|cert| cert.digest()).collect::<BTreeSet<_>>(),
+            expected,
+            "{request}: every certificate but the corrupted one is served"
+        );
+        assert_eq!(served.len(), expected.len(), "{request}: each certificate is served once");
+        for cert in &served {
+            assert_matches!(
+                cert.signature_verification_state(),
+                SignatureVerificationState::VerifiedDirectly(sig)
+                    if Some(*sig) == fixture.certificate(cert.header()).aggregated_signature(),
+                "{request}: a served copy carries a signature this node checked"
+            );
+            assert_matches!(
+                store
+                    .read(cert.digest())
+                    .expect("store")
+                    .expect("stored")
+                    .signature_verification_state(),
+                SignatureVerificationState::VerifiedDirectly(_),
+                "{request}: the check is stored with the certificate"
+            );
+        }
+        assert_matches!(
+            store.read(corrupted.digest()).expect("store").expect("stored").signature_verification_state(),
+            SignatureVerificationState::Unsigned(sig) if *sig == BlsSignature::default(),
+            "{request}: the corrupted copy stays stored, marked as failed"
+        );
     }
 }

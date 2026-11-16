@@ -1,0 +1,59 @@
+{
+  "automated_security_fixes": {
+    "enabled": false,
+    "paused": false
+  },
+  "commands": [
+    "gh api repos/Telcoin-Association/telcoin-network/vulnerability-alerts --include",
+    "gh api repos/Telcoin-Association/telcoin-network/automated-security-fixes",
+    "gh api repos/Telcoin-Association/telcoin-network/dependency-graph/sbom"
+  ],
+  "path_alert_delivery": "unverified",
+  "recognized_main_branch_packages": [
+    {
+      "name": "libp2p-tls",
+      "versionInfo": ">= 0.7.0,< 0.8.0"
+    },
+    {
+      "name": "quinn-proto",
+      "versionInfo": ">= 0.11.0,< 0.12.0"
+    },
+    {
+      "name": "aws-lc-rs",
+      "versionInfo": "1.16.2"
+    },
+    {
+      "name": "tokio-rustls",
+      "versionInfo": "0.26.4"
+    },
+    {
+      "name": "quinn-proto",
+      "versionInfo": "0.11.18"
+    },
+    {
+      "name": "aws-lc-sys",
+      "versionInfo": "0.39.1"
+    },
+    {
+      "name": "rustls",
+      "versionInfo": "0.23.37"
+    },
+    {
+      "name": "hyper-rustls",
+      "versionInfo": "0.27.7"
+    },
+    {
+      "name": "futures-rustls",
+      "versionInfo": "0.26.0"
+    },
+    {
+      "name": "libp2p-tls",
+      "versionInfo": "0.7.0"
+    }
+  ],
+  "recorded_at": "2026-09-30",
+  "repository": "Telcoin-Association/telcoin-network",
+  "vendored_libp2p_quic_recognized": false,
+  "version_updates_configured": false,
+  "vulnerability_alerts_status": 204
+}

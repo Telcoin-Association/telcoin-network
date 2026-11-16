@@ -1,0 +1,29 @@
+# Prometheus configuration for the observability compose profile.
+#
+# The telcoin-node job scrapes the four local validators over the compose bridge
+# (each node binds --metrics to its fixed 10.10.0.2N address) and names them
+# validator1..4 in the instance label. The node job scrapes node_exporter on
+# loopback. Every series therefore carries the job and instance labels the
+# dashboard and the rules scope on.
+# See docs/src/getting-started/host-network-observability.md.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - rules/*.rules.yaml
+
+scrape_configs:
+  - job_name: telcoin-node
+    static_configs:
+      - targets: ["10.10.0.21:9101"]
+        labels: { instance: validator1 }
+      - targets: ["10.10.0.22:9101"]
+        labels: { instance: validator2 }
+      - targets: ["10.10.0.23:9101"]
+        labels: { instance: validator3 }
+      - targets: ["10.10.0.24:9101"]
+        labels: { instance: validator4 }
+  - job_name: node
+    static_configs:
+      - targets: ["127.0.0.1:9100"]

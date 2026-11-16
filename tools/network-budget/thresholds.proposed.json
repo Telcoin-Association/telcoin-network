@@ -1,0 +1,63 @@
+{
+  "status": "proposed",
+  "acceptance": "pending maintainer decision",
+  "parameters_defaults": {
+    "min_header_delay_seconds": 1.0,
+    "max_header_delay_seconds": 2.5,
+    "vote_timeout_seconds": 5.0,
+    "libp2p_request_timeout_seconds": 10.0,
+    "batch_vote_timeout_seconds": 10.0
+  },
+  "thresholds": [
+    {
+      "id": "vote-service-p99", "check": "service_p99", "class": "vote", "phases": ["catch-up", "mixed"],
+      "limit_seconds": 1.0, "aggregation": "worst_pair", "status": "proposed",
+      "rationale": "The default min_header_delay is 1 s. A vote p99 of 1 s or less keeps votes inside one header interval and far below the 5 s vote_timeout. The measure is the worst (node, network) pair, so one slow validator cannot hide in a committee pool."
+    },
+    {
+      "id": "epoch-record-service-p99", "check": "service_p99", "class": "epoch_record", "phases": ["catch-up", "mixed"],
+      "limit_seconds": 2.5, "aggregation": "worst_pair", "status": "proposed",
+      "rationale": "The default max_header_delay is 2.5 s. An epoch record p99 of 2.5 s or less stays inside one header interval and below the 10 s request timeout. The measure is the worst (node, network) pair."
+    },
+    {
+      "id": "batch-service-p99", "check": "service_p99", "class": "batch", "phases": ["catch-up", "mixed"],
+      "limit_seconds": 5.0, "aggregation": "worst_pair", "status": "proposed",
+      "rationale": "ReportBatch is the 2f+1 quorum-ack request, so batch is critical on worker swarms. The default batch_vote_timeout is 10 s. A batch p99 of 5 s or less on the worst (node, network) pair keeps quorum acks at half of that timeout."
+    },
+    {
+      "id": "critical-sheds", "check": "critical_sheds", "phases": ["steady", "catch-up", "reconnect", "hostile", "mixed"],
+      "limit": 0, "status": "proposed",
+      "rationale": "A shed vote, epoch record or batch request fails without a response, and the requester gets a stream error. Batch is critical because ReportBatch is the 2f+1 quorum-ack request. The count covers every shed reason: queue_full, unsubscribed and admission. The candidate must shed none in all phases."
+    },
+    {
+      "id": "critical-failures", "check": "critical_failures", "phases": ["steady", "catch-up", "hostile", "mixed"],
+      "limit": 0, "status": "proposed",
+      "rationale": "An admitted vote, epoch record or batch request must not fail with timeout, omitted, closed, io or unsupported. The reconnect phase is excluded: its planned restarts close in-flight streams, so closed and io failures there are expected. critical-sheds still covers reconnect. An admission shed also counts here as omitted."
+    },
+    {
+      "id": "established-within-allocation", "check": "within_allocation", "phases": ["steady", "catch-up", "reconnect", "hostile", "mixed"],
+      "status": "proposed",
+      "rationale": "The candidate sets process_budget. Established connections must not be more than the swarm allocation in any sample."
+    },
+    {
+      "id": "hostile-rejections-recover", "check": "hostile_recovery", "status": "proposed",
+      "rationale": "Hostile traffic must increase established-stage connection limit rejections (established_total, established_per_peer or established_incoming). At the last sample, established connections must be at or below the steady peak for each swarm."
+    },
+    {
+      "id": "persistence", "check": "persistence_ratio", "phases": ["steady", "mixed"], "limit": 0.95, "status": "proposed",
+      "rationale": "The candidate must keep at least 95 percent of the baseline block rate. The block rate comes from eth_blockNumber polls."
+    },
+    {
+      "id": "catch-up-time", "check": "catch_up_ratio", "limit": 1.10, "status": "proposed",
+      "rationale": "From the same state, the candidate catch-up time must be at most 110 percent of the baseline catch-up time."
+    },
+    {
+      "id": "rss-peak", "check": "rss_fraction", "limit": 0.5, "status": "proposed",
+      "rationale": "Peak process RSS must stay at or below half of host RAM. The remainder is headroom for execution, storage and other servers."
+    },
+    {
+      "id": "cpu-p95", "check": "cpu_fraction", "limit": 0.75, "status": "proposed",
+      "rationale": "Process CPU p95 must stay at or below 75 percent of host CPUs. Record the network share separately from a profiler trace."
+    }
+  ]
+}

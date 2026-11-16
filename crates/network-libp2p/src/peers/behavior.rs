@@ -1,7 +1,13 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
-use super::{manager::PeerManager, types::DialRequest, PeerEvent};
-use crate::peers::types::ConnectionType;
+use super::{
+    manager::PeerManager, public_share::PublicShareExceeded, types::DialRequest, PeerEvent,
+};
+use crate::{
+    diagnostics::bounded_error,
+    metrics::{ConnectionDirection, ListenFailureReason},
+    peers::types::ConnectionType,
+};
 use libp2p::{
     core::{transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{
@@ -9,12 +15,79 @@ use libp2p::{
         dial_opts::{DialOpts, PeerCondition},
         dummy::ConnectionHandler,
         ConnectionClosed, ConnectionDenied, ConnectionId, DialError, DialFailure, FromSwarm,
-        NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
+        ListenFailure, NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
     },
     Multiaddr, PeerId,
 };
 use std::task::{Context, Poll};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, info, trace};
+
+/// A policy denial owned by the peer manager, preserved through libp2p's error wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerAdmissionDenied {
+    /// The remote identity is this swarm's own identity.
+    LocalPeer,
+    /// The authenticated remote peer is banned.
+    BannedPeer,
+    /// The remote address has no supported, unbanned IP address.
+    InvalidIp,
+    /// The Closed admission policy refuses this peer.
+    ClosedAdmission,
+    /// The public connection share refuses this peer without privilege.
+    PublicShare(PublicShareExceeded),
+}
+
+impl PeerAdmissionDenied {
+    /// Every policy denial, in label order.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::LocalPeer,
+        Self::BannedPeer,
+        Self::InvalidIp,
+        Self::ClosedAdmission,
+        Self::PublicShare(PublicShareExceeded::Share),
+        Self::PublicShare(PublicShareExceeded::PerPeer),
+    ];
+
+    /// The bounded metric reason for this policy denial.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::LocalPeer => "peer_manager_local_peer",
+            Self::BannedPeer => "peer_manager_banned_peer",
+            Self::InvalidIp => "peer_manager_invalid_ip",
+            Self::ClosedAdmission => "peer_manager_closed_admission",
+            Self::PublicShare(exceeded) => exceeded.reason(),
+        }
+    }
+}
+
+impl std::fmt::Display for PeerAdmissionDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::LocalPeer => "self-connection: remote peer id is our own",
+            Self::BannedPeer => "peer is banned",
+            Self::InvalidIp => "Connection denied: peer has no valid unbanned IP addresses",
+            Self::ClosedAdmission => "closed connection admission policy",
+            Self::PublicShare(PublicShareExceeded::Share) => "public connection share is full",
+            Self::PublicShare(PublicShareExceeded::PerPeer) => {
+                "peer without privilege holds its connection limit"
+            }
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for PeerAdmissionDenied {}
+
+/// Whether the Closed admission policy refused this dial.
+fn is_closed_admission_denial(error: &DialError) -> bool {
+    matches!(
+        error,
+        DialError::Denied { cause }
+            if cause
+                .downcast_ref::<PeerAdmissionDenied>()
+                .is_some_and(|denied| matches!(denied, PeerAdmissionDenied::ClosedAdmission))
+    )
+}
 
 impl NetworkBehaviour for PeerManager {
     type ConnectionHandler = ConnectionHandler;
@@ -27,6 +100,9 @@ impl NetworkBehaviour for PeerManager {
         addresses: &[Multiaddr], // kad may dial by PeerId only
         _effective_role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        // Check before the in-flight shortcut and Kademlia registration. Unknown identities
+        // cannot start a Closed dial; every established connection is checked again.
+        self.check_admission(maybe_peer.as_ref(), ConnectionDirection::Outbound)?;
         // kademlia can initiate dial attempts
         //
         // ensure PeerId isn't banned if known and register dial attempt
@@ -80,36 +156,38 @@ impl NetworkBehaviour for PeerManager {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        debug!(target: "network", ?remote_addr, "handle pending inbound connection");
         self.sanitize_ip_addr(remote_addr)
     }
 
     fn handle_established_inbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        trace!(target: "peer-manager", ?peer, ?remote_addr, "inbound connection established");
         // drop a self-connection (loopback/hairpin back to our own id) without
         // scoring it. The inbound peer id is only known at this stage, so this is
         // the earliest point an inbound self-connection can be rejected.
         if self.is_local_peer(&peer) {
-            debug!(target: "peer-manager", ?peer, ?remote_addr, "denying inbound self-connection");
-            return Err(ConnectionDenied::new("self-connection: remote peer id is our own"));
+            return Err(ConnectionDenied::new(PeerAdmissionDenied::LocalPeer));
         }
         // ensure banned peers are not accepted
         if self.peer_banned(&peer) {
-            return Err(ConnectionDenied::new("peer is banned"));
+            return Err(ConnectionDenied::new(PeerAdmissionDenied::BannedPeer));
         }
+        // Check admission after the local and ban checks, so those denials keep their labels.
+        self.check_admission(Some(&peer), ConnectionDirection::Inbound)?;
+        // A peer without privilege takes a public share slot; a full share refuses it here.
+        self.reserve_public_connection(connection_id, peer)?;
 
+        self.reserve_source(connection_id, peer, remote_addr, ConnectionDirection::Inbound)?;
         Ok(ConnectionHandler)
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         addr: &Multiaddr,
         _role_override: Endpoint,
@@ -123,17 +201,23 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new("self-connection: remote peer id is our own"));
         }
         if self.peer_banned(&peer) {
-            error!(target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
+            bounded_error!(PeerAdmission, target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
             return Err(ConnectionDenied::new("peer is banned"));
         }
 
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
         self.sanitize_ip_addr(addr)?;
+        // Check admission after the local, ban and IP checks, so those denials keep their causes.
+        self.check_admission(Some(&peer), ConnectionDirection::Outbound)?;
+        // A peer without privilege takes a public share slot; a full share refuses it here.
+        self.reserve_public_connection(connection_id, peer)?;
 
+        self.reserve_source(connection_id, peer, addr, ConnectionDirection::Outbound)?;
         Ok(ConnectionHandler)
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
+        self.on_source_swarm_event(&event);
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id, endpoint, ..
@@ -148,13 +232,28 @@ impl NetworkBehaviour for PeerManager {
             }
             FromSwarm::ConnectionClosed(ConnectionClosed {
                 peer_id,
+                connection_id,
                 endpoint,
                 remaining_established,
                 ..
-            }) => self.on_connection_closed(peer_id, endpoint, remaining_established),
-            FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id: _ }) => {
+            }) => {
+                self.on_connection_closed(peer_id, connection_id, endpoint, remaining_established)
+            }
+            FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id }) => {
                 debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
+                // An established outbound hook may hold a public share slot: free it.
+                self.release_public_connection(connection_id);
                 self.on_dial_failure(peer_id, error);
+            }
+            FromSwarm::ListenFailure(ListenFailure { error, connection_id, .. }) => {
+                // An established inbound hook may hold a public share slot when another
+                // behaviour refuses the connection: free it here. Peers are registered only on
+                // ConnectionEstablished, after every behaviour has accepted. The swarm and
+                // connection_limits own pending slots and clean them up on this same event.
+                // Do not disconnect the peer or complete a concurrent outbound dial here.
+                // Counters replace per-attempt logs on this remotely driven failure path.
+                self.metrics.record_listen_failure(ListenFailureReason::from_error(error));
+                self.release_public_connection(connection_id);
             }
             FromSwarm::ExternalAddrConfirmed(_) => {
                 // The external address was confirmed: possible to support NAT traversal
@@ -205,6 +304,8 @@ impl NetworkBehaviour for PeerManager {
                 opts: DialOpts::peer_id(peer_id)
                     .condition(PeerCondition::Disconnected)
                     .addresses(multiaddrs)
+                    // Try signed endpoints in order, with one connection attempt at a time.
+                    .override_dial_concurrency_factor(std::num::NonZeroU8::MIN)
                     .build(),
             });
         }
@@ -219,9 +320,7 @@ impl PeerManager {
     fn sanitize_ip_addr(&self, remote_addr: &Multiaddr) -> Result<(), ConnectionDenied> {
         // only support ipv4 and ipv6
         if !self.has_valid_unbanned_ips(std::slice::from_ref(remote_addr)) {
-            return Err(ConnectionDenied::new(
-                "Connection denied: peer has no valid unbanned IP addresses".to_string(),
-            ));
+            return Err(ConnectionDenied::new(PeerAdmissionDenied::InvalidIp));
         }
         Ok(())
     }
@@ -264,7 +363,7 @@ impl PeerManager {
         };
 
         // check connection limits
-        if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
+        if self.peer_limit_reached(endpoint) && !self.peer_is_privileged(&peer_id) {
             debug!(target: "peer-manager", ?peer_id, "peer limit reached - disconnecting with PX");
             // gracefully disconnect and indicate excess peers
             self.disconnect_peer(peer_id, true);
@@ -282,29 +381,32 @@ impl PeerManager {
     }
 
     /// Handle the connection closed event.
+    ///
+    /// The public share slot is freed per connection, ahead of the check of the peer's remaining
+    /// connections; the peer state changes only when its last connection closes.
     fn on_connection_closed(
         &mut self,
         peer_id: PeerId,
+        connection_id: ConnectionId,
         _endpoint: &ConnectedPoint,
         remaining_established: usize,
     ) {
-        if remaining_established > 0 {
-            return;
+        self.release_public_connection(connection_id);
+        if remaining_established == 0 {
+            // there are no more connections
+            if self.is_peer_connected_or_disconnecting(&peer_id) {
+                // if the peer's connection status is either `Connected` or `Disconnecting`,
+                // ensure the application layer is notified the peer has disconnected
+                self.push_event(PeerEvent::PeerDisconnected(peer_id));
+                debug!(target: "peer-manager", ?peer_id, "peer disconnected");
+            }
+
+            // if this node has too many peers, disconnect from the peer.
+            // when this happens, the peer manager still needs to register this peer
+            self.register_disconnected(&peer_id);
+
+            self.metrics.record_connection_closed();
         }
-
-        // there are no more connections
-        if self.is_peer_connected_or_disconnecting(&peer_id) {
-            // if the peer's connection status is either `Connected` or `Disconnecting`,
-            // ensure the application layer is notified the peer has disconnected
-            self.push_event(PeerEvent::PeerDisconnected(peer_id));
-            debug!(target: "peer-manager", ?peer_id, "peer disconnected");
-        }
-
-        // if this node has too many peers, disconnect from the peer.
-        // when this happens, the peer manager still needs to register this peer
-        self.register_disconnected(&peer_id);
-
-        self.metrics.record_connection_closed();
     }
 
     /// Dial attempt failed.
@@ -314,7 +416,12 @@ impl PeerManager {
     pub(super) fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
         self.metrics.record_dial_failure();
         if let Some(peer_id) = peer_id {
-            if !self.is_connected(&peer_id) {
+            // A Closed admission denial of an untracked peer adds no table entry, so refused
+            // discovery candidates do not churn the table. A peer that `dial_peer` registered
+            // as Dialing still moves to Disconnected.
+            let untracked_denial =
+                is_closed_admission_denial(error) && !self.is_tracked_peer(&peer_id);
+            if !self.is_connected(&peer_id) && !untracked_denial {
                 self.register_disconnected(&peer_id);
             }
 

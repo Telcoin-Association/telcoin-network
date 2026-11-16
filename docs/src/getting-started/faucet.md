@@ -2,7 +2,7 @@
 
 **1. Visit the Telcoin Network TEL Faucet**
 
-Visit[ https://telcoin.network/faucet](https://telcoin.network/faucet) on a desktop browser.
+Visit [https://telcoin.network/faucet](https://telcoin.network/faucet) on a desktop browser.
 
 Mobile users may need to follow a different procedure based on their mobile wallet application. For example, MetaMask users [must access the faucet webpage from the MetaMask application browser](https://support.metamask.io/getting-started/how-to-use-the-metamask-mobile-browser/) in order to interact with the faucet.
 
@@ -37,7 +37,7 @@ You will be prompted to add the new network information. Enter the following det
   * https://node3.telcoin.network
 * **Chain ID**: 2017
 * **Currency Symbol**: TEL
-* **Block Explorer URL**: https://telscan.io
+* **Block Explorer URL**: https://telscan.io (alternate: https://www.telscan.xyz)
 
 **Important Points to Remember**
 

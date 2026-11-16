@@ -22,10 +22,12 @@ load grows.
 
 - **Image ref** (`deployment.yaml`): `telcoin-node-record-api:latest` is a local build tag.
   Point it at your registry, e.g. `registry.example.com/telcoin/node-record-api:<tag>`.
-- **Committee file** (`deployment.yaml`): the `node-record-api-committee` ConfigMap is created
-  from the repository's `chain-configs/testnet/committee.yaml` in the manifest's comment; create
-  it for the chain you are deploying against. It supplies both the tracked key floor and the
-  worker DHT bootstrap addresses.
+- **Chain-config files** (`deployment.yaml`): the `node-record-api-committee` ConfigMap is
+  created from the repository's `chain-configs/testnet/committee.yaml` and
+  `chain-configs/testnet/bootstrap_servers.yaml` in the manifest's comment; create it for the
+  chain you are deploying against. The committee file supplies the tracked key floor and the
+  bootstrap servers file the worker DHT bootstrap addresses. Recreate the ConfigMap when a
+  release changes the chain's bootstrap servers.
 - **Chain id** (`deployment.yaml`): `NODE_RECORD_API_CHAIN_ID` is `2017` (testnet). A wrong
   chain id does not fail loudly; it yields an empty directory.
 - **Live committee** (optional): set `NODE_RECORD_API_RPC_URL` to a node's JSON-RPC to track

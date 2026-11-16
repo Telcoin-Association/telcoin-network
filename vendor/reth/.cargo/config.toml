@@ -1,0 +1,14 @@
+# TN(TN-0080): cargo configuration for the nested reth workspace. tn/cargo.sh used to pass these
+# with --config, but cargo does not forward --config to external subcommands, so cargo-nextest's
+# inner `cargo test` resolved revm-inspectors from the registry and reth's tests never ran against
+# the carried patch. A config file here applies to every cargo invocation from this directory.
+
+[patch.crates-io]
+# TN's root manifest carries the same patch (patches/revm-inspectors/PATCH.md). The path is
+# relative to the directory that holds .cargo, i.e. vendor/reth.
+revm-inspectors = { path = "../../patches/revm-inspectors" }
+
+[resolver]
+# A package neither TN's Cargo.lock nor tn/test-only.lock pins resolves to a version that supports
+# this workspace's rust-version (tn/lockfile.py).
+incompatible-rust-versions = "fallback"

@@ -1,0 +1,373 @@
+# Established connection calibration
+
+The optional `process_budget` in the YAML `network-config` file allocates established QUIC resources across the
+primary and every configured worker swarm. Production limits and deployment qualification remain
+pending [issue #1433](https://github.com/Telcoin-Association/telcoin-network/issues/1433).
+Omitting this section applies the built-in swarm bound: 128 established connections per swarm,
+eight per peer, and the `quic_config` defaults of 256 incoming streams, 2 MiB of stream credit and
+4 MiB of connection credit per connection.
+
+Each swarm keeps a privileged reserve of its established connections, 50 of the default 128.
+Peers without privilege (not committee members, trusted operator peers or Closed admission
+grants) share only the remainder, at most two connections each, so 78 of the default 128 are
+public. A `process_budget` keeps this split: the reserve of a swarm is its allocated total times
+50/128, rounded down. So a swarm with 12 established connections reserves 4, and a small budget
+still admits peers without privilege.
+
+## Allocation
+
+The following is an arithmetic example, **not a calibrated production recommendation**:
+
+```yaml
+process_budget:
+  swarm_count: 2
+  max_established_connections: 144
+  max_established_connections_per_peer: 8
+  max_inbound_streams: 4096
+  max_receive_credit_bytes: 1073741824
+```
+
+For `S` swarms and process connection ceiling `C`, each swarm receives `floor(C / S)` connections.
+Let `A = S * floor(C / S)`. Each connection receives at most `floor(max_inbound_streams / A)` incoming
+bidirectional streams and `floor(max_receive_credit_bytes / A)` bytes of connection receive credit.
+Remainders stay unused. Transport values saturate at `u32::MAX`, and explicitly lower `quic_config`
+settings remain lower. Stream receive credit cannot exceed the effective connection receive credit.
+In this example there are 72 connections per swarm, 28 streams per connection and 7,456,540 bytes
+of credit per connection. These are capacities, not observed usage.
+
+The node checks `swarm_count` against one primary plus every configured worker before spawning
+any swarm. Include workers currently inactive on chain, since their swarms still run. Changing the
+worker count requires recalculating the allocation and restarting the node. An allocation too small
+to give each swarm one connection, or each connection one stream/byte, fails startup.
+
+Inbound and outbound connections, committee members, trusted peers and ordinary peers all consume
+the same established limits. No peer bypass is installed in the connection-limit behaviour. Peer
+admission and trust rules remain separate. Swarms cannot borrow each other's allocation, which
+preserves primary connection capacity when workers fill their allocation. This does not reserve
+service within a swarm: hostile peers can occupy its slots, and bulk traffic can still delay votes
+or epoch records. The [inbound service class](#inbound-service-classes) metrics show this delay, but
+nothing limits it. Admission policy and message scheduling need joint calibration.
+
+Receive credit is advertised protocol capacity. It is not RSS or a bound on application buffers,
+tasks, CPU, locally initiated streams, pre-admission handshake state, or transient transport state
+before an established connection is accepted. Measure those independently. TCP is not configured
+by the current consensus swarm builder. Other network servers in the process require separate
+headroom.
+
+## Inbound service classes
+
+Each swarm sends inbound requests and gossip to the application through one bounded queue. The swarm
+puts each inbound message in one service class:
+
+| Class | Messages |
+| --- | --- |
+| `vote` | Primary vote requests (critical) |
+| `epoch_record` | Primary epoch record requests (critical) |
+| `certificate_sync` | Certificate catch-up requests on the request-response protocol (bulk) |
+| `batch` | Worker batch reports. `ReportBatch` is the 2f+1 quorum-ack request, so it is critical on worker swarms |
+| `gossip` | Gossip messages |
+| `other` | Peer exchange, stream catch-up, batch fetch and all other requests |
+
+No current primary request uses `certificate_sync`. Certificate catch-up and batch fetch use the
+stream protocol, and the swarm cannot see their class before it forwards them, so they are `other`.
+Thus `other` is not a low-priority class.
+
+The classes label the swarm metrics below and select the application's
+[serve budget](#serve-permits). They do not change swarm admission, queue space or scheduling.
+A message is shed, whatever its class, for one of five reasons. `queue_full`: the queue is full.
+`unsubscribed`: no application task receives from the queue. The primary network event queue uses
+this reason in a gap for all events other than epoch votes, see
+[Primary event queue bounds](#primary-event-queue-bounds). `queue_budget`: the primary network
+event queue already holds a gap cap for an epoch vote. `admission`: the application drops the
+request at its admission check.
+`serve_budget`: the application's serve budget for the class had no free permit. A
+shed request gets no response: the swarm drops the response channel, libp2p closes the stream, and
+the requester gets a stream error at once. It does not wait for its request timeout. The swarm does
+not schedule by priority, so unanswered requests of any class can fill the queue and make the swarm
+shed votes.
+
+### Primary event queue bounds
+
+The primary network event queue holds the requests and gossip that the swarm forwards to the
+primary. The queue lives for the full process, but its event loop lives for one epoch. A live event
+loop receives each event when it arrives, so the queue can fill only in a gap with no event loop:
+between two epochs, and at start before the first epoch. While an event loop receives from the
+queue, the queue has no caps other than its capacity.
+
+In a gap, the queue holds only gossip on the epoch-vote topic, because the epoch votes arrive as
+gossip between two epochs and epoch-record voting needs them. The byte weight of a vote is the
+length of its data. The queue holds a vote only when its data decodes to a vote for the epoch of the
+last event loop or the epoch before it. These are the epoch records that the vote handler accepts
+at this boundary: the record that closes, and the previous record when it has no certificate. The
+share key of a vote is its gossip source and its epoch. The swarm forwards only gossip that an
+authorized publisher signed, so each forwarded vote has a source.
+
+Before the first event loop, the queue has no epoch and holds no vote. The vote collector
+republishes each vote until quorum, so a vote shed at start arrives again after the event loop
+starts.
+
+The queue sheds all other events in a gap as `unsubscribed`. Thus certificate gossip and
+consensus-output gossip cannot take the space of the epoch votes. A shed gossip event drops its
+validation ticket, and the ticket reports Ignore to gossipsub. Thus this node does not relay
+certificate gossip that arrives in a gap, or a consensus result that a newer result of its author
+replaces there (#1772). The certificate fetcher and state sync recover the content. The
+certificate fetcher of the new epoch gets a shed certificate
+again when a later certificate names it as a parent. State sync gets shed consensus output again.
+A shed request drops its response channel, and the peer sends the request again. The certifier
+sends a vote request again until a new proposal replaces it. Peers send epoch-record and stream
+requests again.
+
+The caps of one gap come from the committee parameters. At a boundary, the members of three
+committees (the previous, the current and the next) can publish on the epoch-vote topic. The caps
+are sized for committees of 100 members.
+
+| Cap | Value | Source |
+| --- | --- | --- |
+| Copies of one vote | 2 | The vote of one author for one epoch record, and one republished copy |
+| Epoch records | 2 | The closing epoch record, and the previous record when it has no certificate |
+| Votes | 1,200 | 3 committees x 100 members x 2 records x 2 copies |
+| Bytes | 14,400,000 | 1,200 votes x the gossip message limit of 12,000 bytes |
+
+The swarm sheds a vote past one of these caps as `queue_budget`. Thus one member cannot take the
+space of the other members. The item cap is less than the queue capacity of 10,000, so the votes
+that the queue holds in a gap do not fill the queue.
+
+Known residual, replay: gossipsub has no freshness check, so a connected peer can replay old vote
+frames that a member signed. The queue sheds a replayed vote for an epoch outside the window as
+`unsubscribed`, so it takes no share. A replayed vote for an epoch in the window is a genuine vote
+of the member for that record, so the member loses no vote. The policy does not check the vote
+signature, so a member can publish votes with any epoch, but the window limits the member to 2
+records x 2 copies. Replayed votes in the window still count against the item cap of 1,200.
+
+When the event loop of a new epoch subscribes, the queue discards the events other than epoch votes
+that the previous event loop left. It keeps the votes in order and sets the gap counts to zero,
+also the count of each author and epoch. If the gap dropped or discarded events, the primary writes one
+warning with the number of events kept, dropped, over the caps and discarded.
+
+## Serve permits
+
+A serve permit covers the application side of one forwarded request. The request handler asks for
+it after it dequeues the request and before it does any work for it, and the ask does not block.
+The permit ends when the handler drops it: after it sends the response, when it fails, when the
+swarm cancels the request after the request-response timeout (10 s) or a closed connection, or
+when its task is dropped at an epoch boundary. The permit window is distinct from
+`tn_network_inbound_requests_pending`, which the swarm measures from the forward to the response and
+which also spans the event-queue wait. It is also distinct from the event queue, which holds
+requests that no handler has dequeued yet. Gossip has no response and takes no permit.
+
+The primary vote and epoch record handlers and the worker batch report handler take permits. The
+`certificate_sync` and `other` pools exist and export their series, but no handler takes a permit
+from them yet, so their held gauge stays at zero. The pools register all six classes at zero when
+the swarm's network is built, so a missing series means that the metric is not exported, not zero.
+
+The optional `serve_budget` in the YAML `network-config` file sets the permits per class. Every key
+is optional and zero is the default:
+
+```yaml
+serve_budget:
+  vote: 0
+  epoch_record: 0
+  certificate_sync: 0
+  batch: 0
+  other: 0
+```
+
+Zero means unbounded: the handler admits every request of that class and the series only observe.
+A node without this section serves exactly what it served before. A positive value is the number
+of requests of that class in service at once. When every permit is held, the handler sheds the
+request before any work: it drops the response channel, the requester gets a stream error at once,
+and the request counts once under `tn_network_inbound_requests_shed_total{reason="serve_budget"}`.
+The dropped channel also counts an `omitted` failure, as an `admission` shed does. The primary's
+epoch record admission cap runs first, so an epoch record request takes a permit only after it
+passes that cap.
+
+A positive value also bounds each peer. One peer can hold at most 2 permits of an enforcing
+class (`MAX_PERMITS_PER_PEER`). An offer from a peer that already holds 2 is shed under
+`serve_budget`, even when the class has free permits. Without this share, one peer could hold every
+permit of a class, and the node would shed the requests of every other peer in that class. Committee
+peers are exempt from penalties, so peer scoring does not stop a committee peer that does this.
+
+A permit is held for the whole task. A vote task can wait on the vote lock of its author, behind an
+earlier vote request of the same peer, so `tn_network_serve_permits_held{class="vote"}` counts that
+wait as well as the evaluation of a header. The per-peer share limits the wait to one task per peer.
+A batch permit is usually held for milliseconds.
+
+To size a budget, run with zero and watch the peaks of `tn_network_serve_permits_held` per class
+over honest steady state, catch-up and reconnect overlap. For votes, a capacity of at least two
+times the committee size gives every committee member its full share, whatever the other peers do.
+A smaller vote capacity can shed honest proposers while faulty peers hold their shares. Epoch records are bounded by the admission cap of 5 concurrent requests. Batch reports
+scale with the number of committee workers and their batch rate. Set each class above its honest
+peak with headroom. A budget below the honest peak sheds honest requests. The swarm does not
+schedule by priority, so a budget bounds the application's work for a class but does not reserve
+queue space for it. Budget values are not calibrated; the calibration record below applies.
+
+## Observations
+
+The connection metrics below have the configured `network` label (`primary`, `worker-0`, etc.). The
+rejection and denial counters also have a `reason` label:
+
+| Metric | Meaning |
+| --- | --- |
+| `tn_network_established_connections` | Current established connections across both directions |
+| `tn_network_established_connection_limit` | Per-swarm ceiling; zero means the legacy unbounded total |
+| `tn_network_inbound_streams_per_connection_limit` | Effective incoming stream capacity per connection |
+| `tn_network_receive_credit_per_connection_bytes` | Effective advertised credit per connection |
+| `tn_network_connection_limit_rejections_total` | Connections refused by a connection limit. `reason`: `pending_incoming`, `pending_outgoing`, `established_incoming`, `established_outgoing`, `established_per_peer`, `established_total` or `unknown` |
+| `tn_network_inbound_connections_denied_total` | Inbound connections the swarm refused, counted once per refusal. `stage`: `transport_cap` (a connection limit), `pre_auth` (before the peer is authenticated), `authenticated_policy` (a peer manager or source admission policy after authentication) or `unknown`. `reason`: `pending_incoming_limit`, `established_per_peer_limit`, `established_total_limit` or `other_limit` for a limit; `peer_manager_local_peer`, `peer_manager_banned_peer`, `peer_manager_invalid_ip`, `peer_manager_closed_admission`, `peer_manager_public_share` or `peer_manager_public_peer_connections` for the peer manager; the snake-case `AdmissionError` variant (for example `peer_full`) for source admission; `unknown` for any other cause |
+| `tn_network_listener_errors_total` | Non-fatal listener errors by I/O error kind. `reason`: `address_in_use`, `address_not_available`, `permission_denied`, `connection`, `timed_out`, `invalid_data`, `other` or `unknown` |
+| `tn_network_listeners_closed_total` | Listeners that closed. `outcome`: `ok` or `error` |
+
+`tn_network_inbound_connections_denied_total` is the terminal count of inbound refusals.
+`tn_network_connection_limit_rejections_total` counts limit refusals in both directions. The
+peer manager stage counters `tn_network_listen_failures_total`,
+`tn_network_source_admission_denied_total` and `tn_network_closed_admission_denied_total`
+count the same refusals where the peer manager makes the decision, so they overlap the terminal
+count on purpose. The peer manager registers every series of these three families at zero when
+it starts, so a rate query reads `0` and not a missing series.
+
+Connection occupancy updates after swarm event processing. Scrapes can miss short peaks, so record
+the sampling interval and use transport tracing when measuring peak streams or retained buffers.
+The connection count times the credit ceiling describes configured capacity on established
+connections, not bytes currently retained. Sum that product over every swarm on the same node.
+Never interpret missing samples as zero. The connection gauges do not give active-stream occupancy.
+
+The service class metrics also have a `class` label with the six values above. The shed counter also
+has a `reason` label (`queue_full`, `unsubscribed`, `queue_budget`, `admission` or
+`serve_budget`). The failure
+counter also has an `outcome` label (`timeout`, `omitted`, `closed`, `io` or `unsupported`). The
+node registers every class, reason and outcome series at zero when the swarm starts, so a missing
+series means that the metric is not exported, not zero.
+
+| Metric | Meaning |
+| --- | --- |
+| `tn_network_inbound_requests_pending` | Inbound requests sent to the application that wait for a response |
+| `tn_network_inbound_request_service_seconds` | Time from sending a request to the application to sending its response. Answered requests only |
+| `tn_network_inbound_requests_shed_total` | Inbound messages dropped before service, by the swarm or at application admission |
+| `tn_network_inbound_requests_failed_total` | Inbound requests sent to the application that got no response |
+| `tn_network_serve_permit_capacity` | Configured serve permits for the class; zero means unbounded |
+| `tn_network_serve_permits_held` | Forwarded requests that hold a serve permit now |
+| `tn_network_serve_requests_offered_total` | Forwarded requests that asked for a serve permit |
+| `tn_network_serve_requests_admitted_total` | Offered requests that got a serve permit |
+
+The exporter can render the service time as a summary (quantiles with `_sum` and `_count`) or as
+buckets. These metrics give queue occupancy and service time by class, not network round-trip time.
+An `admission` or `serve_budget` shed also counts as an `omitted` failure, so do not add the shed
+and failure counters.
+
+The serve permit series carry the `network` and `class` labels. Occupancy and headroom are defined
+for bounded classes only, so restrict them to a positive capacity:
+
+```promql
+# Occupancy ratio, 0 to 1, bounded classes only
+tn_network_serve_permits_held / clamp_min(tn_network_serve_permit_capacity, 1)
+  and tn_network_serve_permit_capacity > 0
+# Headroom in permits, bounded classes only
+(tn_network_serve_permit_capacity - tn_network_serve_permits_held)
+  and tn_network_serve_permit_capacity > 0
+# Offered, admitted and shed rates in requests per second
+rate(tn_network_serve_requests_offered_total[5m])
+rate(tn_network_serve_requests_admitted_total[5m])
+rate(tn_network_inbound_requests_shed_total{reason="serve_budget"}[5m])
+# Shed ratio, 0 to 1, only where the offered rate is positive
+rate(tn_network_inbound_requests_shed_total{reason="serve_budget"}[5m])
+  / ignoring(reason) (rate(tn_network_serve_requests_offered_total[5m]) > 0)
+```
+
+## Reproducible calibration record
+
+Use ten validators, one primary and one worker swarm per node, on 8 CPU / 32 GiB hosts as the
+reference topology. Repeat for other supported worker counts. Record committee size, trusted peer
+population, admission exemptions, RTT/loss, storage, database size, catch-up distance, load generator
+revision/commands and the baseline node revision. Keep consensus, execution and storage headroom
+explicit in the process CPU/RSS/state budgets. Agree vote and epoch-record latency, persistence and
+catch-up regression thresholds with maintainers before selecting production limits.
+
+`tools/network-budget/capture.py` records observations for an **externally driven** workload. It does
+not start validators, generate hostile traffic, instrument QUIC internals, or certify acceptance.
+Create a JSON manifest with these fields:
+
+| Field | Required content |
+| --- | --- |
+| `revision` | Full 40-character commit of the node build |
+| `build_command` | Exact toolchain, flags and build command |
+| `topology` | Integer `validators`, `workers_per_node`, `cpus_per_node`, `ram_bytes_per_node` |
+| `nodes` | One object per validator, with unique `name` and `metrics_url` |
+| `artifacts` | Paths relative to the manifest for binaries, lockfile, all node configs, topology and threshold decisions |
+| `workload` | Exact commands, load generator revision, duration, baseline identity and traffic/topology details |
+| `decisions` | Agreed thresholds, process headroom and rationale, or an explicit pending decision |
+
+For example, a node entry is `{"name":"validator-0","metrics_url":"http://validator-0:9100/metrics"}`.
+Hash inputs are streamed; the tool records hashes and paths, so archive the corresponding artifacts
+with the run. Capture the source tree including any patch used to build a dirty revision.
+
+```sh
+python3 tools/network-budget/capture.py calibration.json results/baseline --phase baseline --samples 600
+python3 tools/network-budget/capture.py candidate.json results/catch-up --phase catch-up --samples 600
+python3 -m unittest discover -s tools/network-budget -p 'test_*.py'
+```
+
+Use a fresh output directory for every run. The collector saves provenance, timestamped JSONL
+observations and scrape errors. It accepts only fixed resource metric names and topology-bounded
+labels, limits each HTTP response to 8 MiB, and exits nonzero if any scrape fails. Missing metrics and
+swarm labels are listed explicitly. If the exporter does not expose `reth_process_resident_memory_bytes`
+or `reth_process_cpu_seconds_total`, collect RSS and CPU with the deployment's OS/container observer and
+archive those traces separately. Include task counts, active streams and retained buffers from
+dedicated tracing. The collector's result always leaves acceptance pending. Each node entry can also
+set `rpc_url`. The collector then reads `eth_blockNumber` at each sample for persistence and catch-up,
+and records a missing value as missing, never as zero.
+
+### Harness, evaluation and derivation
+
+`tools/network-budget/harness.py` runs the phases over ssh from a JSON inventory. `plan` prints every
+command and runs nothing. `setup` generates keys and genesis on the hosts. `run` stages the network
+config for one build, starts the nodes and calls `capture.py`. Only the candidate build writes
+`process_budget`, and the harness refuses a template that already sets it. The hostile and mixed
+phases need a load generator command in the inventory: `generator`, with a `{target}` placeholder,
+and `hostile_targets`. The generator must print one JSON object. No generator ships with this tool.
+Without one, the harness does not run these phases, and their thresholds stay pending.
+
+Before the capture starts, `run` polls each `metrics_url` until it answers, for at most
+`ready_timeout_secs` (default 60). `stop` sends SIGTERM and waits for at most `stop_timeout_secs`
+(default 60). Then it sends SIGKILL. It keeps the pid file until the process exits, and it fails if
+the process is still alive. `begin` refuses a pid file that names a live process, and it appends to
+`node.log` after a start marker. In the reconnect phase, `phase.json` records an expected-down
+window for each restarted node. `run` ignores scrape failures only when all failures are accounted
+for inside those windows. An unexplained nonzero collector exit remains a failure.
+
+`evaluate.py` gives pass, fail or pending for each threshold. Missing data is pending, never zero.
+A threshold is pending when any manifest node or swarm lacks the metric and class it needs in a
+phase. Counter deltas and CPU rates require at least two samples per series. A record with a scrape
+error, missing metrics or missing swarms also makes the phase pending outside an expected-down
+window. Scrapes overlapping those windows are excluded from measurements. Each
+service p99 is the worst (node, network) pair. `critical-failures` does not include the reconnect
+phase, because planned restarts close in-flight streams. `critical-sheds` includes it.
+It exits nonzero on any fail, and acceptance always stays "pending maintainer decision".
+`derive.py` proposes a `process_budget` from the baseline honest phases: the peak times the headroom,
+divided like the node allocation. Its transport input is a JSON file with peaks from tracing. It
+refuses to run when an input is missing or has a gap that keeps `evaluate.py` pending. `thresholds.proposed.json` holds the proposed thresholds.
+Each threshold has the status "proposed" and a rationale that cites the `Parameters` defaults.
+Maintainers accept or change them in review.
+
+```sh
+python3 tools/network-budget/harness.py inventory.json plan --output results
+python3 tools/network-budget/harness.py inventory.json run --build baseline --phase steady --output results
+python3 tools/network-budget/evaluate.py tools/network-budget/thresholds.proposed.json results
+python3 tools/network-budget/derive.py results transport.json --headroom 1.5 --output proposed-budget.json
+```
+
+Run and archive the following phases against baseline and candidate builds with identical state:
+
+1. Honest steady state, sustained catch-up and reconnect overlap. Measure peaks and tails for all
+   swarms, including trusted peers and configured inactive workers.
+2. Hostile attempts to fill connection and stream ceilings from both one identity and many identities.
+   Confirm rejection counters rise, occupancy stays within allocations, and closing connections
+   allows recovery. Include committee/trusted identities where the test deployment permits it.
+3. Mixed catch-up and ceiling pressure while publishing votes and epoch records. Measure service
+   occupancy and tail latency by message class, persistence throughput and catch-up completion.
+4. Repeat after reconnects and at every supported worker count. Account for handshake/transient state
+   independently from established connection capacity.
+
+Compare each workload with its pinned baseline and agreed thresholds. Record maximum connections,
+concurrent streams, credit, retained bytes, tasks, RSS, CPU and service occupancy separately. Leave
+missing measurements and threshold decisions pending. Only a maintainer-approved derivation and
+passing workload regressions can select defaults or complete #1433.

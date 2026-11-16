@@ -217,6 +217,36 @@ pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = 407;
 /// this constant does not exist there.
 pub const SEED_SIGNATURE_FORK_EPOCH: Epoch = 383;
 
+/// Whether `epoch` is at or past `fork`: the `>=` activation rule for every gate in this module
+/// that stays on from its fork epoch onward.
+///
+/// Every adiri `*_build_fork_active` gate, every `test-utils` override closure and every `>=`
+/// arming assert calls this function, and a new gate of that kind should too, rather than spell
+/// out `epoch >= FORK`. Because the fork epoch is a parameter, Clippy does not see a constant at
+/// the comparison, so an `Epoch::MAX` "not yet scheduled" placeholder does not trip
+/// `clippy::absurd_extreme_comparisons` and needs no `#[expect]`. To arm a placeholder fork,
+/// change only its constant.
+///
+/// Comparisons that are not `>=` activation gates keep their own operators and must not be
+/// rewritten to this rule:
+/// - strict floor asserts (`FORK > FLOOR`): Clippy does not flag `FLOOR < Epoch::MAX`, so a
+///   placeholder on the left needs no expectation there;
+/// - the one-shot boundary triggers in `tn-reth::evm::block` (`concluding.checked_add(1) ==
+///   Some(FORK)` for `CONSENSUS_REGISTRY_FORK_EPOCH` and `governance_safe_fork_epoch()`): each
+///   fires in exactly one epoch-closing block, and under `>=` it would re-run at every later epoch
+///   close;
+/// - the duplicate-batch replay cutoffs (`epoch > ADIRI_DUP_BATCH_EPOCH`): that constant is the
+///   last legacy epoch, not a fork's first epoch.
+///
+/// `const fn` keeps the arming asserts at compile time. Compiled only where a caller exists (the
+/// `adiri` gates and asserts, the `test-utils` overrides), so the default feature set has no dead
+/// code.
+#[cfg(any(feature = "adiri", feature = "test-utils"))]
+#[inline]
+const fn fork_active_at(epoch: Epoch, fork: Epoch) -> bool {
+    epoch >= fork
+}
+
 /// Whether `Header`s of `epoch` carry the `seed_signature` field on the wire and the epoch
 /// seed chain drives the epoch-close committee shuffle (#1032).
 ///
@@ -236,7 +266,7 @@ pub fn seed_signature_active(epoch: Epoch) -> bool {
     #[cfg(feature = "test-utils")]
     {
         seed_signature_fork_epoch_override()
-            .map_or_else(|| build_fork_active(epoch), |fork| epoch >= fork)
+            .map_or_else(|| build_fork_active(epoch), |fork| fork_active_at(epoch, fork))
     }
     #[cfg(not(feature = "test-utils"))]
     {
@@ -253,7 +283,7 @@ pub fn seed_signature_active(epoch: Epoch) -> bool {
 const fn build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
     {
-        epoch >= SEED_SIGNATURE_FORK_EPOCH
+        fork_active_at(epoch, SEED_SIGNATURE_FORK_EPOCH)
     }
     #[cfg(not(feature = "adiri"))]
     {
@@ -346,7 +376,7 @@ pub const PREVRANDAO_FORK_EPOCH: Epoch = 574;
 /// a retarget that sets the PREVRANDAO fork below the seed fork fails to compile instead of
 /// shipping a gate that silently stays dormant until the seed fork fires.
 #[cfg(feature = "adiri")]
-const _: () = assert!(PREVRANDAO_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
+const _: () = assert!(fork_active_at(PREVRANDAO_FORK_EPOCH, SEED_SIGNATURE_FORK_EPOCH));
 
 /// Whether executed blocks of `epoch` derive `PREVRANDAO` from the epoch seed chain (#1247).
 ///
@@ -371,7 +401,7 @@ fn prevrandao_fork_point_active(epoch: Epoch) -> bool {
     #[cfg(feature = "test-utils")]
     {
         prevrandao_fork_epoch_override()
-            .map_or_else(|| prevrandao_build_fork_active(epoch), |fork| epoch >= fork)
+            .map_or_else(|| prevrandao_build_fork_active(epoch), |fork| fork_active_at(epoch, fork))
     }
     #[cfg(not(feature = "test-utils"))]
     {
@@ -388,7 +418,7 @@ fn prevrandao_fork_point_active(epoch: Epoch) -> bool {
 const fn prevrandao_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
     {
-        epoch >= PREVRANDAO_FORK_EPOCH
+        fork_active_at(epoch, PREVRANDAO_FORK_EPOCH)
     }
     #[cfg(not(feature = "adiri"))]
     {
@@ -478,7 +508,7 @@ pub const MULTI_WORKERS_FORK_EPOCH: Epoch = 570;
 /// [`CONSENSUS_REGISTRY_FORK_EPOCH`] fails to compile instead of leaving the ordering to a
 /// reader's arithmetic.
 #[cfg(feature = "adiri")]
-const _: () = assert!(MULTI_WORKERS_FORK_EPOCH >= CONSENSUS_REGISTRY_FORK_EPOCH);
+const _: () = assert!(fork_active_at(MULTI_WORKERS_FORK_EPOCH, CONSENSUS_REGISTRY_FORK_EPOCH));
 
 /// Whether the [`Committee`](crate::Committee) of `epoch` is bcs-encoded in the multi-worker
 /// layout (issue #554).
@@ -497,8 +527,10 @@ const _: () = assert!(MULTI_WORKERS_FORK_EPOCH >= CONSENSUS_REGISTRY_FORK_EPOCH)
 pub fn multi_workers_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "test-utils")]
     {
-        multi_workers_fork_epoch_override()
-            .map_or_else(|| multi_workers_build_fork_active(epoch), |fork| epoch >= fork)
+        multi_workers_fork_epoch_override().map_or_else(
+            || multi_workers_build_fork_active(epoch),
+            |fork| fork_active_at(epoch, fork),
+        )
     }
     #[cfg(not(feature = "test-utils"))]
     {
@@ -509,8 +541,9 @@ pub fn multi_workers_fork_active(epoch: Epoch) -> bool {
 /// This build's compile-time fork point for the multi-workers fork, with no test override
 /// applied.
 ///
-/// Spelled out in full rather than sharing [`build_fork_active`] (the seed-signature gate)
-/// because the two forks arm independently and must never be tied to one constant.
+/// A gate of its own rather than a call to [`build_fork_active`] (the seed-signature gate)
+/// because the two forks arm independently and must never be tied to one constant. Only the
+/// [`fork_active_at`] rule is shared.
 ///
 /// Unchanged from [`MULTI_WORKERS_FORK_EPOCH`]'s documented contract: adiri (testnet, which
 /// carries pre-multi-worker (#554) packs on disk) stays dormant before
@@ -523,7 +556,7 @@ pub fn multi_workers_fork_active(epoch: Epoch) -> bool {
 const fn multi_workers_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
     {
-        epoch >= MULTI_WORKERS_FORK_EPOCH
+        fork_active_at(epoch, MULTI_WORKERS_FORK_EPOCH)
     }
     #[cfg(not(feature = "adiri"))]
     {
@@ -622,7 +655,7 @@ pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = 567;
 /// fails to compile instead of shipping a gate that silently stays dormant until the seed fork
 /// fires (the [`leader_seeded_ordering_active`] conjunct).
 #[cfg(feature = "adiri")]
-const _: () = assert!(LEADER_SEEDED_ORDERING_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
+const _: () = assert!(fork_active_at(LEADER_SEEDED_ORDERING_FORK_EPOCH, SEED_SIGNATURE_FORK_EPOCH));
 
 /// Compile-time enforcement of the second arming constraint documented on
 /// [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]: arming the fork at or below
@@ -662,8 +695,10 @@ pub fn leader_seeded_ordering_active(epoch: Epoch) -> bool {
 fn leader_seeded_ordering_fork_point_active(epoch: Epoch) -> bool {
     #[cfg(feature = "test-utils")]
     {
-        leader_seeded_ordering_fork_epoch_override()
-            .map_or_else(|| leader_seeded_ordering_build_fork_active(epoch), |fork| epoch >= fork)
+        leader_seeded_ordering_fork_epoch_override().map_or_else(
+            || leader_seeded_ordering_build_fork_active(epoch),
+            |fork| fork_active_at(epoch, fork),
+        )
     }
     #[cfg(not(feature = "test-utils"))]
     {
@@ -674,8 +709,9 @@ fn leader_seeded_ordering_fork_point_active(epoch: Epoch) -> bool {
 /// This build's compile-time fork point for the leader-seeded-ordering fork, with no test
 /// override applied.
 ///
-/// Spelled out in full rather than sharing another gate's helper because the forks arm
-/// independently and must never be tied to one constant.
+/// A gate of its own rather than a call to another fork's gate because the forks arm
+/// independently and must never be tied to one constant. Only the [`fork_active_at`] rule is
+/// shared.
 ///
 /// Unchanged from [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]'s documented contract: adiri (testnet,
 /// which carries legacy-ordered commits in its history) stays dormant before
@@ -685,7 +721,7 @@ fn leader_seeded_ordering_fork_point_active(epoch: Epoch) -> bool {
 const fn leader_seeded_ordering_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
     {
-        epoch >= LEADER_SEEDED_ORDERING_FORK_EPOCH
+        fork_active_at(epoch, LEADER_SEEDED_ORDERING_FORK_EPOCH)
     }
     #[cfg(not(feature = "adiri"))]
     {
@@ -755,35 +791,40 @@ pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
 ///   the same PR: headers already committed at or past the fork epoch in the eight-field layout do
 ///   not decode under the armed build.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
-/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
-/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
-/// constant that differs between binaries has no other in-protocol detection.
+/// Armed for adiri (chain 2017) at epoch 747: every header and committed sub-DAG whose own epoch
+/// is 747 or later carries millisecond timestamps. Measured boundary: Thu 2026-11-12 14:33:02 UTC
+/// (08:33 CST). Derived from the registry's `getEpochInfo` first-block heights for epochs 732-735
+/// and the timestamps of the epoch-closing blocks just before them (20:33:02 UTC on 2026-11-08,
+/// then 02:33:02, 08:33:02 and 14:33:02 UTC on 2026-11-09, exactly 21,600 s apart), snapshotted
+/// at epoch 735 / block 526809 on 2026-11-09 15:39 UTC via rpc.adiri.tel; the same six-hour grid
+/// reproduces the epoch-574 boundary (2026-09-30 08:33 UTC) 161 epochs earlier. 747 is 12 epochs
+/// past the snapshot, so the eight-epoch margin above holds for a merge before epoch 739 begins
+/// (Tue 2026-11-10 14:33 UTC).
 ///
-/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
+/// Re-verify at merge and at tag time. If epoch 747 has begun, raise the constant in the same PR
+/// (the second arming constraint above). The full fork schedule is logged at startup so operators
+/// can diff it across the fleet; a compile-time constant that differs between binaries has no
+/// other in-protocol detection.
+///
+/// Rollout sequence (standard hard-fork rule): the gate-capable build goes out fleet-wide first
 /// (safe indefinitely while dormant, since it keeps the seconds-only layout and rules for every
-/// epoch below the constant), then land the epoch-setting PR fleet-wide before the fork epoch
-/// begins. A straggler still on an old build past the boundary has no ninth header field to read
-/// and keeps applying the seconds-only rules, so the fleet must be fully upgraded before the
-/// epoch is armed.
+/// epoch below the constant), and every validator, observer and RPC node must run a build that
+/// carries this constant before the closing block of epoch 746, the boundary that opens 747. A
+/// straggler past that boundary, whether on a build without the gate or on a gate-capable build
+/// without this constant, has no ninth header field to read and keeps applying the seconds-only
+/// rules, so it cannot decode the fleet's post-fork headers.
 ///
 /// Non-adiri builds (mainnet) have no dormant period: millisecond timestamps are active from
 /// genesis and this constant does not exist there.
-pub const SUBSECOND_TIMESTAMP_FORK_EPOCH: Epoch = u32::MAX;
+pub const SUBSECOND_TIMESTAMP_FORK_EPOCH: Epoch = 747;
 
 /// Compile-time enforcement of the first arming constraint documented on
 /// [`SUBSECOND_TIMESTAMP_FORK_EPOCH`]: a rollout PR that sets this fork below the seed fork
 /// fails to compile instead of shipping a gate that silently stays dormant until the seed fork
 /// fires (the [`subsecond_timestamp_active`] conjunct).
 #[cfg(feature = "adiri")]
-#[expect(
-    clippy::absurd_extreme_comparisons,
-    reason = "always true only while SUBSECOND_TIMESTAMP_FORK_EPOCH is the `u32::MAX` \
-              placeholder; once the rollout PR lowers the constant the comparison becomes \
-              live and this expectation flags itself for removal"
-)]
 const _: () = assert!(
-    SUBSECOND_TIMESTAMP_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH,
+    fork_active_at(SUBSECOND_TIMESTAMP_FORK_EPOCH, SEED_SIGNATURE_FORK_EPOCH),
     "SUBSECOND_TIMESTAMP_FORK_EPOCH must be at or above SEED_SIGNATURE_FORK_EPOCH: the \
      millisecond header field follows the seed signature"
 );
@@ -827,8 +868,10 @@ pub fn subsecond_timestamp_active(epoch: Epoch) -> bool {
 fn subsecond_timestamp_fork_point_active(epoch: Epoch) -> bool {
     #[cfg(feature = "test-utils")]
     {
-        subsecond_timestamp_fork_epoch_override()
-            .map_or_else(|| subsecond_timestamp_build_fork_active(epoch), |fork| epoch >= fork)
+        subsecond_timestamp_fork_epoch_override().map_or_else(
+            || subsecond_timestamp_build_fork_active(epoch),
+            |fork| fork_active_at(epoch, fork),
+        )
     }
     #[cfg(not(feature = "test-utils"))]
     {
@@ -844,14 +887,8 @@ fn subsecond_timestamp_fork_point_active(epoch: Epoch) -> bool {
 #[inline]
 const fn subsecond_timestamp_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "SUBSECOND_TIMESTAMP_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) \
-                  is the gate the future epoch-setting PR relies on, and this expectation flags \
-                  itself for removal once that PR lowers the constant"
-    )]
     {
-        epoch >= SUBSECOND_TIMESTAMP_FORK_EPOCH
+        fork_active_at(epoch, SUBSECOND_TIMESTAMP_FORK_EPOCH)
     }
     #[cfg(not(feature = "adiri"))]
     {
@@ -1381,7 +1418,7 @@ mod tests {
     /// fork fires only in the epoch-closing block that concludes epoch 553, the boundary that opens
     /// [`GOVERNANCE_SAFE_FORK_EPOCH`]; the boundary before it, the one after it, and every later
     /// one stay silent. The closure mirrors the trigger in `tn-reth::evm::block`, `checked_add`
-    /// included: a concluding epoch of `u32::MAX` has no successor, so it neither fires nor
+    /// included: a concluding epoch of `Epoch::MAX` has no successor, so it neither fires nor
     /// overflows.
     #[cfg(feature = "adiri")]
     #[test]
@@ -1390,7 +1427,7 @@ mod tests {
             |concluding: Epoch| concluding.checked_add(1) == Some(GOVERNANCE_SAFE_FORK_EPOCH);
 
         for concluding in
-            [0, 1, 2, GOVERNANCE_SAFE_FORK_EPOCH - 2, GOVERNANCE_SAFE_FORK_EPOCH, u32::MAX]
+            [0, 1, 2, GOVERNANCE_SAFE_FORK_EPOCH - 2, GOVERNANCE_SAFE_FORK_EPOCH, Epoch::MAX]
         {
             assert!(!fires(concluding), "concluding epoch {concluding} must not fire the fork");
         }
@@ -1423,7 +1460,7 @@ mod tests {
     /// Pin the seed-signature gate to the rollout contract this build actually implements.
     ///
     /// #1032 was reviewed on the claim that the gate is dormant before
-    /// [`SEED_SIGNATURE_FORK_EPOCH`] (then the `u32::MAX` placeholder, now a concrete epoch).
+    /// [`SEED_SIGNATURE_FORK_EPOCH`] (then the `Epoch::MAX` placeholder, now a concrete epoch).
     /// That holds only under `adiri`. Every other build — including the default
     /// one that produces both the shipped node binary and the e2e binary — is active from
     /// genesis, so epoch 1 takes the post-fork anchor path in production. Nothing
@@ -1435,7 +1472,7 @@ mod tests {
     #[test]
     fn build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             assert!(
                 build_fork_active(epoch),
                 "non-adiri builds carry no legacy layout and are active from genesis; epoch \
@@ -1451,7 +1488,7 @@ mod tests {
                      be pre-fork",
                 );
             });
-            [SEED_SIGNATURE_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+            [SEED_SIGNATURE_FORK_EPOCH, Epoch::MAX].into_iter().for_each(|epoch| {
                 assert!(
                     build_fork_active(epoch),
                     "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
@@ -1459,6 +1496,33 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// [`fork_active_at`] is the `>=` rule every gate, override and arming assert shares: dormant
+    /// one epoch below the fork, active at the fork epoch itself and at every later epoch. The
+    /// `Epoch::MAX` rows pin the placeholder reading: dormant for every epoch below `Epoch::MAX`,
+    /// and the rule itself carries no special case for it.
+    #[cfg(any(feature = "adiri", feature = "test-utils"))]
+    #[test]
+    fn fork_active_at_is_inclusive_at_the_fork_epoch() {
+        [(0, 0), (383, 383), (384, 383), (Epoch::MAX, 383), (Epoch::MAX, Epoch::MAX)]
+            .into_iter()
+            .for_each(|(epoch, fork)| {
+                assert!(
+                    fork_active_at(epoch, fork),
+                    "the rule must fire from the fork epoch onward (`>=`, not `>`); epoch {epoch} \
+                     must be active for fork {fork}",
+                );
+            });
+        [(0, 1), (382, 383), (0, Epoch::MAX), (Epoch::MAX - 1, Epoch::MAX)].into_iter().for_each(
+            |(epoch, fork)| {
+                assert!(
+                    !fork_active_at(epoch, fork),
+                    "the rule must stay dormant below the fork epoch; epoch {epoch} must be \
+                     dormant for fork {fork}",
+                );
+            },
+        );
     }
 
     /// With no `TN_SEED_SIGNATURE_FORK_EPOCH` in the environment, the test override must be
@@ -1474,7 +1538,7 @@ mod tests {
             "this test requires a process without TN_SEED_SIGNATURE_FORK_EPOCH set; the \
              override is OnceLock-latched, so run the unset case in its own process",
         );
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             assert_eq!(
                 seed_signature_active(epoch),
                 build_fork_active(epoch),
@@ -1493,7 +1557,7 @@ mod tests {
     #[test]
     fn prevrandao_build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             assert!(
                 prevrandao_build_fork_active(epoch),
                 "non-adiri builds carry no pre-fork executed history and are active from \
@@ -1509,7 +1573,7 @@ mod tests {
                      be pre-fork",
                 );
             });
-            [PREVRANDAO_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+            [PREVRANDAO_FORK_EPOCH, Epoch::MAX].into_iter().for_each(|epoch| {
                 assert!(
                     prevrandao_build_fork_active(epoch),
                     "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
@@ -1532,7 +1596,7 @@ mod tests {
             "this test requires a process without TN_PREVRANDAO_FORK_EPOCH set; the \
              override is OnceLock-latched, so run the unset case in its own process",
         );
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             assert_eq!(
                 prevrandao_fork_point_active(epoch),
                 prevrandao_build_fork_active(epoch),
@@ -1568,7 +1632,7 @@ mod tests {
         let output = std::process::Command::new(exe)
             .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
             .env(TN_TEST_PREVRANDAO_CONJUNCT_CHILD, "1")
-            .env("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX.to_string())
+            .env("TN_SEED_SIGNATURE_FORK_EPOCH", Epoch::MAX.to_string())
             .env("TN_PREVRANDAO_FORK_EPOCH", "0")
             .output()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1596,7 +1660,7 @@ mod tests {
         );
         assert_eq!(
             seed_signature_fork_epoch_override(),
-            Some(u32::MAX),
+            Some(Epoch::MAX),
             "this child requires TN_SEED_SIGNATURE_FORK_EPOCH=4294967295 latched from its \
              spawn env; the override is OnceLock-latched, so it cannot be set after startup",
         );
@@ -1606,10 +1670,10 @@ mod tests {
             "this child requires TN_PREVRANDAO_FORK_EPOCH=0 latched from its spawn env; \
              the override is OnceLock-latched, so it cannot be set after startup",
         );
-        // The seed gate is `>=`, so `u32::MAX` itself fires it: the dormant grid stops one
+        // The seed gate is `>=`, so `Epoch::MAX` itself fires it: the dormant grid stops one
         // below. Every epoch on it has the fork point active (anti-vacuity: the conjunction
         // is actually being exercised) yet must stay on the legacy arm.
-        [0, 1, 2, u32::MAX - 1].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX - 1].into_iter().for_each(|epoch| {
             assert!(
                 prevrandao_fork_point_active(epoch),
                 "anti-vacuity: the pinned fork point must be active at epoch {epoch}",
@@ -1737,7 +1801,7 @@ mod tests {
     #[test]
     fn multi_workers_build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             assert!(
                 multi_workers_build_fork_active(epoch),
                 "non-adiri builds carry no legacy committee layout and are active from genesis; \
@@ -1753,7 +1817,7 @@ mod tests {
                      pre-fork",
                 );
             });
-            [MULTI_WORKERS_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+            [MULTI_WORKERS_FORK_EPOCH, Epoch::MAX].into_iter().for_each(|epoch| {
                 assert!(
                     multi_workers_build_fork_active(epoch),
                     "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
@@ -1776,7 +1840,7 @@ mod tests {
             "this test requires a process without TN_MULTI_WORKERS_FORK_EPOCH set; the override \
              is OnceLock-latched, so run the unset case in its own process",
         );
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             assert_eq!(
                 multi_workers_fork_active(epoch),
                 multi_workers_build_fork_active(epoch),
@@ -1801,7 +1865,7 @@ mod tests {
     #[test]
     fn leader_seeded_ordering_build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             assert!(
                 leader_seeded_ordering_build_fork_active(epoch),
                 "non-adiri builds never produced a legacy-ordered commit and are active from \
@@ -1820,7 +1884,7 @@ mod tests {
                          {epoch} must be pre-fork",
                     );
                 });
-            [LEADER_SEEDED_ORDERING_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+            [LEADER_SEEDED_ORDERING_FORK_EPOCH, Epoch::MAX].into_iter().for_each(|epoch| {
                 assert!(
                     leader_seeded_ordering_build_fork_active(epoch),
                     "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
@@ -1843,7 +1907,7 @@ mod tests {
             "this test requires a process without TN_LEADER_SEEDED_ORDERING_FORK_EPOCH set; \
              the override is OnceLock-latched, so run the unset case in its own process",
         );
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             // The fork point is the half that carries the override; the public gate wraps it
             // in the `seed_signature_active` conjunct, which is orthogonal to the override.
             assert_eq!(
@@ -1889,7 +1953,7 @@ mod tests {
         let mut command = std::process::Command::new(exe);
         command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]);
         command.env(TN_TEST_SEED_CONJUNCT_CHILD, "1");
-        command.env("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX.to_string());
+        command.env("TN_SEED_SIGNATURE_FORK_EPOCH", Epoch::MAX.to_string());
         command.env("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH", "0");
         let output = command.output().expect("spawn child test");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1921,7 +1985,7 @@ mod tests {
         // property this process cannot hold; a silent skip here would read as a pass.
         assert_eq!(
             seed_signature_fork_epoch_override(),
-            Some(u32::MAX),
+            Some(Epoch::MAX),
             "this child requires TN_SEED_SIGNATURE_FORK_EPOCH=4294967295 latched from its \
              spawn env; the override is OnceLock-latched, so it cannot be set after startup",
         );
@@ -1933,7 +1997,7 @@ mod tests {
         );
         // 383 is adiri's SEED_SIGNATURE_FORK_EPOCH, written as a literal because the
         // constant does not exist on non-adiri builds and this child is not adiri-gated.
-        [0, 1, 383, u32::MAX - 1].into_iter().for_each(|epoch| {
+        [0, 1, 383, Epoch::MAX - 1].into_iter().for_each(|epoch| {
             assert!(
                 leader_seeded_ordering_fork_point_active(epoch),
                 "the fork point is pinned to 0, so it must be active at epoch {epoch}; \
@@ -1950,7 +2014,7 @@ mod tests {
     /// Pin the sub-second-timestamp gate to the rollout contract this build actually implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states
-    /// for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds only under
+    /// for the seed-signature gate: "dormant while the constant is `Epoch::MAX`" holds only under
     /// `adiri`. Every other build, including the default one that produces both the shipped node
     /// binary and the e2e binary, is active from genesis, so epoch 0 already uses the millisecond
     /// layout and rules there.
@@ -1961,7 +2025,7 @@ mod tests {
     #[test]
     fn subsecond_timestamp_build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             assert!(
                 subsecond_timestamp_build_fork_active(epoch),
                 "non-adiri builds carry no seconds-only history and are active from genesis; \
@@ -1980,7 +2044,7 @@ mod tests {
                          {epoch} must be pre-fork",
                     );
                 });
-            [SUBSECOND_TIMESTAMP_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+            [SUBSECOND_TIMESTAMP_FORK_EPOCH, Epoch::MAX].into_iter().for_each(|epoch| {
                 assert!(
                     subsecond_timestamp_build_fork_active(epoch),
                     "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
@@ -2003,7 +2067,7 @@ mod tests {
             "this test requires a process without TN_SUBSECOND_TIMESTAMP_FORK_EPOCH set; the \
              override is OnceLock-latched, so run the unset case in its own process",
         );
-        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+        [0, 1, 2, Epoch::MAX].into_iter().for_each(|epoch| {
             // The fork point is the half that carries the override; the public gate wraps it
             // in the `seed_signature_active` conjunct, which is orthogonal to the override.
             assert_eq!(
@@ -2055,7 +2119,7 @@ mod tests {
         let mut command = std::process::Command::new(exe);
         command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]);
         command.env(TN_TEST_SUBSECOND_CONJUNCT_CHILD, "1");
-        command.env("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX.to_string());
+        command.env("TN_SEED_SIGNATURE_FORK_EPOCH", Epoch::MAX.to_string());
         command.env("TN_SUBSECOND_TIMESTAMP_FORK_EPOCH", "0");
         let output = command.output().expect("spawn child test");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2088,7 +2152,7 @@ mod tests {
         // property this process cannot hold; a silent skip here would read as a pass.
         assert_eq!(
             seed_signature_fork_epoch_override(),
-            Some(u32::MAX),
+            Some(Epoch::MAX),
             "this child requires TN_SEED_SIGNATURE_FORK_EPOCH=4294967295 latched from its \
              spawn env; the override is OnceLock-latched, so it cannot be set after startup",
         );
@@ -2100,7 +2164,7 @@ mod tests {
         );
         // 383 is adiri's SEED_SIGNATURE_FORK_EPOCH, written as a literal because the
         // constant does not exist on non-adiri builds and this child is not adiri-gated.
-        [0, 1, 383, u32::MAX - 1].into_iter().for_each(|epoch| {
+        [0, 1, 383, Epoch::MAX - 1].into_iter().for_each(|epoch| {
             assert!(
                 subsecond_timestamp_fork_point_active(epoch),
                 "the fork point is pinned to 0, so it must be active at epoch {epoch}; \
@@ -2116,11 +2180,11 @@ mod tests {
                  though the sub-second fork point is active from 0",
             );
         });
-        // the seed gate is `>=`, so the pin fires it at `u32::MAX` itself. With both conjuncts
+        // the seed gate is `>=`, so the pin fires it at `Epoch::MAX` itself. With both conjuncts
         // true there the gate must open, which rules out a gate that never opens at all.
         assert!(
-            seed_signature_active(u32::MAX) && subsecond_timestamp_active(u32::MAX),
-            "with the seed fork and the sub-second fork point both active at u32::MAX, the \
+            seed_signature_active(Epoch::MAX) && subsecond_timestamp_active(Epoch::MAX),
+            "with the seed fork and the sub-second fork point both active at Epoch::MAX, the \
              public gate must open",
         );
         assert_eq!(

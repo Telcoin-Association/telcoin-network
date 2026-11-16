@@ -1,0 +1,6 @@
+{
+  "status": "killed",
+  "mutation": "remove only transport failure arm from CI aggregation copy",
+  "failing_case": "test_maintainer_keeps_transport_required (<run_path>.TransportGate.test_maintainer_keeps_transport_required) (outcome='skipped')",
+  "failure": "Traceback (most recent call last):\n  File \"etc/transport-patches/test_ci_gate.py\", line 35, in test_maintainer_keeps_transport_required\n    self.assertNotEqual(execute(\"pull_request\", False, outcome).returncode, 0)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 0 == 0\n"
+}

@@ -2,9 +2,11 @@
 # This is a starting point, not a turnkey manifest -- see ../README.md for the
 # placeholders you must replace before applying it.
 #
-# Create the committee ConfigMap from the chain's committee file first, e.g.
+# Create the committee ConfigMap from the chain's committee and bootstrap servers files first,
+# e.g.
 #   kubectl create configmap node-record-api-committee \
-#     --from-file=committee.yaml=chain-configs/testnet/committee.yaml
+#     --from-file=committee.yaml=chain-configs/testnet/committee.yaml \
+#     --from-file=bootstrap_servers.yaml=chain-configs/testnet/bootstrap_servers.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,9 +49,12 @@ spec:
             # yields an empty directory, not an error.
             - name: NODE_RECORD_API_CHAIN_ID
               value: "2017"
-            # Key floor + worker DHT bootstrap addresses, from the mounted ConfigMap.
+            # Key floor, from the mounted ConfigMap.
             - name: NODE_RECORD_API_COMMITTEE_FILE
               value: /etc/node-record-api/committee.yaml
+            # Worker DHT bootstrap addresses, from the mounted ConfigMap.
+            - name: NODE_RECORD_API_BOOTSTRAP_SERVERS_FILE
+              value: /etc/node-record-api/bootstrap_servers.yaml
             # Optional: a node's JSON-RPC for the live committee and epoch-boundary
             # scheduling. Uncomment and point at your node.
             # - name: NODE_RECORD_API_RPC_URL
@@ -104,3 +109,5 @@ spec:
             items:
               - key: committee.yaml
                 path: committee.yaml
+              - key: bootstrap_servers.yaml
+                path: bootstrap_servers.yaml

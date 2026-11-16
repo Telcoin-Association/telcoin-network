@@ -2,7 +2,7 @@
 
 use crate::{
     error::{TNRpcError, TelcoinNetworkRpcResult},
-    EngineToPrimary, RpcNodeInfo,
+    ConsensusStorageError, EngineToPrimary, RpcAdmissionSnapshot, RpcNodeInfo,
 };
 use alloy::{
     eips::{BlockId, BlockNumberOrTag},
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroUsize,
     sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 use tn_reth::{
     error::{EvmReadError, EvmReadResult},
@@ -65,7 +66,16 @@ pub struct BlockTimestampMillis {
     /// exception is a block without a consensus header (genesis), which reports
     /// `timestamp * 1000`.
     ///
-    /// Non-decreasing within an epoch; blocks executed from one consensus output share a value.
+    /// Normally `timestamp == floor(timestamp_millis / 1000)`. It does not hold when execution
+    /// raised the block's `timestamp` to its parent's, which the engine counts in
+    /// `evm_timestamp_clamped_total`: this value then stays the consensus commit time and is below
+    /// `timestamp * 1000`. Execution raises a block's `timestamp` only from the sub-second
+    /// timestamp fork on, and then only after a consensus regression or for an epoch-0 commit made
+    /// while the validators' clocks lag the genesis timestamp (epoch 0 has no commit floor).
+    ///
+    /// Non-decreasing within an epoch, except from genesis to block 1 if the validators' clocks
+    /// lagged the genesis timestamp at launch: genesis reports `timestamp * 1000` and block 1
+    /// reports its earlier commit time. Blocks executed from one consensus output share a value.
     /// Across an epoch boundary only `timestamp` is guaranteed not to decrease: the blocks of an
     /// epoch's first commit can report up to 998 ms less than the previous epoch's last block,
     /// within the same whole second.
@@ -128,6 +138,16 @@ pub trait TelcoinNetworkRpcExtApi {
     /// transient modes such as `CvvInactive` while a restarted node catches up.
     #[method(name = "nodeMode")]
     async fn node_mode(&self) -> TelcoinNetworkRpcResult<NodeMode>;
+    /// Return the node's admission snapshot: for each swarm, its connection admission status and
+    /// every BLS key it tracks, with the key's slots, addresses and whether its PeerId is in the
+    /// swarm's authorized set.
+    ///
+    /// Host firewall tooling reads this to keep its P2P allowlist a superset of the peers the node
+    /// admits. Listing a key grants it nothing; `admitted` reports whether the key's PeerId is in
+    /// the authorized set that `Closed` admission enforces, whatever the effective mode.
+    /// Returns "Not Found." until the node's networks have started.
+    #[method(name = "admissionSnapshot")]
+    async fn admission_snapshot(&self) -> TelcoinNetworkRpcResult<RpcAdmissionSnapshot>;
     /// Return the latest consensus header.
     #[method(name = "latestConsensusHeader")]
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader>;
@@ -145,14 +165,19 @@ pub trait TelcoinNetworkRpcExtApi {
     /// block this node does not know: an unknown number or hash, `safe` and `finalized` before
     /// the first block is finalized, and heights below a snapshot-restored node's restored header
     /// window. A known block whose consensus header is missing from local storage (for example,
-    /// its epoch's consensus pack is absent) is a "Not Found." error rather than `null`.
+    /// its epoch's consensus pack is absent) is a "Not Found." error rather than `null`. A known
+    /// block whose epoch's consensus pack is on disk but cannot be read is an "internal error".
+    /// This server then answers "internal error" for 30 seconds for any block of that epoch it has
+    /// not already resolved, without reading the pack again, so a repaired pack is picked up
+    /// within that time.
     ///
     /// Validators should not expose the `tn` namespace publicly. A request for a block from a
     /// sealed epoch can open that epoch's consensus pack, and the storage layer opens packs
     /// synchronously into a small cache it shares with state sync and peer epoch serving. The
     /// lookup runs off the async runtime and under a tight concurrency bound, but public callers
     /// can still churn that cache until storage opens and evicts packs without blocking; serve the
-    /// namespace from non-validating nodes instead.
+    /// namespace from non-validating nodes instead, and omit `tn` from the validator's
+    /// `--http.api`/`--ws.api`.
     #[method(name = "getBlockTimestampMillis")]
     async fn get_block_timestamp_millis(
         &self,
@@ -313,6 +338,33 @@ const MAX_CONCURRENT_PACK_READS: usize = 2;
 /// need invalidation, only eviction.
 const COMMIT_TIME_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("4096 is nonzero");
 
+/// How long `getBlockTimestampMillis` answers [`TNRpcError::Internal`] for an epoch whose
+/// consensus pack could not be read, without asking storage again.
+///
+/// A pack that cannot be read is usually damaged on disk, has the wrong permissions or was written
+/// with an incompatible index version, and it stays that way until an operator repairs or
+/// re-imports it. Asking storage on every request would repeat the failed open (several file
+/// opens and, for some damage, two 2 MiB bloom-filter reads) and log another warning each time,
+/// for as long as a caller keeps asking.
+///
+/// Thirty seconds means a caller polling that epoch in a loop reaches storage about once per half
+/// minute instead of on every request, and the endpoint still recovers within half a minute of the
+/// pack being repaired, without a restart. Requests already past the memo when a failure is
+/// recorded (queued for a [`MAX_CONCURRENT_PACK_READS`] permit, say) still reach storage. Each
+/// worker's RPC server keeps its own memo, so the rate applies per server.
+///
+/// The `tn_getBlockTimestampMillis` method documentation states this value to callers.
+const PACK_FAILURE_TTL: Duration = Duration::from_secs(30);
+
+/// Number of epochs whose recent pack failures `getBlockTimestampMillis` remembers (see
+/// [`PACK_FAILURE_TTL`]).
+///
+/// This caps the memo's size. Only an epoch whose pack is on disk but unreadable gets an entry, so
+/// entries start evicting each other only on a node with more damaged packs than this. A caller
+/// cycling through that many then reaches storage more often than once per TTL per epoch, still
+/// under the [`MAX_CONCURRENT_PACK_READS`] bound.
+const PACK_FAILURE_MEMO_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).expect("64 is nonzero");
+
 /// Run `work` on `spawner`'s blocking pool under a `guard` permit, and await its value.
 ///
 /// This is how every synchronous endpoint in this namespace runs its work. Handler bodies are
@@ -426,6 +478,14 @@ pub struct TelcoinNetworkRpcExt<N: EngineToPrimary> {
     /// Recently resolved consensus commit times, keyed by consensus header digest (see
     /// [`COMMIT_TIME_CACHE_CAPACITY`]).
     commit_times: Mutex<LruCache<B256, ConsensusCommitTime>>,
+    /// Epochs whose consensus pack recently could not be read, each with the time the failure was
+    /// recorded (see [`PACK_FAILURE_TTL`] and [`PACK_FAILURE_MEMO_CAPACITY`]).
+    pack_failures: Mutex<LruCache<Epoch, Instant>>,
+    /// How long an entry in `pack_failures` answers for its epoch.
+    ///
+    /// Always [`PACK_FAILURE_TTL`] outside this module's tests, which shorten it to observe an
+    /// entry expiring without waiting that long.
+    pack_failure_ttl: Duration,
 }
 
 #[async_trait]
@@ -440,6 +500,11 @@ where
     async fn node_mode(&self) -> TelcoinNetworkRpcResult<NodeMode> {
         Ok(self.inner_node_network.node_mode())
     }
+
+    async fn admission_snapshot(&self) -> TelcoinNetworkRpcResult<RpcAdmissionSnapshot> {
+        self.inner_node_network.admission_snapshot().await.ok_or(TNRpcError::NotFound)
+    }
+
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())
     }
@@ -660,17 +725,34 @@ where
 }
 
 impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
+    /// Return a live mode reader for transaction admission on worker RPC servers.
+    ///
+    /// Shares the primary interface with `tn_nodeMode`, so admission follows the
+    /// same demotion and rejoin updates without caching a mode at server startup.
+    pub fn node_mode_reader(
+        &self,
+    ) -> impl Fn() -> tn_types::NodeMode + Send + Sync + 'static + use<N>
+    where
+        N: Send + Sync + 'static,
+    {
+        let primary = Arc::clone(&self.inner_node_network);
+        move || primary.node_mode()
+    }
+
     /// Create new instance of the Telcoin Network RPC extension.
     pub fn new(evm_state: RethEnv, inner_node_network: N) -> Self {
         let blocking_io_guard = Arc::new(Semaphore::new(MAX_CONCURRENT_BLOCKING_RPC_WORK));
         let pack_read_guard = Arc::new(Semaphore::new(MAX_CONCURRENT_PACK_READS));
         let commit_times = Mutex::new(LruCache::new(COMMIT_TIME_CACHE_CAPACITY));
+        let pack_failures = Mutex::new(LruCache::new(PACK_FAILURE_MEMO_CAPACITY));
         Self {
             evm_state,
             inner_node_network: Arc::new(inner_node_network),
             blocking_io_guard,
             pack_read_guard,
             commit_times,
+            pack_failures,
+            pack_failure_ttl: PACK_FAILURE_TTL,
         }
     }
 
@@ -776,6 +858,26 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
     fn cached_commit_time(&self, digest: &B256) -> Option<ConsensusCommitTime> {
         self.commit_times.lock().unwrap_or_else(PoisonError::into_inner).get(digest).copied()
     }
+
+    /// Whether reading `epoch`'s consensus pack failed less than `pack_failure_ttl` ago.
+    ///
+    /// An expired entry stays until a new failure overwrites it or the cache evicts it; it no
+    /// longer answers, so the next lookup reaches storage again.
+    fn pack_failed_recently(&self, epoch: Epoch) -> bool {
+        self.pack_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&epoch)
+            .is_some_and(|failed_at| failed_at.elapsed() < self.pack_failure_ttl)
+    }
+
+    /// Record that reading `epoch`'s consensus pack failed just now.
+    fn record_pack_failure(&self, epoch: Epoch) {
+        self.pack_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .put(epoch, Instant::now());
+    }
 }
 
 impl<N> TelcoinNetworkRpcExt<N>
@@ -800,11 +902,17 @@ where
     /// Resolve the commit time of consensus header `digest` from `epoch`.
     ///
     /// Tries, in order: the commit-time cache; the latest consensus header, which costs no
-    /// storage read; then `epoch`'s consensus pack. A digest the pack does not return is
-    /// [`TNRpcError::NotFound`]. The execution block that references it exists, so the consensus
-    /// header is missing or unreadable locally (for example, an epoch whose pack this node does
-    /// not have), and the caller must be able to tell that apart from an unknown block. Failures
-    /// are not cached, so the header resolves once its pack arrives.
+    /// storage read; then `epoch`'s consensus pack. Only a resolved commit time is cached.
+    ///
+    /// A digest the pack does not hold is [`TNRpcError::NotFound`]. The execution block that
+    /// references it exists, so the consensus header is missing locally (for example, an epoch
+    /// whose pack this node does not have), and the caller must be able to tell that apart from an
+    /// unknown block. A miss is not remembered, so the header resolves once its pack arrives.
+    ///
+    /// A pack that storage cannot read is [`TNRpcError::Internal`], and the failure is
+    /// remembered for [`PACK_FAILURE_TTL`]. Until then, a request for any block of that epoch that
+    /// gets past the cache and the latest header answers `Internal` without asking the primary, so
+    /// repeating the request does not reopen the pack or log the failure again.
     async fn consensus_commit_time(
         &self,
         epoch: Epoch,
@@ -817,7 +925,19 @@ where
         let header = if B256::from(latest.digest()) == digest {
             latest
         } else {
-            self.consensus_header_from_pack(epoch, digest).await?.ok_or(TNRpcError::NotFound)?
+            // checked before the pack-read permit is taken, so a request the memo answers
+            // neither queues behind pack reads nor reaches storage
+            if self.pack_failed_recently(epoch) {
+                return Err(TNRpcError::Internal);
+            }
+            match self.consensus_header_from_pack(epoch, digest).await? {
+                Ok(header) => header.ok_or(TNRpcError::NotFound)?,
+                Err(ConsensusStorageError) => {
+                    // the primary has already logged the cause
+                    self.record_pack_failure(epoch);
+                    return Err(TNRpcError::Internal);
+                }
+            }
         };
         let commit = ConsensusCommitTime::from(&header);
         self.commit_times.lock().unwrap_or_else(PoisonError::into_inner).put(digest, commit);
@@ -826,6 +946,9 @@ where
 
     /// Look up consensus header `digest` in `epoch`'s consensus pack on the blocking pool, under a
     /// [`MAX_CONCURRENT_PACK_READS`] permit.
+    ///
+    /// The outer result reports whether the lookup could be dispatched and awaited; the inner one
+    /// is the primary's answer, passed through unchanged.
     ///
     /// The storage call is async but does blocking work before it first yields. Reading a sealed
     /// epoch whose pack is not cached opens the pack synchronously (several file opens, about
@@ -853,7 +976,7 @@ where
         &self,
         epoch: Epoch,
         digest: B256,
-    ) -> TelcoinNetworkRpcResult<Option<ConsensusHeader>> {
+    ) -> TelcoinNetworkRpcResult<Result<Option<ConsensusHeader>, ConsensusStorageError>> {
         let primary = Arc::clone(&self.inner_node_network);
         spawn_bounded_blocking(
             &self.pack_read_guard,
@@ -912,9 +1035,15 @@ fn is_real_header(requested: BlockId, header: &SealedHeader, real_header_floor: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonrpsee::core::{to_json_value, JsonValue};
+    use crate::{
+        RpcAdmissionEntry, RpcAdmissionFallback, RpcAdmissionMode, RpcAdmissionSlot,
+        RpcAdmissionStatus, RpcEntrySource, RpcSwarmAdmission,
+    };
+    use jsonrpsee::core::{server::MethodsError, to_json_value, EmptyServerParams, JsonValue};
+    use jsonrpsee_types::ErrorObjectOwned;
+    use serde::de::DeserializeOwned;
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         future::Future as _,
         pin::pin,
         sync::atomic::{AtomicUsize, Ordering},
@@ -925,9 +1054,9 @@ mod tests {
     use tempfile::TempDir;
     use tn_types::{
         forks::{seed_signature_fork_epoch_override, subsecond_timestamp_fork_epoch_override},
-        test_chain_spec_arc, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
-        ConsensusHeaderDigest, EpochSeedChainValue, ExecHeader, ReputationScores,
-        SignatureVerificationState, TaskManager,
+        hex, test_chain_spec_arc, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
+        ConsensusHeaderDigest, EpochSeedChainValue, ExecHeader, NetworkKeypair, NetworkPublicKey,
+        ReputationScores, SignatureVerificationState, TaskManager,
     };
 
     /// Fixed keypair so nothing here depends on an RNG. `[7u8; 32]` is a valid BLS12-381 scalar
@@ -1260,6 +1389,9 @@ mod tests {
         latest: ConsensusHeader,
         /// The headers `consensus_header_by_digest` can find.
         packs: BTreeMap<(Epoch, B256), ConsensusHeader>,
+        /// Epochs whose pack storage cannot read: a lookup in one of them fails whether or not
+        /// `packs` holds the header, as a damaged pack on disk does.
+        unreadable: std::sync::Mutex<BTreeSet<Epoch>>,
         /// When set, every pack lookup waits for a permit from this gate before it answers, so a
         /// test controls when the pack responds.
         pack_gate: Option<Arc<Semaphore>>,
@@ -1268,6 +1400,9 @@ mod tests {
         thread_gate: Option<Arc<ThreadGate>>,
         /// Read counters, shared with the test.
         reads: Arc<Reads>,
+        /// Returned by `admission_snapshot`; `None` until a test sets one, as on a node whose
+        /// networks have not started.
+        snapshot: Option<RpcAdmissionSnapshot>,
     }
 
     impl FakePrimary {
@@ -1278,7 +1413,25 @@ mod tests {
                 .into_iter()
                 .map(|header| ((header.sub_dag.leader_epoch(), header.digest().into()), header))
                 .collect();
-            Self { latest, packs, pack_gate: None, thread_gate: None, reads: Arc::default() }
+            Self {
+                latest,
+                packs,
+                unreadable: std::sync::Mutex::default(),
+                pack_gate: None,
+                thread_gate: None,
+                reads: Arc::default(),
+                snapshot: None,
+            }
+        }
+
+        /// Make every later lookup in `epoch`'s pack fail.
+        fn break_pack(&self, epoch: Epoch) {
+            self.unreadable.lock().expect("unreadable lock is never poisoned").insert(epoch);
+        }
+
+        /// Let lookups in `epoch`'s pack succeed again, as they do once the pack is repaired.
+        fn repair_pack(&self, epoch: Epoch) {
+            self.unreadable.lock().expect("unreadable lock is never poisoned").remove(&epoch);
         }
     }
 
@@ -1300,7 +1453,7 @@ mod tests {
             &self,
             epoch: Epoch,
             digest: ConsensusHeaderDigest,
-        ) -> Option<ConsensusHeader> {
+        ) -> Result<Option<ConsensusHeader>, ConsensusStorageError> {
             self.reads.pack.fetch_add(1, Ordering::SeqCst);
             if let Some(gate) = &self.thread_gate {
                 gate.park();
@@ -1308,7 +1461,10 @@ mod tests {
             if let Some(gate) = &self.pack_gate {
                 gate.acquire().await.expect("the pack gate is never closed").forget();
             }
-            self.packs.get(&(epoch, digest.into())).cloned()
+            if self.unreadable.lock().expect("unreadable lock is never poisoned").contains(&epoch) {
+                return Err(ConsensusStorageError);
+            }
+            Ok(self.packs.get(&(epoch, digest.into())).cloned())
         }
 
         fn node_info(&self) -> &RpcNodeInfo {
@@ -1317,6 +1473,10 @@ mod tests {
 
         fn node_mode(&self) -> NodeMode {
             unreachable!("node mode is not exercised by these tests")
+        }
+
+        async fn admission_snapshot(&self) -> Option<RpcAdmissionSnapshot> {
+            self.snapshot.clone()
         }
     }
 
@@ -1396,9 +1556,16 @@ mod tests {
     /// Execution block `number` executed from `consensus`, with its commit's whole second as the
     /// EVM `timestamp` and its leader's nonce, as the payload builder stamps them.
     fn executed_block(number: u64, consensus: &ConsensusHeader) -> SealedHeader {
+        executed_block_at(number, consensus, consensus.sub_dag.commit_timestamp())
+    }
+
+    /// Execution block `number` executed from `consensus`, with EVM `timestamp` in place of the
+    /// commit's whole second. The payload builder stamps a later second when it raises a block to
+    /// its parent's `timestamp`.
+    fn executed_block_at(number: u64, consensus: &ConsensusHeader, timestamp: u64) -> SealedHeader {
         SealedHeader::seal_slow(ExecHeader {
             number,
-            timestamp: consensus.sub_dag.commit_timestamp(),
+            timestamp,
             nonce: consensus.sub_dag.leader().nonce().into(),
             parent_beacon_block_root: Some(consensus.digest().into()),
             ..Default::default()
@@ -1491,6 +1658,133 @@ mod tests {
         }
     }
 
+    /// A pack lookup that fails in storage is `Internal`, not `NotFound`. The pack here holds the
+    /// header, so answering "not found" would tell the caller a header is missing when the node
+    /// has it and only failed to read it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_pack_is_an_internal_error() {
+        pin_forks();
+        let stored = consensus_header(8, SUBSECOND_FORK_EPOCH);
+        let primary = FakePrimary::new(ConsensusHeader::default(), [stored.clone()]);
+        primary.break_pack(SUBSECOND_FORK_EPOCH);
+        let rpc = TestRpc::new("unreadable-pack", primary);
+
+        let result = rpc.ext.block_timestamp_millis(&executed_block(4, &stored)).await;
+
+        assert_eq!(rpc.reads.pack(), 1, "the request reached the pack");
+        assert!(
+            matches!(result, Err(TNRpcError::Internal)),
+            "a pack storage cannot read is an internal error, not a missing header: {result:?}"
+        );
+    }
+
+    /// Once reading an epoch's pack fails, a later request for a block of that epoch answers
+    /// `Internal` without asking the primary, so a caller that repeats the request does not reopen
+    /// the pack each time. The failure is remembered per epoch: a block of another epoch still
+    /// reaches its own pack.
+    ///
+    /// The ttl is left at [`PACK_FAILURE_TTL`], far longer than the test runs, so the remembered
+    /// failure cannot expire between the requests on a slow machine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_pack_is_not_reopened_within_the_ttl() {
+        pin_forks();
+        let broken_epoch = SUBSECOND_FORK_EPOCH;
+        let first = consensus_header(8, broken_epoch);
+        let sibling = consensus_header(9, broken_epoch);
+        let other_epoch = consensus_header(10, broken_epoch + 1);
+        let primary = FakePrimary::new(
+            ConsensusHeader::default(),
+            [first.clone(), sibling.clone(), other_epoch.clone()],
+        );
+        primary.break_pack(broken_epoch);
+        let rpc = TestRpc::new("pack-failure-memo", primary);
+        let first_block = executed_block(4, &first);
+
+        let result = rpc.ext.block_timestamp_millis(&first_block).await;
+        assert!(matches!(result, Err(TNRpcError::Internal)), "first request: {result:?}");
+        assert_eq!(rpc.reads.pack(), 1, "the first request reads the pack and fails");
+
+        let repeat = rpc.ext.block_timestamp_millis(&first_block).await;
+        // another consensus header of the same epoch, so it is the epoch that is remembered and
+        // not the digest
+        let sibling_result = rpc.ext.block_timestamp_millis(&executed_block(5, &sibling)).await;
+        assert_eq!(
+            rpc.reads.pack(),
+            1,
+            "inside the ttl, requests for the failed epoch do not reach the primary"
+        );
+        assert!(matches!(repeat, Err(TNRpcError::Internal)), "repeated request: {repeat:?}");
+        assert!(
+            matches!(sibling_result, Err(TNRpcError::Internal)),
+            "same-epoch request: {sibling_result:?}"
+        );
+
+        let other_result = rpc.ext.block_timestamp_millis(&executed_block(6, &other_epoch)).await;
+        assert_eq!(rpc.reads.pack(), 2, "a failure in one epoch does not answer for another");
+        let other = other_result.expect("another epoch's pack is readable");
+        assert_eq!(other.consensus_number, Some(U64::from(10)));
+    }
+
+    /// The failure memo answers only for lookups that would reach the pack. While an epoch's
+    /// failure is remembered, a block of that epoch whose commit time is cached, or that was
+    /// executed from the latest consensus header, still resolves without a pack lookup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remembered_failure_leaves_cached_and_latest_headers_answering() {
+        pin_forks();
+        let epoch = SUBSECOND_FORK_EPOCH;
+        let cached = consensus_header(7, epoch);
+        let unreadable = consensus_header(8, epoch);
+        let latest = consensus_header(9, epoch);
+        let primary = FakePrimary::new(latest.clone(), [cached.clone(), unreadable.clone()]);
+        let rpc = TestRpc::new("memo-scope", primary);
+        let cached_block = executed_block(3, &cached);
+
+        rpc.ext.block_timestamp_millis(&cached_block).await.expect("the pack is readable at first");
+        rpc.ext.inner_node_network.break_pack(epoch);
+        let result = rpc.ext.block_timestamp_millis(&executed_block(4, &unreadable)).await;
+        assert!(matches!(result, Err(TNRpcError::Internal)), "{result:?}");
+        assert!(rpc.ext.pack_failed_recently(epoch), "the failure is remembered");
+        assert_eq!(rpc.reads.pack(), 2, "one successful read, then the failed one");
+
+        let from_cache = rpc.ext.block_timestamp_millis(&cached_block).await;
+        let from_latest = rpc.ext.block_timestamp_millis(&executed_block(5, &latest)).await;
+        let from_cache = from_cache.expect("a cached commit time answers despite the failure");
+        let from_latest = from_latest.expect("the latest header answers despite the failure");
+        assert_eq!(from_cache.consensus_number, Some(U64::from(7)));
+        assert_eq!(from_latest.consensus_number, Some(U64::from(9)));
+        assert_eq!(rpc.reads.pack(), 2, "neither answer needs the pack");
+    }
+
+    /// A remembered failure expires: after the ttl, a request for the epoch asks the primary
+    /// again, and a pack that has become readable resolves the block.
+    ///
+    /// The ttl is shortened for the test, and the wait is ten times longer than it, so a slow
+    /// machine cannot send the request before the failure has expired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_pack_is_read_again_after_the_ttl() {
+        pin_forks();
+        let epoch = SUBSECOND_FORK_EPOCH;
+        let stored = consensus_header(8, epoch);
+        let primary = FakePrimary::new(ConsensusHeader::default(), [stored.clone()]);
+        primary.break_pack(epoch);
+        let mut rpc = TestRpc::new("memo-expiry", primary);
+        rpc.ext.pack_failure_ttl = Duration::from_millis(50);
+        let block = executed_block(4, &stored);
+
+        let result = rpc.ext.block_timestamp_millis(&block).await;
+        assert!(matches!(result, Err(TNRpcError::Internal)), "{result:?}");
+        assert_eq!(rpc.reads.pack(), 1);
+
+        rpc.ext.inner_node_network.repair_pack(epoch);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let result = rpc.ext.block_timestamp_millis(&block).await;
+        assert_eq!(rpc.reads.pack(), 2, "once the failure expires the primary is asked again");
+        let response = result.expect("the repaired pack resolves the block");
+        assert_eq!(response.consensus_number, Some(U64::from(8)));
+        assert_eq!(response.timestamp_millis, U64::from(COMMIT_FLOOR_MS + 1));
+    }
+
     /// The pack-read permit stays with the lookup task until the pack answers, even when the
     /// caller stops waiting first, so abandoned lookups cannot push the pack thread past
     /// [`MAX_CONCURRENT_PACK_READS`].
@@ -1574,7 +1868,7 @@ mod tests {
 
         gate.release();
         let header = call.await.expect("the lookup completes once released");
-        assert_eq!(header, Some(stored));
+        assert_eq!(header, Ok(Some(stored)));
         assert_eq!(rpc.reads.pack(), 1);
     }
 
@@ -1606,6 +1900,48 @@ mod tests {
         assert_eq!(pre.consensus_number, Some(U64::from(5)));
         assert!(post.sub_second, "a post-fork leader commits in milliseconds");
         assert_eq!(post.timestamp_millis, U64::from(COMMIT_FLOOR_MS + 1));
+    }
+
+    /// A block whose EVM `timestamp` execution raised to its parent's reports its consensus
+    /// header's commit time unchanged, which is then below `timestamp * 1000`: the one case where
+    /// `timestamp == floor(timestampMillis / 1000)` does not hold. The block here carries the
+    /// commit's whole second plus one, as a block raised to a parent one second later does.
+    ///
+    /// Reporting the larger of the commit time and `timestamp * 1000` instead fails the
+    /// `timestampMillis` assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raised_evm_timestamp_reports_the_commit_time_unchanged() {
+        pin_forks();
+        let latest = consensus_header(7, SUBSECOND_FORK_EPOCH);
+        let rpc = TestRpc::new("raised-timestamp", FakePrimary::new(latest.clone(), Vec::new()));
+        let commit_ms = latest.sub_dag.commit_timestamp_ms().as_millis();
+        let raised = latest.sub_dag.commit_timestamp() + 1;
+        let block = executed_block_at(3, &latest, raised);
+
+        let response =
+            rpc.ext.block_timestamp_millis(&block).await.expect("the latest header resolves");
+
+        assert_eq!(
+            response.timestamp_millis,
+            U64::from(commit_ms),
+            "timestampMillis is the consensus commit time, whatever execution stamped as timestamp"
+        );
+        assert!(
+            response.timestamp_millis < U64::from(raised * 1000),
+            "a raised block reports a commit time below its timestamp in milliseconds"
+        );
+        assert_eq!(
+            response,
+            BlockTimestampMillis {
+                block_number: U64::from(3),
+                block_hash: block.hash(),
+                timestamp: U64::from(raised),
+                timestamp_millis: U64::from(commit_ms),
+                sub_second: true,
+                consensus_number: Some(U64::from(7)),
+                consensus_digest: Some(latest.digest().into()),
+            }
+        );
     }
 
     /// Genesis has no consensus header. Every id that selects it reports the genesis timestamp in
@@ -1730,5 +2066,341 @@ mod tests {
         );
         assert_eq!(BlockTimestampMillis::deserialize(full_json).expect("round-trips"), full);
         assert_eq!(BlockTimestampMillis::deserialize(genesis_json).expect("round-trips"), genesis);
+    }
+
+    /// The 96-byte compressed BLS public key of the fixed scalar `[seed; 32]`.
+    fn bls_key(seed: u8) -> Bytes {
+        let keypair = BlsKeypair::from_bytes(&[seed; 32])
+            .expect("a small repeated byte is a valid bls private key scalar");
+        Bytes::from(keypair.public().to_bytes().to_vec())
+    }
+
+    /// The ed25519 network key of the fixed seed `[seed; 32]`.
+    fn network_key(seed: u8) -> NetworkPublicKey {
+        NetworkKeypair::ed25519_from_bytes([seed; 32])
+            .expect("a 32-byte array is a valid ed25519 secret seed")
+            .public()
+            .into()
+    }
+
+    /// An entry the swarm resolved from the signed record of the validator with key seed `seed`,
+    /// published at `record_timestamp` with the single address `address`.
+    fn record_entry(
+        seed: u8,
+        slots: &[RpcAdmissionSlot],
+        address: &str,
+        record_timestamp: u64,
+        admitted: bool,
+    ) -> RpcAdmissionEntry {
+        let network_pubkey = network_key(seed);
+        RpcAdmissionEntry {
+            bls_pubkey: bls_key(seed),
+            slots: slots.to_vec(),
+            peer_id: Some(network_pubkey.to_peer_id().to_string()),
+            network_pubkey: Some(network_pubkey),
+            multiaddrs: vec![address.to_string()],
+            record_multiaddrs: None,
+            record_timestamp: Some(record_timestamp),
+            source: RpcEntrySource::Record,
+            admitted,
+        }
+    }
+
+    /// The schema's example snapshot: a `Closed` primary swarm at epoch 42 tracking a current
+    /// committee member it admits and an eligible validator it does not, in key order.
+    fn schema_example_snapshot() -> RpcAdmissionSnapshot {
+        RpcAdmissionSnapshot::new(
+            Some(42),
+            vec![RpcSwarmAdmission {
+                network: "primary".to_string(),
+                worker_id: None,
+                available: true,
+                tracked_epoch: Some(42),
+                admission: Some(RpcAdmissionStatus {
+                    configured: RpcAdmissionMode::Closed,
+                    effective: RpcAdmissionMode::Closed,
+                    epoch: Some(42),
+                    fallback: None,
+                    resolved_current: 4,
+                    required_current: 3,
+                    connected_current: 3,
+                    contradicted: 0,
+                }),
+                entries: vec![
+                    record_entry(
+                        7,
+                        &[RpcAdmissionSlot::Current, RpcAdmissionSlot::Eligible],
+                        "/ip4/203.0.113.10/udp/49590/quic-v1",
+                        1_793_750_400,
+                        true,
+                    ),
+                    record_entry(
+                        9,
+                        &[RpcAdmissionSlot::Eligible],
+                        "/ip4/198.51.100.7/udp/49590/quic-v1",
+                        1_793_736_000,
+                        false,
+                    ),
+                ],
+            }],
+        )
+    }
+
+    /// The JSON the schema documents for [`record_entry`]'s entry: the BLS key as `0x` hex, the
+    /// PeerId in base58, the network key in the base58 protobuf encoding `tn_info` uses, lowercase
+    /// slot and source names, and no `record_multiaddrs`.
+    fn record_entry_json(
+        seed: u8,
+        slots: &[&str],
+        address: &str,
+        record_timestamp: u64,
+        admitted: bool,
+    ) -> JsonValue {
+        let network_pubkey = network_key(seed);
+        json_object([
+            ("bls_pubkey", to_json(hex::encode_prefixed(bls_key(seed)))),
+            ("slots", to_json(slots)),
+            ("peer_id", to_json(network_pubkey.to_peer_id().to_string())),
+            ("network_pubkey", to_json(network_pubkey.to_string())),
+            ("multiaddrs", to_json([address])),
+            ("record_timestamp", to_json(record_timestamp)),
+            ("source", to_json("record")),
+            ("admitted", to_json(admitted)),
+        ])
+    }
+
+    /// The keys of JSON object `value`.
+    fn keys(value: &JsonValue) -> BTreeSet<&str> {
+        value.as_object().expect("a json object").keys().map(String::as_str).collect()
+    }
+
+    /// `tn_admissionSnapshot` serves the node's snapshot as the schema documents it, key for key:
+    /// snake_case names, `0x` hex BLS keys of 96 bytes, capitalised mode names, a `null`
+    /// fallback, and no `record_multiaddrs` while no launch address replaces a record's
+    /// addresses. The response parses back into the snapshot the node returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_snapshot_serves_the_schema_example() {
+        pin_forks();
+        let snapshot = schema_example_snapshot();
+        let entries = &snapshot.swarms[0].entries;
+        assert!(entries[0].bls_pubkey < entries[1].bls_pubkey, "swarms list entries in key order");
+        let mut primary = FakePrimary::new(ConsensusHeader::default(), Vec::new());
+        primary.snapshot = Some(snapshot.clone());
+        let rpc = TestRpc::new("admission-snapshot", primary);
+        let module = rpc.ext.into_rpc();
+
+        let response: JsonValue = module
+            .call("tn_admissionSnapshot", EmptyServerParams::new())
+            .await
+            .expect("a node with started networks serves its snapshot");
+
+        let swarm = &response["swarms"][0];
+        let entry = &swarm["entries"][0];
+        assert_eq!(keys(&response), BTreeSet::from(["version", "epoch", "swarms"]));
+        assert_eq!(
+            keys(swarm),
+            BTreeSet::from([
+                "network",
+                "worker_id",
+                "available",
+                "tracked_epoch",
+                "admission",
+                "entries"
+            ])
+        );
+        assert_eq!(
+            keys(&swarm["admission"]),
+            BTreeSet::from([
+                "configured",
+                "effective",
+                "epoch",
+                "fallback",
+                "resolved_current",
+                "required_current",
+                "connected_current",
+                "contradicted",
+            ])
+        );
+        assert_eq!(
+            keys(entry),
+            BTreeSet::from([
+                "bls_pubkey",
+                "slots",
+                "peer_id",
+                "network_pubkey",
+                "multiaddrs",
+                "record_timestamp",
+                "source",
+                "admitted",
+            ])
+        );
+        let bls_hex = entry["bls_pubkey"].as_str().expect("bls_pubkey is a string");
+        let bls_bytes =
+            hex::decode(bls_hex.strip_prefix("0x").expect("bls_pubkey has a 0x prefix"))
+                .expect("bls_pubkey is hex");
+        assert_eq!(bls_bytes.len(), 96, "a compressed bls public key");
+        assert_eq!(bls_hex, bls_hex.to_ascii_lowercase());
+
+        let expected = json_object([
+            ("version", to_json(1)),
+            ("epoch", to_json(42)),
+            (
+                "swarms",
+                to_json([json_object([
+                    ("network", to_json("primary")),
+                    ("worker_id", JsonValue::Null),
+                    ("available", to_json(true)),
+                    ("tracked_epoch", to_json(42)),
+                    (
+                        "admission",
+                        json_object([
+                            ("configured", to_json("Closed")),
+                            ("effective", to_json("Closed")),
+                            ("epoch", to_json(42)),
+                            ("fallback", JsonValue::Null),
+                            ("resolved_current", to_json(4)),
+                            ("required_current", to_json(3)),
+                            ("connected_current", to_json(3)),
+                            ("contradicted", to_json(0)),
+                        ]),
+                    ),
+                    (
+                        "entries",
+                        to_json([
+                            record_entry_json(
+                                7,
+                                &["current", "eligible"],
+                                "/ip4/203.0.113.10/udp/49590/quic-v1",
+                                1_793_750_400,
+                                true,
+                            ),
+                            record_entry_json(
+                                9,
+                                &["eligible"],
+                                "/ip4/198.51.100.7/udp/49590/quic-v1",
+                                1_793_736_000,
+                                false,
+                            ),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        assert_eq!(response, expected);
+        assert_eq!(RpcAdmissionSnapshot::deserialize(response).expect("round-trips"), snapshot);
+    }
+
+    /// Before the node's networks start, `tn_admissionSnapshot` answers the `tn` namespace's
+    /// not-found error rather than an empty snapshot, which a caller would read as a swarm
+    /// tracking nobody.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_snapshot_is_not_found_before_the_networks_start() {
+        pin_forks();
+        let rpc = TestRpc::new(
+            "admission-snapshot-none",
+            FakePrimary::new(ConsensusHeader::default(), Vec::new()),
+        );
+        let module = rpc.ext.into_rpc();
+
+        let result =
+            module.call::<_, JsonValue>("tn_admissionSnapshot", EmptyServerParams::new()).await;
+
+        let expected = ErrorObjectOwned::from(TNRpcError::NotFound);
+        assert!(
+            matches!(&result, Err(MethodsError::JsonRpc(error)) if *error == expected),
+            "{result:?}"
+        );
+    }
+
+    /// A swarm that did not answer is listed with `available: false` and a `null` admission and
+    /// keeps every other field of the schema, so a parser finds the same keys on every swarm.
+    #[test]
+    fn unavailable_swarm_serializes_a_null_admission() {
+        let swarm = RpcSwarmAdmission {
+            network: "worker-0".to_string(),
+            worker_id: Some(0),
+            available: false,
+            tracked_epoch: None,
+            admission: None,
+            entries: Vec::new(),
+        };
+
+        let json = to_json(&swarm);
+
+        assert_eq!(
+            json,
+            json_object([
+                ("network", to_json("worker-0")),
+                ("worker_id", to_json(0)),
+                ("available", to_json(false)),
+                ("tracked_epoch", JsonValue::Null),
+                ("admission", JsonValue::Null),
+                ("entries", to_json(Vec::<JsonValue>::new())),
+            ])
+        );
+        assert_eq!(RpcSwarmAdmission::deserialize(json).expect("round-trips"), swarm);
+    }
+
+    /// An entry lists `record_multiaddrs` only while a configured launch address replaces the
+    /// signed record's addresses in `multiaddrs`.
+    #[test]
+    fn record_addresses_are_listed_only_when_a_launch_address_replaces_them() {
+        let launch = "/ip4/192.0.2.1/udp/49590/quic-v1";
+        let record = "/ip4/203.0.113.10/udp/49590/quic-v1";
+        let mut entry = record_entry(7, &[RpcAdmissionSlot::Current], record, 1_793_750_400, true);
+        assert!(to_json(&entry).get("record_multiaddrs").is_none());
+
+        entry.source = RpcEntrySource::Stub;
+        entry.multiaddrs = vec![launch.to_string()];
+        entry.record_multiaddrs = Some(vec![record.to_string()]);
+        let json = to_json(&entry);
+
+        assert_eq!(json["multiaddrs"], to_json([launch]));
+        assert_eq!(json["record_multiaddrs"], to_json([record]));
+        assert_eq!(json["source"], to_json("stub"));
+        assert_eq!(RpcAdmissionEntry::deserialize(json).expect("round-trips"), entry);
+    }
+
+    /// Modes and fallbacks serialize by their capitalised names, slots and sources in lowercase:
+    /// the strings the schema documents, each of which parses back to its variant.
+    #[test]
+    fn admission_names_serialize_as_the_schema_documents() {
+        /// Assert every `(variant, name)` pair serializes to `name` and parses back.
+        fn assert_names<T>(names: &[(T, &str)])
+        where
+            T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            for (variant, name) in names {
+                assert_eq!(to_json(variant), to_json(name), "{variant:?}");
+                assert_eq!(&T::deserialize(to_json(name)).expect("a documented name"), variant);
+            }
+        }
+
+        assert_names(&[
+            (RpcAdmissionMode::Open, "Open"),
+            (RpcAdmissionMode::Grace, "Grace"),
+            (RpcAdmissionMode::Closed, "Closed"),
+        ]);
+        assert_names(&[
+            (RpcAdmissionFallback::Missing, "Missing"),
+            (RpcAdmissionFallback::Stale, "Stale"),
+            (RpcAdmissionFallback::Contradictory, "Contradictory"),
+            (RpcAdmissionFallback::Unresolved, "Unresolved"),
+        ]);
+        assert_names(&[
+            (RpcAdmissionSlot::Previous, "previous"),
+            (RpcAdmissionSlot::Current, "current"),
+            (RpcAdmissionSlot::Next, "next"),
+            (RpcAdmissionSlot::Scheduled, "scheduled"),
+            (RpcAdmissionSlot::Eligible, "eligible"),
+            (RpcAdmissionSlot::Trusted, "trusted"),
+            (RpcAdmissionSlot::Bootstrap, "bootstrap"),
+        ]);
+        assert_names(&[
+            (RpcEntrySource::Record, "record"),
+            (RpcEntrySource::Config, "config"),
+            (RpcEntrySource::Stub, "stub"),
+            (RpcEntrySource::Unresolved, "unresolved"),
+        ]);
     }
 }

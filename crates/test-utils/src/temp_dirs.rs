@@ -47,4 +47,8 @@ impl TelcoinDirs for TelcoinTempDirs {
     fn network_config_path(&self) -> PathBuf {
         self.0.path().join("network-config")
     }
+
+    fn node_pid_path(&self) -> PathBuf {
+        self.0.path().join("telcoin.pid")
+    }
 }

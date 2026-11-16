@@ -1,0 +1,26 @@
+[package]
+name = "reth-fs-util"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Commonly used fs utils in reth."
+
+[lints]
+workspace = true
+
+[dependencies]
+# misc
+serde_json = { workspace = true, features = ["std"] }
+serde.workspace = true
+thiserror.workspace = true
+
+# TN(TN-0117): a plain `fsync` on macOS for `fsync_file` (already in the lockfile through
+# tempfile, with these features).
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
+
+[dev-dependencies]
+tempfile.workspace = true

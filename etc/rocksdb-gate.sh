@@ -1,53 +1,96 @@
 #!/bin/bash
 #
-# RocksDB guard: fail if rocksdb enters the default feature graph.
+# RocksDB guard: fail if RocksDB comes back anywhere in the build.
 #
 # librocksdb-sys is the entire RocksDB C++ engine (332 translation units) and the single
-# largest native compile in the tree. Storage here is MDBX-only, so the workspace manifest
-# takes reth without its default features and leaves `rocksdb` off; see the note above the
-# `reth` entry in Cargo.toml, including the warning that reth's `edge` feature implies it.
-# This guard catches the bump that re-introduces it through some other default set: the
-# cost would land on every build, and the cache warm on main would absorb it without a
-# word.
+# largest native compile in the tree. TN does not use RocksDB in any configuration: the
+# vendored reth (vendor/reth) has its RocksDB backend, its `rocksdb`/`edge` features and the
+# `rocksdb` crate removed (vendor/reth/CHANGES.md TN-0014), and no TN crate has a `rocksdb`
+# feature. This guard keeps it that way. It catches a dependency bump or an upstream reth sync
+# (`vendor/reth/tn/vendor.py sync`) that brings it back, before the cost lands on every build.
 #
-# Structured check: count rocksdb packages in the feature-resolved metadata graph instead
-# of scraping cargo's error wording. Resolves the graph only and compiles nothing; with the
-# registry index already present (a restored cargo home in CI, any earlier build locally)
-# it takes seconds.
+# Two checks, both reading files only (no cargo invocation, nothing compiled):
+#   1. Cargo.lock holds no package whose name contains "rocksdb" (rocksdb, librocksdb-sys, and
+#      renamed forks such as rust-librocksdb-sys). The lockfile resolves every feature, target
+#      and dev-dependency of the workspace, so this covers optional and transitive paths too.
+#      Neither does vendor/reth/tn/test-only.lock, which pins what only the vendored reth's own
+#      tests need (vendor/reth/tn/lockfile.py).
+#   2. No manifest under vendor/reth, the TN crates, the carried patches/ crates or the testing/
+#      tools mentions rocksdb outside a comment. That catches a re-added optional dependency or
+#      feature before anyone enables it.
 #
-# Fails closed: `set -euo pipefail` turns a cargo or jq failure into a failed assignment
-# instead of a "zero hits" pass, and a missing jq is refused up front rather than reported
-# as a clean graph.
+# Fails closed: a missing lockfile or scanned directory, or a file grep cannot read, is an
+# error, not a pass.
+#
+# etc/test_rocksdb_gate.py runs this script against planted lockfiles and manifests.
 #
 # Runs in the `test` job of .github/workflows/pr.yaml and in etc/test-and-attest.sh, so the
-# queue enforces what the maintainer's attested run checked.
+# queue enforces what the maintainer's attested run checked, and in the `build-tests` job
+# of .github/workflows/main-compiles.yaml, which checks pushes the queue did not make.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if ! command -v jq > /dev/null; then
-    echo "rocksdb guard FAILED: jq is required and was not found on PATH."
-    exit 1
+LOCKFILES=(Cargo.lock vendor/reth/tn/test-only.lock)
+for lockfile in "${LOCKFILES[@]}"; do
+    if [[ ! -f "$lockfile" ]]; then
+        echo "rocksdb guard FAILED: $lockfile not found in $ROOT_DIR."
+        exit 1
+    fi
+done
+
+# Directories and files whose Cargo.toml files are scanned: every tracked manifest. patches/
+# holds the crates that the root [patch.crates-io] puts into the build; testing/ the standalone
+# test tools.
+SCANNED=(vendor/reth bin crates examples patches testing Cargo.toml)
+for path in "${SCANNED[@]}"; do
+    if [[ ! -e "$path" ]]; then
+        echo "rocksdb guard FAILED: $path not found in $ROOT_DIR; update SCANNED in $0."
+        exit 1
+    fi
+done
+
+# grep's matching lines. No match (status 1) is a pass; an error (status 2, such as a file it
+# cannot read) fails the guard.
+search() {
+    local status=0
+    grep "$@" || status=$?
+    if ((status > 1)); then
+        echo "rocksdb guard FAILED: grep $* exited $status." >&2
+        exit 1
+    fi
+}
+
+failed=0
+
+for lockfile in "${LOCKFILES[@]}"; do
+    locked=$(search -iE '^name = "[^"]*rocksdb[^"]*"$' "$lockfile")
+    if [[ -n "$locked" ]]; then
+        echo "rocksdb guard FAILED: $lockfile contains RocksDB packages:"
+        echo "$locked"
+        failed=1
+    fi
+done
+
+# Comment lines are skipped: manifests may explain that RocksDB is gone.
+manifests=$(search -rIilE --include=Cargo.toml '^[^#]*rocksdb' "${SCANNED[@]}")
+if [[ -n "$manifests" ]]; then
+    echo "rocksdb guard FAILED: these manifests mention rocksdb:"
+    echo "$manifests"
+    failed=1
 fi
 
-hits=$(cargo metadata --locked --format-version 1 |
-    jq '[.resolve.nodes[].id | select(test("[/#]rocksdb@"))] | length')
-
-if [[ "$hits" -ne 0 ]]; then
-    echo "rocksdb guard FAILED: librocksdb-sys re-entered the default dependency graph (${hits} rocksdb package(s) resolved)."
-    echo
-    cargo tree --locked -e features -i rocksdb || true
-    echo
+if [[ "$failed" -ne 0 ]]; then
     cat <<'EOF'
-rocksdb is gated behind an off-by-default feature so that no build in this workspace pays
-for the RocksDB C++ engine. A dependency change has pulled it back into the default graph.
-Find the edge in the tree above and cut it (turn the feature off on that dependency, or
-take it without default features and re-enable the ones needed). The note above the `reth`
-entry in Cargo.toml has the background.
+
+RocksDB was removed from TN and from the vendored reth on purpose (a very expensive native
+build that TN does not use). Find what brought it back (`cargo tree -i rocksdb` for a
+dependency, the manifest diff for a feature) and cut it. If an upstream reth sync re-added
+it, drop it again in the vendored crate and note it in vendor/reth/CHANGES.md.
 EOF
     exit 1
 fi
 
-echo "rocksdb guard passed: rocksdb absent from the default feature graph"
+echo "rocksdb guard passed: no rocksdb package in either lockfile and no rocksdb in any manifest"

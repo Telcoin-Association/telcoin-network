@@ -3,12 +3,15 @@
 A cold build and test of the workspace on a GitHub-hosted runner takes over 45 minutes, and the e2e suites cannot run there at all within a reasonable budget.
 So the full suite runs on a maintainer's machine, and CI checks that the resulting commit hash was attested on-chain.
 
-`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, both test lanes, the two guards and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+`etc/test-and-attest.sh` (`make attest`) runs fmt, clippy, the three test lanes CI runs (`test-default`, `test-adiri`, `test-vendor-reth`; `test-default` includes the backend gate), the archive-mode and RocksDB guards, the engine's and the adapter's heavy test variants, and the e2e suites locally, then writes the HEAD commit hash to the git attestation registry on adiri (`0xf102928273a399cda6151b8616209af019499c84`).
+The e2e suites it runs are the `#[ignore]`d tests of `e2e-tests` on the default (tn-lmdb) node binary, then `make test-e2e-reth-migration` (a committee on the MDBX build, each validator restarted onto the default binary) and `make test-e2e-resync` (a validator rebuilt in layout v2 with `db reset-execution`); both skip, passing, under the generic selection, which sets neither their marker nor the previous binary.
+The nightly `durable-e2e.yaml` runs the restart, epoch and sigkill suites and the same two; the rolling-upgrade suite (`make test-upgrade`) stays manual.
 The `verify-on-chain` lane in `.github/workflows/pr.yaml` reads that registry back.
 
 The lanes themselves live in **`etc/ci-lanes.sh`**, and both `test-and-attest.sh` and `pr.yaml` call it.
 That is the only reason "the queue runs what was attested" is a fact rather than a hope: when the two spelled out their own commands, they had already drifted (CI ran clippy under `--all-features` only, and excluded a package deleted long ago).
 Edit a lane there and both callers change together.
+Two more callers run on `main`: `cache-deps.yaml` compiles the lanes to warm the caches the queue restores (see "Caches"), and `main-compiles.yaml` compiles them after every push to `main` that the merge queue did not make, as a tripwire for commits that never went through the queue (see "Where the coverage gap is").
 The e2e suites are deliberately not in that file -- anything added to it lands in the merge queue.
 
 ## What the merge queue changes
@@ -19,11 +22,15 @@ Two PRs that each pass alone can still break each other, and no amount of attest
 
 So the two gates cover different things and neither replaces the other:
 
-| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, the guards) |
+| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `vendor-reth-test`, the guards) |
 |---|---|---|
 | commit tested | the PR head | main + this PR + every PR ahead of it in the batch |
 | suite | everything, e2e included | everything CI can afford; no e2e |
 | runs on | a maintainer's machine | GitHub runners |
+| on the pull request | checked on every run | `fmt`, `clippy` and the guards for every PR, drafts included; `test`, `adiri-test` and `vendor-reth-test` skipped for a draft or a maintainer-authored PR |
+
+`vendor-reth-test` runs reth's own tests for the vendored crates in `vendor/reth`, and the opt-in `js-tracer` build (`etc/ci-lanes.sh test-vendor-reth`); the root lanes cannot reach either. It first checks that the nested workspace resolves only pinned packages (`vendor/reth/tn/lockfile.py check`).
+The carried patch crates under `patches/` that sit outside the workspace get a job each (`connection-limits-patch`, `quinn-proto-patch`, `gossipsub-patch`, `revm-inspectors-patch`) for the same reason.
 
 The queue builds a temporary `gh-readonly-queue/main/...` branch and fires a `merge_group` event against it.
 Three consequences worth remembering:
@@ -33,9 +40,11 @@ Three consequences worth remembering:
   ejects the PR. `pr.yaml` triggers on both events, and `CI Success` is the only required
   check, on purpose: a second required name means a second workflow that has to learn the
   same lesson.
-- **The maintainer and draft skips do not apply in the queue.** Whoever wrote the PR, the
-  merged commit has never been compiled anywhere, so every lane runs. `CI Success` treats a
-  skipped lane as a failure on `merge_group` for the same reason.
+- **The maintainer and draft skips cover the three test lanes only, and never apply in the queue.**
+  On a pull request, `ci-scope` skips `test`, `adiri-test` and `vendor-reth-test` for a draft or a maintainer-authored PR.
+  `fmt`, `clippy` and the guards run for every author, draft or not, so a PR whose test code does not compile fails on its own run instead of being ejected from the queue.
+  In the queue, whoever wrote the PR, the merged commit has never been compiled anywhere, so every lane runs.
+  `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of those three test lanes only, and only when `ci-scope` asked for it.
 - **The attestation is checked on the pull request only, never in the queue.** GitHub
   creates the merge group's commit seconds before CI starts, so no local run could have
   covered it and nothing can attest it; a lane that demanded one would hang the queue until
@@ -47,7 +56,11 @@ Three consequences worth remembering:
 ### Re-running the attestation check
 
 `make attest` writes to adiri and touches nothing on GitHub, so nothing re-runs `verify-on-chain` by itself.
-Two ways to re-run it on the same sha: request a review on the PR (`review_requested` is in the workflow's `pull_request.types` for exactly this), or re-run the failed job from the Actions tab.
+After attesting, open the PR's failed run in the Actions tab and choose *Re-run failed jobs*.
+That re-runs the failed `verify-on-chain` and `CI Success` in the same run, and `CI Success` reads the other jobs' results from the first attempt, so nothing is compiled or tested again and nothing can turn `CI Success` green on a sha whose compile lanes failed.
+`gh run rerun <run-id> --failed` does the same from a shell, but only with a token that has `actions: write`, so the Actions tab is the documented path.
+The re-run uses the script as it stands on `main` at that moment, so a change to the script or its registry address reaches an open PR on its next run.
+Requesting a review re-runs nothing: `review_requested` used to be the trigger for this, and it re-ran the whole workflow (8 minutes warm, 16 cold) for one job, and opening a PR whose paths have code owners fired it three times.
 Do not push: a new sha needs a new attestation.
 
 ### Why SQUASH
@@ -72,30 +85,65 @@ This is why `test-and-attest.sh` refuses to attest a branch that is behind `orig
 `ALLOW_STALE_BASE=1` overrides it when the drift is provably irrelevant.
 The nightly `durable-e2e` lane is the backstop for what still slips through.
 
+The second gap is a merge that goes around the queue altogether.
+The fix for a GitHub security advisory is developed in a temporary private fork and merged from the advisory.
+GitHub runs no status checks on a temporary fork and enforces no branch protection when an advisory is merged, so neither `pull_request` nor `merge_group` fires and the ruleset never asks for `CI Success`.
+On 2026-10-29, between 02:26 and 02:32 UTC, four advisory fixes landed that way: GHSA-qf73 as `87180d74f`, GHSA-86x7 as `5f912b1dd`, GHSA-4947 as `ed092164d` and GHSA-f64w as `b68ce0c78`.
+Each had been forked from `main` on its own, and the four met for the first time on `main`, where the test targets no longer compiled: two E0061 errors and an E0308 in the `tn-network-libp2p` library tests, clippy's `manual_repeat_n` in two test modules, and two tests that still asserted the behavior the fixes had changed.
+Only the push-triggered workflows ran on those commits: CodeQL, and `cache-deps.yaml`, whose warm job failed on the errors but is a cache warmer that nobody reads as a gate.
+The nightly `durable-e2e` failed the same way.
+From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
+
+`.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
+On every push to `main` that the merge queue did not make, it runs `fmt` and the three `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` or `vendor/reth/tn/test-only.lock` and no manifest names one, builds the test binaries of the three test lanes CI runs under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
+It cannot block anything.
+No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
+It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
+
+*Main compiles* skips its jobs on a push the queue made (`github.actor` is `github-merge-queue[bot]`): that push lands the very `merge_group` commit, same sha, that `pr.yaml` has just compiled and tested.
+The commit cannot tell the routes apart, since queue, advisory and admin merges are all committed by `web-flow` with one parent, but the actor can.
+A renamed bot makes the jobs run, which is the safe direction, and a dispatch from the Actions tab always runs.
+The skip trusts the queue's run, so it holds only while `CI Success` is required: if the check is removed under the escape hatch (item 6 of the settings below) and a PR still goes through the queue, its push is skipped although its `merge_group` run may have failed.
+
+Before merging advisory fixes, do the queue's job by hand:
+
+1. Cut a local branch from the current `origin/main`.
+2. Merge the head of every pending advisory fork onto it.
+3. Run `./etc/ci-lanes.sh all` on the combined tip.
+4. Only once that passes, merge the advisories.
+
+Or publish the advisory and route the fix through the queue as an ordinary pull request.
+What broke `main` on 2026-10-29 was four separately forked fixes meeting for the first time there.
+
 ### Repository settings this requires
 
 The workflow changes are not enough on their own.
-In order of urgency:
+In order of importance:
 
-1. **Add `CI Success` as a required status check. It is missing today.** The `main` ruleset
-   has no `required_status_checks` rule at all, so the queue gates nothing yet: a PR can be
-   queued unattested with no green lane, and the queue merges each entry as soon as GitHub
-   has built it. Add the check with *Require branches to be up to date before merging*
-   **off**: strict mode would force a re-push, and so a re-attestation, every time `main`
+1. **`CI Success` is the required status check** (the `main` ruleset, source GitHub
+   Actions). Without it the queue would gate nothing: a PR could be queued unattested with
+   no green lane. Keep *Require branches to be up to date before merging* **off**, as it is
+   now: strict mode would force a re-push, and so a re-attestation, every time `main`
    moved, and the queue already tests `main + PR`. Require `CI Success` only, not
    `verify-on-chain`, which is a job inside `pr.yaml` that `CI Success` already depends on.
    GitHub matches a required check by name, so a job called `CI Success` in any workflow
    would satisfy it; keep the name unique to `pr.yaml`.
-2. **Merge queue.** Merge method `SQUASH` (already set). Start with a build concurrency of
-   **2**: each group runs seven jobs, so five groups is about 35 concurrent jobs queueing
-   behind the organization's runner concurrency. Raise the status check timeout from 60 to
-   **90 minutes**: it counts from the group's creation, runner backlog included, so 60 can
-   eject a lane that took 45 after queueing for 15.
-3. **Pull request rule.** *Dismiss stale pull request approvals when new commits are pushed*
-   (already set) is, together with (1), what makes a late push cost a re-approval.
-   Recommended: *Require approval of the most recent reviewable push*, so the author of that
-   push cannot approve it themselves. `require_code_owner_review` is a latent switch with no
-   CODEOWNERS file to consult; leave it off.
+2. **Merge queue.** Merge method `SQUASH` (already set).
+   Recommended, and not yet set: a build concurrency of **2** (the ruleset has 5).
+   `pr.yaml` is the only workflow that runs on `merge_group`, so a queue entry starts its jobs and nothing else.
+   It reports twelve jobs, counting `CI Success` and the reusable transport workflow's `transport-evidence / qualify`, and eleven of them run in a merge group, where `verify-on-chain` is skipped; five groups is about 55 concurrent jobs queueing behind the organization's runner concurrency.
+   And a status check timeout of **90 minutes** (it is 60): it counts from the group's creation, runner backlog included, so 60 can eject a lane that took 45 after queueing for 15.
+3. **Pull request rule.** One approval is required. *Dismiss stale pull request approvals
+   when new commits are pushed* (already set) is, together with (1), what makes a late push
+   cost a re-approval. *Require review from Code Owners* (`require_code_owner_review`) is
+   on, and `.github/CODEOWNERS` assigns `/.github/`, `/etc/`, `/Makefile` and the tool
+   configuration the lanes read (`.cargo/`, `.config/`, the toolchain pins, and every
+   `rustfmt.toml` and `clippy.toml`) to the four accounts in `MAINTAINERS` (the `ci-scope`
+   job in `pr.yaml`), so a PR that touches any of them needs one of those four to approve
+   it. GitHub reads CODEOWNERS from the PR's base branch, so a PR cannot change who has to
+   review it. Other paths need the one approval, but not a code owner's. Recommended, and
+   still off: *Require approval of the most recent reviewable push*, so the author of that
+   push cannot approve it themselves.
 4. **Repository settings** (Settings -> General -> Pull Requests). *Allow auto-merge* is not
    in the ruleset and does not look related, so it is the one that gets missed: the "Merge
    when ready" button calls the `enablePullRequestAutoMerge` GraphQL mutation even on a
@@ -103,14 +151,15 @@ In order of urgency:
    every attempt to queue a PR fails with *"failed enabling auto-merge for pull request"*,
    however green the PR is. Also *Allow squash merging*, with the default squash message
    set to the PR title and description.
-5. **Delete the `merge-into-main` environment** (Settings -> Environments) and drop the
-   empty `required_deployments` rule from the `main` ruleset. The old
+5. **Delete the `merge-into-main` environment** (Settings -> Environments). The old
    `maintainer-verify.yaml` workflow ran in that environment; it was folded into `pr.yaml`
-   and deleted, and the replacement lane deliberately has no `environment:` of its own: it
-   reads a public RPC and uses no secrets, and an environment that ever gained a protection
-   rule would park the merge queue on a manual approval until the queue timed out. The
-   `required_deployments` rule lists no environments, so it enforces nothing while leaving
-   a live switch that would hang the queue if anyone filled it in.
+   and deleted, and no workflow names the environment now. The replacement lane
+   deliberately has no `environment:` of its own: it reads a public RPC and uses no
+   secrets, and an environment with a protection rule would park the merge queue on a
+   manual approval until the queue timed out. The `main` ruleset no longer has a
+   `required_deployments` rule, so nothing requires a deployment to it either. The
+   environment still carries a required-reviewers protection rule, which makes it a switch
+   that would hang the queue if a job ever named it again.
 6. **Escape hatch.** If the `merge_group` path of `CI Success` is ever broken, no PR can
    land to fix it, because the fix itself has to pass through the queue. An admin has to
    remove the required check temporarily (or use a bypass) to land the fix, then put it
@@ -120,44 +169,363 @@ In order of urgency:
 
 GitHub's own answer is only "anyone with write access", and there is no finer-grained setting.
 The real gate here is the attestation plus the approval: `CI Success` depends on `verify-on-chain`, required checks must pass *before* a PR can be queued, and `verify-on-chain` passes only for a commit hash already written to the registry by a holder of the MAINTAINER key.
-So a contributor cannot make their own PR queue-eligible -- a maintainer has to run `test-and-attest.sh` against that exact commit first, which is a stronger claim than a CODEOWNERS entry makes.
-This is documented, not enforced by GitHub: nothing stops a maintainer from queueing an attested PR without a review, other than the approval rule.
+That binds a PR that leaves the gate alone, and only such a PR.
+
+`verify-on-chain` runs `.github/scripts/verify_commit_hash.sh` from `main` as it stands when the job starts, not from the PR, so editing the script does nothing for the PR that edits it.
+The new script judges every run after it lands on `main`, on every open PR, a re-run of failed jobs included.
+The `attest` job definition and the `CI Success` allowlist still come from the PR's merge commit, though, and the queue run uses the PR's `pr.yaml` and skips `verify-on-chain`.
+So a PR that edits the job or the allowlist can turn `CI Success` green without an attestation, on the PR and in the queue.
+The lanes are in the same position: the queue runs `etc/ci-lanes.sh` from the merge commit, so a PR that edits it is tested by its own edit.
+Nothing inside `pr.yaml` can take these out of the PR's hands; that needs a decision at the ruleset level.
+
+What stops such a PR is the required code-owner review (item 3 above).
+Whoever approves must treat any change to a path `.github/CODEOWNERS` lists as a change to the gate itself: a green `CI Success` on such a PR does not by itself show that it was attested or tested.
+That includes the tool configuration: `[profile.ci]` in `.config/nextest.toml` is read only by the CI lanes (`NEXTEST_PROFILE: ci` in `pr.yaml`), so `make attest` never exercises an edit to it.
+The admin role can bypass the `main` ruleset, and with it both the approval and `CI Success`.
+All four code owners hold that role, so the code-owner review is a check on everyone but them: any one of the four can land a change to the gate that no second owner has read, and so can every other account with admin on the repository (Settings -> Collaborators and teams), code owner or not.
+The bypass mode is *Always allow*, which also lets an admin push to `main` with no pull request at all; *For pull requests only* would keep the escape hatch in item 6 and leave a pull request behind every bypass.
+An advisory merge is a second route around the ruleset: GitHub enforces no branch protection when a security advisory's fix is merged, so it needs neither the approval nor `CI Success` ("Where the coverage gap is" above).
+Nothing stops either route beforehand.
+*Main compiles* runs on every push to `main` that the merge queue did not make, so it catches a commit from either route that breaks the build, after the fact.
 
 ## Caches
 
-`main` is the only cache writer.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin). `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
+`main` is the only writer of the cache entries the lanes restore.
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for the three clippy passes, the release graph and every target under `--all-features` and under every feature but `mdbx`, under the nightly pin) and `test-cache` (dependencies for the three test lanes CI runs: the default and adiri features, and the nested vendor/reth workspace with js-tracer, under the stable pin; nothing warms the hand-run `test-mdbx` lane).
+`Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
+That includes the 57 vendored reth crates: they are path packages inside the repository, so every test lane rebuilds them, where the git dependency they replaced was cached.
+rust-cache's pruning also keys on the root workspace's packages, so the dependencies only reth's own tests use (in `target/vendor-reth`) may not survive a save either.
+The lanes' times with the vendored reth have not yet been measured on a GitHub runner.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
+`main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push that the queue did not make it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
+Three workflows name `clippy-cache`: `cache-deps.yaml` writes it, and `pr.yaml` and `main-compiles.yaml` restore it.
+`test-cache` has four more readers: the `metrics` job in `quic-observations.yaml`, the `regression` job in `consensus-liveness.yaml` and both jobs in `committee-convergence.yaml`.
+They hash what the warm hashes, the same six `env:` variables and the same toolchains, so they restore its entry, and each says so above its `env:` block.
+Their mutation harnesses therefore build under `-D warnings` as well: every mutant is written to compile warning-free, and each harness tells a compile error from a caught mutation (a `--no-run` build before the tests, or the test's own failure markers) and fails on the former.
+The rust-cache step in `quic-interop.yaml` keys its own `quic-<release>` entries and saves them only on `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`, so the weekly schedule or a dispatch there), for the same reason.
+The `observations` job in `quic-observations.yaml` keys its own entry too and never saves it: it runs only on pull requests and by hand, and its PR-scoped entries, 12 of them and 4 GB with the cache at 97 % of its quota, were evicting `main`'s warm entries.
 
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
 
-Two properties of `Swatinem/rust-cache` shape all of this:
+All sixteen cache steps pin the same `Swatinem/rust-cache` release: two in `cache-deps.yaml`, four in `pr.yaml`, two in `main-compiles.yaml`, two each in `quic-observations.yaml` and `committee-convergence.yaml`, and one each in `consensus-liveness.yaml`, `durable-e2e.yaml`, `sigkill-recovery.yaml` and `quic-interop.yaml`.
+Three of its properties shape all of this.
+They were checked against v2.9.2, and a later release can change them; the third is about a release that changes the key:
 
-- The key is `<prefix-key>-<shared-key>-<os>-<hash of rustc and every CARGO*/RUST*
-  variable in the environment>-<hash of relevant Cargo manifests, lockfiles and toolchain/config files>`. So the `env:` block and the steps
-  before the cache step must be identical in `cache-deps.yaml` and `pr.yaml`; they are,
-  and both files say so. The clippy jobs hash seven variables (the six in `env:` plus
-  `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step); the test jobs hash six.
-  Each cache step prints what it computed in its "Cache Configuration" log group (Restore
-  Key, Cache Key, Environment considered). When a restore misses, compare that group
-  between the two workflows first.
-- Entries are immutable, and an exact key hit skips the save. So changing *what* a warm job
-  builds (a lane added, a feature set changed) writes nothing until the key changes: bump
-  `prefix-key` in both workflows, `cache-deps.yaml` first, then `pr.yaml` once `main` has
-  written the new entries. (Or delete the entries under Settings -> Actions -> Caches and
-  re-run the warm.) Both workflows now use `prefix-key: v1-rust`; the old
-  `v0-rust-*` entries can be deleted after the first successful PR and merge-group
-  runs restore `v1-rust-*`.
+- The key is `<prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo manifests, lockfiles and toolchain/config files>`, so the two entries start with `v2-rust-clippy-cache-Linux-x64-` and `v1-rust-test-cache-Linux-x64-`.
+  The env hash covers `rustc -vV` of every toolchain that `rustup toolchain list` reports, and every variable whose name starts with `CARGO`, `CC`, `CFLAGS`, `CXX`, `CMAKE` or `RUST` and whose value is non-empty.
+  So the `env:` block and the steps before the cache step, including every step that installs a toolchain, must be identical in `cache-deps.yaml`, `pr.yaml` and `main-compiles.yaml`; they are, and all three files say so.
+  The four other `test-cache` readers (above) must hash the same six variables and toolchains; they do, with steps of their own.
+  The clippy jobs hash seven variables (the six in `env:` plus `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step); the test jobs hash six.
+  The toolchains hashed are the stable pinned in `rust-toolchain.toml` and, in the clippy jobs, the pinned nightly.
+  The runner image brings a stable Rust of its own, and every job that restores or saves a `clippy-cache`, `test-cache` or `durable-e2e-cache` entry removes it (`rustup toolchain uninstall stable`) after its last toolchain install and before its cache step, then lists what is left.
+  The clippy jobs install the stable pin explicitly too; otherwise rust-cache's `rustc -vV` probe installs it as a side effect, because `rust-toolchain.toml` applies in the repository.
+  Each cache step prints what it computed in its "Cache Configuration" log group: Restore Key, Cache Key, and the environment considered, which includes a "Rust Versions:" list of every toolchain it hashed.
+  When a restore misses, start by comparing that group in the warm's log with the one in the run that missed.
+- Entries are immutable, and an exact key hit skips the save.
+  So changing *what* a warm job builds (a lane added, a feature set changed) writes nothing until the key changes: bump that entry's `prefix-key` in every workflow that names its shared key, in the same pull request; the next bullet says why not `cache-deps.yaml` first.
+  (Or delete the entries under Settings -> Actions -> Caches and re-run the warm.)
+  The prefix-key is per entry: `clippy-cache` is on `v2-rust`, bumped when the clippy lane's two library-only passes became the release-graph pass and the all-targets `--all-features` pass, and `test-cache` is on `v1-rust`.
+  `durable-e2e.yaml` and `sigkill-recovery.yaml` set no prefix-key, so their `durable-e2e-cache` entries carry rust-cache's default, `v0-rust`.
+  Entries under an older key are superseded generations, which the `prune-caches` job (below) deletes: `v1-rust-clippy-cache-*` from before that bump, and `v0-rust-clippy-cache-*` and `v0-rust-test-cache-*` from before `v1-rust` and rust-cache v2.7.7's with no `x64` after `Linux-`.
+- How the key is computed belongs to the release, so a `Swatinem/rust-cache` release that
+  changes it is a change of key like any other. Whoever reviews a rust-cache bump reads
+  the release notes of every release it covers for anything about the key, hashing or
+  cached paths; comparing the "Cache Key" a warm prints before and after the bump shows
+  whether a release changes the key. Such a release moves every cache step together, in
+  one pull request and one attestation, and the queue then builds every dependency cold,
+  from that pull request's own queue run until the warm its merge triggers has finished
+  on `main`; whether a cold lane fits its `timeout-minutes` is the thing to check (the
+  cold timings measured are below, with the warm ones). Moving the writer,
+  `cache-deps.yaml`, first no longer keeps the queue warm: the `prune-caches` job deletes
+  the old key's entries at the end of the first warm that saves the new ones, so
+  `pr.yaml` would have nothing to restore until it moved too. The bump from v2.7.7 to
+  v2.9.2 changed the key and moved all six steps together. Dependabot sends rust-cache
+  bumps as a pull request of their own (`.github/dependabot.yaml`), so that such a
+  release is reviewed on its own, without the other actions riding along.
 
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
+Those clippy figures, and the 2026-09-30 cold one below, were measured when the lane compiled libraries only, before it gained `--all-targets`.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
-Check the total under Settings -> Actions -> Caches now and then: three entries should be there (`clippy-cache`, `test-cache`, `durable-e2e-cache`), well inside the 10 GB quota.
+The lanes have been timed from a cold cache once, on 2026-09-30, with every restore missing: `clippy` took 10.5 min, `test` 14 min and `adiri-test` 12 min, start to finish, tests included.
+The clippy lane has been timed cold once since, in the three-pass form that came before the two-pass one: it compiled for 16.5 min (7m32s, 1m15s and 7m19s; `librocksdb-sys` under `--all-features` is the long pole).
+The two-pass lane was timed cold on 2026-10-29, with no entry to restore: 10 m 21 s, 5 m 21 s for the release graph and 5 m 00 s for every target under `--all-features`, in a `clippy` job of 10 m 44 s.
+A third pass, every target under every feature but `mdbx`, joined on 2026-11-09 when tn-lmdb became the default reth backend and `--all-features` came to mean MDBX; it reuses the second pass's dependencies and re-lints only what depends on tn-reth (not yet timed in CI).
+The warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
+Each `Cargo.lock` change on `main` writes a new generation of every entry, and GitHub would keep the previous one until it went 7 days without a restore, or evict the least recently used entries once the total passed the quota, which can take a live one with it.
+The `prune-caches` job in `cache-deps.yaml` deletes those superseded generations of the three entries after every successful warm on `main`.
+A family is every entry on `main` whose key starts `v<N>-rust-clippy-cache-`, `v<N>-rust-test-cache-` or `v<N>-rust-durable-e2e-cache-`, whatever its prefix-key version, architecture and hashes.
+In each family the job keeps the entries created since the warm began, failing those the ones accessed since, and failing both the single most recently accessed one, and deletes the rest, so a family is never left empty.
+It never touches an entry outside the three families: not CodeQL's, not another ref's, not another workflow's.
+To run it by hand, from the repository root, `DRY_RUN=1 GH_REPO=Telcoin-Association/telcoin-network .github/scripts/prune_caches.sh` prints what it would delete and deletes nothing; the same without `DRY_RUN=1` deletes.
+Run by hand, it counts "since the warm began" from the latest successful warm on `main`, and deleting needs a `gh` login that can delete caches, which takes write access to the repository.
+Two things are still worth a look under Settings -> Actions -> Caches now and then: entries on other refs, because a warm dispatched on a branch writes gigabytes into that branch's scope and nothing prunes it, and the total against the quota (10 GB in September 2026).
 
 One exposure to know about: `rust-toolchain.toml` pins `channel = "1.94"`, so a 1.94.x point release changes the rustc version, which is in the key, and every entry misses with no fallback until the next warm (the schedule within 3-4 days, or a manual dispatch).
 Pinning `1.94.x` would make the rotation explicit and deliberate.
 That is a decision to make, not one made here.
+
+The runner image's own stable Rust used to be hashed into every key as well, since rust-cache v2.9.2 hashes every installed toolchain, and this repository does not control it.
+In October 2026 two flavours of `ubuntu-latest`, with Rust 1.99.0 and 1.99.1, were in the fleet at once, so a job that landed on the other flavour from the warm's missed its restore; most `merge_group` test lanes sampled were cold for that reason, `test` taking 15.1 min against 5.2 with a hit, `adiri-test` 14.3 against 2.9 and `clippy` 14.4 against 1.7.
+That is why every cache step of the three families now comes after the step that removes the image's toolchain (above), so no image update or rollout changes a key.
+With no default toolchain left, a bare `cargo` or `rustc` outside the repository fails; every later step in those jobs runs in the repository, where `rust-toolchain.toml` applies, or names its toolchain with `+`.
+Build scripts run in their dependency's own directory but inherit the toolchain, because rustup sets `RUSTUP_TOOLCHAIN` for the `cargo` it starts.
+A "Rust Versions:" list with a toolchain the job did not install by name means a step before the cache step installed one, and that job's restores miss.
+
+## Action pins
+
+Every `uses:` in `.github/workflows/` names the action by a full 40-character commit SHA, with the release it stands for in a trailing comment on the same line (`actions/checkout@<sha> # vX.Y.Z`).
+A tag such as `v4` is a pointer the action's owner can move at any time.
+A moved tag runs new code in the gate on the next run, with no change in this repository and nothing for a reviewer to see.
+A SHA cannot be moved, so the code that runs is the code that was reviewed when the pin was set.
+Two positions made this worth doing:
+
+- `taiki-e/install-action` runs in `cache-deps.yaml`'s `warm-test-cache` job, which writes
+  the `main`-scope cache entry that every PR and queue run restores.
+- `actions/deploy-pages` runs with `pages: write` and `id-token: write`.
+
+Foundry, whose `cast` decides `verify-on-chain` and the attestation check on a release tag, is not installed by an action at all: the `attest` job in `pr.yaml` and two jobs in `release.yaml` download the release archive themselves and pin it by digest, as "What a pin does not cover" below describes.
+
+The pinned actions and the runtime each one uses (each pin's SHA, and the release it stands for in the `# vX.Y.Z` comment beside it, are in the workflows, and only there):
+
+| Action | Runtime |
+|---|---|
+| `actions/checkout` | node24 |
+| `taiki-e/install-action` | composite (shell steps only) |
+| `actions/upload-pages-artifact` | composite (runs `actions/upload-artifact`, node24, itself pinned by SHA) |
+| `actions/deploy-pages` | node24 |
+| `actions/upload-artifact` | node24 |
+| `actions/download-artifact` | node24 |
+| `actions/setup-python` | node24 |
+
+`Swatinem/rust-cache` is left out of the table: its pin moves on its own terms, and "Caches" above covers it.
+The runtime column matters because GitHub removed Node 20 from the hosted runners on 2026-09-23 and now forces any node20 action onto Node 24, which it was not written for.
+`release.yaml` uses no action but `actions/checkout`, which is already in the table.
+
+### How a pin moves
+
+Dependabot (`.github/dependabot.yaml`) checks the actions weekly and opens one grouped pull request for all of them except `Swatinem/rust-cache`, with each SHA and its version comment rewritten together.
+It proposes a release only once the release is 7 days old, so one that is pulled or found to be compromised in its first days never reaches one of its pull requests; a pin set by hand skips that wait.
+The grouping is for the attestation: a pull request cannot enter the queue until a maintainer has run the full local suite on its head and attested it, and `taiki-e/install-action` alone was released about five times a week in September 2026.
+`Swatinem/rust-cache` arrives as a pull request of its own, so that a release that changes how the cache key is computed can be moved as "Caches" above describes, without the other actions riding along.
+
+Whoever reviews such a pull request:
+
+- reads the release notes for every bump in it, all of them between the old release and
+  the new one. A changed default is how `upload-pages-artifact` came to drop mdBook's
+  `.nojekyll`: v4 changed it, and this repository went from v3 to v5 in one step (see
+  the comment in `docs.yaml`).
+- treats it as a change to the gate. It is under `.github/`, so it needs a code owner's
+  approval, and its head needs `make attest` like any other. Its own workflow runs get a
+  read-only token and no secrets; the new code first runs with more than that after it
+  lands, in `cache-deps.yaml` (the `main` cache the lanes restore), `durable-e2e.yaml`
+  (its own `main` cache entry, nightly), `docs.yaml` (the Pages deployment) and
+  `release.yaml` (`draft-release`, which can write releases, at the next tag).
+
+A new `uses:` takes the same form, SHA plus `# vX.Y.Z` on the same line; Dependabot rewrites the comment only when it is on the line it updates.
+
+One limit to know: Dependabot raises no security alert for an action pinned by SHA, only for one referenced by a version.
+The weekly version update is therefore the only channel through which a fixed release of a pinned action arrives, and the cooldown holds it back 7 days.
+A fix that cannot wait has to be pinned by hand.
+
+### Checking a pin by hand
+
+```sh
+git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>' 'refs/tags/<tag>^{}'
+```
+
+For an annotated tag this prints two lines, and the `^{}` line is the commit to pin; the other is the tag object.
+For a lightweight tag it prints one line, and that is the commit.
+
+### What a pin does not cover
+
+A pin fixes the action's own code, not what that code downloads when it runs.
+That is why Foundry is not installed by an action: `foundry-rs/foundry-toolchain` downloaded and ran `foundryup`, itself unpinned, which unpacked the release and ran every binary in it before any later step could check one.
+A digest check placed after the install gated the registry call and nothing that ran before it.
+The `Install Foundry` step in the `attest` job in `pr.yaml` does the download itself instead.
+The same step, byte for byte, runs in the `validate-tag` and `verify-release` jobs in `release.yaml`, where `etc/release.sh` calls `verify_commit_hash.sh` on the tagged commit.
+Two `env:` values on that step are the pin: `FOUNDRY_VERSION`, a Foundry release tag, and `FOUNDRY_SHA256`, the SHA-256 digest of that release's `foundry_<version>_linux_amd64.tar.gz`.
+The step downloads the archive with `curl` into `$RUNNER_TEMP` and checks it against `FOUNDRY_SHA256` with `sha256sum --check --strict` before it extracts anything; a mismatch fails the job.
+Only then does it extract `cast` and `forge` into a directory under `$RUNNER_TEMP`, write that directory to `$GITHUB_PATH` so the steps after it find both on `PATH`, and print `cast --version`, the first time anything from the archive runs.
+So nothing from upstream runs or is unpacked before the digest check: there is no `foundryup` and no action code between the download and the check.
+A release asset replaced under the same tag, or the tag re-pointed, therefore fails this step instead of deciding `verify-on-chain`.
+The digest is that of the `linux_amd64` archive, because `ubuntu-latest` is x64; a runner of another architecture needs another archive and a new digest.
+`forge` comes out of the same verified archive although nothing in `pr.yaml` or `release.yaml` runs it today, so that a step that needs it later inherits this pin instead of installing a Foundry of its own.
+Dependabot has no part in this pin: there is no action for it to bump, so the release and the digest stay where they are until someone moves them, together and by hand:
+
+1. Download the new release's `linux_amd64` archive, check it against the release's own
+   `.sha256` asset, against the digest GitHub reports for that asset and against the
+   build provenance Foundry's release workflow signs, and print its digest. The commands
+   are for Linux; on macOS, `shasum -a 256` stands in for `sha256sum`.
+
+   ```sh
+   v=vX.Y.Z   # the release to move to
+   f="foundry_${v}_linux_amd64.tar.gz"
+   base="https://github.com/foundry-rs/foundry/releases/download/$v"
+   curl -fsSLO "$base/$f"
+   curl -fsSL "$base/foundry_${v}_linux_amd64.sha256" | sha256sum --check -
+   gh api "repos/foundry-rs/foundry/releases/tags/$v" \
+     --jq '.assets[] | select(.name=="'"$f"'") | .digest'
+   gh attestation verify "$f" --repo foundry-rs/foundry \
+     --signer-workflow foundry-rs/foundry/.github/workflows/release.yml \
+     --source-ref "refs/tags/$v"
+   sha256sum "$f"
+   ```
+
+   The `gh api` command prints `sha256:<hex>`, and that hex must be the digest the last
+   command prints. `gh attestation verify` must exit 0; it prints nothing when its output
+   is not a terminal. The archive is hashed, never unpacked or run.
+2. In `pr.yaml` and in both `Install Foundry` steps in `release.yaml`, set `FOUNDRY_VERSION` to the release and `FOUNDRY_SHA256` to that digest, in the same pull request.
+   The three `run:` blocks and their `env:` values stay byte-identical, so a `diff` of them shows a missed copy; only the last paragraph of the comment differs in `release.yaml`, where the job definition comes from the tagged commit rather than a pull request.
+3. That pull request's own `verify-on-chain` run tests the new pin end to end: the step
+   downloads the archive, checks it against the new digest, and the registry call runs
+   with the `cast` from it. If the runner gets anything other than the archive that was
+   hashed, the step fails there, before anything lands.
+
+That pull request does not run the two copies in `release.yaml`, and a re-run of a tag's workflow runs them as they were at the tagged commit, so a broken pin there would hold up the next release.
+After the pull request lands, dispatch the release workflow (*Release* -> *Run workflow*, `mode: validate`) on any existing tag: the step must pass, even where the tag checks after it fail.
+
+The `.sha256` asset and the digest GitHub reports come from the same place as the archive, so they are only as trustworthy as the release itself.
+They catch a corrupted download, and a file that differs from what the release published.
+The provenance check goes one step further: it passes only for an archive that Foundry's `release.yml` built in a run at that tag, so an asset put on the release by any other route fails it.
+None of the three would catch a release built from a source tree or a workflow that was already compromised.
+What the pin adds is that the archive checked when the pin was set is the archive every later run gets.
+The provenance check is part of moving the pin and not of the `attest` job: it needs GitHub's attestation API and a token on every run, and a timeout there would fail `verify-on-chain`, while the digest already holds each run to the archive that passed it.
+
+Both values are part of the `attest` job definition, which comes from the PR's merge commit, so they guard against a change upstream, not against a PR that edits them; "Who can put a PR in the queue" above says what stops such a PR.
+The copies in `release.yaml` come from the tagged commit, and "Release workflow" below says what stops a tag on a commit that edits them.
+What is still not pinned: the runner image (`ubuntu-latest`), and with it everything preinstalled on it, including the `curl`, `tar` and `sha256sum` the step runs, which it has to trust because they fetch, check and unpack the archive.
+The local `make attest` and `make release-*` runs use whatever `cast` the maintainer has installed, which this pin does not reach.
+
+One thing a pin does newly fix: `taiki-e/install-action` resolves a tool requested without a version (`tool: cargo-nextest`) from the manifest in the pinned commit, with a checksum, so the cargo-nextest version stays the same until the pin moves.
+
+## Release workflow
+
+`.github/workflows/release.yaml` checks a release tag, opens a draft GitHub release for it, and checks the release again once a maintainer has published it.
+It builds, signs and publishes nothing: a maintainer does those on their own machines with the `make release-*` targets, which run `etc/release.sh`.
+The procedure is in the [maintainer guide](https://docs.telcoin.network/maintainers/releasing.html), and the checks an operator runs on a release are in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html).
+The release signatures and the on-chain attestation answer different questions: the attestation says a maintainer ran the full suite on a commit, and the signatures say which files the maintainers vouch for as that commit's release.
+
+| Job | Event | Runs | Token | Timeout |
+|---|---|---|---|---|
+| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `Install Foundry`, `etc/release.sh check-tag`, then `etc/release.sh notes` into the step summary | `contents: read`, `actions: read` | 15 min |
+| `draft-release` | a pushed `v*` tag, once `validate-tag` has passed | `etc/release.sh draft` | `contents: write` | 5 min |
+| `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `Install Foundry`, `etc/release.sh verify` | `contents: read` | 20 min |
+
+`validate-tag` checks that the tag is an annotated tag signed by a key in the allowlist (`.github/maintainer-gpg-keys/` on `main`), that it points at a commit on `main` whose Cargo version and `CHANGELOG.md` section match it, and that the commit was attested on-chain, which is what `cast` is installed for.
+A tag is validated against every release tag that exists when it is pushed: on the push, the first run of `validate-tag` compares it with every `v*` tag in its checkout, and a re-run with the tags created before GitHub created the run, which `actions: read` lets it look up; the date in the tag plays no part there.
+The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly there instead of being ignored, and `etc/release.sh` decides what a release tag is.
+`draft-release` creates the draft with the same notes, or refreshes the notes of a draft it created before; the draft carries no assets until the maintainer's `make release-build` uploads them.
+`published` is the event type that fires when a draft is published as a prerelease, which every adiri and rc release is; `prereleased` does not fire for those.
+The maintainer publishes with their own `gh` login, so the event fires; GitHub starts no workflow for an event that a `GITHUB_TOKEN` caused.
+
+A dispatch (*Release* -> *Run workflow*) takes a `tag` and a `mode`, and is possible only once the workflow is on `main`.
+`validate` runs `validate-tag` alone and drafts nothing; run on an old, unsigned tag, it shows that the gate fails closed.
+`verify` works on a published release only, because a read-only token cannot see drafts.
+If the attestation was missing when a tag was pushed, run `make attest` on the tagged commit, with `ALLOW_STALE_BASE=1` if `main` has moved past it, and re-run the failed jobs; there is no need to re-tag.
+No job in `release.yaml` may be named `CI Success`: item 1 of "Repository settings this requires" says why, and a tag can be pushed on any commit, a pull request's head included.
+
+### Scripts and keys come from `main`
+
+Every job checks out `refs/heads/main`, never the tagged tree, with `fetch-depth: 0` (every tag, and the `refs/remotes/origin/main` that the ancestry and version checks read) and `persist-credentials: false`.
+The checkout step still receives the job's token and fetches with it; `persist-credentials: false` only keeps the token out of `.git/config` for the steps after it.
+`etc/release.sh`, `.github/scripts/verify_commit_hash.sh` and the allowlist all come from that checkout.
+The reason is the one the `attest` job in `pr.yaml` gives for its `trusted/` checkout: a tag on a commit that edits a script or adds a key would otherwise be judged by its own edit.
+The local `make release-*` targets read the allowlist from `origin/main` as well, and `make release-build` and `make release-publish` refuse to run when `etc/release.sh` or `verify_commit_hash.sh` differs from it.
+The operator check in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) also builds its keyring from a checkout of `main`, and fetches the tag into it by its full name, `refs/tags/<TAG>`, because `git clone --branch <TAG>` prefers a branch of the same name.
+
+The job definitions are the exception.
+GitHub reads `release.yaml` itself from the tagged commit (for a dispatch, from the branch it runs on), so a tag on a commit that edits the workflow runs the edited workflow under that tag's name.
+The tag ruleset below lets only the maintainers create a `v*` tag and nobody move or delete one, so an edited workflow cannot run for a release tag a maintainer did not push.
+It does not keep a `contents: write` token from anyone with write access: they can push a branch whose workflow asks for one, or create, edit, publish and delete releases with their own credentials.
+What protects a release is the maintainer signatures, which `make release-publish` and `verify-release` check against the allowlist on `main`, not the token.
+
+### Why CI never builds
+
+CI cannot run the full suite (the top of this file says why).
+What vouches for a released commit is the attested local run, e2e included, and the release binary and image are built from that commit on the maintainer's host by `make release-build`.
+A `GITHUB_TOKEN` must also never be able to publish an artifact.
+A CI build would compile every dependency, build scripts and procedural macros included, in a job holding a token that can upload release assets or push the image.
+In `release.yaml` no job has `packages: write`, and the one job with any write, `draft-release`, runs only the pinned `actions/checkout`, which fetches `main` with the token and does not leave it in the checkout, and `etc/release.sh draft`, which calls `gh`.
+Its `contents: write` lets the token create, edit, publish and delete releases and their assets, and push any branch or tag that no ruleset protects, but it holds no artifact and cannot sign one.
+Anyone with write access can get the same permission from a workflow on their own branch, so what protects an operator is the check in Installing a release: the signature over `SHA256SUMS` against the allowlist on `main`, and the fingerprint comparison with `SECURITY.md` on `main`.
+The release text is not protected: anyone with write access can edit a draft's notes, so the install page, built from `main`, is the reference.
+
+### The post-publish check is detective only
+
+`verify-release` repeats the checks `make release-publish` runs before it publishes: the tag checks, the asset set and `SHA256SUMS`, the signatures on `SHA256SUMS` against the allowlist on `main`, the image digest against the registry, and that the binary in the image is the one in the tarball and reports the tagged commit.
+By the time it runs the release is public, so a failure is an alarm for a maintainer, not a gate.
+It runs only for a publish that was not made with a `GITHUB_TOKEN`: GitHub starts no workflow for an event a `GITHUB_TOKEN` caused, so a draft that anyone with write access publishes from a workflow on their own branch is never checked here and raises no alarm.
+After every publish, check that a `verify-release` run exists for the tag, and if none does, start one with a `verify` dispatch.
+What keeps a release from changing after it passed is the immutable-releases setting below, not this job.
+
+### Settings the release workflow requires
+
+None of these is visible to the workflow, and each closes a gap the workflow leaves open.
+
+1. **A tag ruleset** (Settings -> Rules -> Rulesets) on the `v*` tags: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one.
+   A ruleset's bypass list applies to every rule in it, so this takes two tag rulesets on `refs/tags/v*`: one with *Restrict creations* and the maintainers on its bypass list, and one with *Restrict updates* and *Restrict deletions* and an empty bypass list.
+   The signature is not a GitHub rule: `validate-tag` and every later step refuse a tag that does not carry exactly one signature by an allowlisted key.
+   `validate-tag` proves who signed a tag, not who pushed it, and GitHub runs the workflow definition at the tagged commit.
+   Without the rule, anyone with write access could push a `v*` tag on a commit with an edited `release.yaml`, or move or delete a tag after it was validated.
+   A wrong tag therefore stays, and the next version supersedes it; the version rules refuse a final release or a release candidate whose version is not above every final release in its channel.
+   The rule limits who can create, move or delete a `v*` tag and nothing else; it does not limit who can create, edit, publish or delete releases, which write access alone allows.
+2. **Immutable releases** (Settings -> General -> Releases).
+   Once a release is published its assets and its tag cannot change, so the files `verify-release` checked are the files operators download.
+3. **The release packages `ghcr.io/telcoin-association/tn-mainnet` (mainnet tags) and `ghcr.io/telcoin-association/tn-testnet` (Adiri tags) are public, linked to this repository, and writable only by the release maintainer account, by account and by workflow.**
+   Operators, `verify-release` and `etc/release.sh` read them anonymously, and the script stops with "package is not public" on a 401 or 403 from the registry.
+   A package exists only after its first push, which `make release-build` makes for a network's first release only with `RELEASE_FIRST_PUSH` set to the package, so these settings are made right after it, as the maintainer guide's one-time setup describes; until then ghcr answers 403 for the package as it does for a private one.
+   The `org.opencontainers.image.source` label in `etc/Dockerfile` links the package to the repository when an image is pushed, and GitHub gives the workflows of a linked repository access to the package.
+   Two lists in each package's settings decide who can push: under "Manage access", remove the access inherited from this repository and give write only to the release maintainer account; under "Manage Actions access", this repository must be absent or have the Read role.
+   Otherwise anyone with write access here can push to the package, directly or from a workflow on any branch that asks for `packages: write`, and overwrite `:vX.Y.Z`, `:latest` or `:adiri`.
+   No workflow here asks for `packages: write`, but anyone with write access can add one on a branch, so that is not a control.
+   A digest cannot be overwritten, which is why operators and `verify-release` pull by the digest in `IMAGE_DIGEST`.
+   `etc/release.sh` takes the package from the tag's channel and refuses an `IMAGE_DIGEST` that names an image in any other package, so an Adiri image cannot be released under a mainnet tag, nor the reverse.
+   A third package, `ghcr.io/telcoin-association/tn-dev`, takes the ad-hoc `dev-<flavor>-<TAG>` images of `make docker-adiri` and `make docker-devnet`; it holds no release, and nothing in the release process reads it.
+   The earlier package `ghcr.io/telcoin-association/telcoin-network` never held a release and is no longer used.
+4. **The repository's default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions).
+   `draft-release` asks for `contents: write` in its own `permissions:` block, which GitHub grants regardless of that default; without it `gh release create` fails with a 403.
+
+## tn-lmdb regression bench
+
+`.github/workflows/tn-lmdb-bench.yaml` runs `etc/tn-lmdb-bench-compare.sh --tier quick --sync nosync,durable <base sha> <head sha>` on a pull request (a dispatch takes the tier's own sync modes): the tn-lmdb engine bench (`crates/tn-lmdb-bench`) built against both commits, run as interleaved rounds and compared row by row.
+The script's header comment is the reference for what it builds, runs and reports.
+
+It runs only when asked:
+
+- on a pull request labeled `bench`, against what merging it changes: its merge commit (`github.sha`) against that commit's first parent, the base branch's tip it merges onto, so changes made on the base after the branch point do not show as the pull request's. It runs when the label is added, and again on every push or reopen while it stays. Adding some other label does not run it, nor cancel a running one: a run that skips takes a concurrency group of its own. The label has to exist in the repository (Issues -> Labels) before it can be applied;
+- by hand (*tn-lmdb bench* -> *Run workflow*), with a `base` (required), a `head` (empty: the commit the run is on) and a `tier` (`quick`, `default` or `full`). A `base` or `head` that does not resolve as given is read as `origin/<branch>` when that resolves, since the checkout has a local branch for the run's own ref only.
+
+It is optional by construction, and must stay so.
+It is not in `pr.yaml`, never runs on `merge_group`, and is not a required check; `CI Success` stays the only one (item 1 of "Repository settings this requires"), and the job's name is not `CI Success`.
+A red run blocks nothing: it is information for the reviewer.
+It is still not `continue-on-error`, so the pull request shows a red check when the script exits non-zero: 1 for a gated regression, 2 for a refusal, a build or run error, or any failure the script does not expect (never 1).
+A run with nothing to compare (tn-lmdb and the root `Cargo.toml` unchanged, or a change that does not reach the bench binary) is green, and its job summary gives the one-line reason.
+A pull request whose base has no tn-lmdb (no `crates/tn-lmdb/Cargo.toml`) gets exit 2 from the base check; dispatch it by hand with a base that has tn-lmdb instead.
+
+The report is written to the job summary and uploaded, with the run settings (`meta.tsv`), each run's JSON and the build and run logs, as the artifact `tn-lmdb-bench-<run id>-<attempt>`, kept 15 days.
+Download it and run `etc/tn-lmdb-bench-compare.sh --report-only <dir> [--threshold PCT]` to compare the same runs again under other thresholds.
+
+Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows) catches large regressions only.
+The quick tier runs nosync only, so a pull request's run adds `--sync nosync,durable` (about 6 s more per run) for the durable rows: `reth.block.pages_synced`, the pages synced per block commit, is exact and gated; the durable time rows are reported, not gated.
+The quick tier's three small-run rows, the two single-commit rows (`put.seq.commit`, `put.rand.commit`) and the 4-thread `ro.txn.mt`, are reported, not gated, in any run of fewer than 1M entries: one commit of 100k entries is too short to hold still, and the thread row wants four idle cores a shared runner does not have.
+For anything finer, run the script locally, with more rounds, on an idle machine.
+
+The job uses the same toolchain install step as the other workflows, and the builds use the head commit's `rust-toolchain.toml`.
+It has no dependency cache: the bench builds as two small standalone packages in their own target directories under `runner.temp`, so it neither reads nor writes the entries in "Caches" (and is not one of the cache steps counted there).
+It triggers on `pull_request`, never `pull_request_target`: it compiles and runs the pull request's code, with a read-only token and no secrets, like every other pull request job.
+
+## aarch64 CRC kernel
+
+`.github/workflows/arm64-crc.yaml` (*arm64 CRC kernel*) runs `cargo nextest run --locked -p tn-lmdb -p tn-lmdb-reth` on `ubuntu-24.04-arm`: the execution engine's and its reth adapter's whole suites.
+`crates/tn-lmdb/src/crc.rs` (a copy of `crates/storage/src/archive/crc.rs`) has a PMULL carry-less-multiply CRC-32 kernel that is compiled on little-endian aarch64 only, and its tests compare that kernel with `crc32fast`.
+Before the tests, a step diffs the two files with every comment line and the `allow(dead_code)` and `#[inline]` attribute lines dropped (the differences tn-lmdb's copy documents), and fails on any other difference, the unit tests included: the one arm64 run then covers both copies without building tn-storage.
+Every test lane in `pr.yaml` runs on `ubuntu-latest`, which is x86_64, so without this workflow the kernel, and the engine's page, mmap and file code on aarch64 Linux, never ran in CI; the maintainers' attested runs on Apple silicon were their only coverage.
+
+It runs on a `pull_request` or a push to `main` that touches `crates/tn-lmdb/**`, `crates/tn-lmdb-reth/**`, `crates/storage/src/archive/crc.rs`, `rust-toolchain.toml`, `Cargo.lock` or the workflow itself, and on every `merge_group` (that event takes no path filter).
+It is not a required check and is not in `CI Success`'s `needs` list, so a red run blocks nothing but shows on the pull request; keep it that way (item 1 of "Repository settings this requires").
+The checkout takes no submodule (tn-lmdb needs none), the toolchain and `cargo-nextest` install steps are the same as the test lanes', and there is no dependency cache: a second architecture's entries would eat the quota the queue's entries need. tn-lmdb builds from cold in about a minute; tn-lmdb-reth adds the vendored reth database crates it adapts, a few minutes more, inside the job's 30-minute limit.
 
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.
@@ -177,5 +545,5 @@ Two channels are pinned in the repo root:
 - **`rust-nightly`** — single-line file containing the nightly date (currently `nightly-2026-03-20`). Used only for `cargo fmt` and `cargo clippy`, which require nightly-only rustfmt/clippy options (`imports_granularity`, `wrap_comments`, etc.). The Makefile, `etc/test-and-attest.sh`, and CI workflows read this file and invoke `cargo +<date>` explicitly.
 
 To bump nightly: edit `rust-nightly`.
-To bump stable: edit `rust-toolchain.toml` (and align with `Cargo.toml`'s `rust-version` and `etc/Dockerfile`'s base image tag).
+To bump stable: edit `rust-toolchain.toml` (and align with `Cargo.toml`'s `rust-version`, `etc/Dockerfile`'s base image tag and digest, and its `RUSTUP_TOOLCHAIN`, which names the exact `rustc` version of that image, such as `1.94.1`, so the release build never downloads a toolchain).
 Either bump rotates the dependency caches; see "Caches" above.

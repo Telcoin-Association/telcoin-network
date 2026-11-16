@@ -9,22 +9,24 @@ use libp2p::{
 };
 use std::{
     collections::VecDeque,
-    convert::Infallible,
+    io,
     task::{Context, Poll},
     time::Duration,
 };
 use tokio::sync::oneshot;
 
 use crate::{
-    error::NetworkError,
+    error::{is_negotiation_failure, NetworkError},
     stream::upgrade::{StreamError, StreamFailure, TNStreamProtocol},
     types::NetworkResult,
 };
 
-/// Timeout for negotiating a single outbound stream substream.
+/// Timeout for negotiating a single stream substream, inbound or outbound.
 ///
 /// Enforced by libp2p via [`SubstreamProtocol::with_timeout`]; on expiry the
-/// handler receives a [`StreamUpgradeError::Timeout`].
+/// handler receives a [`StreamUpgradeError::Timeout`]. An inbound stream that
+/// sends no protocol header holds its negotiation slot for this long, so the
+/// swarm reaches the data streams queued behind it within a bounded time.
 pub(crate) const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound on outbound opens a single connection handler will buffer before
@@ -117,15 +119,22 @@ impl StreamHandler {
 
 /// Classify an outbound upgrade error into a scoring failure plus the
 /// caller-facing error returned through the open's oneshot.
-fn classify_outbound(error: StreamUpgradeError<Infallible>) -> (StreamFailure, StreamError) {
+fn classify_outbound(error: StreamUpgradeError<io::Error>) -> (StreamFailure, StreamError) {
     match error {
         StreamUpgradeError::Timeout => (StreamFailure::Timeout, StreamError::Timeout),
         StreamUpgradeError::NegotiationFailed => {
             (StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)
         }
-        StreamUpgradeError::Io(e) => (StreamFailure::Io(e.kind()), StreamError::UpgradeIo),
-        // `TNStreamProtocol`'s upgrade error is `Infallible`, so `Apply` is unconstructable.
-        StreamUpgradeError::Apply(infallible) => match infallible {},
+        // `TNStreamProtocol::upgrade_outbound` does not read, so under the swarm's lazy
+        // negotiation a rejection of the sync protocol fails the caller's first read
+        // (`is_unsupported_protocol`) and does not reach this arm. the arm keeps an
+        // upgrade-time rejection classified as unsupported should an upgrade read again
+        StreamUpgradeError::Apply(e) if is_negotiation_failure(&e) => {
+            (StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)
+        }
+        StreamUpgradeError::Io(e) | StreamUpgradeError::Apply(e) => {
+            (StreamFailure::Io(e.kind()), StreamError::UpgradeIo)
+        }
     }
 }
 
@@ -138,7 +147,7 @@ impl ConnectionHandler for StreamHandler {
     type OutboundOpenInfo = OutboundOpen;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(self.listen_upgrade(), ())
+        SubstreamProtocol::new(self.listen_upgrade(), ()).with_timeout(STREAM_OPEN_TIMEOUT)
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
@@ -231,7 +240,7 @@ impl ConnectionHandler for StreamHandler {
 mod tests {
     use super::classify_outbound;
     use crate::stream::upgrade::{StreamError, StreamFailure};
-    use libp2p::swarm::StreamUpgradeError;
+    use libp2p::{core::upgrade::NegotiationError, swarm::StreamUpgradeError};
     use std::io;
 
     /// Outbound upgrade errors map to the right scoring failure and caller error.
@@ -247,6 +256,17 @@ mod tests {
 
         let (failure, error) = classify_outbound(StreamUpgradeError::Io(io::Error::other("boom")));
         assert!(matches!(failure, StreamFailure::Io(_)));
+        assert!(matches!(error, StreamError::UpgradeIo));
+
+        // an upgrade-time lazy rejection, should an upgrade read again, stays unsupported
+        let rejection = io::Error::from(NegotiationError::Failed);
+        let (failure, error) = classify_outbound(StreamUpgradeError::Apply(rejection));
+        assert!(matches!(failure, StreamFailure::UnsupportedProtocol));
+        assert!(matches!(error, StreamError::UpgradeFailed));
+
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        let (failure, error) = classify_outbound(StreamUpgradeError::Apply(reset));
+        assert!(matches!(failure, StreamFailure::Io(io::ErrorKind::ConnectionReset)));
         assert!(matches!(error, StreamError::UpgradeIo));
     }
 }

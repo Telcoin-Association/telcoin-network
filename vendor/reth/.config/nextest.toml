@@ -1,0 +1,15 @@
+# nextest configuration for the nested reth workspace. TN-owned: upstream's .config/nextest.toml is
+# not carried. nextest reads the config of the workspace it runs in, so TN's root
+# .config/nextest.toml does not apply here, and etc/ci-lanes.sh's test-vendor-reth lane runs here
+# under the same NEXTEST_PROFILE as the root lanes (`ci` in GitHub Actions). These profiles mirror
+# the root's.
+
+[profile.default]
+retries = 0
+fail-fast = false
+test-threads = "num-cpus"
+
+[profile.ci]
+retries = 2
+fail-fast = true
+test-threads = "num-cpus"

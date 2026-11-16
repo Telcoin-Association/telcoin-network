@@ -1,4 +1,6 @@
-//! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
+//! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies,
+//! apart from `write_all`'s failure path, which needs the crate-internal `FAIL_SAVE_CERT_AFTER`
+//! hook, and the check that pruning keeps the rounds a rejoining validator rebuilds from.
 
 use std::{
     cmp::{max, Ordering},
@@ -41,9 +43,10 @@ pub trait CertificateStore {
     /// Inserts a certificate to the store
     fn write(&self, certificate: Certificate) -> StoreResult<()>;
 
-    /// Inserts multiple certificates in the storage. This is an atomic operation.
-    /// In the end it notifies any subscribers that are waiting to hear for the
-    /// value.
+    /// Inserts multiple certificates in the storage in one transaction, then notifies any
+    /// subscribers that are waiting to hear for them. Not atomic on error: if a certificate fails
+    /// to save, the ones before it are still written (with any rows of the failing one written
+    /// before its error) and, once that write succeeds, notified; the error is returned.
     fn write_all<'a>(
         &self,
         certificates: impl IntoIterator<Item = &'a Certificate>,
@@ -125,13 +128,19 @@ pub trait CertificateStore {
     fn is_empty_certs(&self) -> bool;
 }
 
-/// Save a cert using an open txn.
+/// Save a cert using an open txn. Its subscribers are notified by the caller, once the txn has
+/// ended, so a notified reader finds the certificate in the store (a backend may make a txn's
+/// writes readable only when it ends).
 fn save_cert<TX: DbTxMut>(
     txn: &mut TX,
     digest: HeaderDigest,
     certificate: &Certificate,
 ) -> StoreResult<()> {
     txn.insert::<Certificates>(&digest, certificate)?;
+    #[cfg(test)]
+    if test_hook::fail_this_save() {
+        eyre::bail!("a save_cert failure injected by a test");
+    }
 
     // write the certificates id by their rounds
     let key = (certificate.round(), certificate.origin().clone());
@@ -140,8 +149,6 @@ fn save_cert<TX: DbTxMut>(
     // write the certificates id by their origins
     let key = (certificate.origin().clone(), certificate.round());
     txn.insert::<CertificateDigestByOrigin>(&key, &digest)?;
-
-    NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
 
     Ok(())
 }
@@ -181,29 +188,49 @@ impl<DB: Database> CertificateStore for DB {
         save_cert(&mut txn, id, &certificate)?;
 
         txn.commit()?;
+        NOTIFY_SUBSCRIBERS.notify(&id, &certificate);
         gc_rounds(self, round)?;
         Ok(())
     }
 
-    /// Inserts multiple certificates in the storage. This is an atomic operation.
-    /// In the end it notifies any subscribers that are waiting to hear for the
-    /// value.
+    /// Inserts multiple certificates in the storage in one transaction, then notifies any
+    /// subscribers that are waiting to hear for them. Not atomic on error: if a certificate fails
+    /// to save, the ones before it are still written (with any rows of the failing one written
+    /// before its error) and, once that write succeeds, notified; the error is returned.
     fn write_all<'a>(
         &self,
         certificates: impl IntoIterator<Item = &'a Certificate>,
     ) -> StoreResult<()> {
         let mut txn = self.write_txn()?;
         let mut round = 0;
+        let mut saved = Vec::new();
         for certificate in certificates {
             let digest = certificate.digest();
             round = max(round, certificate.round());
             if let Err(e) = save_cert(&mut txn, digest, certificate) {
                 tracing::error!("Failed to write certificate for {digest} due to error {e}.");
+                // No rollback: the certificates saved so far are written (tndb would write the txn
+                // on drop anyway). Commit here so a failed write is seen, and notify only after one
+                // that succeeded.
+                match txn.commit() {
+                    Ok(()) => {
+                        for (digest, certificate) in saved {
+                            NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
+                        }
+                    }
+                    Err(commit) => tracing::error!(
+                        "Failed to write the certificates saved before {digest}: {commit}"
+                    ),
+                }
                 return Err(e);
             }
+            saved.push((digest, certificate));
         }
 
         txn.commit()?;
+        for (digest, certificate) in saved {
+            NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
+        }
         gc_rounds(self, round)?;
         Ok(())
     }
@@ -455,3 +482,179 @@ impl<DB: Database> CertificateStore for DB {
 
 // NOTE: tests for this module are in primary/tests/it/storage_tests.rs to avoid circular
 // dependancies.
+
+/// Test-only: make `save_cert` fail part way through a `write_all`.
+#[cfg(test)]
+mod test_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `save_cert` fails after this many more calls on this thread succeed, once the failing
+        /// call's `Certificates` row is buffered (a failing certificate with some rows written).
+        pub(super) static FAIL_SAVE_CERT_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Whether this `save_cert` call is the one to fail (counting down `FAIL_SAVE_CERT_AFTER`).
+    pub(super) fn fail_this_save() -> bool {
+        FAIL_SAVE_CERT_AFTER.with(|after| match after.get() {
+            Some(0) => {
+                after.set(None);
+                true
+            }
+            Some(n) => {
+                after.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        future::Future as _,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use tempfile::TempDir;
+    use tn_types::{
+        rejoin_round_window, AuthorityIdentifier, Certificate, Database as _, Hash as _,
+        HeaderBuilder, HeaderDigest, Round,
+    };
+
+    use super::{test_hook::FAIL_SAVE_CERT_AFTER, CertificateStore as _, NOTIFY_SUBSCRIBERS};
+    use crate::{
+        tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
+        tndb::{SplitDatabase, TnDbOptions},
+        ROUNDS_TO_KEEP,
+    };
+
+    /// tndb with the certificate tables open.
+    fn open_db(dir: &TempDir) -> SplitDatabase {
+        let db = SplitDatabase::open_with(dir.path(), TnDbOptions::default()).expect("open tndb");
+        db.open_table::<Certificates>().expect("open table");
+        db.open_table::<CertificateDigestByRound>().expect("open table");
+        db.open_table::<CertificateDigestByOrigin>().expect("open table");
+        db
+    }
+
+    /// Three certificates of round 5, from three authors (distinct digests).
+    fn certificates() -> Vec<Certificate> {
+        (1..=3)
+            .map(|author| {
+                let header = HeaderBuilder::default()
+                    .author(AuthorityIdentifier::dummy_for_test(author))
+                    .round(5)
+                    .epoch(0)
+                    .build();
+                let mut certificate = Certificate::default();
+                certificate.update_header_for_test(header);
+                certificate
+            })
+            .collect()
+    }
+
+    /// Whether a subscriber registered for `digest` before the write has been notified.
+    fn notified(digest: HeaderDigest, write: impl FnOnce()) -> bool {
+        let mut registration = pin!(NOTIFY_SUBSCRIBERS.register_one(&digest));
+        write();
+        matches!(
+            registration.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(_)
+        )
+    }
+
+    /// `write_all` failing on its second certificate keeps and notifies the first (it is not
+    /// atomic) and returns the error; the certificates after the failing one are not written.
+    #[test]
+    fn test_write_all_keeps_the_certificates_before_a_failure() {
+        let dir = TempDir::with_prefix("cert_write_all_failure").expect("temp dir");
+        let db = open_db(&dir);
+        let certs = certificates();
+        let mut result = None;
+        let first_notified = notified(certs[0].digest(), || {
+            FAIL_SAVE_CERT_AFTER.with(|after| after.set(Some(1)));
+            result = Some(db.write_all(&certs));
+        });
+        let err = result.expect("ran").expect_err("the second certificate fails");
+        assert!(err.to_string().contains("injected by a test"), "the save error: {err}");
+        assert!(first_notified, "the certificate written before the failure is notified");
+        assert_eq!(db.read(certs[0].digest()).expect("read"), Some(certs[0].clone()));
+        assert_eq!(db.read(certs[2].digest()).expect("read"), None, "nothing after the failure");
+    }
+
+    /// When the commit of the certificates saved before a failure fails too, none is notified,
+    /// and the error returned is the save's, not the commit's.
+    #[test]
+    fn test_write_all_notifies_nothing_when_the_failure_commit_fails() {
+        let dir = TempDir::with_prefix("cert_write_all_commit_failure").expect("temp dir");
+        let db = open_db(&dir);
+        let certs = certificates();
+        db.fail_durability_for_test::<Certificates>();
+        let mut result = None;
+        let first_notified = notified(certs[0].digest(), || {
+            FAIL_SAVE_CERT_AFTER.with(|after| after.set(Some(1)));
+            result = Some(db.write_all(&certs));
+        });
+        let err = result.expect("ran").expect_err("the second certificate fails");
+        assert!(err.to_string().contains("injected by a test"), "the save error: {err}");
+        assert!(!first_notified, "nothing is notified after a failed write");
+    }
+
+    /// A validator that restarts consensus at its last handled leader round `C` (a rejoin, a
+    /// restart) rebuilds its DAG from every round above its GC round `C - gc_depth`, fetched from
+    /// peers whose stores prune below their newest written round `H` minus `ROUNDS_TO_KEEP`. A
+    /// rejoin promotes up to `rejoin_round_window` (20 at `gc_depth` 50) behind the newest header
+    /// and the store's head runs a few rounds past that header, so `H - C` is 25 here, and every
+    /// round from `C - 49` must survive the pruning. The former `ROUNDS_TO_KEEP` of 64 fails this
+    /// (it kept rounds from `H - 64` = 136 while the rebuild needs 126; it fails once `H - C`
+    /// reaches 16).
+    #[test]
+    fn rejoin_rebuild_rounds_survive_pruning() {
+        const COMMITTEE: u8 = 4;
+        const GC_DEPTH: Round = 50;
+        const HEAD: Round = 200;
+        // the rejoin window plus the store's head running 5 rounds past the newest header
+        const REJOIN_ROUND: Round = HEAD - rejoin_round_window(GC_DEPTH) - 5;
+
+        let dir = TempDir::with_prefix("cert_rejoin_rebuild").expect("temp dir");
+        let db = open_db(&dir);
+        for round in 1..=HEAD {
+            for author in 1..=COMMITTEE {
+                let header = HeaderBuilder::default()
+                    .author(AuthorityIdentifier::dummy_for_test(author))
+                    .round(round)
+                    .epoch(0)
+                    .build();
+                let mut certificate = Certificate::default();
+                certificate.update_header_for_test(header);
+                // each write prunes, as on the gossip and fetch paths
+                db.write(certificate).expect("write");
+            }
+        }
+
+        let stored = db.origins_after_round(0).expect("origins");
+        assert_eq!(
+            stored.keys().next(),
+            Some(&(HEAD - ROUNDS_TO_KEEP)),
+            "the store keeps the rounds from its head minus ROUNDS_TO_KEEP"
+        );
+
+        // the consensus restore reads `after_round(gc_round + 1)`; the certificate manager and
+        // bullshark need every one of those rounds for the parents of the rounds above
+        let gc_round = REJOIN_ROUND - GC_DEPTH;
+        let rebuild = db.origins_after_round(gc_round + 1).expect("origins");
+        for round in gc_round + 1..=HEAD {
+            assert_eq!(
+                rebuild.get(&round).map(Vec::len),
+                Some(usize::from(COMMITTEE)),
+                "round {round} of the rebuild from {} was pruned",
+                gc_round + 1
+            );
+        }
+        let restored = db.after_round(gc_round + 1).expect("after round");
+        assert_eq!(restored.len(), (HEAD - gc_round) as usize * usize::from(COMMITTEE));
+    }
+}

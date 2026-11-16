@@ -406,7 +406,7 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 // We are still using a swap table with no bad list...
                 assert_eq!(committed_dag_6.leader().author(), ids.get(2).unwrap());
                 assert_eq!(committed_dag_8.leader().author(), ids.get(3).unwrap());
-                assert_eq!(committed_dag_10.leader().author(), ids.get(0).unwrap());
+                assert_eq!(committed_dag_10.leader().author(), ids.first().unwrap());
                 assert_eq!(committed_dag_12.leader().author(), ids.get(1).unwrap());
                 assert_eq!(committed_dag_14.leader().author(), ids.get(2).unwrap());
                 // Note that round 16 (when committed) would be auth 3 except it now has a bad rep.
@@ -433,7 +433,7 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 // update happened the leader schedule changed and now the Authority
                 // 3 is flagged as low score and it will be swapped with Authority
                 // 0.
-                assert_eq!(committed_dag.leader().author(), ids.get(0).unwrap());
+                assert_eq!(committed_dag.leader().author(), ids.first().unwrap());
                 break;
             }
         }
@@ -568,7 +568,7 @@ async fn dead_node() {
     let mut committed_sub_dags: Vec<CommittedSubDag> = Vec::new();
     for _commit_rounds in 1..=4 {
         let committed_sub_dag = rx_output.recv().await.unwrap();
-        let headers: Vec<Header> = committed_sub_dag.headers().iter().cloned().collect();
+        let headers: Vec<Header> = committed_sub_dag.headers().to_vec();
         committed.extend(headers);
         committed_sub_dags.push(committed_sub_dag);
     }
@@ -1742,7 +1742,7 @@ fn legacy_replay_sequence(leader: &Certificate, state: &ConsensusState) -> Vec<H
     let mut stack = vec![leader.clone()];
     let mut seen: HashSet<HeaderDigest> = HashSet::new();
     let mut discovered = std::iter::from_fn(|| {
-        stack.pop().map(|certificate| {
+        stack.pop().inspect(|certificate| {
             certificate.header().parents().iter().for_each(|parent| {
                 state
                     .dag
@@ -1760,7 +1760,6 @@ fn legacy_replay_sequence(leader: &Certificate, state: &ConsensusState) -> Vec<H
                         }
                     });
             });
-            certificate
         })
     })
     .collect::<Vec<_>>();

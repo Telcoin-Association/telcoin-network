@@ -12,8 +12,9 @@ publish = false
 
 [dependencies]
 # `server` + `macros` back the TN eth-method overrides (`rpc_fee_history` and the
-# `--rpc.txfeecap` guard's `rpc_fee_cap`).
-jsonrpsee = { workspace = true, features = ["server", "macros"] }
+# `--rpc.txfeecap` guard's `rpc_fee_cap`). `http-client` backs the `--forward-txs` relay
+# (`rpc_tx_forward`); the client crate is already in the graph through reth's IPC transport.
+jsonrpsee = { workspace = true, features = ["server", "macros", "http-client"] }
 async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
@@ -22,22 +23,45 @@ tn-worker = { workspace = true }
 tn-storage = { workspace = true }
 dirs-next = "2.0.0"
 parking_lot = { workspace = true }
+fixed-cache = { workspace = true }
+# the decoded-batch cache's two byte-bounded parts (`env/tx_bodies/cache.rs`)
+lru = { workspace = true }
 
-reth = { workspace = true }
+# TN takes reth's individual crates, not the `reth` umbrella crate (see the root
+# `Cargo.toml`). The umbrella's default features are enabled here on the crates it forwarded
+# them to, with three exceptions. jemalloc only matters to a binary that installs jemalloc as its
+# `#[global_allocator]`, which the umbrella's `reth` binary does and TN's binaries do not.
+# otlp and otlp-logs only fed reth's own OTLP exporters, which are removed (vendor/reth
+# CHANGES.md TN-0029); TN wires its own. js-tracer is this crate's opt-in `js-tracer` feature
+# (see `[features]` and js-tracer.md). Enabled: keccak-cache-global (reth-node-core); asm-keccak
+# (reth-node-core, revm); min-debug-logs (reth-node-core, which caps `tracing` at debug in
+# release builds).
+# TN does not use reth's node builder (it wires provider, EVM, pool and RPC itself), so neither
+# reth-node-builder nor reth-node-ethereum is a dependency; see vendor/reth/ROADMAP.md.
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
-reth-node-core = { workspace = true }
-reth-node-ethereum = { workspace = true }
+reth-node-core = { workspace = true, features = [
+    "keccak-cache-global",
+    "asm-keccak",
+    "min-debug-logs",
+] }
 reth-chainspec = { workspace = true }
-reth-chain-state = { workspace = true }
+reth-chain-state = { workspace = true, features = ["rayon"] }
 reth-cli-util = { workspace = true }
-reth-primitives = { workspace = true }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }
-reth-revm = { workspace = true }
+reth-revm = { workspace = true, features = ["optional-balance-check"] }
+# Direct dependencies only for their features, which reth-node-ethereum and reth-engine-tree
+# used to enable before TN stopped depending on them (vendor/reth/ROADMAP.md, Phase 1). revm's
+# precompile backends (secp256k1, blst, c-kzg) and asm-keccak are consensus-relevant: they pick
+# the ecrecover, BLS12-381, KZG and keccak implementations. trie-sparse's std selects its
+# parallel paths. `tn/graph.py diff` against the previous graph must stay empty for these.
+revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_limit", "asm-keccak"] }
+reth-trie-sparse = { workspace = true, features = ["std", "metrics"] }
 reth-evm = { workspace = true }
-reth-node-builder = { workspace = true }
+reth-node-types = { workspace = true }
+reth-payload-primitives = { workspace = true }
 reth-provider = { workspace = true }
 reth-prune-types = { workspace = true }
 reth-primitives-traits = { workspace = true }
@@ -45,14 +69,21 @@ reth-stages-types = { workspace = true }
 reth-trie = { workspace = true }
 reth-trie-db = { workspace = true }
 reth-transaction-pool = { workspace = true }
+reth-ethereum-engine-primitives = { workspace = true }
 
 reth-errors = { workspace = true }
+reth-rpc = { workspace = true }
+reth-rpc-api = { workspace = true }
+reth-rpc-builder = { workspace = true }
 reth-rpc-eth-api = { workspace = true }
 reth-rpc-eth-types = { workspace = true }
-reth-network-peers = { workspace = true }
+# `secp256k1` provides `Enr` and `NodeRecord::from_secret_key` for the worker's network stub;
+# reth-rpc enabled it before its admin module went (vendor/reth CHANGES.md TN-0021).
+reth-network-peers = { workspace = true, features = ["secp256k1"] }
 reth-network-api = { workspace = true }
-reth-discv4 = { workspace = true }
-reth-eth-wire = { workspace = true }
+reth-eth-wire-types = { workspace = true }
+# `enr::secp256k1::SecretKey` is the key type reth-network-api's `local_enr` names.
+enr = { workspace = true }
 reth-tasks = { workspace = true }
 reth-tokio-util = { workspace = true }
 reth-tracing = { workspace = true }
@@ -68,18 +99,26 @@ tracing = { workspace = true }
 eyre = { workspace = true }
 # `json-rpc` exposes the request/response packet types the size-capped forwarder transport
 # implements `Service` over (issue #1275).
-alloy = { workspace = true, features = ["genesis", "json-rpc"] }
+# `rpc-types-mev` exposes the signed-bundle request and response types used by the epoch-fee adapter.
+# `rpc-types-engine`: `traits.rs` and `rpc_server_args.rs` use `alloy::rpc::types::engine`.
+alloy = { workspace = true, features = ["genesis", "json-rpc", "rpc-types-engine", "rpc-types-mev"] }
 alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
-tokio = { workspace = true, features = ["macros", "time", "sync"] }
+# `rt-multi-thread`: RPC's own blocking pool (`rpc_blocking.rs`).
+tokio = { workspace = true, features = ["macros", "time", "sync", "rt-multi-thread"] }
 # `Service` impl for the size-capped forwarder transport (issue #1275). Only the trait; the
 # HTTP client underneath comes through alloy's re-export so the TLS backend stays alloy's.
 tower = { workspace = true }
 tokio-stream = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
+# The engine under TN's reth execution database (`tn_lmdb_reth::TnLmdbEnv`), unless the `mdbx`
+# feature selects MDBX. The MDBX build reads its data-file name to refuse a tn-lmdb database.
+tn-lmdb-reth = { workspace = true }
+# The OS page size, as reth reads it for MDBX's default page size (`default_page_size`).
+page_size = "0.6.0"
 
 [dev-dependencies]
 metrics-util = { workspace = true }
@@ -88,6 +127,8 @@ tn-types = { workspace = true, features = ["test-utils"] }
 secp256k1 = { workspace = true }
 proptest = { workspace = true }
 rand = { workspace = true }
+# the format-freeze tests' digests (src/env/format_freeze_tests.rs)
+sha2 = "0.10.8"
 tn-reth = { workspace = true, features = ["test-utils"] }
 # `rt` and `test-util` back the forwarder's bound tests: they drive spawned forwards and run
 # them on a paused clock so a two-minute budget costs no wall time. `net` and `io-util` back
@@ -110,11 +151,16 @@ test-utils = ["dep:secp256k1"]
 # Expose the production sorted-run accumulator to the allocation benchmark.
 bench-internals = []
 adiri = ["faucet", "tn-types/adiri"]
-# Opt back in to reth's RocksDB storage backend (librocksdb-sys, the RocksDB C++ engine).
-# Off by default: storage is MDBX-only today, so `RocksDBProvider` resolves to reth's
-# zero-size stub and the 332-translation-unit native compile is skipped entirely.
-# Required before any storage-v2 / `StorageSettings` experimentation.
-rocksdb = ["reth/rocksdb"]
+# Serve JavaScript tracers in `debug_trace*` (geth's custom tracers). Off by default: it compiles
+# boa, a JavaScript engine, and lets a debug-namespace caller run scripts on the node. Without
+# it, a JS tracer request gets "JS Tracer is not enabled" and the built-in tracers still work.
+# reth-rpc forwards it to reth-rpc-eth-api and reth-rpc-eth-types. See js-tracer.md.
+js-tracer = ["reth-rpc/js-tracer"]
+# Run TN's reth execution database on MDBX (`reth_db::DatabaseEnv`), the legacy backend, instead
+# of the default tn-lmdb engine. Off by default: it is kept for tests of the legacy path until
+# testnet has resynced. MDBX stays compiled either way: reth's crates require it, and the default
+# build reads an MDBX database to migrate it. See the README's "Database backend" section.
+mdbx = []
 
 [[bench]]
 name = "output_overlay"

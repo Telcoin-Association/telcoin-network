@@ -2,20 +2,22 @@
 //!
 //! This is the only reth CLI/config surface TN exposes: [`RethCommand`] narrows reth's full
 //! argument set to RPC, transaction-pool, and database args, and [`RethConfig::new`] fills in
-//! the rest of reth's `NodeConfig` with pinned values — reth networking/discovery fully
-//! disabled (TN runs its own libp2p stack), no reth payload builder, no dev/debug options, and
-//! reth's metrics server never launched (the prometheus endpoint is owned by `tn-metrics`).
+//! the rest of reth's `NodeConfig` with pinned values — no reth payload builder, no dev/debug
+//! options, and reth's metrics server never launched (the prometheus endpoint is owned by
+//! `tn-metrics`). reth's devp2p networking is not compiled in at all (TN runs its own libp2p
+//! stack; see vendor/reth CHANGES.md TN-0008).
 //!
 //! Security/operational policies enforced here:
 //! - RPC namespace allowlist: only the modules in `ALLOWED_MODULES` (eth, net, web3, debug, trace,
-//!   rpc) can be enabled, and every module dropped from a selection is warned about by name. A
-//!   `--http.api all` style selection is rewritten to `DEFAULT_MODULES`, which deliberately omits
-//!   the expensive `debug` and `trace` namespaces: they stay available, but only when named
-//!   explicitly, and enabling them warns (see `RethConfig::validate_rpc_modules`). The IPC
-//!   transport has no selection flag; it serves the same `DEFAULT_MODULES` set
-//!   (`RethConfig::ipc_modules`, applied in `RethEnv::get_rpc_server`). The allowlist governs reth
-//!   namespaces only: the TN-specific `tn_*` module is registered unconditionally on every enabled
-//!   transport (`RethEnv::get_rpc_server`).
+//!   rpc) and TN's own `tn` namespace can be enabled, and every module dropped from a selection is
+//!   warned about by name. An enabled transport without `--http.api`/`--ws.api`, and an `all` style
+//!   selection, resolve to the default set (eth, net, web3, rpc, tn), which deliberately omits the
+//!   expensive `debug` and `trace` namespaces: they stay available, but only when named explicitly,
+//!   and enabling them warns (see `RethConfig::validate_rpc_modules`). An explicit list is served
+//!   as written, so a list without `tn` serves no `tn_*` methods and `none` serves nothing. The IPC
+//!   transport has no selection flag; it serves the default set (`RethConfig::ipc_modules`, applied
+//!   in `RethEnv::get_rpc_server`). `RethEnv::get_rpc_server` merges the `tn_*` methods into
+//!   exactly the transports whose selection includes `tn`.
 //! - Pruning is disabled: every `PruningArgs` field is off, so nodes keep full history (archive
 //!   mode). Other code relies on this — e.g. ExEx replay treats missing receipts for an existing
 //!   block as database corruption (`TnRethError::ReplayReceiptsMissing`), which is only sound
@@ -29,45 +31,79 @@
 //!   [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`] (256, vs reth's 16), and the default IPC endpoint
 //!   becomes TN's [`DEFAULT_IPC_ENDPOINT`] (`tn.ipc`) rather than reth's `reth.ipc`.
 
-use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr},
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
-use reth::{
-    args::{
-        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs,
-        EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
-    },
-    network::transactions::{
-        config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
-    },
-    rpc::builder::{RethRpcModule, RpcModuleSelection},
-};
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_discv4::NatResolver;
-use reth_node_builder::{
-    NodeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
-    DEFAULT_RESERVED_CPU_CORES, DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
-    DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
+// The engine-tree defaults, from reth-engine-primitives (reth-tasks has its own
+// `DEFAULT_RESERVED_CPU_CORES` with a different value; this is the engine's).
+use reth_engine_primitives::{
+    DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES, DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
 };
-use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
+use reth_node_core::{
+    args::{
+        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, EngineArgs,
+        EraArgs, EraSourceArgs, MetricArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs,
+        StorageArgs, TxPoolArgs,
+    },
+    node_config::{NodeConfig, DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB},
+};
+use reth_rpc_builder::{RethRpcModule, RpcModuleSelection};
+use tn_lmdb_reth::GapFill;
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use tracing::{info, warn};
 
 use crate::{
     dirs::path_to_datadir,
     rpc_server_args::{RpcServerArgs, DEFAULT_IPC_ENDPOINT},
+    rpc_tx_forward::TxForwardConfig,
+    DatadirFormat, StorageLayout, TxBodies, TX_BODY_CACHE_BYTES,
 };
 
 /// A wrapper abstraction around a Reth node config.
+///
+/// The second field carries TN's transaction-forwarding settings (`--forward-txs`,
+/// `--sanitize-txs`), which reth's `NodeConfig` has no place for. The third is the storage layout
+/// a new datadir gets ([`RethConfig::new_datadir_layout`]). The fourth is tn-lmdb's gap fill,
+/// `--db.gap-fill` (off, a width in pages, or auto; [`RethConfig::db_gap_fill`]), which reth's
+/// `DatabaseArgs` has no place for. The fifth is where a new datadir keeps its transactions and
+/// the decoded-batch cache's budget ([`RethConfig::new_datadir_tx_bodies`],
+/// [`RethConfig::tx_body_cache_bytes`]).
 #[derive(Clone, Debug)]
-pub struct RethConfig(pub(crate) NodeConfig<RethChainSpec>);
+pub struct RethConfig(
+    pub(crate) NodeConfig<RethChainSpec>,
+    pub(crate) TxForwardConfig,
+    pub(crate) StorageLayout,
+    pub(crate) GapFill,
+    pub(crate) TxBodiesConfig,
+);
+
+/// Where a new datadir keeps its transactions, and how the env reads those a datadir stores by
+/// position (`env::tx_bodies`).
+#[derive(Clone, Debug)]
+pub(crate) struct TxBodiesConfig {
+    /// What a new datadir is asked for ([`TxBodies::for_new_datadirs`] unless chosen).
+    new_datadirs: TxBodies,
+    /// The decoded-batch cache's budget in bytes ([`TX_BODY_CACHE_BYTES`] unless chosen; 0: none).
+    cache_bytes: usize,
+    /// Test builds: the `MemoryBatches` to read batches from before any consensus pack, and to
+    /// remember every batch a persist stores by position in (temp chains that store transactions
+    /// by position use the process-wide one).
+    #[cfg(any(test, feature = "test-utils"))]
+    memory_batches: Option<Arc<crate::MemoryBatches>>,
+}
+
+impl Default for TxBodiesConfig {
+    fn default() -> Self {
+        Self {
+            new_datadirs: TxBodies::for_new_datadirs(),
+            cache_bytes: TX_BODY_CACHE_BYTES,
+            #[cfg(any(test, feature = "test-utils"))]
+            memory_batches: None,
+        }
+    }
+}
 
 /// Reth specific command line args.
 #[derive(Debug, Parser, Clone)]
@@ -90,13 +126,39 @@ pub struct RethCommand {
     /// All database related arguments
     #[clap(flatten)]
     pub db: DatabaseArgs,
+
+    /// tn-lmdb only: gap fill, `auto`, `off` or a width in pages (at most 64; 0 is off). Unset, it
+    /// is `auto` on Linux and off elsewhere ([`DEFAULT_DB_GAP_FILL`]). A durable commit first
+    /// rewrites each gap of at most this many clean pages between two runs of its dirty pages with
+    /// the bytes they hold, so the disk takes fewer, larger writes for more bytes written. A width
+    /// suits disks that cap I/Os per second (cloud block storage), not local NVMe; `auto` chooses
+    /// the width per commit from the disk's measured costs (settling at 0 where filling does not
+    /// pay). Refused on MDBX, whose build defaults to off. The rewritten pages include live pages
+    /// of the last durable state, so gap fill is safe at a power loss only on a drive that writes
+    /// each logical block atomically when the power fails (NVMe, cloud block storage); on any
+    /// other drive set `off`, since `auto` also fills while it measures the disk.
+    #[arg(long = "db.gap-fill", value_name = "PAGES|auto", help_heading = "Database")]
+    pub db_gap_fill: Option<GapFill>,
 }
 
-const DEFAULT_UNUSED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-
-/// The rpc modules an operator may enable at all.
+/// The gap fill a node runs with when `--db.gap-fill` is unset.
 ///
-/// Disallow admin, txpool: they do not work as expected with TN, or at all.
+/// [`GapFill::Auto`] on the tn-lmdb build on Linux: a completed commit leaves the same bytes on
+/// disk whatever width it picks, it settles at 0 on local NVMe, and it cuts the write I/Os of a
+/// durable commit on cloud block storage that caps them per second. It needs a drive that writes
+/// each logical block atomically when the power fails, as the drives the hardware requirements
+/// name do (the flag's help). Off on the MDBX build, which refuses gap fill, and on other OSes:
+/// macOS syncs a commit as ranged msyncs, which mislead the width's cost fit.
+pub const DEFAULT_DB_GAP_FILL: GapFill = if cfg!(all(target_os = "linux", not(feature = "mdbx"))) {
+    GapFill::Auto
+} else {
+    GapFill::OFF
+};
+
+/// The reth rpc modules an operator may enable at all.
+///
+/// Disallow admin, txpool: they do not work as expected with TN, or at all. TN's own `tn`
+/// module is allowed as well; it cannot live in a const array (see `is_allowed`).
 const ALLOWED_MODULES: [RethRpcModule; 6] = [
     RethRpcModule::Eth,
     RethRpcModule::Net,
@@ -106,7 +168,9 @@ const ALLOWED_MODULES: [RethRpcModule; 6] = [
     RethRpcModule::Rpc,
 ];
 
-/// The subset `--http.api all` expands to.
+/// The reth modules in the default set, which an absent flag and `--http.api all` expand to.
+///
+/// `default_modules` adds TN's `tn` module, which cannot live in a const array.
 ///
 /// `debug` and `trace` are allowed but deliberately not part of `all`. They are the two most
 /// expensive namespaces to serve, and TN nodes run archive mode by policy, so the whole chain
@@ -118,6 +182,25 @@ const DEFAULT_MODULES: [RethRpcModule; 4] =
 
 /// Modules that are honoured only when named explicitly, never through `all`.
 const EXPENSIVE_MODULES: [RethRpcModule; 2] = [RethRpcModule::Debug, RethRpcModule::Trace];
+
+/// The name that selects TN's own `tn_*` namespace in `--http.api`/`--ws.api`.
+pub(crate) const TN_MODULE: &str = "tn";
+
+/// Every module name an operator can select, for the `--http.api`/`--ws.api` help text.
+///
+/// Reth's own list of names advertises modules TN drops (admin, txpool, ots, ...) and has no
+/// entry for `tn`.
+pub(crate) const SELECTABLE_MODULE_NAMES: [&str; 7] =
+    ["eth", "net", "web3", "rpc", TN_MODULE, "debug", "trace"];
+
+/// The selection entry for TN's own `tn_*` namespace.
+///
+/// Reth has no variant for `tn`: its parser turns the name into `RethRpcModule::Other("tn")`, and
+/// its registry builds nothing for an `Other` module. The entry only decides which transports
+/// `RethEnv::get_rpc_server` merges the `tn_*` methods into.
+pub(crate) fn tn_module() -> RethRpcModule {
+    RethRpcModule::Other(TN_MODULE.to_string())
+}
 
 /// Telcoin Network's per-sender transaction pool slot default.
 ///
@@ -176,7 +259,7 @@ pub fn init_reth_defaults() {
         .is_err()
     {
         // The lock is already taken, so reading it back cannot change the outcome.
-        let effective = reth::args::RpcServerArgs::default().ipcpath;
+        let effective = reth_node_core::args::RpcServerArgs::default().ipcpath;
         if effective != DEFAULT_IPC_ENDPOINT {
             warn!(
                 target: "tn::reth",
@@ -189,36 +272,42 @@ pub fn init_reth_defaults() {
 }
 
 impl RethConfig {
-    /// Make sure that some modules are not selected, primarily they won't work as expected with TN
-    /// (or at all).
-    fn validate_rpc_modules(mods: &mut Option<RpcModuleSelection>) {
+    /// Resolve a transport's module selection to the explicit set TN serves on it.
+    ///
+    /// Modules that do not work as expected with TN (or at all) are dropped. `all`, reth's
+    /// code-only `Standard`, and an absent flag on an enabled transport become the default set
+    /// (eth, net, web3, rpc, tn). They have to be rewritten here rather than when the server is
+    /// built: reth expands `All` to every reth module and `Standard` to a set without `tn`, and
+    /// it turns an absent flag into that same standard set, which then cannot be told apart from
+    /// an explicit list. An absent flag on a disabled transport stays unset, since a set flag
+    /// makes reth warn that the transport is off.
+    fn validate_rpc_modules(enabled: bool, mods: &mut Option<RpcModuleSelection>) {
         match &mods {
-            Some(RpcModuleSelection::All) => {
+            Some(RpcModuleSelection::All | RpcModuleSelection::Standard) => {
                 // `all` means every module that is safe to serve by default, which excludes
                 // the expensive ones. An operator who wants those names them explicitly. The
                 // log line is the runtime signal for operators whose `all` enabled debug and
                 // trace before this rewrite.
                 info!(
                     target: "tn::reth",
-                    "The `all` RPC selection enables eth, net, web3, rpc; the expensive debug \
+                    "The `all` RPC selection enables eth, net, web3, rpc, tn; the expensive debug \
                      and trace modules must be named explicitly"
                 );
-                *mods = Some(RpcModuleSelection::Selection(HashSet::from(DEFAULT_MODULES)));
+                *mods = Some(RpcModuleSelection::Selection(default_modules()));
             }
-            Some(RpcModuleSelection::Standard) => {}
             Some(RpcModuleSelection::Selection(hash_set)) => {
-                let new_set: HashSet<RethRpcModule> = ALLOWED_MODULES
-                    .into_iter()
-                    .filter(|module| hash_set.contains(module))
-                    .collect();
+                let new_set: HashSet<RethRpcModule> =
+                    hash_set.iter().filter(|module| is_allowed(module)).cloned().collect();
                 // Name every dropped module: admin and txpool are unsupported on TN, and
                 // anything else is an unknown or mis-cased name reth parsed as `Other`.
-                // With debug/trace reachable only by explicit name, a typo that silently
+                // With debug/trace/tn reachable only by explicit name, a typo that silently
                 // cost the namespace would otherwise look like success.
                 hash_set.difference(&new_set).for_each(|dropped| {
                     warn!(
                         target: "tn::reth",
-                        "Dropping unsupported RPC module `{dropped}` from the selection"
+                        "Dropping unsupported RPC module `{dropped}` from the selection \
+                         (supported: {})",
+                        SELECTABLE_MODULE_NAMES.join(", ")
                     );
                 });
                 EXPENSIVE_MODULES.into_iter().filter(|module| hash_set.contains(module)).for_each(
@@ -233,6 +322,9 @@ impl RethConfig {
                 );
                 *mods = Some(RpcModuleSelection::Selection(new_set));
             }
+            None if enabled => {
+                *mods = Some(RpcModuleSelection::Selection(default_modules()));
+            }
             None => {}
         }
     }
@@ -244,10 +336,11 @@ impl RethConfig {
     /// and txpool included, so no operator input reaches that slot and
     /// [`Self::validate_rpc_modules`] never runs on it. `RethEnv::get_rpc_server` rewrites the
     /// slot with this set instead: the unconfigurable full-module default gets the same
-    /// treatment as an `all` selection, so a local IPC client sees exactly what
-    /// `--http.api all` serves, with nothing expensive enabled implicitly.
+    /// treatment as an `all` selection, so a local IPC client sees exactly what an absent flag
+    /// or `--http.api all` serves (eth, net, web3, rpc, tn), with nothing expensive enabled
+    /// implicitly.
     pub(crate) fn ipc_modules() -> RpcModuleSelection {
-        RpcModuleSelection::Selection(HashSet::from(DEFAULT_MODULES))
+        RpcModuleSelection::Selection(default_modules())
     }
 
     /// Create a new RethConfig wrapper.
@@ -263,63 +356,13 @@ impl RethConfig {
         // TN's per-sender slot default is seeded into reth's global pool defaults by
         // `init_reth_defaults` before parsing, so `txpool` already carries either that default
         // or the operator's explicit value. Nothing to override here.
-        let RethCommand { mut rpc, txpool, db } = reth_config;
+        let RethCommand { mut rpc, txpool, db, db_gap_fill } = reth_config;
+        crate::env::database::warn_max_size_is_a_reservation(&db);
 
-        Self::validate_rpc_modules(&mut rpc.http_api);
-        Self::validate_rpc_modules(&mut rpc.ws_api);
+        Self::validate_rpc_modules(rpc.http, &mut rpc.http_api);
+        Self::validate_rpc_modules(rpc.ws, &mut rpc.ws_api);
         // We don't just use Default for these Reth args.
         // This will force us to look at new options and make sure they are good for our use.
-        // We DO NOT use the Reth networking so these settings should reflect that.
-        let network = NetworkArgs {
-            discovery: DiscoveryArgs {
-                disable_discovery: true,
-                disable_nat: true,
-                disable_dns_discovery: true,
-                disable_discv4_discovery: true,
-                enable_discv5_discovery: false,
-                addr: DEFAULT_UNUSED_ADDR,
-                port: 0,
-                discv5_addr: None,
-                discv5_addr_ipv6: None,
-                discv5_port: 0,
-                discv5_port_ipv6: 0,
-                discv5_lookup_interval: 0,
-                discv5_bootstrap_lookup_interval: 0,
-                discv5_bootstrap_lookup_countdown: 0,
-            },
-            trusted_only: false,
-            trusted_peers: vec![],
-            bootnodes: None,
-            dns_retries: 0,
-            peers_file: None,
-            identity: "Reth Null Network".to_string(),
-            p2p_secret_key: None,
-            no_persist_peers: true,
-            nat: NatResolver::None,
-            addr: DEFAULT_UNUSED_ADDR,
-            port: 0,
-            max_outbound_peers: None,
-            max_inbound_peers: None,
-            max_concurrent_tx_requests: 0,
-            max_concurrent_tx_requests_per_peer: 0,
-            max_seen_tx_history: 0,
-            max_pending_pool_imports: 0,
-            soft_limit_byte_size_pooled_transactions_response: 0,
-            soft_limit_byte_size_pooled_transactions_response_on_pack_request: 0,
-            max_capacity_cache_txns_pending_fetch: 0,
-            net_if: None,
-            tx_propagation_policy: TransactionPropagationKind::None,
-            tx_ingress_policy: TransactionIngressPolicy::None,
-            disable_tx_gossip: true,
-            propagation_mode: TransactionPropagationMode::Max(0),
-            required_block_hashes: vec![],
-            network_id: None,
-            enforce_enr_fork_id: false,
-            max_peers: None,
-            netrestrict: None,
-            p2p_secret_key_hex: None,
-        };
-
         // Not using the Reth payload builder.
         let builder = PayloadBuilderArgs {
             extra_data: "tn-reth-na".to_string(),
@@ -440,13 +483,17 @@ impl RethConfig {
         // Parameters to configure block history syncing.
         let era = EraArgs { enabled: false, source: EraSourceArgs { path: None, url: None } };
 
+        // The forwarding args are TN-only: take them out before `rpc` converts into reth's args,
+        // which have no field for them.
+        let tx_forward =
+            TxForwardConfig { targets: rpc.forward_txs.take(), sanitize: rpc.sanitize_txs };
+
         let mut this = NodeConfig {
             config: None,
             chain,
             metrics,
             instance,
             datadir,
-            network,
             rpc: rpc.into(),
             txpool,
             builder,
@@ -465,7 +512,125 @@ impl RethConfig {
         // adjust rpc instance ports
         this.adjust_instance_ports();
 
-        Self(this)
+        Self(
+            this,
+            tx_forward,
+            StorageLayout::for_new_datadirs(),
+            db_gap_fill.unwrap_or(DEFAULT_DB_GAP_FILL),
+            TxBodiesConfig::default(),
+        )
+    }
+
+    /// Wrap a reth node config built without a parsed [`RethCommand`] (temp chains, snapshot
+    /// restores, tests), with transaction forwarding off.
+    pub(crate) fn from_node_config(node_config: NodeConfig<RethChainSpec>) -> Self {
+        Self(
+            node_config,
+            TxForwardConfig::default(),
+            StorageLayout::for_new_datadirs(),
+            GapFill::OFF,
+            TxBodiesConfig::default(),
+        )
+    }
+
+    /// The storage layout a new datadir gets: [`StorageLayout::for_new_datadirs`] unless
+    /// [`Self::with_new_datadir_layout`] chose another. An existing datadir always opens in the
+    /// layout it was created with (`env::layout`).
+    pub fn new_datadir_layout(&self) -> StorageLayout {
+        self.2
+    }
+
+    /// This config, giving a new datadir `layout`: for benches and tests that compare the
+    /// layouts. The MDBX build refuses v2 when it creates the datadir.
+    pub fn with_new_datadir_layout(mut self, layout: StorageLayout) -> Self {
+        self.2 = layout;
+        self
+    }
+
+    /// Where a new datadir keeps its transactions: [`TxBodies::for_new_datadirs`] unless
+    /// [`Self::with_new_datadir_tx_bodies`] chose otherwise. Pointers need layout v2: a new v1
+    /// datadir stores them inline whatever this says. An existing datadir keeps its own
+    /// (`env::layout`).
+    pub fn new_datadir_tx_bodies(&self) -> TxBodies {
+        self.4.new_datadirs
+    }
+
+    /// This config, asking a new datadir for `tx_bodies`: for benches and tests that compare the
+    /// formats.
+    pub fn with_new_datadir_tx_bodies(mut self, tx_bodies: TxBodies) -> Self {
+        self.4.new_datadirs = tx_bodies;
+        self
+    }
+
+    /// The format a new datadir is asked for: [`Self::new_datadir_layout`] and
+    /// [`Self::new_datadir_tx_bodies`].
+    pub fn new_datadir_format(&self) -> DatadirFormat {
+        DatadirFormat { layout: self.2, tx_bodies: self.4.new_datadirs }
+    }
+
+    /// The decoded-batch cache's budget in bytes: [`TX_BODY_CACHE_BYTES`] unless
+    /// [`Self::with_tx_body_cache_bytes`] chose otherwise.
+    pub fn tx_body_cache_bytes(&self) -> usize {
+        self.4.cache_bytes
+    }
+
+    /// This config, with a decoded-batch cache of `bytes` (0: none, so every read of a
+    /// transaction stored by position reads its pack): for tests and benches.
+    pub fn with_tx_body_cache_bytes(mut self, bytes: usize) -> Self {
+        self.4.cache_bytes = bytes;
+        self
+    }
+
+    /// Test builds: the `MemoryBatches` the env reads batches from, if any.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn memory_batches(&self) -> Option<Arc<crate::MemoryBatches>> {
+        self.4.memory_batches.clone()
+    }
+
+    /// Test builds: this config, with the env reading batches from the process-wide
+    /// `MemoryBatches` before any consensus pack and remembering there every batch a persist
+    /// stores by position, as temp chains that store transactions by position do.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_memory_batches(mut self, enabled: bool) -> Self {
+        self.4.memory_batches = enabled.then(crate::MemoryBatches::global);
+        self
+    }
+
+    /// Test builds: [`Self::with_memory_batches`] with `memory` in place of the process-wide
+    /// `MemoryBatches`, for a test that must read only the batches it put there.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_memory_batches_from(mut self, memory: Arc<crate::MemoryBatches>) -> Self {
+        self.4.memory_batches = Some(memory);
+        self
+    }
+
+    /// tn-lmdb's gap fill (`--db.gap-fill`; [`DEFAULT_DB_GAP_FILL`] when unset, off for a config
+    /// built without a parsed [`RethCommand`]), which the database open passes to
+    /// the engine (`EnvOptions::gap_fill`). The MDBX build refuses any but off at the open.
+    pub fn db_gap_fill(&self) -> GapFill {
+        self.3
+    }
+
+    /// The largest single growth step of the execution database: `--db.growth-step` when set, else
+    /// the backend's default (tn-lmdb's `MAX_GROWTH`, 1 GiB; reth's 4 GiB for MDBX). The consensus
+    /// chain keeps this much free beside its own stores when it imports a peer's pack.
+    pub fn execution_db_growth_step(&self) -> u64 {
+        #[cfg(not(feature = "mdbx"))]
+        let default = tn_lmdb_reth::MAX_GROWTH;
+        #[cfg(feature = "mdbx")]
+        let default = 4 << 30;
+        self.0.db.growth_step.map_or(default, |step| u64::try_from(step).unwrap_or(u64::MAX))
+    }
+
+    /// This config, with tn-lmdb's gap fill at `gap_fill`: for benches.
+    pub fn with_db_gap_fill(mut self, gap_fill: GapFill) -> Self {
+        self.3 = gap_fill;
+        self
+    }
+
+    /// The node's `--forward-txs` / `--sanitize-txs` settings.
+    pub fn tx_forward(&self) -> &TxForwardConfig {
+        &self.1
     }
 
     /// Assert the archive-mode invariant that every pinned historical read depends on.
@@ -526,10 +691,27 @@ impl RethConfig {
     }
 }
 
+/// The default module set: `DEFAULT_MODULES` plus TN's `tn` module.
+///
+/// An enabled transport without a selection flag, an `all` selection, and the IPC transport
+/// all resolve to this set.
+fn default_modules() -> HashSet<RethRpcModule> {
+    DEFAULT_MODULES.into_iter().chain([tn_module()]).collect()
+}
+
+/// Whether an operator may enable `module`: one of `ALLOWED_MODULES`, or TN's `tn` module.
+///
+/// The `tn` match is exact, so a mis-cased `TN` is dropped like any other unknown name.
+fn is_allowed(module: &RethRpcModule) -> bool {
+    ALLOWED_MODULES.contains(module)
+        || matches!(module, RethRpcModule::Other(name) if name == TN_MODULE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth::rpc::builder::RpcModuleSelection;
+    use clap::CommandFactory as _;
+    use reth_rpc_builder::RpcModuleSelection;
     use tempfile::TempDir;
     use tn_types::test_genesis;
 
@@ -539,26 +721,51 @@ mod tests {
     /// coincide with reth's, which is the condition that made 16 unreachable in the first place.
     const RETH_MAX_ACCOUNT_SLOTS_PER_SENDER: usize = 16;
 
-    /// Resolve a selection through the validator and return the surviving set.
+    /// Resolve a selection on an enabled transport through the validator and return the
+    /// surviving set.
     fn validated(selection: RpcModuleSelection) -> HashSet<RethRpcModule> {
         let mut mods = Some(selection);
-        RethConfig::validate_rpc_modules(&mut mods);
+        RethConfig::validate_rpc_modules(true, &mut mods);
         match mods {
             Some(RpcModuleSelection::Selection(set)) => set,
             other => panic!("expected an explicit selection, got {other:?}"),
         }
     }
 
-    #[test]
-    fn test_rpc_validator() {
-        let mut mods: Option<RpcModuleSelection> = None;
-        RethConfig::validate_rpc_modules(&mut mods);
-        assert!(mods.is_none());
+    /// Parse `args` the way the CLI does, build the node config through [`RethConfig::new`], and
+    /// return the HTTP and WS selections it resolved.
+    fn resolved_selections(
+        args: &[&str],
+    ) -> eyre::Result<(Option<RpcModuleSelection>, Option<RpcModuleSelection>)> {
+        let tmp_dir = TempDir::new()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_command =
+            RethCommand::try_parse_from(std::iter::once("tn-reth").chain(args.iter().copied()))?;
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
+        Ok((config.0.rpc.http_api, config.0.rpc.ws_api))
+    }
 
-        // Through `validated` rather than an `if let` arm: a non-`Selection` result panics
-        // instead of skipping the assertions, and equality proves debug/trace absent rather
-        // than only `DEFAULT_MODULES` present.
-        assert_eq!(validated(RpcModuleSelection::All), HashSet::from(DEFAULT_MODULES));
+    /// Every module an operator may enable: `ALLOWED_MODULES` plus TN's `tn`.
+    fn allowed_set() -> HashSet<RethRpcModule> {
+        ALLOWED_MODULES.into_iter().chain([tn_module()]).collect()
+    }
+
+    /// A disabled transport keeps an absent flag unset: a set flag would make reth warn that the
+    /// selection is ignored because the transport is off.
+    #[test]
+    fn absent_flag_on_disabled_transport_stays_unset() {
+        let mut mods: Option<RpcModuleSelection> = None;
+        RethConfig::validate_rpc_modules(false, &mut mods);
+        assert!(mods.is_none());
+    }
+
+    /// An enabled transport without a flag serves the default set, `tn` included. Left unset,
+    /// reth would fill it with its own standard set, which has no `tn` entry.
+    #[test]
+    fn absent_flag_on_enabled_transport_serves_the_default_set() {
+        let mut mods: Option<RpcModuleSelection> = None;
+        RethConfig::validate_rpc_modules(true, &mut mods);
+        assert_eq!(mods, Some(RpcModuleSelection::Selection(default_modules())));
     }
 
     /// `--http.api all` must not hand out the expensive namespaces. TN nodes are archive by
@@ -568,7 +775,9 @@ mod tests {
     fn all_excludes_debug_and_trace() {
         let resolved = validated(RpcModuleSelection::All);
 
-        assert_eq!(resolved, HashSet::from(DEFAULT_MODULES));
+        // equality proves debug/trace absent rather than only the default modules present.
+        assert_eq!(resolved, default_modules());
+        assert!(resolved.contains(&tn_module()), "`all` must keep the tn namespace");
         for module in EXPENSIVE_MODULES {
             assert!(!resolved.contains(&module), "`all` must not enable {module}");
         }
@@ -606,21 +815,62 @@ mod tests {
         assert!(!resolved.contains(&RethRpcModule::Txpool));
     }
 
-    /// `standard` and an absent flag are reth's own behaviour and stay untouched.
+    /// `Standard` cannot be typed (reth parses `standard` as an unknown name), but code can build
+    /// it. Reth's `Standard` never contains `tn`, so it resolves to the default set like `all`.
     #[test]
-    fn standard_selection_is_left_alone() {
-        let mut mods = Some(RpcModuleSelection::Standard);
-        RethConfig::validate_rpc_modules(&mut mods);
-        assert!(matches!(mods, Some(RpcModuleSelection::Standard)));
+    fn standard_selection_resolves_to_the_default_set() {
+        assert_eq!(validated(RpcModuleSelection::Standard), default_modules());
     }
 
-    /// The three module lists form a two-way partition: every allowed module is either in
-    /// `all`'s expansion or in the expensive explicit-only list, and never both. Subset
-    /// checks alone would let a new `ALLOWED_MODULES` entry ship unclassified (reachable by
-    /// name, absent from `all`, absent from the expensive warning) with every test green.
+    /// `tn` is selected by name like reth's modules: reth parses it as `Other("tn")` and the
+    /// allowlist keeps it.
+    #[test]
+    fn tn_is_selectable_by_name() -> eyre::Result<()> {
+        let (http, _) = resolved_selections(&["--http", "--http.api", "eth,tn"])?;
+
+        assert_eq!(
+            http,
+            Some(RpcModuleSelection::Selection(HashSet::from([RethRpcModule::Eth, tn_module()])))
+        );
+        Ok(())
+    }
+
+    /// An explicit list is served as written: `eth,net` serves no `tn_*` methods, and `none`
+    /// serves nothing at all.
+    #[test]
+    fn explicit_selection_without_tn_is_literal() -> eyre::Result<()> {
+        let (http, ws) =
+            resolved_selections(&["--http", "--http.api", "eth,net", "--ws", "--ws.api", "none"])?;
+
+        assert_eq!(
+            http,
+            Some(RpcModuleSelection::Selection(HashSet::from([
+                RethRpcModule::Eth,
+                RethRpcModule::Net
+            ])))
+        );
+        assert_eq!(ws, Some(RpcModuleSelection::Selection(HashSet::new())));
+        Ok(())
+    }
+
+    /// Module names are case-sensitive (only `all` and `none` are not): `TN` parses as a
+    /// different unknown module and is dropped with a warning, so no `tn_*` methods are served.
+    #[test]
+    fn misspelled_tn_is_dropped() -> eyre::Result<()> {
+        let (http, _) = resolved_selections(&["--http", "--http.api", "eth,TN"])?;
+
+        assert_eq!(http, Some(RpcModuleSelection::Selection(HashSet::from([RethRpcModule::Eth]))));
+        Ok(())
+    }
+
+    /// The module lists form a two-way partition of everything an operator may enable: every
+    /// allowed module, `tn` included, is either in the default set or in the expensive
+    /// explicit-only list, and never both. Subset checks alone would let a new allowed module
+    /// ship unclassified (reachable by name, absent from `all`, absent from the expensive
+    /// warning) with every test green.
     #[test]
     fn allowed_modules_partition_into_default_and_expensive() {
-        let default_set = HashSet::from(DEFAULT_MODULES);
+        let default_set = default_modules();
         let expensive_set = HashSet::from(EXPENSIVE_MODULES);
         assert!(
             default_set.is_disjoint(&expensive_set),
@@ -631,34 +881,62 @@ mod tests {
             default_set.union(&expensive_set).cloned().collect();
         assert_eq!(
             classified,
-            HashSet::from(ALLOWED_MODULES),
+            allowed_set(),
             "every allowed module must be classified as default or expensive"
         );
+        assert!(classified.iter().all(is_allowed), "every classified module must be allowed");
     }
 
-    /// The validator must be wired into [`RethConfig::new`] for both transports: every other
-    /// test here calls `validate_rpc_modules` directly, so deleting the two calls in `new`
-    /// would keep them all green while shipping `all` unrewritten.
+    /// The validator must be wired into [`RethConfig::new`] for both transports, with each
+    /// transport's own enable flag: every other selection test here calls
+    /// `validate_rpc_modules` directly, so deleting or crossing the two calls in `new` would
+    /// keep them all green while shipping `all` unrewritten or a bare `--http` without `tn`.
     #[test]
     fn validate_rpc_modules_is_wired_into_new() -> eyre::Result<()> {
-        let tmp_dir = TempDir::new()?;
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let reth_command = RethCommand::try_parse_from([
-            "tn-reth",
-            "--http",
-            "--http.api",
-            "all",
-            "--ws",
-            "--ws.api",
-            "all",
-        ])?;
+        let expected = Some(RpcModuleSelection::Selection(default_modules()));
 
-        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
+        let (http, ws) =
+            resolved_selections(&["--http", "--http.api", "all", "--ws", "--ws.api", "all"])?;
+        assert_eq!(http, expected);
+        assert_eq!(ws, expected);
 
-        let expected = Some(RpcModuleSelection::Selection(HashSet::from(DEFAULT_MODULES)));
-        assert_eq!(config.0.rpc.http_api, expected);
-        assert_eq!(config.0.rpc.ws_api, expected);
+        // a bare `--http` resolves to the default set, and the disabled ws transport stays unset.
+        let (http, ws) = resolved_selections(&["--http"])?;
+        assert_eq!(http, expected);
+        assert_eq!(ws, None);
         Ok(())
+    }
+
+    /// The names `--help` advertises are exactly the modules an operator can enable: each one
+    /// parses to an allowed module, and together they cover the whole allowlist, so the help
+    /// text neither lists a name TN drops nor hides one it serves.
+    #[test]
+    fn selectable_module_names_match_the_allowlist() {
+        let parsed: HashSet<RethRpcModule> = SELECTABLE_MODULE_NAMES
+            .iter()
+            .map(|name| name.parse::<RethRpcModule>().expect("reth parses every module name"))
+            .collect();
+
+        assert_eq!(parsed.len(), SELECTABLE_MODULE_NAMES.len(), "names must be distinct");
+        for module in &parsed {
+            assert!(is_allowed(module), "`{module}` is advertised but dropped");
+        }
+        assert_eq!(parsed, allowed_set());
+
+        // both selection flags advertise exactly these names.
+        let command = RethCommand::command();
+        for flag in ["http.api", "ws.api"] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some(flag))
+                .unwrap_or_else(|| panic!("--{flag} is defined"));
+            let advertised: Vec<String> = arg
+                .get_possible_values()
+                .iter()
+                .map(|value| value.get_name().to_string())
+                .collect();
+            assert_eq!(advertised, SELECTABLE_MODULE_NAMES, "--{flag} help text");
+        }
     }
 
     /// IPC has no selection flag, so its slot must resolve to `all`'s expansion rather than
@@ -699,6 +977,53 @@ mod tests {
         assert_eq!(config.0.txpool.max_account_slots, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
     }
 
+    /// The execution database's growth step the consensus chain's imports keep free is the
+    /// configured `--db.growth-step`, else the backend's default largest step.
+    #[test]
+    fn execution_db_growth_step_is_the_configured_or_default_step() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let config = |args: &[&str]| -> eyre::Result<RethConfig> {
+            let command = RethCommand::try_parse_from(
+                std::iter::once("tn-reth").chain(args.iter().copied()),
+            )?;
+            Ok(RethConfig::new(command, None, tmp_dir.path(), true, chain.clone()))
+        };
+        #[cfg(not(feature = "mdbx"))]
+        let default = tn_lmdb_reth::MAX_GROWTH;
+        #[cfg(feature = "mdbx")]
+        let default = 4 << 30;
+        assert_eq!(config(&[])?.execution_db_growth_step(), default);
+        assert_eq!(config(&["--db.growth-step", "4GB"])?.execution_db_growth_step(), 4 << 30);
+        Ok(())
+    }
+
+    /// The TN-only forwarding args reach the config beside reth's `NodeConfig`, which has no
+    /// field for them, and a command without them leaves forwarding off.
+    #[test]
+    fn forward_txs_args_survive_reth_config_new() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_command = RethCommand::try_parse_from([
+            "tn-reth",
+            "--forward-txs",
+            "10.0.0.1,10.0.0.2:8566",
+            "--sanitize-txs",
+        ])?;
+        let expected = crate::rpc_tx_forward::parse_forward_targets("10.0.0.1,10.0.0.2:8566")?;
+
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain.clone());
+        assert_eq!(
+            config.tx_forward(),
+            &TxForwardConfig { targets: Some(expected), sanitize: true }
+        );
+
+        let reth_command = RethCommand::try_parse_from(["tn-reth"])?;
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
+        assert_eq!(config.tx_forward(), &TxForwardConfig::default());
+        Ok(())
+    }
+
     /// The `--instance` port offsets the CLI README documents, checked against the values reth's
     /// `adjust_instance_ports` resolves from TN's defaults: instance 1 keeps the defaults, each
     /// further instance moves HTTP down by one and WebSocket up by two, and the IPC suffix is
@@ -732,7 +1057,8 @@ mod tests {
     fn config_with_pruning(enable: impl FnOnce(&mut PruningArgs)) -> RethConfig {
         init_reth_defaults();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let mut config = RethConfig(NodeConfig { chain, ..NodeConfig::default() });
+        let mut config =
+            RethConfig::from_node_config(NodeConfig { chain, ..NodeConfig::default() });
         enable(&mut config.0.pruning);
         config
     }

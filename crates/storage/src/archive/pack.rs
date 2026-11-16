@@ -1,5 +1,5 @@
-//! A data/log file of archival data.  Once written is only indended to be read and shared with
-//! other nodes.
+//! A data/log file of archival data: an append-only log of CRC-framed records, once written only
+//! intended to be read and shared with other nodes.
 
 use serde::{de::DeserializeOwned, Serialize};
 use tn_types::{encode_into_buffer, try_decode};
@@ -11,21 +11,28 @@ use crate::archive::{
         load_header::LoadHeaderError, open::OpenError, rename::RenameError,
     },
     fxhasher::FxHasher,
-    pack_iter::{PackIter, MAX_RECORD_SIZE},
+    pack_iter::{decompress_checked, PackIter, MAX_RECORD_SIZE},
 };
 
-use super::{crc::add_crc32, data_file::DataFile};
+use super::{
+    crc::{add_crc32, crc32},
+    data_file::{DataFileReader, MapView, MmapDataFile, MmapFileOptions},
+};
 use std::{
     fmt::Debug,
-    fs::{self, File},
     hash::Hasher as _,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, Write},
     marker::PhantomData,
+    ops::Range,
     path::Path,
 };
 
-/// An instance of a DB.
-/// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
+/// The sequential record iterator [`Pack::raw_iter`] returns.
+pub type RawIter<V> = PackIter<V, DataFileReader>;
+
+/// An append-only log of records, each framed `[u32 len | payload | u32 crc]`, in one
+/// memory-mapped data file. Indexes over it (digest, position, B+tree) are separate files owned by
+/// the pack's user.
 #[derive(Debug)]
 pub struct Pack<V>
 where
@@ -38,7 +45,8 @@ impl<V> Pack<V>
 where
     V: Debug + Serialize + DeserializeOwned,
 {
-    /// Open a new or reopen an existing database.
+    /// Open a new or reopen an existing database. The data file is memory-mapped
+    /// ([`MmapDataFile`]).
     pub fn open<P: AsRef<Path>>(
         path: P,
         uid_idx: u64,
@@ -46,7 +54,20 @@ where
         compression: PackCompression,
         version: u16,
     ) -> Result<Self, OpenError> {
-        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression, version)? })
+        Self::open_with(path, uid_idx, read_only, compression, version, MmapFileOptions::default())
+    }
+
+    /// [`Self::open`] with explicit options for the data file's mapping (for example a
+    /// [`reserve`](MmapFileOptions::reserve) so the mapping never moves while the pack is open).
+    pub fn open_with<P: AsRef<Path>>(
+        path: P,
+        uid_idx: u64,
+        read_only: bool,
+        compression: PackCompression,
+        version: u16,
+        opts: MmapFileOptions,
+    ) -> Result<Self, OpenError> {
+        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression, version, opts)? })
     }
 
     /// Length of the Pack file.
@@ -54,34 +75,124 @@ where
         self.inner.file_len()
     }
 
+    /// True when the backing data file was opened without a valid clean-close sentinel — it was not
+    /// sealed by a clean shutdown and is most likely still padded/torn, so a consistency check
+    /// should treat the pack as needing recovery.
+    pub fn opened_unclean(&self) -> bool {
+        self.inner.opened_unclean()
+    }
+
+    /// Clear the backing data file's "opened unclean" flag after a successful recovery/heal, so a
+    /// clean `Drop` re-seals the pack (and a reopen reports it clean) instead of replaying the WAL
+    /// on every restart. Callers invoke this once recovery has made the log + its derived
+    /// indexes self-consistent. See
+    /// [`MmapDataFile::mark_consistent`](crate::archive::data_file::MmapDataFile::mark_consistent).
+    pub fn mark_consistent(&mut self) {
+        self.inner.mark_consistent();
+    }
+
+    /// Clamp a read-only pack's read bound down to `logical_end` (the index-attested record end),
+    /// so reads never touch bytes above the committed data even if the underlying file were
+    /// physically padded. Defense-in-depth against the read-only-mmap SIGBUS window; no-op on a
+    /// writable pack.
+    pub fn set_read_bound(&mut self, logical_end: u64) {
+        self.inner.data_file.set_read_bound(logical_end);
+    }
+
     /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
-        self.inner.fetch(pos)
+    pub fn fetch(&self, pos: u64) -> Result<V, FetchError> {
+        self.inner.read_record(pos)
     }
 
     /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
-    pub fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
+    pub fn read_bytes(&self, start_pos: u64, end_pos: u64) -> Result<&[u8], FetchError> {
         self.inner.read_bytes(start_pos, end_pos)
     }
 
-    /// Read the record size (with crc32) at position.
-    /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    pub fn record_size(&mut self, pos: u64) -> Result<u32, FetchError> {
+    /// The CRC-checked, zero-copy value bytes of the record at `pos`, borrowed from the mmap -- the
+    /// raw byte-log read paired with [`Self::append_raw`]. Unlike [`Self::fetch`] it does not
+    /// decode through the `V` codec or allocate a `Vec`, so a byte-oriented caller can decode
+    /// straight from the map. Valid for an uncompressed pack (`PackCompression::None`).
+    pub fn record_bytes(&self, pos: u64) -> Result<&[u8], FetchError> {
+        self.inner.record_bytes(pos)
+    }
+
+    /// The lock-free reader view of the data file's mapping (see [`MapView`]). An owner may
+    /// publish how much of the log readers may see ([`MapView::publish_len`]; the B+tree index
+    /// does); tndb does not, and bounds each read by its snapshot's own limit instead
+    /// (`MapView::tail_within`), so its rollback's rewind is guarded by that limit, not by the
+    /// view.
+    pub(crate) fn view(&self) -> std::sync::Arc<MapView> {
+        self.inner.data_file.view()
+    }
+
+    /// [`Self::record_bytes`] through a lock-free [`MapView`], bounded by `limit` (see
+    /// [`MapView::tail_within`]): CRC-check the record at `pos` and borrow its payload. Log
+    /// records never change once appended, so a record written before the call is safe to read
+    /// with no lock. `max` is the pack's record cap (see [`MmapFileOptions::max_record_size`]).
+    ///
+    /// # Safety
+    ///
+    /// [`MapView::tail_within`]'s, for `[pos, limit)`: every byte of it written in full by writes
+    /// that happen before the call, and none written or cut while the payload lives. The
+    /// contract rests on where the caller's `limit` came from, which this fn cannot see.
+    pub(crate) unsafe fn record_bytes_within(
+        view: &MapView,
+        pos: u64,
+        limit: u64,
+        max: u32,
+    ) -> Result<&[u8], FetchError> {
+        // SAFETY: this fn's own contract is `tail_within`'s, for the same range.
+        checked_payload_in(unsafe { view.tail_within(pos, limit) }, max)
+    }
+
+    /// The on-disk size of the record at `pos` (its frame: payload plus 8 bytes), CRC-checked.
+    /// Errors on IO or a failed CRC32 integrity check.
+    pub fn record_size(&self, pos: u64) -> Result<u32, FetchError> {
         self.inner.record_size(pos)
     }
 
-    /// Return a refernce to the pack files header.
+    /// True iff the record-length-prefix region at `pos` has been written — any of the up-to-4
+    /// prefix bytes within the logical data `[pos, min(pos + 4, len()))` is non-zero.
+    ///
+    /// A real record's 4-byte length prefix is non-zero, whereas freshly-grown mmap capacity
+    /// padding reads as zeros. This checks every one of the up-to-4 prefix bytes (not just the
+    /// leading one — a valid length that is a multiple of 256 has a zero low byte), so it
+    /// distinguishes "a record (even a torn one) was written here" — which a caller must not
+    /// silently overwrite — from unwritten zero padding or an empty tail. Bounded by the
+    /// logical end, so a cleanly-sealed file with nothing at `pos` (`pos >= len()`) returns
+    /// false, and a crash-grown, zero-padded file with no record written past `pos` also
+    /// returns false.
+    pub(crate) fn record_present_at(&self, pos: u64) -> bool {
+        let avail = self.inner.data_file.len().saturating_sub(pos).min(4) as usize;
+        avail != 0
+            && self.inner.data_file.slice(pos, avail).is_some_and(|b| b.iter().any(|&x| x != 0))
+    }
+
+    /// True iff any logical byte at or after `pos` is non-zero — i.e. real record bytes (a meta or
+    /// an output) were written past `pos`, as opposed to unwritten, zero-filled mmap capacity
+    /// padding. Reads a zero-copy view of the mapped bytes and short-circuits at the first non-zero
+    /// byte, so an occupied pack returns immediately while a genuinely empty, all-zero-padded tail
+    /// is fully scanned.
+    ///
+    /// Complements [`Self::record_present_at`], which inspects only the 4-byte length prefix: a
+    /// prefix corrupted to zero reads there as "no record", but real content can still sit past
+    /// `pos`. `open_append` uses this to tell a genuinely header-only file (safe to initialize)
+    /// from an occupied pack whose meta length-prefix was zeroed (which a blind re-initialize would
+    /// erase).
+    pub(crate) fn any_content_after(&self, pos: u64) -> bool {
+        let span = self.inner.data_file.len().saturating_sub(pos) as usize;
+        span != 0
+            && self.inner.data_file.slice(pos, span).is_some_and(|b| b.iter().any(|&x| x != 0))
+    }
+
+    /// Return a reference to the pack file's header.
     pub fn header(&self) -> &DataHeader {
         &self.inner.header
     }
 
-    /// Insert a new key/value pair in Db.
-    ///
-    /// For the data file this means inserting:
-    ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
-    ///   - value size (u32)
-    ///   - key data
-    ///   - value data
+    /// Append `value` as one record (encoded through the `V` codec, compressed if the pack is),
+    /// returning its position: a frame `[u32 len | payload | u32 crc]` at the end of the log.
     ///
     /// A WriteDataError moves the DB to a failed state.  While the DB is failed, each append
     /// and each commit returns a copy of the error that caused the failed state.  This error
@@ -91,13 +202,49 @@ where
         self.inner.append(value)
     }
 
+    /// Append already-serialized `value` bytes as one record, returning its position. Sibling of
+    /// [`Self::append`] that skips the value serialize step -- for a caller that has already
+    /// produced the final bytes (e.g. `tndb`, which serializes at its typed layer), so re-encoding
+    /// them through the `V` codec would be a redundant copy. Read the bytes back with
+    /// [`Self::record_bytes`] (not [`Self::fetch`], which would decode them through the `V` codec).
+    pub fn append_raw(&mut self, value: &[u8]) -> Result<u64, AppendError> {
+        self.inner.append_raw(value)
+    }
+
+    /// [`Self::append_raw`] of the concatenation of `parts`, written as one record straight from
+    /// the slices (no joined copy): the same record, CRC and position as appending the joined
+    /// bytes. For a byte log whose records have several pieces (e.g. a key then a value).
+    pub fn append_raw_parts(&mut self, parts: &[&[u8]]) -> Result<u64, AppendError> {
+        self.inner.append_raw_parts(parts)
+    }
+
+    /// Append `stored`, a value already encoded the way this pack stores it (by a
+    /// [`RecordEncoder`] made with this pack's compression), as one record: the record
+    /// [`Self::append`] would write for that value, encoded beforehand so an owner that serializes
+    /// appends behind a lock need not hold it while it encodes and compresses.
+    pub(crate) fn append_stored(&mut self, stored: &[u8]) -> Result<u64, AppendError> {
+        self.inner.append_stored(stored)
+    }
+
+    /// The largest record payload this pack takes (see [`MmapFileOptions::max_record_size`]).
+    pub(crate) fn max_record(&self) -> u32 {
+        self.inner.max_record
+    }
+
     /// Test-only failure injector: make the next append fail with
     /// [`AppendError::WriteDataError`], the same classification a real io write failure gets.
     /// The append path then marks the pack failed, which is the poisoned state the queued-save
     /// regression tests start from.
     #[cfg(test)]
     pub(crate) fn fail_next_append_for_test(&mut self) {
-        self.inner.fail_next_append = true;
+        self.fail_next_append_with_kind_for_test(io::ErrorKind::StorageFull);
+    }
+
+    /// Test-only failure injector like [`Self::fail_next_append_for_test`], with the io error
+    /// kind of the injected failure chosen by the caller.
+    #[cfg(test)]
+    pub(crate) fn fail_next_append_with_kind_for_test(&mut self, kind: io::ErrorKind) {
+        self.inner.fail_next_append = Some(kind);
     }
 
     /// Return the DB version.
@@ -115,12 +262,16 @@ where
         self.inner.uid()
     }
 
-    /// Flush any caches to disk and sync the data and index file.
+    /// Sync the data file to disk (see [`MmapDataFile::sync_all`]).
     /// All data should be safely on disk if this call succeeds.
     /// Note this is an expensive call (syncing to disk is not cheap).
     /// On a pack in the failed state this returns [`CommitError::Failed`] with a copy of the
     /// error that caused the failed state.
-    pub fn commit(&mut self) -> Result<(), CommitError> {
+    ///
+    /// A pure durability barrier: it changes nothing but the data file's own (atomic) flush
+    /// bookkeeping, so it needs only shared access. An owner that serializes appends behind a lock
+    /// can commit under that lock's shared mode, leaving readers unblocked during the sync.
+    pub fn commit(&self) -> Result<(), CommitError> {
         self.inner.commit()
     }
 
@@ -135,10 +286,11 @@ where
         self.inner.flush()
     }
 
-    /// Close and destroy the Pack (remove it's file).
-    /// If it can not remove a file it will silently ignore this.
-    pub fn destroy(self) {
-        self.inner.destroy();
+    /// Mark the underlying data file to be removed (not sealed) when this handle drops. Used to
+    /// abandon a partial/failed build cheaply, skipping the clean-close
+    /// msync+truncate+sentinel+fsync.
+    pub fn set_remove_on_drop(&mut self) {
+        self.inner.data_file.set_remove_on_drop();
     }
 
     /// Rename the pack file to name.
@@ -146,15 +298,83 @@ where
         self.inner.rename(path)
     }
 
-    /// Truncate the pack file.  Use this get back to known good state.
-    pub fn truncate(&mut self, new_len: u64) -> Result<(), io::Error> {
-        self.inner.truncate(new_len)
+    /// Roll the log's logical end back to `new_len`, zeroing the abandoned region, WITHOUT a
+    /// physical truncate/remap (see [`MmapDataFile::rewind_to`]). Used to atomically undo a partial
+    /// append without opening a read-only-mmap SIGBUS window; a later append lands at `new_len`.
+    pub fn rewind_to(&mut self, new_len: u64) -> Option<std::ops::Range<u64>> {
+        self.inner.data_file.rewind_to(new_len)
+    }
+
+    /// The durable acked-data watermark recovered from the tail commit marker of an unclean pack,
+    /// if present (see [`MmapDataFile::committed_end`]). `None` on a clean/fresh open. Recovery
+    /// uses it as an index-free way to detect at-rest corruption of the last committed record.
+    pub fn committed_end(&self) -> Option<u64> {
+        self.inner.data_file.committed_end()
+    }
+
+    /// Seal the data file now and report the outcome (see [`MmapDataFile::seal`]), for an owner
+    /// that installs or trusts the pack on the strength of its seal: dropping the pack seals it
+    /// too, but can only log a failure. A pack in the failed state is refused with that state's
+    /// cause, nothing written. Consumes the pack; whatever the outcome, its `Drop` writes nothing
+    /// more.
+    pub(crate) fn seal(mut self) -> io::Result<()> {
+        self.inner.seal()
+    }
+
+    /// Test-only: the data file's next seal reports a failed final fsync (see
+    /// [`MmapDataFile::fail_next_seal_sync_for_test`]).
+    #[cfg(test)]
+    pub(crate) fn fail_next_seal_sync_for_test(&mut self) {
+        self.inner.data_file.fail_next_seal_sync_for_test();
+    }
+
+    /// Poison the data file: a sync of it failed elsewhere (see [`Self::note_synced`]), so its
+    /// state on disk is unknown. It refuses every later append and barrier, and is never sealed
+    /// as clean (the next open recovers it).
+    pub(crate) fn poison(&self) {
+        self.inner.data_file.poison();
+    }
+
+    /// How many times the data file has grown (see [`MmapDataFile::growths`]).
+    pub(crate) fn growths(&self) -> u64 {
+        self.inner.data_file.growths()
+    }
+
+    /// Record a sync made outside this pack (see [`MmapDataFile::note_synced`]).
+    pub(crate) fn note_synced(&self, end: u64) {
+        self.inner.data_file.note_synced(end);
+    }
+
+    /// A duplicate of the data file's descriptor (see [`MmapDataFile::dup_file`]).
+    pub(crate) fn dup_file(&self) -> std::io::Result<std::fs::File> {
+        self.inner.data_file.dup_file()
+    }
+
+    /// True once the pack is failed or its data file poisoned: every later append or commit
+    /// fails.
+    pub(crate) fn is_failed(&self) -> bool {
+        self.inner.failed.is_some() || self.inner.data_file.is_poisoned()
+    }
+
+    /// Stamp the tail commit marker at `committed`, an end a sync made outside this pack covered
+    /// (see [`Self::note_synced`] and [`MmapDataFile::stamp_commit_marker_at`]). Returns whether
+    /// the marker was stamped.
+    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) -> bool {
+        self.inner.data_file.stamp_commit_marker_at(committed)
+    }
+
+    /// Stamp the tail commit marker (`committed_end == file_len()`) — a best-effort, no-extra-sync
+    /// record of the acked frontier (see [`MmapDataFile::stamp_commit_marker`]). Call AFTER
+    /// [`Self::commit`] so the marker can never be ahead of durable data.
+    pub fn stamp_commit_marker(&mut self) {
+        self.inner.data_file.stamp_commit_marker();
     }
 
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
-    pub fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
+    /// Each iterator reads at its own position, so several can be live over one pack at once.
+    pub fn raw_iter(&self) -> Result<RawIter<V>, LoadHeaderError> {
         self.inner.raw_iter()
     }
 }
@@ -170,19 +390,23 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     header: DataHeader,
-    data_file: DataFile,
-    value_buffer: Vec<u8>,
-    /// Used as a second buffer for compress and decompress operations on records.
-    compression_buffer: Vec<u8>,
+    data_file: MmapDataFile,
+    /// The zstd context every compressed append reuses, created on the first one.
+    zstd_ctx: Option<ZstdCtx>,
+    /// The reused buffer every append encodes its value into (see [`write_payload`]).
+    stage: Vec<u8>,
     /// Root cause of the failed state: a copy of the io error from the append that failed
     /// the pack. While this is `Some`, each append and each commit returns a copy of this
     /// error so callers see the root cause and not a generic guard error.
     failed: Option<io::Error>,
     read_only: bool,
     uid_idx: u64, // Store for opening an iterator.
-    /// Test-only: when set, the next append fails as if the data write hit an io error.
+    /// The largest record written or read (see [`MmapFileOptions::max_record_size`]).
+    max_record: u32,
+    /// Test-only: when set, the next append fails as if the data write hit an io error of this
+    /// kind.
     #[cfg(test)]
-    fail_next_append: bool,
+    fail_next_append: Option<io::ErrorKind>,
     _value: PhantomData<V>,
 }
 
@@ -191,7 +415,9 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     fn drop(&mut self) {
-        if !self.read_only {
+        // A file to be removed (an abandoned build) is discarded, not made durable, and a sealed
+        // one ([`Pack::seal`]) is closed.
+        if !self.read_only && !self.data_file.removes_on_drop() && !self.data_file.is_closed() {
             let _ = self.commit();
         }
     }
@@ -208,20 +434,36 @@ where
         read_only: bool,
         compression: PackCompression,
         version: u16,
+        opts: MmapFileOptions,
     ) -> Result<Self, OpenError> {
+        let max_record = opts.max_record_size.unwrap_or(MAX_RECORD_SIZE);
+        // Every read caps a decompressed record at `MAX_RECORD_SIZE`, and a compressed pack's cap
+        // applies to the record before compression: above it, an append could succeed and the
+        // read fail. Checked against the compression asked for before a new file is created, and
+        // against the one an existing file's header records (which is what its appends use).
+        let cap_too_large = |compression| {
+            matches!(compression, PackCompression::ZStd) && max_record > MAX_RECORD_SIZE
+        };
+        if cap_too_large(compression) {
+            return Err(OpenError::RecordCapTooLarge(max_record));
+        }
         let (data_file, header) =
-            Self::open_data_file(path, uid_idx, read_only, compression, version)
+            Self::open_data_file(path, uid_idx, read_only, compression, version, opts)
                 .map_err(OpenError::DataFileOpen)?;
+        if cap_too_large(header.compression()) {
+            return Err(OpenError::RecordCapTooLarge(max_record));
+        }
         Ok(Self {
             header,
             data_file,
-            value_buffer: Vec::new(),
-            compression_buffer: Vec::new(),
+            zstd_ctx: None,
+            stage: Vec::new(),
             failed: None,
             read_only,
             uid_idx,
+            max_record,
             #[cfg(test)]
-            fail_next_append: false,
+            fail_next_append: None,
             _value: PhantomData,
         })
     }
@@ -231,42 +473,44 @@ where
         self.data_file.len()
     }
 
-    /// Fetch the value stored at key.  Will return an error if not found.
-    fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
-        self.read_record(pos)
+    /// True when the data file was opened without a valid clean-close sentinel (not cleanly
+    /// sealed).
+    fn opened_unclean(&self) -> bool {
+        self.data_file.opened_unclean()
+    }
+
+    /// Clear the backing data file's "opened unclean" flag (see
+    /// [`MmapDataFile::mark_consistent`](crate::archive::data_file::MmapDataFile::mark_consistent)).
+    fn mark_consistent(&mut self) {
+        self.data_file.mark_consistent();
     }
 
     /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
-    fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
-        // Validate the range against the file length before allocating so a corrupt or
-        // oversized bound (the position index has no per-record CRC) errors instead of
-        // triggering a huge up-front allocation that would only fail at read_exact.
+    fn read_bytes(&self, start_pos: u64, end_pos: u64) -> Result<&[u8], FetchError> {
+        // Validate the range against the file length so a corrupt or oversized bound (a
+        // caller-supplied out-of-range end offset) errors instead of reading past the log.
         if start_pos > end_pos || end_pos > self.data_file.len() {
             return Err(FetchError::IO(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "read_bytes range out of bounds",
             )));
         }
-        let mut bytes = vec![0; (end_pos - start_pos) as usize];
-        self.data_file.seek(SeekFrom::Start(start_pos))?;
-        self.data_file.read_exact(&mut bytes[..])?;
-        Ok(bytes)
+        // A range validated against the logical length is always mapped; if it somehow is not,
+        // that is an error, never an (empty) answer.
+        self.data_file
+            .slice(start_pos, (end_pos - start_pos) as usize)
+            .ok_or_else(|| FetchError::IO(io::Error::other("read_bytes range is not mapped")))
     }
 
     /// Test-only injection point: fail the append the way a real io write failure fails.
-    /// Armed by [`Pack::fail_next_append_for_test`]; disarms after one use. The injected
-    /// error carries the StorageFull kind, a sentinel that is not the Other default, so
-    /// tests can assert that a replayed copy keeps the kind.
+    /// Armed by [`Pack::fail_next_append_for_test`] (StorageFull, a sentinel kind that is not the
+    /// Other default, so tests can assert that a replayed copy keeps the kind) or
+    /// [`Pack::fail_next_append_with_kind_for_test`]; disarms after one use.
     #[cfg(test)]
     fn injected_append_failure(&mut self) -> Result<(), AppendError> {
-        std::mem::take(&mut self.fail_next_append)
-            .then(|| {
-                AppendError::WriteDataError(io::Error::new(
-                    io::ErrorKind::StorageFull,
-                    "injected write failure",
-                ))
-            })
-            .map_or(Ok(()), Err)
+        self.fail_next_append.take().map_or(Ok(()), |kind| {
+            Err(AppendError::WriteDataError(io::Error::new(kind, "injected write failure")))
+        })
     }
 
     /// Do the actual insert so the public function can rollback easily on an error.
@@ -276,23 +520,77 @@ where
         #[cfg(test)]
         self.injected_append_failure()?;
 
-        write_value(
-            value,
-            &mut self.data_file,
-            &mut self.value_buffer,
-            &mut self.compression_buffer,
-            self.header.compression,
-        )?;
+        self.write_record(Payload::Value(value))?;
         Ok(record_pos)
     }
 
-    /// Insert a new key/value pair in Db.
-    ///
-    /// For the data file this means inserting:
-    ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
-    ///   - value size (u32)
-    ///   - key data
-    ///   - value data
+    /// Raw-bytes sibling of [`Self::append_inner`]: frame `value` as one record without the
+    /// serialize step (the bytes are already final).
+    fn append_raw_inner(&mut self, value: &[u8]) -> Result<u64, AppendError> {
+        let record_pos = self.data_file.len();
+
+        #[cfg(test)]
+        self.injected_append_failure()?;
+
+        self.write_record(Payload::Raw(value))?;
+        Ok(record_pos)
+    }
+
+    /// Multi-slice sibling of [`Self::append_raw_inner`].
+    fn append_raw_parts_inner(&mut self, parts: &[&[u8]]) -> Result<u64, AppendError> {
+        let record_pos = self.data_file.len();
+
+        #[cfg(test)]
+        self.injected_append_failure()?;
+
+        self.write_record(Payload::RawParts(parts))?;
+        Ok(record_pos)
+    }
+
+    /// Stored-bytes sibling of [`Self::append_inner`]: frame `stored` (already encoded, and
+    /// compressed if the pack is) as one record, as is.
+    fn append_stored_inner(&mut self, stored: &[u8]) -> Result<u64, AppendError> {
+        let record_pos = self.data_file.len();
+
+        #[cfg(test)]
+        self.injected_append_failure()?;
+
+        let result = frame_record::<V>(
+            &mut self.data_file,
+            None,
+            &mut self.stage,
+            Payload::Raw(stored),
+            self.max_record,
+        );
+        if result.is_err() {
+            self.data_file.rewind_to(record_pos);
+        }
+        result?;
+        Ok(record_pos)
+    }
+
+    /// Append `payload` as one framed record (see [`frame_record`]), compressing it with this
+    /// pack's reused zstd context when the pack is compressed. A record that fails part-way is
+    /// rolled back: whatever of it reached the file is zeroed and the logical end moves back to
+    /// where the record began, so a refused or failed append leaves the log as it was.
+    fn write_record(&mut self, payload: Payload<'_, V>) -> Result<(), AppendError> {
+        let record_pos = self.data_file.len();
+        let zstd = match self.header.compression {
+            PackCompression::None => None,
+            PackCompression::ZStd => Some(match &mut self.zstd_ctx {
+                Some(ctx) => ctx,
+                slot @ None => slot.insert(ZstdCtx::new()?),
+            }),
+        };
+        let result =
+            frame_record(&mut self.data_file, zstd, &mut self.stage, payload, self.max_record);
+        if result.is_err() {
+            self.data_file.rewind_to(record_pos);
+        }
+        result
+    }
+
+    /// Append `value` as one record (see [`Pack::append`]).
     ///
     /// A WriteDataError moves the DB to a failed state.  While the DB is failed, each append
     /// and each commit returns a copy of the error that caused the failed state.  This error
@@ -304,17 +602,65 @@ where
         }
         self.failed_cause().map_err(AppendError::WriteDataError)?;
         let result = self.append_inner(value);
+        self.classify_append(result)
+    }
+
+    /// Raw-bytes sibling of [`Self::append`]: append already-serialized `value` bytes as one record
+    /// (no codec re-encode), sharing the same read-only guard, failed-state guard, and
+    /// poison classification. Used by `tndb`'s byte-oriented shared log.
+    fn append_raw(&mut self, value: &[u8]) -> Result<u64, AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        self.failed_cause().map_err(AppendError::WriteDataError)?;
+        let result = self.append_raw_inner(value);
+        self.classify_append(result)
+    }
+
+    /// [`Self::append_raw`] of `parts` written as one record (see [`Pack::append_raw_parts`]).
+    fn append_raw_parts(&mut self, parts: &[&[u8]]) -> Result<u64, AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        self.failed_cause().map_err(AppendError::WriteDataError)?;
+        let result = self.append_raw_parts_inner(parts);
+        self.classify_append(result)
+    }
+
+    /// Append an already-encoded value as one record (see [`Pack::append_stored`]), with the same
+    /// guards and failure classification as [`Self::append`].
+    fn append_stored(&mut self, stored: &[u8]) -> Result<u64, AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        self.failed_cause().map_err(AppendError::WriteDataError)?;
+        let result = self.append_stored_inner(stored);
+        self.classify_append(result)
+    }
+
+    /// Poison the pack on a write io error, shared between [`Self::append`] and
+    /// [`Self::append_raw`]. A write io error, whatever its kind, moves the pack to the failed
+    /// state. A record too large to ever be read back (`RecordTooLarge`) is rolled back where it
+    /// stopped ([`Self::write_record`]), so the log is left as it was and the pack stays healthy:
+    /// neither it nor the other non-write errors poison the pack.
+    fn classify_append(&mut self, result: Result<u64, AppendError>) -> Result<u64, AppendError> {
         if let Err(err) = &result {
             match err {
-                // These errors all indicate a failed DB that can no longer be inserted too.
+                // A write io error, whatever its kind, indicates a failed DB that can no longer be
+                // inserted to.
                 AppendError::WriteDataError(io_err) => {
-                    self.failed = Some(Self::copy_io_error(io_err))
+                    self.failed = Some(Self::copy_io_error(io_err));
                 }
-                // These errors do not indicate a failed DB.
-                AppendError::SerializeValue(_)
+                // These errors do not indicate a failed DB. A `RecordTooLarge` record is rolled
+                // back where it stopped, so the log is left as it was (the read path likewise
+                // rejects an oversize record without failing the pack).
+                AppendError::RecordTooLarge { .. }
+                | AppendError::SerializeValue(_)
                 | AppendError::ReadOnly
                 | AppendError::CrcError
-                | AppendError::DuplicateKey => {}
+                | AppendError::CorruptIndex(_)
+                | AppendError::DuplicateKey
+                | AppendError::KeySize { .. } => {}
             }
         }
         result
@@ -333,6 +679,12 @@ where
         self.failed.as_ref().map_or(Ok(()), |cause| Err(Self::copy_io_error(cause)))
     }
 
+    /// See [`Pack::seal`].
+    fn seal(&mut self) -> io::Result<()> {
+        self.failed_cause()?;
+        self.data_file.seal()
+    }
+
     /// Return the DB version.
     fn version(&self) -> u16 {
         self.header.version()
@@ -348,15 +700,13 @@ where
         self.header.uid()
     }
 
-    /// Flush any caches to disk and sync the data and index file.
-    /// All data should be safely on disk if this call succeeds.
+    /// Sync the data file to disk. All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
-    fn commit(&mut self) -> Result<(), CommitError> {
+    fn commit(&self) -> Result<(), CommitError> {
         if self.read_only {
             return Err(CommitError::ReadOnly);
         }
         self.failed_cause().map_err(CommitError::Failed)?;
-        self.flush().map_err(CommitError::Flush)?;
         self.data_file.sync_all().map_err(CommitError::DataFileSync)?;
         Ok(())
     }
@@ -374,163 +724,371 @@ where
         ro: bool,
         compression: PackCompression,
         version: u16,
-    ) -> Result<(DataFile, DataHeader), LoadHeaderError> {
-        let mut data_file = DataFile::open(path, ro)?;
-        let file_end = data_file.data_file_end();
-
-        let header = if file_end == 0 {
-            let header = DataHeader::new(uid_idx, compression, version);
-            header.write_header(&mut data_file)?;
-            header
-        } else {
-            let header = DataHeader::load_header(&mut data_file, uid_idx)?;
-            if header.version() > version {
-                // Do not allow a newer version than we request but allow an older.
-                return Err(LoadHeaderError::InvalidVersion);
-            }
-            if header.appnum() != 1 {
-                return Err(LoadHeaderError::InvalidAppNum);
-            }
-            header
-        };
-        data_file.flush()?;
+        opts: MmapFileOptions,
+    ) -> Result<(MmapDataFile, DataHeader), LoadHeaderError> {
+        let mut data_file = MmapDataFile::open_with(path, ro, opts)?;
+        let header = Self::init_header(&mut data_file, uid_idx, compression, version, ro)?;
         Ok((data_file, header))
     }
 
-    /// Read the record at position.
-    /// Returns the (key, value) tuple
-    /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    fn read_record(&mut self, position: u64) -> Result<V, FetchError> {
-        self.data_file.seek(SeekFrom::Start(position))?;
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        let mut val_size_buf = [0_u8; 4];
-        self.data_file.read_exact(&mut val_size_buf)?;
-        crc32_hasher.update(&val_size_buf);
-        let val_size = u32::from_le_bytes(val_size_buf);
-        if val_size > MAX_RECORD_SIZE {
-            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
-        }
-        self.value_buffer.resize(val_size as usize, 0);
-        self.data_file.read_exact(&mut self.value_buffer[..])?;
-        crc32_hasher.update(&self.value_buffer);
-        let calc_crc32 = crc32_hasher.finalize();
-        let mut buf_u32 = [0_u8; 4];
-        self.data_file.read_exact(&mut buf_u32)?;
-        let read_crc32 = u32::from_le_bytes(buf_u32);
-        if calc_crc32 != read_crc32 {
-            return Err(FetchError::CrcFailed);
-        }
-        let buffer = match self.header.compression {
-            PackCompression::None => &self.value_buffer,
-            PackCompression::ZStd => {
-                let mut decoder = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
-                decoder.window_log_max(24)?;
-                self.compression_buffer.clear();
-                // +1 lets us detect overflow vs. natural EOF
-                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(&mut self.compression_buffer)?;
-                if self.compression_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
-                }
-                &self.compression_buffer
+    /// Write a fresh [`DataHeader`] to an empty (or never-written) file, or load and validate an
+    /// existing one, then flush.
+    fn init_header(
+        data_file: &mut MmapDataFile,
+        uid_idx: u64,
+        compression: PackCompression,
+        version: u16,
+        read_only: bool,
+    ) -> Result<DataHeader, LoadHeaderError> {
+        let file_end = data_file.data_file_end();
+        // A file with a physical size but all-zero logical bytes was sized by a first write
+        // (`grow_to`'s preallocate + ftruncate) that crashed before the header reached disk. It is
+        // semantically unwritten — the same "all-zero == unwritten" rule the pack applies to
+        // records — so treat it as fresh rather than feeding zeros to `load_header` (which fails
+        // with a bare CRC error no door can classify). `is_unwritten` is gated on `opened_unclean`
+        // since a clean close always leaves a non-zero trailing sentinel.
+        let never_written = file_end != 0 && data_file.opened_unclean() && data_file.is_unwritten();
+        if file_end == 0 || (never_written && !read_only) {
+            if never_written {
+                // Reset the sized-but-unwritten file to empty; this discards only zeros, so it is a
+                // fresh initialization, not a repair of any committed data.
+                data_file.truncate(0)?;
             }
-        };
-        let val =
-            try_decode::<V>(buffer).map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
-        Ok(val)
+            let header = DataHeader::new(uid_idx, compression, version);
+            header.write_header(data_file)?;
+            // Make the header durable (msync + fsync) NOW, before anything can observe the pack.
+            // Otherwise a crash after `grow_to` sized the file but before the meta commit leaves an
+            // empty or all-zero file; syncing here narrows that window and keeps a fresh header on
+            // disk.
+            data_file.sync_disk()?;
+            return Ok(header);
+        } else if never_written {
+            // Read-only door: it cannot re-initialize, so surface a classifiable, actionable error
+            // instead of a bare CRC failure.
+            return Err(LoadHeaderError::Unwritten);
+        }
+        let header = DataHeader::load_header(data_file, uid_idx)?;
+        if header.version() > version {
+            // Do not allow a newer version than we request but allow an older.
+            return Err(LoadHeaderError::InvalidVersion);
+        }
+        if header.appnum() != 1 {
+            return Err(LoadHeaderError::InvalidAppNum);
+        }
+        data_file.flush()?;
+        Ok(header)
     }
 
-    /// Read the record size (with crc32) at position.
-    /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    fn record_size(&mut self, position: u64) -> Result<u32, FetchError> {
-        self.data_file.seek(SeekFrom::Start(position))?;
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        let mut val_size_buf = [0_u8; 4];
-        self.data_file.read_exact(&mut val_size_buf)?;
-        crc32_hasher.update(&val_size_buf);
-        let val_size = u32::from_le_bytes(val_size_buf);
-        if val_size > MAX_RECORD_SIZE {
-            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
-        }
-        self.value_buffer.resize(val_size as usize, 0);
-        self.data_file.read_exact(&mut self.value_buffer[..])?;
-        crc32_hasher.update(&self.value_buffer);
-        let calc_crc32 = crc32_hasher.finalize();
-        let mut buf_u32 = [0_u8; 4];
-        self.data_file.read_exact(&mut buf_u32)?;
-        let read_crc32 = u32::from_le_bytes(buf_u32);
-        if calc_crc32 != read_crc32 {
-            return Err(FetchError::CrcFailed);
-        }
-        Ok(val_size + 8)
+    /// Read and decode the record at `position`.
+    /// Errors on IO, a failed CRC32 integrity check, or a decode failure.
+    fn read_record(&self, position: u64) -> Result<V, FetchError> {
+        self.read_record_into(position)
     }
 
-    /// Close and destroy the Pack (remove it's file).
-    /// If it can not remove a file it will silently ignore this.
-    fn destroy(self) {
-        let path = self.data_file.path().to_owned();
-        drop(self);
-        let _ = fs::remove_file(&path);
+    /// CRC-check the record at `position` and return the zero-copy `&[u8]` payload -- the raw
+    /// stored value bytes (before any decompression), borrowed straight from the mmap. Shared
+    /// by [`Self::read_record_into`] and [`Self::record_bytes`].
+    fn checked_payload(&self, position: u64) -> Result<&[u8], FetchError> {
+        checked_payload_in(self.data_file.tail(position), self.max_record)
+    }
+
+    /// Decode the record at `position`, decompressing first if the pack is compressed. The value
+    /// `bytes` are decoded straight from where they were read (the mmap, for the zero-copy path).
+    fn read_record_into(&self, position: u64) -> Result<V, FetchError> {
+        let payload = self.checked_payload(position)?;
+        match self.header.compression {
+            PackCompression::None => {
+                try_decode(payload).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+            }
+            PackCompression::ZStd => {
+                // Decompress (capped at `MAX_RECORD_SIZE`) into a buffer, then decode the slice:
+                // decoding from the decompressor itself would let a length prefix in a damaged
+                // record allocate up to the codec's sequence limit before the bytes ran out,
+                // where a slice's decode checks each length against the bytes it has. It is also
+                // the faster decode for the consensus pack's reads (its batches are compressed):
+                // one decompression pass, then a slice decode instead of one through the reader.
+                let mut decompressed = Vec::new();
+                let bytes = decompress_checked(payload, &mut decompressed)?;
+                try_decode(bytes).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+            }
+        }
+    }
+
+    /// The CRC-checked, zero-copy value bytes of the record at `position`, borrowed from the mmap
+    /// -- the raw byte-log read that skips the `V` codec (and the `Vec` [`Self::read_record`]
+    /// would allocate). Returns the raw stored payload: valid for an uncompressed pack
+    /// (`PackCompression::None`); on a compressed pack the bytes are still compressed.
+    fn record_bytes(&self, position: u64) -> Result<&[u8], FetchError> {
+        self.checked_payload(position)
+    }
+
+    /// The on-disk size of the record at `position` (see [`Pack::record_size`]).
+    fn record_size(&self, position: u64) -> Result<u32, FetchError> {
+        Ok(self.checked_payload(position)?.len() as u32 + 8)
     }
 
     /// Rename the pack file to name.
     fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
-        self.data_file.rename(path)
-    }
-
-    /// Truncate the pack file.  Use this get back to known good state.
-    fn truncate(&mut self, new_len: u64) -> Result<(), io::Error> {
-        self.data_file.set_len(new_len)
+        self.data_file.rename(path.as_ref())
     }
 
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
-    fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
-        let dat_file = { self.data_file.try_clone()? };
-        PackIter::open(dat_file, self.uid_idx)
+    fn raw_iter(&self) -> Result<RawIter<V>, LoadHeaderError> {
+        // `try_clone` does NOT truncate the capacity padding, so read to the logical `end` it
+        // returns rather than physical EOF — otherwise a concurrent append that re-grows and
+        // re-pads the file would feed the iterator trailing zeros (a 0-size record → CRC failure).
+        let (dat_file, end) = self.data_file.try_clone()?;
+        Ok(PackIter::open(dat_file, self.uid_idx, end)?.with_max_record(self.max_record))
     }
 }
 
-/// Do the actual insert so the public function can rollback easily on an error.
-pub fn write_value<V, W>(
-    value: &V,
-    writer: &mut W,
-    value_buffer: &mut Vec<u8>,
-    mut compression_buffer: &mut Vec<u8>,
+/// CRC-check the record at the start of `tail` (every readable byte from the record's position on:
+/// the data file's own mapping, or a lock-free [`MapView`]) and return its payload (the raw stored
+/// value bytes, before any decompression) borrowed in place.
+///
+/// A record is `[len u32 | payload | crc u32]` with the CRC over the contiguous `[len | payload]`,
+/// so it is checked with one bounds-checked borrow and one CRC call over those bytes.
+fn checked_payload_in(tail: Option<&[u8]>, max: u32) -> Result<&[u8], FetchError> {
+    let Some(tail) = tail.filter(|tail| tail.len() >= 4) else {
+        return Err(FetchError::IO(io::Error::other("Unable to get mmap slice.")));
+    };
+    let val_size = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
+    if val_size > max {
+        return Err(FetchError::RequestedSizeTooLarge(val_size, max));
+    }
+    let crc_at = 4 + val_size as usize;
+    let Some(stored) = tail.get(crc_at..crc_at + 4) else {
+        return Err(FetchError::IO(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Unable to read the full record and CRC",
+        )));
+    };
+    if crc32(&tail[..crc_at]) != u32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]]) {
+        return Err(FetchError::CrcFailed);
+    }
+    Ok(&tail[4..crc_at])
+}
+
+/// What one append writes: a value to encode through the pack's codec, or bytes the caller has
+/// already serialized (the raw byte-log path, e.g. `tndb`, which serializes at its typed layer).
+enum Payload<'a, V> {
+    Value(&'a V),
+    Raw(&'a [u8]),
+    /// Raw bytes in pieces, written back to back as one payload.
+    RawParts(&'a [&'a [u8]]),
+}
+
+/// The zstd compression context a pack's appends reuse, instead of allocating a fresh one per
+/// record. Configured like `zstd::stream::write::Encoder::new(_, 0)` (zstd's default level), so the
+/// frames it produces are byte-identical to that encoder's.
+struct ZstdCtx(zstd::zstd_safe::CCtx<'static>);
+
+impl Debug for ZstdCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ZstdCtx")
+    }
+}
+
+impl ZstdCtx {
+    fn new() -> io::Result<Self> {
+        let mut ctx = zstd::zstd_safe::CCtx::create();
+        ctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(0)).map_err(zstd_error)?;
+        Ok(Self(ctx))
+    }
+}
+
+/// Encodes values the way a pack stores them (the codec, then one zstd frame for a compressed
+/// pack), for [`Pack::append_stored`]: the same bytes [`Pack::append`] writes for a value, made
+/// beforehand. One encoder serves many values, reusing its zstd context and staging buffer, and
+/// appends each into a buffer the caller keeps (so a warm caller allocates nothing).
+#[derive(Debug)]
+pub(crate) struct RecordEncoder {
     compression: PackCompression,
-) -> Result<(), std::io::Error>
-where
-    V: Debug + Serialize,
-    W: ?Sized + std::io::Write,
-{
-    value_buffer.clear();
-    encode_into_buffer(value_buffer, value).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let buffer = match compression {
-        PackCompression::None => value_buffer,
-        PackCompression::ZStd => {
-            compression_buffer.clear();
-            {
-                let mut compressor = zstd::stream::write::Encoder::new(&mut compression_buffer, 0)?;
-                compressor.write_all(value_buffer)?;
-                compressor.finish()?;
+    zstd_ctx: Option<ZstdCtx>,
+    stage: Vec<u8>,
+    max: u32,
+}
+
+impl RecordEncoder {
+    /// An encoder for a pack of `compression` whose records are at most `max` bytes.
+    pub(crate) fn new(compression: PackCompression, max: u32) -> Self {
+        Self { compression, zstd_ctx: None, stage: Vec::new(), max }
+    }
+
+    /// The bytes the encoder's staging buffer holds on to (it grows to the largest value encoded).
+    pub(crate) fn stage_capacity(&self) -> usize {
+        self.stage.capacity()
+    }
+
+    /// Free the staging buffer (the next value encoded grows it again). The encoded bytes do not
+    /// depend on it.
+    pub(crate) fn free_stage(&mut self) {
+        self.stage = Vec::new();
+    }
+
+    /// Append `value`'s stored bytes (what [`Pack::append`] would frame for it) to `out`, and
+    /// return where they are in it. On an error `out` is left as it was.
+    pub(crate) fn encode_into<V: Serialize>(
+        &mut self,
+        value: &V,
+        out: &mut Vec<u8>,
+    ) -> Result<Range<usize>, AppendError> {
+        let start = out.len();
+        let encoded = self.write_stored(value, out).and_then(|()| {
+            let size = out.len() - start;
+            if size > self.max as usize {
+                return Err(AppendError::RecordTooLarge { size, max: self.max });
             }
-            compression_buffer
+            Ok(start..out.len())
+        });
+        if encoded.is_err() {
+            out.truncate(start);
+        }
+        encoded
+    }
+
+    /// Write `value`'s stored bytes to the end of `out`.
+    fn write_stored<V: Serialize>(
+        &mut self,
+        value: &V,
+        out: &mut Vec<u8>,
+    ) -> Result<(), AppendError> {
+        match self.compression {
+            PackCompression::None => {
+                write_payload(out, &mut self.stage, Payload::Value(value), self.max)
+            }
+            PackCompression::ZStd => {
+                let ctx = match &mut self.zstd_ctx {
+                    Some(ctx) => ctx,
+                    slot @ None => slot.insert(ZstdCtx::new()?),
+                };
+                // A value that failed part-way left its frame unfinished; start every value clean.
+                ctx.0.reset(zstd::zstd_safe::ResetDirective::SessionOnly).map_err(zstd_error)?;
+                let mut encoder = zstd::stream::write::Encoder::with_context(out, &mut ctx.0);
+                write_payload(&mut encoder, &mut self.stage, Payload::Value(value), self.max)?;
+                encoder.finish()?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A zstd library error code as an io error.
+fn zstd_error(code: usize) -> io::Error {
+    io::Error::other(zstd::zstd_safe::get_error_name(code))
+}
+
+/// The payload end of a record write: everything written goes straight into the data file (the
+/// frame's length and CRC are taken from the written bytes afterwards).
+struct RecordSink<'a> {
+    file: &'a mut MmapDataFile,
+}
+
+impl Write for RecordSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    /// A no-op: the bytes are in the mapping as soon as they are written, and durability is the
+    /// pack's commit, not a per-record flush (the zstd encoder flushes its writer on `finish`).
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Write `payload` to `out` as one write, mapping a failure to the append error it means: a value
+/// the codec rejects is [`AppendError::SerializeValue`], a payload past the decoded cap is
+/// [`AppendError::RecordTooLarge`] (refused before any of it is written), and a write that failed
+/// below is [`AppendError::WriteDataError`].
+///
+/// A value is encoded whole into `stage`, a buffer the pack reuses for every append. The codec
+/// writes a byte vector one byte per call (serde has no byte specialization and `bcs` writes each
+/// element on its own), which compiles to a tight loop into a plain `Vec` but costs a full call per
+/// byte through any other writer, so the encode stays in the `Vec` and only its result moves on.
+///
+/// The cap: every read path caps the decompressed payload at [`MAX_RECORD_SIZE`], so a payload that
+/// compresses to <= the cap but decodes above it would be appended and acked yet could never be
+/// fetched, iterated, replayed, or served to a peer (and an unclean reopen would then see
+/// `CorruptPack`).
+fn write_payload<V: Serialize, W: Write>(
+    mut out: W,
+    stage: &mut Vec<u8>,
+    payload: Payload<'_, V>,
+    max: u32,
+) -> Result<(), AppendError> {
+    let bytes = match payload {
+        Payload::Value(value) => {
+            stage.clear();
+            encode_into_buffer(stage, value)
+                .map_err(|e| AppendError::SerializeValue(e.to_string()))?;
+            &stage[..]
+        }
+        Payload::Raw(bytes) => bytes,
+        Payload::RawParts(parts) => {
+            let size: usize = parts.iter().map(|part| part.len()).sum();
+            if size > max as usize {
+                return Err(AppendError::RecordTooLarge { size, max });
+            }
+            for part in parts {
+                out.write_all(part).map_err(AppendError::WriteDataError)?;
+            }
+            return Ok(());
         }
     };
+    if bytes.len() > max as usize {
+        return Err(AppendError::RecordTooLarge { size: bytes.len(), max });
+    }
+    out.write_all(bytes).map_err(AppendError::WriteDataError)
+}
 
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    // Once we have written to write_buffer, it needs to be rolled back before returning an
-    // error. Space for the value length.
-    let value_size = (buffer.len() as u32).to_le_bytes();
-    writer.write_all(&value_size)?;
-    crc32_hasher.update(&value_size);
-
-    writer.write_all(buffer)?;
-    crc32_hasher.update(buffer);
-    let crc32 = crc32_hasher.finalize();
-    writer.write_all(&crc32.to_le_bytes())?;
-
+/// Write one framed record `[u32 len | payload | u32 crc]` (little-endian) at the end of `file`,
+/// writing the payload straight into the mapping: a value is encoded into the reused `stage` buffer
+/// (see [`write_payload`]) and, with `zstd`, compressed from there directly into the file, so the
+/// compressed bytes are never staged. The length is known only once the
+/// payload is written, so its prefix is reserved as zeros and patched in after; the CRC over the
+/// then-contiguous `len | payload` is one pass over those written bytes in the mapping.
+///
+/// Until the prefix is patched the record reads as nothing (a zero length prefix, like capacity
+/// padding), and the append is acked only after the CRC is written, so an interrupted append is an
+/// unacked tail. On an error the caller rolls the record back ([`PackInner::write_record`]).
+fn frame_record<V: Serialize>(
+    file: &mut MmapDataFile,
+    zstd: Option<&mut ZstdCtx>,
+    stage: &mut Vec<u8>,
+    payload: Payload<'_, V>,
+    max: u32,
+) -> Result<(), AppendError> {
+    let record_pos = file.len();
+    file.write_all(&[0; 4])?;
+    let mut sink = RecordSink { file };
+    match zstd {
+        None => write_payload(&mut sink, stage, payload, max)?,
+        Some(ctx) => {
+            // A record that failed part-way left its frame unfinished; start every record clean.
+            ctx.0.reset(zstd::zstd_safe::ResetDirective::SessionOnly).map_err(zstd_error)?;
+            let mut encoder = zstd::stream::write::Encoder::with_context(&mut sink, &mut ctx.0);
+            write_payload(&mut encoder, stage, payload, max)?;
+            encoder.finish()?;
+        }
+    }
+    let RecordSink { file } = sink;
+    // Pack data files append, so the payload is everything written past the prefix.
+    let len = file.len() - record_pos - 4;
+    // Every read path refuses a framed record larger than the cap (and a payload past `u32::MAX`
+    // would silently truncate the size prefix), so such a record is refused here.
+    if len > max as u64 {
+        return Err(AppendError::RecordTooLarge { size: len as usize, max });
+    }
+    file.slice_mut(record_pos, 4)
+        .ok_or_else(|| io::Error::other("record length prefix is not mapped"))?
+        .copy_from_slice(&(len as u32).to_le_bytes());
+    let crc = crc32(
+        file.slice(record_pos, 4 + len as usize)
+            .ok_or_else(|| io::Error::other("record is not mapped"))?,
+    );
+    file.write_all(&crc.to_le_bytes())?;
     Ok(())
 }
 
@@ -708,7 +1266,10 @@ impl PackCompression {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
+    use std::{
+        fs::{File, OpenOptions},
+        io::SeekFrom,
+    };
 
     use serde::Deserialize;
     use tempfile::TempDir;
@@ -721,6 +1282,128 @@ mod tests {
         name: String,
     }
     type TestPack = Pack<TestRec>;
+
+    /// The raw byte-log path used by `tndb`: `append_raw` stores value bytes verbatim (no `V`
+    /// codec) and `record_bytes` reads them back zero-copy, CRC-checked. Covers empty, small, and
+    /// larger payloads, and confirms a flipped payload byte surfaces as `CrcFailed`.
+    #[test]
+    fn append_raw_and_record_bytes_roundtrip() {
+        let tmp = TempDir::with_prefix("pack_append_raw").expect("temp dir");
+        let path = tmp.path().join("raw");
+        let mut pack: Pack<Vec<u8>> =
+            Pack::open(&path, 0, false, PackCompression::None, 1).expect("open");
+
+        let empty: &[u8] = b"";
+        let small: &[u8] = b"hello raw world";
+        let large: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let pos_empty = pack.append_raw(empty).expect("append empty");
+        let pos_small = pack.append_raw(small).expect("append small");
+        let pos_large = pack.append_raw(&large).expect("append large");
+
+        assert_eq!(pack.record_bytes(pos_empty).expect("read empty"), empty);
+        assert_eq!(pack.record_bytes(pos_small).expect("read small"), small);
+        assert_eq!(pack.record_bytes(pos_large).expect("read large"), large.as_slice());
+
+        // Records are `[u32 len | payload | u32 crc]`, so the payload starts at pos + 4. Flip one
+        // byte and the recomputed CRC no longer matches the stored one.
+        let payload = pack.inner.data_file.slice_mut(pos_small + 4, 1).expect("payload slice");
+        payload[0] ^= 0xFF;
+        assert!(matches!(pack.record_bytes(pos_small), Err(FetchError::CrcFailed)));
+    }
+
+    /// `append_raw_parts` writes exactly the record `append_raw` would for the joined bytes, and
+    /// the raw iterator yields every payload in order, ending at the first bad frame.
+    #[test]
+    fn append_raw_parts_matches_append_raw_and_iterates_raw() {
+        let tmp = TempDir::with_prefix("pack_append_parts").expect("temp dir");
+        let mut joined: Pack<Vec<u8>> =
+            Pack::open(tmp.path().join("joined"), 0, false, PackCompression::None, 1)
+                .expect("open");
+        let mut parts: Pack<Vec<u8>> =
+            Pack::open(tmp.path().join("parts"), 0, false, PackCompression::None, 1).expect("open");
+        let records: [&[&[u8]]; 4] = [
+            &[b"key1".as_slice(), b"value one".as_slice()],
+            &[b"".as_slice(), b"x".as_slice()],
+            &[b"k".as_slice(), b"".as_slice(), b"tail".as_slice()],
+            &[],
+        ];
+        for pieces in records {
+            let a = joined.append_raw(&pieces.concat()).expect("append_raw");
+            let b = parts.append_raw_parts(pieces).expect("append_raw_parts");
+            assert_eq!(a, b, "same position");
+            assert_eq!(parts.record_bytes(b).expect("read"), pieces.concat().as_slice());
+        }
+        assert_eq!(
+            joined.read_bytes(0, joined.file_len()).expect("bytes"),
+            parts.read_bytes(0, parts.file_len()).expect("bytes"),
+            "byte-identical logs"
+        );
+
+        let mut iter = parts.raw_iter().expect("raw iter");
+        for pieces in records {
+            assert_eq!(iter.next_raw().expect("record").expect("payload"), pieces.concat());
+        }
+        assert!(iter.next_raw().is_none(), "the logical end");
+
+        // A flipped payload byte is a bad frame, not a record.
+        let pos = parts.append_raw(b"last").expect("append");
+        parts.inner.data_file.slice_mut(pos + 4, 1).expect("payload")[0] ^= 0xFF;
+        let mut iter = parts.raw_iter().expect("raw iter");
+        for _ in records {
+            iter.next_raw().expect("record").expect("payload");
+        }
+        assert!(matches!(iter.next_raw(), Some(Err(FetchError::CrcFailed))));
+    }
+
+    /// `read_bytes` never answers an in-range read it cannot serve with an empty slice: with the
+    /// mapping gone it is an error, and an out-of-range bound is still rejected.
+    #[test]
+    fn read_bytes_errors_instead_of_returning_empty() {
+        let tmp = TempDir::with_prefix("pack_read_bytes").expect("temp dir");
+        let mut pack: Pack<Vec<u8>> =
+            Pack::open(tmp.path().join("raw"), 0, false, PackCompression::None, 1).expect("open");
+        let pos = pack.append_raw(b"some record bytes").expect("append");
+        let end = pack.file_len();
+        assert_eq!(pack.read_bytes(pos, end).expect("read").len() as u64, end - pos);
+        assert!(pack.read_bytes(pos, end + 1).is_err(), "past the end");
+
+        pack.inner.data_file.drop_mapping_for_test();
+        assert!(pack.read_bytes(pos, end).is_err(), "an unmapped range is an error, not empty");
+    }
+
+    /// A damaged length prefix never yields a payload: a small change mis-frames the CRC
+    /// (`CrcFailed`), a huge one trips the size cap, and one reaching past the end is an EOF.
+    #[test]
+    fn record_bytes_rejects_damaged_length() {
+        let tmp = TempDir::with_prefix("pack_damaged_len").expect("temp dir");
+        let mut pack: Pack<Vec<u8>> =
+            Pack::open(tmp.path().join("raw"), 0, false, PackCompression::None, 1).expect("open");
+        let first = pack.append_raw(b"first record").expect("append");
+        let last = pack.append_raw(b"last record").expect("append");
+        let mut set_len = |pos: u64, len: u32| {
+            pack.inner
+                .data_file
+                .slice_mut(pos, 4)
+                .expect("prefix")
+                .copy_from_slice(&len.to_le_bytes());
+        };
+        set_len(first, 11); // was 12
+        set_len(last, 11 + 8); // past the end of the log
+        assert!(matches!(pack.record_bytes(first), Err(FetchError::CrcFailed)));
+        assert!(
+            matches!(pack.record_bytes(last), Err(FetchError::IO(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
+        );
+        let mut set_len = |pos: u64, len: u32| {
+            pack.inner
+                .data_file
+                .slice_mut(pos, 4)
+                .expect("prefix")
+                .copy_from_slice(&len.to_le_bytes());
+        };
+        set_len(first, u32::MAX);
+        assert!(matches!(pack.record_bytes(first), Err(FetchError::RequestedSizeTooLarge(..))));
+        assert!(pack.record_bytes(pack.file_len()).is_err(), "no record at the end of the log");
+    }
 
     /// Regression test for the failed-state guard: a failed pack replays the error that
     /// caused the failed state, on both the append and the commit path, instead of the
@@ -801,6 +1484,403 @@ mod tests {
         assert_eq!(ro_err.to_string(), "read only");
     }
 
+    /// A record whose framed size exceeds `MAX_RECORD_SIZE` is rejected on write (it could
+    /// never be read back — the read paths cap at the same size), and because the refused record
+    /// is rolled back the pack is NOT poisoned: a later append still succeeds and reads back, with
+    /// no partial bytes from the rejected record.
+    #[test]
+    fn append_rejects_oversized_record_without_poisoning() {
+        let tmp_path = TempDir::with_prefix("test_pack_oversize").expect("temp dir");
+        let path = tmp_path.path().join("pack_oversize");
+        let mut db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::None, 0).expect("open pack");
+
+        // With no compression the framed size is the encoded size, so a name past the cap pushes
+        // the record over `MAX_RECORD_SIZE`.
+        let oversized = TestRec { idx: 1, name: "x".repeat(MAX_RECORD_SIZE as usize + 1) };
+        let err = db.append(&oversized).expect_err("an oversized record must be rejected on write");
+        assert!(
+            matches!(&err, AppendError::RecordTooLarge { max: MAX_RECORD_SIZE, .. }),
+            "expected a RecordTooLarge rejection, got: {err:?}"
+        );
+
+        // Not poisoned: a normal append and commit still succeed (mirrors the read path rejecting
+        // an oversize record without failing the pack).
+        db.append(&TestRec { idx: 2, name: "ok".to_string() }).expect("pack must not be poisoned");
+        db.commit().expect("commit must succeed");
+
+        // Only the good record was written; the rejected one left no partial bytes behind.
+        drop(db);
+        let db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::None, 0).expect("reopen pack");
+        let recs: Vec<TestRec> =
+            db.raw_iter().expect("raw iter").map(|r| r.expect("decode")).collect();
+        assert_eq!(recs.len(), 1, "only the non-oversized record should be present");
+        assert_eq!(recs[0].idx, 2);
+        assert_eq!(recs[0].name, "ok");
+    }
+
+    /// The buffered framing appends used before they streamed (encode the whole value, compress it
+    /// whole with a fresh encoder, then frame it): the oracle the streamed write must match byte
+    /// for byte, so the on-disk format is unchanged.
+    fn buffered_record(payload: &[u8], compression: PackCompression) -> Vec<u8> {
+        let body = match compression {
+            PackCompression::None => payload.to_vec(),
+            PackCompression::ZStd => {
+                let mut out = Vec::new();
+                let mut encoder = zstd::stream::write::Encoder::new(&mut out, 0).expect("encoder");
+                encoder.write_all(payload).expect("compress");
+                encoder.finish().expect("finish");
+                out
+            }
+        };
+        let len = (body.len() as u32).to_le_bytes();
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&len);
+        crc.update(&body);
+        let mut record = len.to_vec();
+        record.extend_from_slice(&body);
+        record.extend_from_slice(&crc.finalize().to_le_bytes());
+        record
+    }
+
+    /// Streaming a record straight into the file (encode into the compressor into the mapping, the
+    /// length prefix patched in after) writes exactly the bytes the buffered framing wrote, for
+    /// values and raw bytes, compressed or not: small, empty, and past 128 KiB so a compressed
+    /// payload spans several zstd blocks.
+    #[test]
+    fn streamed_records_match_the_buffered_framing() {
+        // Pseudo-random, so zstd has real work to do.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let noisy: String = (0..300_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                char::from(b'a' + (seed % 26) as u8)
+            })
+            .collect();
+        let values = [
+            TestRec { idx: 1, name: "small".to_string() },
+            TestRec { idx: 2, name: noisy.clone() },
+            TestRec { idx: 3, name: String::new() },
+        ];
+        let raws: [&[u8]; 3] = [b"", b"raw bytes", noisy.as_bytes()];
+        for compression in [PackCompression::None, PackCompression::ZStd] {
+            let tmp = TempDir::with_prefix("pack_streamed_framing").expect("temp dir");
+            let mut db: TestPack =
+                Pack::open(tmp.path().join("pack"), 0, false, compression, 1).expect("open pack");
+            for value in &values {
+                let start = db.file_len();
+                db.append(value).expect("append");
+                let expected = buffered_record(&tn_types::encode(value), compression);
+                assert_eq!(
+                    db.read_bytes(start, db.file_len()).expect("record bytes"),
+                    expected.as_slice(),
+                    "{compression:?}: value record {} differs from the buffered framing",
+                    value.idx
+                );
+            }
+            for raw in raws {
+                let start = db.file_len();
+                db.append_raw(raw).expect("append raw");
+                assert_eq!(
+                    db.read_bytes(start, db.file_len()).expect("record bytes"),
+                    buffered_record(raw, compression).as_slice(),
+                    "{compression:?}: raw record of {} bytes differs from the buffered framing",
+                    raw.len()
+                );
+            }
+        }
+    }
+
+    /// A value or raw payload past the decoded cap is refused part-way through its streamed write
+    /// and rolled back: the log ends where it did, the pack is not poisoned, and the next
+    /// record lands exactly where the refused ones began.
+    #[test]
+    fn oversized_records_roll_back_without_poisoning() {
+        for compression in [PackCompression::None, PackCompression::ZStd] {
+            let tmp = TempDir::with_prefix("pack_oversize_rollback").expect("temp dir");
+            let mut db: TestPack =
+                Pack::open(tmp.path().join("pack"), 0, false, compression, 1).expect("open pack");
+            db.append(&TestRec { idx: 1, name: "first".to_string() }).expect("append");
+            let end = db.file_len();
+
+            let oversized = TestRec { idx: 2, name: "x".repeat(MAX_RECORD_SIZE as usize + 1) };
+            let err = db.append(&oversized).expect_err("an oversized value must be refused");
+            assert!(
+                matches!(err, AppendError::RecordTooLarge { max: MAX_RECORD_SIZE, .. }),
+                "{compression:?}: got {err:?}"
+            );
+            assert_eq!(db.file_len(), end, "{compression:?}: the refused value is rolled back");
+            let err = db
+                .append_raw(&vec![0_u8; MAX_RECORD_SIZE as usize + 1])
+                .expect_err("an oversized raw payload must be refused");
+            assert!(
+                matches!(err, AppendError::RecordTooLarge { max: MAX_RECORD_SIZE, .. }),
+                "{compression:?}: got {err:?}"
+            );
+            assert_eq!(db.file_len(), end, "{compression:?}: the refused payload is rolled back");
+
+            let pos = db
+                .append(&TestRec { idx: 3, name: "after".to_string() })
+                .expect("the pack is not poisoned");
+            assert_eq!(pos, end, "{compression:?}: the next record starts where the refused began");
+            assert_eq!(db.fetch(pos).expect("fetch").name, "after");
+        }
+    }
+
+    /// An append interrupted after its payload reached the file but before its length prefix was
+    /// patched leaves that prefix as the reserved zeros. It must never read as a record: the
+    /// records before it read back, and nothing after them does.
+    #[test]
+    fn interrupted_append_reads_as_no_record() {
+        let tmp = TempDir::with_prefix("pack_interrupted_append").expect("temp dir");
+        let mut db: TestPack =
+            Pack::open(tmp.path().join("pack"), 0, false, PackCompression::ZStd, 1)
+                .expect("open pack");
+        db.append(&TestRec { idx: 1, name: "kept".to_string() }).expect("append");
+        let pos = db.append(&TestRec { idx: 2, name: "interrupted".to_string() }).expect("append");
+        db.inner.data_file.slice_mut(pos, 4).expect("prefix is mapped").fill(0);
+
+        let records: Vec<_> = db.raw_iter().expect("raw iter").collect();
+        assert!(
+            matches!(records.first(), Some(Ok(rec)) if rec.idx == 1),
+            "the record before the interrupted one reads back: {records:?}"
+        );
+        assert!(
+            records.iter().skip(1).all(|r| r.is_err()),
+            "the interrupted append must not read as a record: {records:?}"
+        );
+    }
+
+    /// A writer that records the writes it receives.
+    #[derive(Default)]
+    struct WriteLog {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for WriteLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The codec writes a byte vector one byte per call. A value must reach the record's writer (a
+    /// zstd stream step or a data file write per call) as one write of its encoded bytes, never one
+    /// call per byte.
+    #[test]
+    fn value_payload_reaches_the_writer_in_one_write() {
+        let mut stage = Vec::new();
+        for size in [10_usize << 10, 200 << 10] {
+            let value: Vec<u8> = (0..size).map(|i| i as u8).collect();
+            let mut log = WriteLog::default();
+            write_payload(&mut log, &mut stage, Payload::Value(&value), MAX_RECORD_SIZE)
+                .expect("write");
+            assert_eq!(log.bytes, tn_types::encode(&value), "{size}-byte value: bytes unchanged");
+            assert_eq!(log.writes, 1, "a {size}-byte value must reach the writer in one write");
+        }
+    }
+
+    /// A writer that fails every write the way a full disk does.
+    struct DiskFullWriter;
+
+    impl Write for DiskFullWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A failed write keeps its io error kind through the streamed encode. The codec reports a
+    /// writer's error by message only, so without carrying the original back a full disk would
+    /// surface as a generic error.
+    #[test]
+    fn streamed_write_failure_keeps_its_io_kind() {
+        let value = TestRec { idx: 1, name: "value".to_string() };
+        for payload in [Payload::Value(&value), Payload::<TestRec>::Raw(b"raw bytes")] {
+            match write_payload(DiskFullWriter, &mut Vec::new(), payload, MAX_RECORD_SIZE) {
+                Err(AppendError::WriteDataError(e)) => {
+                    assert_eq!(e.kind(), io::ErrorKind::StorageFull, "got {e}")
+                }
+                other => panic!("expected a WriteDataError, got {other:?}"),
+            }
+        }
+    }
+
+    /// Several `raw_iter`s over one pack each read at their own position: interleaving their
+    /// `next()` calls must not make either skip, repeat, or misframe a record. The records total
+    /// well past the iterator's read buffer, so the two cursors really do interleave on the file.
+    #[test]
+    fn concurrent_raw_iters_do_not_share_a_cursor() {
+        let tmp_path = TempDir::with_prefix("test_pack_two_iters").expect("temp dir");
+        let mut db: TestPack =
+            Pack::open(tmp_path.path().join("pack_two_iters"), 0, false, PackCompression::None, 0)
+                .expect("open pack");
+        let names: Vec<String> = (0..200).map(|idx| format!("{idx}:{}", "x".repeat(200))).collect();
+        for (idx, name) in names.iter().enumerate() {
+            db.append(&TestRec { idx: idx as u64, name: name.clone() }).expect("append");
+        }
+        db.commit().expect("commit");
+
+        let mut a = db.raw_iter().expect("iter a");
+        let mut b = db.raw_iter().expect("iter b");
+        let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+        loop {
+            let next_a = a.next().map(|r| r.expect("iter a decodes"));
+            let next_b = b.next().map(|r| r.expect("iter b decodes"));
+            if next_a.is_none() && next_b.is_none() {
+                break;
+            }
+            got_a.extend(next_a.map(|r| r.name));
+            got_b.extend(next_b.map(|r| r.name));
+        }
+        assert_eq!(got_a, names, "iterator a must see every record in order");
+        assert_eq!(got_b, names, "iterator b must see every record in order");
+    }
+
+    /// Poisoning follows the error variant, not the io error kind: a write failure whose kind
+    /// happens to be `InvalidInput` (e.g. `EINVAL` from growing the data file) is a failed write
+    /// like any other and must move the pack to its failed state.
+    #[test]
+    fn invalid_input_write_failure_poisons_the_pack() {
+        let tmp_path = TempDir::with_prefix("test_pack_einval_poisons").expect("temp dir");
+        let mut db: TestPack =
+            Pack::open(tmp_path.path().join("pack_einval"), 0, false, PackCompression::None, 0)
+                .expect("open pack");
+
+        db.fail_next_append_with_kind_for_test(io::ErrorKind::InvalidInput);
+        let err = db
+            .append(&TestRec { idx: 1, name: "one".to_string() })
+            .expect_err("armed append must fail");
+        assert!(
+            matches!(&err, AppendError::WriteDataError(io_err) if io_err.kind() == io::ErrorKind::InvalidInput),
+            "unexpected root cause shape: {err:?}"
+        );
+        let replayed = db
+            .append(&TestRec { idx: 2, name: "two".to_string() })
+            .expect_err("an InvalidInput write failure must poison the pack");
+        assert_eq!(replayed.to_string(), err.to_string(), "append must replay the root cause");
+        assert!(
+            matches!(db.commit(), Err(CommitError::Failed(_))),
+            "commit must report the failed state"
+        );
+    }
+
+    #[test]
+    fn append_rejects_zstd_record_oversized_when_decoded() {
+        // With ZStd the framed-size guard sees the COMPRESSED size, so a highly-compressible
+        // value that decodes past `MAX_RECORD_SIZE` but compresses under it would (without
+        // the decoded-size check) be appended and acked yet be unreadable (every read path
+        // caps the decompressed size). The decoded-size check rejects it at append instead.
+        let tmp_path = TempDir::with_prefix("test_pack_oversize_zstd").expect("temp dir");
+        let path = tmp_path.path().join("pack_oversize_zstd");
+        let mut db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
+
+        // All-'x' compresses to a few hundred bytes, but decodes to > 16 MiB.
+        let oversized = TestRec { idx: 1, name: "x".repeat(MAX_RECORD_SIZE as usize + 1) };
+        let err =
+            db.append(&oversized).expect_err("a ZStd record oversized when decoded is rejected");
+        assert!(
+            matches!(&err, AppendError::RecordTooLarge { max: MAX_RECORD_SIZE, .. }),
+            "expected a RecordTooLarge rejection, got: {err:?}"
+        );
+
+        // Not poisoned: a normal append still succeeds and reads back.
+        db.append(&TestRec { idx: 2, name: "ok".to_string() }).expect("pack must not be poisoned");
+        db.commit().expect("commit must succeed");
+        drop(db);
+        let db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("reopen pack");
+        let recs: Vec<TestRec> =
+            db.raw_iter().expect("raw iter").map(|r| r.expect("decode")).collect();
+        assert_eq!(recs.len(), 1, "only the readable record should be present");
+        assert_eq!(recs[0].idx, 2);
+    }
+
+    /// A compressed pack refuses a record cap above what its reads decompress, rather than take
+    /// records it could not read back.
+    #[test]
+    fn open_refuses_a_zstd_cap_its_reads_cannot_meet() {
+        let tmp_path = TempDir::with_prefix("test_pack_zstd_cap").expect("temp dir");
+        let path = tmp_path.path().join("pack_zstd_cap");
+        let opts = |max| MmapFileOptions { max_record_size: Some(max), ..Default::default() };
+        let err = Pack::<TestRec>::open_with(
+            &path,
+            0,
+            false,
+            PackCompression::ZStd,
+            0,
+            opts(MAX_RECORD_SIZE + 1),
+        )
+        .expect_err("a cap above the read cap");
+        assert!(matches!(err, OpenError::RecordCapTooLarge(_)), "got {err:?}");
+        Pack::<TestRec>::open_with(
+            &path,
+            0,
+            false,
+            PackCompression::ZStd,
+            0,
+            opts(MAX_RECORD_SIZE),
+        )
+        .expect("the read cap itself");
+        // An existing file appends with the compression its header records, whatever the caller
+        // passes: the cap is checked against that.
+        let err = Pack::<TestRec>::open_with(
+            &path,
+            0,
+            false,
+            PackCompression::None,
+            0,
+            opts(MAX_RECORD_SIZE + 1),
+        )
+        .expect_err("a compressed file, opened as uncompressed, with a cap above the read cap");
+        assert!(matches!(err, OpenError::RecordCapTooLarge(_)), "got {err:?}");
+        Pack::<TestRec>::open_with(
+            tmp_path.path().join("plain"),
+            0,
+            false,
+            PackCompression::None,
+            0,
+            opts(MAX_RECORD_SIZE + 1),
+        )
+        .expect("an uncompressed pack reads what it wrote");
+    }
+
+    /// A record whose decoded bytes declare a length far past what is there is a decode error, not
+    /// a panic or an abort: on a compressed pack, where the value is decoded from the decompressed
+    /// slice, and on an uncompressed one. The record beside it, the same bytes with an honest
+    /// length, decodes, so the failure is the lying length's.
+    #[test]
+    fn zstd_read_of_a_lying_length_prefix_fails_cleanly() {
+        for compression in [PackCompression::ZStd, PackCompression::None] {
+            let tmp_path = TempDir::with_prefix("test_pack_zstd_lying_len").expect("temp dir");
+            let path = tmp_path.path().join("pack");
+            let mut db: Pack<Vec<u8>> =
+                Pack::open(&path, 0, false, compression, 0).expect("open pack");
+            // `append_raw` stores the encoded value as the pack stores any value (compressed once
+            // on a compressed pack). ULEB128 for 3, then three bytes.
+            let honest = db.append_raw(&[3, 1, 2, 3]).expect("append");
+            // ULEB128 for 2^31 - 2 (bcs's longest sequence), then the same three bytes.
+            let lying = db.append_raw(&[0xfe, 0xff, 0xff, 0xff, 0x07, 1, 2, 3]).expect("append");
+            db.commit().expect("commit");
+            assert_eq!(db.fetch(honest).expect("an honest length decodes"), vec![1, 2, 3]);
+            let err = db.fetch(lying).expect_err("a length past the bytes");
+            assert!(matches!(err, FetchError::DeserializeValue(_)), "{compression:?}: got {err:?}");
+        }
+    }
+
     fn archive_pack_(compression: PackCompression) {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
         let mut db: TestPack =
@@ -872,7 +1952,7 @@ mod tests {
         assert_eq!(v.name, "Value Three2");
         drop(db);
 
-        let mut db: TestPack =
+        let db: TestPack =
             Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression, 0)
                 .expect("open pack");
         let v = db.fetch(pos_1_2).unwrap();
@@ -892,7 +1972,11 @@ mod tests {
             .create(false)
             .open(tmp_path.path().join("pack_test_one"))
             .unwrap();
-        let mut iter = PackIter::open(data_file, 0).unwrap().map(|r| r.unwrap());
+        // The pack was cleanly closed, so the physical file is the logical data plus an 8-byte
+        // clean-close sentinel; strip the sentinel to get the logical end to bound the iterator at
+        // (the real reopen path does this in `MmapDataFile::open`).
+        let end = data_file.metadata().unwrap().len() - crate::archive::data_file::SENTINEL_LEN;
+        let mut iter = PackIter::open(data_file, 0, end).unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
         assert_eq!(v.name, "Value One");
@@ -950,6 +2034,66 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
+    /// A `raw_iter` snapshots the pack at its clone-time logical `end`. A concurrent append that
+    /// re-grows and re-pads the physical mmap file underneath the already-cloned reader must not
+    /// feed the snapshot iterator the later records or the trailing zero padding (which would
+    /// decode as a 0-size, CRC-failing record). Regression for the `try_clone` EOF-contract
+    /// hazard: under the old truncate-at-clone behavior the post-clone append re-padded the
+    /// file and the stale reader ran off the end into the padding.
+    #[test]
+    fn raw_iter_stops_at_clone_time_end_despite_concurrent_append() {
+        let tmp_path = TempDir::with_prefix("pack_iter_bound").expect("temp dir");
+        let path = tmp_path.path().join("pack_bound");
+        let mut db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::None, 0).expect("open pack");
+
+        // Append the first three records and snapshot an iterator (captures the logical end now).
+        for i in 1..=3u64 {
+            db.append(&TestRec { idx: i, name: format!("v{i}") }).expect("append");
+        }
+        db.flush().expect("flush");
+        let iter = db.raw_iter().expect("raw_iter");
+
+        // Append three MORE records to the same live pack, re-growing and re-padding the physical
+        // file under the already-cloned reader.
+        for i in 4..=6u64 {
+            db.append(&TestRec { idx: i, name: format!("v{i}") }).expect("append");
+        }
+        db.flush().expect("flush");
+
+        // The snapshot iterator yields EXACTLY the three clone-time records and terminates cleanly,
+        // never decoding the later appends or the mmap padding.
+        let got: Vec<u64> =
+            iter.map(|r| r.expect("no read/CRC error past the logical end").idx).collect();
+        assert_eq!(got, vec![1, 2, 3], "iterator is bounded to the clone-time end");
+    }
+
+    /// A frame that straddles the logical end is torn, not a record: the iterator must report it
+    /// rather than finish reading it from bytes past `end`.
+    #[test]
+    fn raw_iter_rejects_a_frame_straddling_the_logical_end() {
+        let tmp_path = TempDir::with_prefix("pack_iter_straddle").expect("temp dir");
+        let mut db: TestPack =
+            Pack::open(tmp_path.path().join("pack_straddle"), 0, false, PackCompression::None, 0)
+                .expect("open pack");
+        for i in 1..=3u64 {
+            db.append(&TestRec { idx: i, name: format!("v{i}") }).expect("append");
+        }
+        db.commit().expect("commit");
+
+        // Bound the scan one byte short of the last frame's end: its bytes are all physically
+        // present, but its CRC lies past the logical end.
+        let (reader, end) = db.inner.data_file.try_clone().expect("clone");
+        let mut iter = PackIter::<TestRec, _>::open(reader, 0, end - 1).expect("open iter");
+        assert_eq!(iter.next().expect("record 1").expect("decodes").idx, 1);
+        assert_eq!(iter.next().expect("record 2").expect("decodes").idx, 2);
+        let torn = iter.next().expect("a straddling frame is reported, not skipped");
+        assert!(
+            matches!(&torn, Err(FetchError::IO(e)) if e.kind() == io::ErrorKind::UnexpectedEof),
+            "expected a torn-frame error, got {torn:?}"
+        );
+    }
+
     #[test]
     fn test_archive_pack_zstd() {
         archive_pack_(PackCompression::ZStd);
@@ -976,7 +2120,10 @@ mod tests {
             let _pack: TestPack =
                 Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
         }
-        let pos = fs::metadata(&path).expect("metadata").len();
+        // The clean close appended an 8-byte sentinel past the header; strip it so the crafted
+        // record lands at the logical end (right after the header) rather than after the sentinel.
+        let pos = std::fs::metadata(&path).expect("metadata").len()
+            - crate::archive::data_file::SENTINEL_LEN;
 
         let payload = vec![0u8; (MAX_RECORD_SIZE as usize) + 1];
         let mut compressed = Vec::new();
@@ -995,6 +2142,8 @@ mod tests {
         let crc = hasher.finalize();
 
         let mut file = OpenOptions::new().append(true).open(&path).expect("open for append");
+        // Drop the clean-close sentinel so the appended record starts at `pos` (the logical end).
+        file.set_len(pos).expect("truncate sentinel");
         file.write_all(&val_size_bytes).expect("write val_size");
         file.write_all(&compressed).expect("write compressed");
         file.write_all(&crc.to_le_bytes()).expect("write crc");
@@ -1053,21 +2202,19 @@ mod tests {
         (tmp_path, pos)
     }
 
-    // F3: the in-memory MAX_RECORD_SIZE cap on decompressed output must fire at every
-    // decompression site (sync fetch, sync iterator, async iterator). Parity tests across
-    // the three sites guard against drift if one site is refactored without the others.
+    // The in-memory MAX_RECORD_SIZE cap bounds decompressed output at every decompression site,
+    // and every site (`fetch` and both iterators) buffers the decompressed bytes and reports the
+    // precise `RequestedDecompressSizeTooLarge`. These parity tests pin that.
 
     #[test]
     fn test_zstd_decompression_bomb_fetch() {
         let (tmp_dir, pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
-        let mut pack: TestPack =
+        let pack: TestPack =
             Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
-            Err(FetchError::RequestedDecompressSizeTooLarge(max)) => {
-                assert_eq!(max, MAX_RECORD_SIZE);
-            }
-            other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
+            Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE)) => {}
+            other => panic!("expected the size-cap rejection, got {other:?}"),
         }
     }
 
@@ -1076,7 +2223,8 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
         let file = File::open(&path).expect("open file");
-        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        let end = file.metadata().expect("metadata").len();
+        let mut iter = PackIter::<TestRec, _>::open(file, 0, end).expect("iter open");
         match iter.next() {
             Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
@@ -1092,7 +2240,8 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
         let file = tokio::fs::File::open(&path).await.expect("open file");
-        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        let mut iter =
+            AsyncPackIter::<TestRec, _>::open(file, 0, u16::MAX).await.expect("iter open");
         match iter.next().await {
             Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
@@ -1101,7 +2250,7 @@ mod tests {
         }
     }
 
-    // F4: a CRC-valid but internally corrupt zstd frame must surface as an error rather
+    // A CRC-valid but internally corrupt zstd frame must surface as an error rather
     // than silently passing through. Either FetchError::IO (zstd decode error) or
     // FetchError::DeserializeValue (zstd produced different bytes that bincode rejects)
     // is acceptable — both signal that the frame did not round-trip cleanly.
@@ -1110,7 +2259,7 @@ mod tests {
     fn test_zstd_corrupt_frame_fetch() {
         let (tmp_dir, pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
-        let mut pack: TestPack =
+        let pack: TestPack =
             Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
             Err(FetchError::IO(_)) | Err(FetchError::DeserializeValue(_)) => {}
@@ -1123,7 +2272,8 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
         let file = File::open(&path).expect("open file");
-        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        let end = file.metadata().expect("metadata").len();
+        let mut iter = PackIter::<TestRec, _>::open(file, 0, end).expect("iter open");
         match iter.next() {
             Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),
@@ -1137,7 +2287,8 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
         let file = tokio::fs::File::open(&path).await.expect("open file");
-        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        let mut iter =
+            AsyncPackIter::<TestRec, _>::open(file, 0, u16::MAX).await.expect("iter open");
         match iter.next().await {
             Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),
@@ -1160,5 +2311,95 @@ mod tests {
         // A valid in-range request still works.
         let len = pack.file_len();
         assert!(pack.read_bytes(0, len).is_ok());
+    }
+
+    /// A pack to be removed when it drops (an abandoned build) does not sync on the way out: its
+    /// bytes are discarded, and a large unsynced one would make the drop (a close cancelling a
+    /// compaction) wait on a flush for nothing.
+    #[test]
+    fn dropping_a_pack_marked_for_removal_does_not_sync() {
+        use crate::archive::data_file::SYNC_BARRIERS;
+        let tmp = TempDir::with_prefix("pack_remove_on_drop").expect("temp dir");
+        let path = tmp.path().join("doomed");
+        let mut pack: Pack<Vec<u8>> =
+            Pack::open(&path, 0, false, PackCompression::None, 1).expect("open");
+        pack.append_raw(&vec![7_u8; 1 << 20]).expect("append");
+        pack.set_remove_on_drop();
+        let before = SYNC_BARRIERS.with(|n| n.get());
+        drop(pack);
+        assert_eq!(SYNC_BARRIERS.with(|n| n.get()), before, "no sync on the way out");
+        assert!(!path.exists(), "the file is removed");
+    }
+
+    /// A pack opened with a record cap other than [`MAX_RECORD_SIZE`] enforces it on append and
+    /// on every read path; a pack opened with the default cap refuses a larger record written
+    /// by another (reads past the cap fail, they never allocate for an absurd length).
+    /// A value encoded beforehand by a [`RecordEncoder`] and appended with
+    /// [`Pack::append_stored`] is the very record [`Pack::append`] writes for it (byte for byte,
+    /// compressed or not), and reads back through `fetch`.
+    #[test]
+    fn stored_append_matches_append() {
+        let tmp = TempDir::with_prefix("pack_stored").expect("temp dir");
+        for compression in [PackCompression::None, PackCompression::ZStd] {
+            let values: Vec<TestRec> = (0..4_u64)
+                .map(|i| TestRec {
+                    idx: i,
+                    name: format!("value {i} {}", "x".repeat(i as usize * 300)),
+                })
+                .collect();
+            let appended = tmp.path().join(format!("appended-{compression:?}"));
+            let stored = tmp.path().join(format!("stored-{compression:?}"));
+            let mut a: Pack<TestRec> =
+                Pack::open(&appended, 0, false, compression, 1).expect("open");
+            let mut b: Pack<TestRec> = Pack::open(&stored, 0, false, compression, 1).expect("open");
+            let mut encoder = RecordEncoder::new(compression, b.max_record());
+            // One buffer for every value, as a save reuses it: each record is its own range.
+            let mut buffer = Vec::new();
+            for value in &values {
+                let at = a.append(value).expect("append");
+                let range = encoder.encode_into(value, &mut buffer).expect("encode");
+                let bt = b.append_stored(&buffer[range]).expect("append stored");
+                assert_eq!(at, bt, "the same position");
+                assert_eq!(a.record_bytes(at).expect("read"), b.record_bytes(bt).expect("read"));
+                let read = b.fetch(bt).expect("fetch");
+                assert_eq!((read.idx, &read.name), (value.idx, &value.name));
+            }
+            assert_eq!(a.file_len(), b.file_len());
+        }
+    }
+
+    #[test]
+    fn per_pack_record_cap() {
+        let tmp = TempDir::with_prefix("pack_record_cap").expect("temp dir");
+        let path = tmp.path().join("capped");
+        let opts = |max| MmapFileOptions { max_record_size: Some(max), ..Default::default() };
+        {
+            let mut small: Pack<Vec<u8>> =
+                Pack::open_with(&path, 0, false, PackCompression::None, 1, opts(1024))
+                    .expect("open");
+            let err = small.append_raw(&[1_u8; 2048]).expect_err("past the cap");
+            assert!(matches!(err, AppendError::RecordTooLarge { max: 1024, .. }), "{err:?}");
+            small.append_raw(&[2_u8; 512]).expect("under the cap");
+        }
+        let big_path = tmp.path().join("big");
+        let big = vec![3_u8; MAX_RECORD_SIZE as usize + 4096];
+        let pos = {
+            let mut pack: Pack<Vec<u8>> =
+                Pack::open_with(&big_path, 0, false, PackCompression::None, 1, opts(64 << 20))
+                    .expect("open");
+            let pos = pack.append_raw(&big).expect("under the larger cap");
+            assert_eq!(pack.record_bytes(pos).expect("read"), &big[..]);
+            let mut iter = pack.raw_iter().expect("iter");
+            assert_eq!(iter.next_raw().expect("a record").expect("read"), &big[..]);
+            pos
+        };
+        let default: Pack<Vec<u8>> = Pack::open(&big_path, 0, true, PackCompression::None, 1)
+            .expect("open with the default cap");
+        assert!(matches!(
+            default.record_bytes(pos),
+            Err(FetchError::RequestedSizeTooLarge(_, MAX_RECORD_SIZE))
+        ));
+        let mut iter = default.raw_iter().expect("iter");
+        assert!(matches!(iter.next_raw(), Some(Err(FetchError::RequestedSizeTooLarge(..)))));
     }
 }

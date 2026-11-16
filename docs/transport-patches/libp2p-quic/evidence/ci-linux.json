@@ -1,0 +1,763 @@
+{
+  "advisories": {
+    "advisory": "RUSTSEC-2024-0373",
+    "advisory_sha256": "e5c0eba785cc39d83831b996a6b08329838b34554123f3f046c5051da70ebf6f",
+    "affected_control": "0.11.6",
+    "carried_applicability": "not affected: >= 0.11.7",
+    "carried_quinn_proto": "0.11.18",
+    "carried_scan": {
+      "command": [
+        "$EVIDENCE/transport-tools/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit",
+        "audit",
+        "--no-fetch",
+        "--db",
+        "$EVIDENCE/transport-db",
+        "--file",
+        "$NODE/Cargo.lock",
+        "--json"
+      ],
+      "exit_code": 1,
+      "stderr": "carried-audit.stderr",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout": "carried-audit.stdout",
+      "stdout_sha256": "92b56bdccbcd3c1e435bf4dfb4c94b771f89b3914f8129991cf0947ce164cede",
+      "transport_findings": [],
+      "workspace_finding_count": 7
+    },
+    "carried_stack": {
+      "libp2p-quic": "0.14.0",
+      "libp2p-tls": "0.7.0",
+      "quinn": "0.11.9",
+      "quinn-proto": "0.11.18",
+      "rustls": "0.23.45"
+    },
+    "control_source": {
+      "sha256": "ba92fb39ec7ad06ca2582c0ca834dfeadcaf06ddfc8e635c80aa7e1c05315fdd",
+      "url": "https://crates.io/api/v1/crates/quinn-proto/0.11.6/download"
+    },
+    "controls": {
+      "path": {
+        "resolved": {
+          "id": "path+file://$EVIDENCE/transport-advisories/sources/quinn-proto-0.11.6#quinn-proto@0.11.6",
+          "name": "quinn-proto",
+          "source": null,
+          "version": "0.11.6"
+        },
+        "results": {
+          "cargo-audit": {
+            "command": [
+              "$EVIDENCE/transport-tools/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit",
+              "audit",
+              "--no-fetch",
+              "--db",
+              "$EVIDENCE/transport-db",
+              "--file",
+              "$EVIDENCE/transport-advisories/path/Cargo.lock",
+              "--json"
+            ],
+            "exit_code": 0,
+            "known_advisory_reported": false,
+            "stderr": "path-cargo-audit.stderr",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout": "path-cargo-audit.stdout",
+            "stdout_sha256": "97d564ef3aedd7d030eaf2d77736313236e6595ed30141f36a3e2f9bf3369368"
+          },
+          "cargo-deny": {
+            "command": [
+              "$EVIDENCE/transport-tools/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny",
+              "--format",
+              "json",
+              "--manifest-path",
+              "$EVIDENCE/transport-advisories/path/Cargo.toml",
+              "--config",
+              "$EVIDENCE/transport-advisories/deny.toml",
+              "--locked",
+              "check",
+              "advisories"
+            ],
+            "exit_code": 0,
+            "known_advisory_reported": false,
+            "stderr": "path-cargo-deny.stderr",
+            "stderr_sha256": "02d186150402cda84d64b50da1dea4b586274b3afbd3fbaf078a7c4e389920c3",
+            "stdout": "path-cargo-deny.stdout",
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      },
+      "registry": {
+        "resolved": {
+          "id": "registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.6",
+          "name": "quinn-proto",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.11.6"
+        },
+        "results": {
+          "cargo-audit": {
+            "command": [
+              "$EVIDENCE/transport-tools/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit",
+              "audit",
+              "--no-fetch",
+              "--db",
+              "$EVIDENCE/transport-db",
+              "--file",
+              "$EVIDENCE/transport-advisories/registry/Cargo.lock",
+              "--json"
+            ],
+            "exit_code": 1,
+            "known_advisory_reported": true,
+            "stderr": "registry-cargo-audit.stderr",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout": "registry-cargo-audit.stdout",
+            "stdout_sha256": "afd9235e3b73da47595588b95536bc69a2734371bb8f236e78b5ac4be1284a85"
+          },
+          "cargo-deny": {
+            "command": [
+              "$EVIDENCE/transport-tools/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny",
+              "--format",
+              "json",
+              "--manifest-path",
+              "$EVIDENCE/transport-advisories/registry/Cargo.toml",
+              "--config",
+              "$EVIDENCE/transport-advisories/deny.toml",
+              "--locked",
+              "check",
+              "advisories"
+            ],
+            "exit_code": 1,
+            "known_advisory_reported": true,
+            "stderr": "registry-cargo-deny.stderr",
+            "stderr_sha256": "1a6ca3d778bf73415c1df5960e0e822f83e8f64f0c4026a7ce64d14f385d3faa",
+            "stdout": "registry-cargo-deny.stdout",
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      }
+    },
+    "database_revision": "9b3a3b73a7f42606494c943e95f8196e9994df46",
+    "deny_database_revision": "9b3a3b73a7f42606494c943e95f8196e9994df46",
+    "scanners": {
+      "cargo-audit": "cargo-audit 0.22.2",
+      "cargo-deny": "cargo-deny 0.20.2"
+    },
+    "status": "passed",
+    "transport_closure_counts": {
+      "adiri": 221,
+      "default": 221
+    }
+  },
+  "artifact": {
+    "digest": "sha256:fdc57c961abf9e79bb92381a6460c1ea84b9eda44be0fdb0559554dd7e09bbdf",
+    "expired": false,
+    "id": 11121816829,
+    "name": "transport-evidence-e3cb9a16eac59072f12159f3b6ac2d341f7e3bf6"
+  },
+  "existing_attestation_gate": "tested commit is not attested; full workspace validation and attestation remain required for merge",
+  "full_report_hashes": {
+    "transport-advisories/summary.json": "6a09e12d647d92b90589111804300f5c923b359abf84be782c0441a32f1c6234",
+    "transport-peers/mutations.json": "6b6644abf2ebdbc622bc42856e2852865ac4f73e5f8c6c70934fe441886fdb26",
+    "transport-peers/summary.json": "92b38d23d8eb8106b6f27222f3f6d550497f98a2bfd064a21a1d7a860f8808b5",
+    "transport-sources/summary.json": "d6abb4ff539dc4bf27b4dd072d58a3ff554e0009bd7b92e5ef5b7047186c701d"
+  },
+  "mutations": {
+    "mutations": {
+      "identity": {
+        "binary_sha256": "417d4e533e1f4ae9f55d53a7bd1976e953be1fac7463a42b4cba9605e3b7616c",
+        "failure": "wrong expected identity was not rejected",
+        "source_sha256": "89296908210872927313765abe7840232d2d46f603b5c147e06b328c32eadb11",
+        "status": "killed"
+      },
+      "traffic": {
+        "binary_sha256": "c9f7dc5b8aca420a36fcdd3f9b13abcce87b7959b1493d13c90881f0b21d26f5",
+        "failure": "peer-mutant <- peer-stock-current, /ip4/127.0.0.1/udp/0/quic-v1, exchange 1: Error: Invalid(\"application echo differs\")\n",
+        "source_sha256": "4ae30f246c0773ccce052b65798e4e961c476d01dea9ee5edba9eae966a4a5e2",
+        "status": "killed"
+      }
+    },
+    "status": "passed"
+  },
+  "peers": {
+    "identity_rejection": {
+      "boundary": "authenticated transport output before application I/O",
+      "dialer_exit_code": 1,
+      "wrong_expected_identity": "rejected"
+    },
+    "key_logging_control": {
+      "labels": [
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "CLIENT_TRAFFIC_SECRET_0",
+        "EXPORTER_SECRET",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        "SERVER_TRAFFIC_SECRET_0"
+      ],
+      "secret_file_removed": true,
+      "setting_SSLKEYLOGFILE": "writes secrets"
+    },
+    "matrix": [
+      {
+        "address": "/ip4/127.0.0.1/udp/0/quic-v1",
+        "dialer": "$EVIDENCE/transport-peers/peer-stock-current",
+        "dialer_source": "stock-current",
+        "exchanges": [
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          },
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          }
+        ],
+        "listener": "$EVIDENCE/transport-peers/peer-carried",
+        "listener_exit_code": 0,
+        "listener_source": "carried",
+        "reconnect": "passed"
+      },
+      {
+        "address": "/ip6/::1/udp/0/quic-v1",
+        "dialer": "$EVIDENCE/transport-peers/peer-stock-current",
+        "dialer_source": "stock-current",
+        "exchanges": [
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          },
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          }
+        ],
+        "listener": "$EVIDENCE/transport-peers/peer-carried",
+        "listener_exit_code": 0,
+        "listener_source": "carried",
+        "reconnect": "passed"
+      },
+      {
+        "address": "/ip4/127.0.0.1/udp/0/quic-v1",
+        "dialer": "$EVIDENCE/transport-peers/peer-carried",
+        "dialer_source": "carried",
+        "exchanges": [
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          },
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          }
+        ],
+        "listener": "$EVIDENCE/transport-peers/peer-stock-current",
+        "listener_exit_code": 0,
+        "listener_source": "stock-current",
+        "reconnect": "passed"
+      },
+      {
+        "address": "/ip6/::1/udp/0/quic-v1",
+        "dialer": "$EVIDENCE/transport-peers/peer-carried",
+        "dialer_source": "carried",
+        "exchanges": [
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          },
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          }
+        ],
+        "listener": "$EVIDENCE/transport-peers/peer-stock-current",
+        "listener_exit_code": 0,
+        "listener_source": "stock-current",
+        "reconnect": "passed"
+      },
+      {
+        "address": "/ip4/127.0.0.1/udp/0/quic-v1",
+        "dialer": "$EVIDENCE/transport-peers/peer-stock-previous",
+        "dialer_source": "stock-previous",
+        "exchanges": [
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          },
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          }
+        ],
+        "listener": "$EVIDENCE/transport-peers/peer-carried",
+        "listener_exit_code": 0,
+        "listener_source": "carried",
+        "reconnect": "passed"
+      },
+      {
+        "address": "/ip6/::1/udp/0/quic-v1",
+        "dialer": "$EVIDENCE/transport-peers/peer-stock-previous",
+        "dialer_source": "stock-previous",
+        "exchanges": [
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          },
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          }
+        ],
+        "listener": "$EVIDENCE/transport-peers/peer-carried",
+        "listener_exit_code": 0,
+        "listener_source": "carried",
+        "reconnect": "passed"
+      },
+      {
+        "address": "/ip4/127.0.0.1/udp/0/quic-v1",
+        "dialer": "$EVIDENCE/transport-peers/peer-carried",
+        "dialer_source": "carried",
+        "exchanges": [
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          },
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          }
+        ],
+        "listener": "$EVIDENCE/transport-peers/peer-stock-previous",
+        "listener_exit_code": 0,
+        "listener_source": "stock-previous",
+        "reconnect": "passed"
+      },
+      {
+        "address": "/ip6/::1/udp/0/quic-v1",
+        "dialer": "$EVIDENCE/transport-peers/peer-carried",
+        "dialer_source": "carried",
+        "exchanges": [
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          },
+          {
+            "authenticated": true,
+            "echo_bytes": 32,
+            "exit_code": 0
+          }
+        ],
+        "listener": "$EVIDENCE/transport-peers/peer-stock-previous",
+        "listener_exit_code": 0,
+        "listener_source": "stock-previous",
+        "reconnect": "passed"
+      }
+    ],
+    "peer_source_sha256": "a59db14f033b9dca41ddfefaa0cc3799f54872ff8b083456bdc236b96fc9ed1a",
+    "peers": {
+      "carried": {
+        "binary_sha256": "db22355e27fca426260c019a865113e435346c95a60a121b882542eb194874f7",
+        "default_provider": "GROUPS X25519MLKEM768,X25519,secp256r1,secp384r1\nCIPHERS TLS13_AES_256_GCM_SHA384,TLS13_AES_128_GCM_SHA256,TLS13_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        "lockfile_sha256": "ff3273d2534a769b838ba4586eeaa020b1aaf23d2fc09b7297fcd953af4cf059",
+        "resolved": [
+          {
+            "features": [
+              "aws-lc-sys",
+              "prebuilt-nasm"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#aws-lc-rs@1.18.1",
+            "name": "aws-lc-rs",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "1.18.1"
+          },
+          {
+            "features": [],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-core@0.44.0",
+            "name": "libp2p-core",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.44.0"
+          },
+          {
+            "features": [
+              "ed25519",
+              "peerid",
+              "rand"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-identity@0.3.0",
+            "name": "libp2p-identity",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.3.0"
+          },
+          {
+            "features": [
+              "tokio"
+            ],
+            "id": "path+file://$NODE/patches/libp2p-quic#0.14.0",
+            "name": "libp2p-quic",
+            "source": null,
+            "version": "0.14.0"
+          },
+          {
+            "features": [],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-tls@0.7.0",
+            "name": "libp2p-tls",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.7.0"
+          },
+          {
+            "features": [
+              "aws-lc-rs",
+              "futures-io",
+              "runtime-tokio",
+              "rustls-aws-lc-rs"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#quinn@0.11.9",
+            "name": "quinn",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.11.9"
+          },
+          {
+            "features": [
+              "aws-lc-rs",
+              "bloom",
+              "log",
+              "ring",
+              "rustls-aws-lc-rs"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.18",
+            "name": "quinn-proto",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.11.18"
+          },
+          {
+            "features": [
+              "alloc",
+              "default",
+              "dev_urandom_fallback",
+              "wasm32_unknown_unknown_js"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14",
+            "name": "ring",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.17.14"
+          },
+          {
+            "features": [
+              "aws-lc-rs",
+              "aws_lc_rs",
+              "log",
+              "logging",
+              "prefer-post-quantum",
+              "ring",
+              "std",
+              "tls12"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#rustls@0.23.45",
+            "name": "rustls",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.23.45"
+          }
+        ]
+      },
+      "stock-current": {
+        "binary_sha256": "0f8b252b7840fadfd0f01bd22107084aad2df2494c0742ff8cc61e4c4e9417ec",
+        "default_provider": "GROUPS X25519MLKEM768,X25519,secp256r1,secp384r1\nCIPHERS TLS13_AES_256_GCM_SHA384,TLS13_AES_128_GCM_SHA256,TLS13_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        "lockfile_sha256": "69c6c767e4634d128b8118dc90ac92f7698c95628fbd822b523b0f2463066c72",
+        "resolved": [
+          {
+            "features": [
+              "aws-lc-sys",
+              "prebuilt-nasm"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#aws-lc-rs@1.18.1",
+            "name": "aws-lc-rs",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "1.18.1"
+          },
+          {
+            "features": [],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-core@0.44.0",
+            "name": "libp2p-core",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.44.0"
+          },
+          {
+            "features": [
+              "ed25519",
+              "peerid",
+              "rand"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-identity@0.3.0",
+            "name": "libp2p-identity",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.3.0"
+          },
+          {
+            "features": [
+              "tokio"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-quic@0.14.0",
+            "name": "libp2p-quic",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.14.0"
+          },
+          {
+            "features": [],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-tls@0.7.0",
+            "name": "libp2p-tls",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.7.0"
+          },
+          {
+            "features": [
+              "aws-lc-rs",
+              "futures-io",
+              "runtime-tokio",
+              "rustls-aws-lc-rs"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#quinn@0.11.9",
+            "name": "quinn",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.11.9"
+          },
+          {
+            "features": [
+              "aws-lc-rs",
+              "bloom",
+              "log",
+              "ring",
+              "rustls-aws-lc-rs"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.18",
+            "name": "quinn-proto",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.11.18"
+          },
+          {
+            "features": [
+              "alloc",
+              "default",
+              "dev_urandom_fallback",
+              "wasm32_unknown_unknown_js"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14",
+            "name": "ring",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.17.14"
+          },
+          {
+            "features": [
+              "aws-lc-rs",
+              "aws_lc_rs",
+              "log",
+              "logging",
+              "prefer-post-quantum",
+              "ring",
+              "std",
+              "tls12"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#rustls@0.23.45",
+            "name": "rustls",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.23.45"
+          }
+        ]
+      },
+      "stock-previous": {
+        "binary_sha256": "efd7154755a73cb61d8560c6b26b316b3b4a471ce952eddfb33ae52f610c924d",
+        "default_provider": "GROUPS X25519MLKEM768,X25519,secp256r1,secp384r1\nCIPHERS TLS13_AES_256_GCM_SHA384,TLS13_AES_128_GCM_SHA256,TLS13_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        "lockfile_sha256": "de7cb8e98e4786014758f70575f479e6a0453ff33af4f49811702f2867aac17b",
+        "resolved": [
+          {
+            "features": [
+              "aws-lc-sys",
+              "prebuilt-nasm"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#aws-lc-rs@1.18.1",
+            "name": "aws-lc-rs",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "1.18.1"
+          },
+          {
+            "features": [],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-core@0.43.2",
+            "name": "libp2p-core",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.43.2"
+          },
+          {
+            "features": [
+              "ed25519",
+              "peerid",
+              "rand"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-identity@0.2.13",
+            "name": "libp2p-identity",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.2.13"
+          },
+          {
+            "features": [
+              "tokio"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-quic@0.13.1",
+            "name": "libp2p-quic",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.13.1"
+          },
+          {
+            "features": [],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#libp2p-tls@0.6.2",
+            "name": "libp2p-tls",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.6.2"
+          },
+          {
+            "features": [
+              "futures-io",
+              "ring",
+              "runtime-tokio",
+              "rustls",
+              "rustls-ring"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#quinn@0.11.9",
+            "name": "quinn",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.11.9"
+          },
+          {
+            "features": [
+              "bloom",
+              "default",
+              "log",
+              "ring",
+              "rustls-ring"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.18",
+            "name": "quinn-proto",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.11.18"
+          },
+          {
+            "features": [
+              "alloc",
+              "default",
+              "dev_urandom_fallback",
+              "wasm32_unknown_unknown_js"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14",
+            "name": "ring",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.17.14"
+          },
+          {
+            "features": [
+              "aws-lc-rs",
+              "aws_lc_rs",
+              "log",
+              "logging",
+              "prefer-post-quantum",
+              "ring",
+              "std",
+              "tls12"
+            ],
+            "id": "registry+https://github.com/rust-lang/crates.io-index#rustls@0.23.45",
+            "name": "rustls",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": "0.23.45"
+          }
+        ]
+      }
+    },
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "production_key_logging": "SSLKEYLOGFILE unset",
+    "status": "passed",
+    "toolchain": "1.94"
+  },
+  "prior_failure_evidence": "ci-shutdown-failure.json",
+  "provider_comparison": "exact baseline group and cipher order preserved in all three independently built peers",
+  "recipe_hashes": {
+    "etc/transport-patches/advisories.py": "16d2525fdf830b80b6aed2bb039598c646206b7431a0c3a713a08d3627873bb1",
+    "etc/transport-patches/mutations.py": "718690d01a24746dd204cf572af93be77ea5f89b453212e2d14152cbfa6732f9",
+    "etc/transport-patches/qualify.py": "e20ea9f975365c0ce560cb13ab0a65c4ce75b033aae204da1e27e51c0af4b811",
+    "etc/transport-patches/sources.py": "2fcba773ba1494a2324959b8c98fdc8f49b50d0fc96874776b23f5fe1e58c111"
+  },
+  "recorded_at": "2026-09-30",
+  "release_feature_comparison": "default and Adiri transport/crypto features preserved across the registry crypto update",
+  "run_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36767437360",
+  "shutdown_synchronization": "dialer held alive until listener ECHO after final stream close, then explicitly released through stdin",
+  "sources": {
+    "node": {
+      "adiri": {
+        "lockfile_sha256": "0e877cdbc8ece40539e16d85b4c3918e44af2d9b6f30a350cb4ce5d1bcd4983c",
+        "release_feature_tree": [
+          "aws-lc-rs v1.18.1|aws-lc-sys,prebuilt-nasm",
+          "aws-lc-sys v0.45.0|prebuilt-nasm",
+          "libp2p-core v0.44.0|serde",
+          "libp2p-identity v0.2.13|ed25519,peerid,secp256k1",
+          "libp2p-identity v0.3.0|ed25519,peerid,rand,serde",
+          "libp2p-quic v0.14.0 ($NODE/patches/libp2p-quic)|tokio",
+          "libp2p-tls v0.7.0|",
+          "quinn v0.11.9|aws-lc-rs,futures-io,runtime-tokio,rustls-aws-lc-rs",
+          "quinn-proto v0.11.18|aws-lc-rs,bloom,log,ring,rustls-aws-lc-rs",
+          "ring v0.17.14|alloc,default,dev_urandom_fallback,std",
+          "rustls v0.23.45|aws-lc-rs,aws_lc_rs,log,logging,prefer-post-quantum,ring,std,tls12",
+          "rustls-webpki v0.103.15|alloc,aws-lc-rs,default,ring,std"
+        ],
+        "transport_closure_count": 221
+      },
+      "default": {
+        "lockfile_sha256": "0e877cdbc8ece40539e16d85b4c3918e44af2d9b6f30a350cb4ce5d1bcd4983c",
+        "release_feature_tree": [
+          "aws-lc-rs v1.18.1|aws-lc-sys,prebuilt-nasm",
+          "aws-lc-sys v0.45.0|prebuilt-nasm",
+          "libp2p-core v0.44.0|serde",
+          "libp2p-identity v0.2.13|ed25519,peerid,secp256k1",
+          "libp2p-identity v0.3.0|ed25519,peerid,rand,serde",
+          "libp2p-quic v0.14.0 ($NODE/patches/libp2p-quic)|tokio",
+          "libp2p-tls v0.7.0|",
+          "quinn v0.11.9|aws-lc-rs,futures-io,runtime-tokio,rustls-aws-lc-rs",
+          "quinn-proto v0.11.18|aws-lc-rs,bloom,log,ring,rustls-aws-lc-rs",
+          "ring v0.17.14|alloc,default,dev_urandom_fallback,std",
+          "rustls v0.23.45|aws-lc-rs,aws_lc_rs,log,logging,prefer-post-quantum,ring,std,tls12",
+          "rustls-webpki v0.103.15|alloc,aws-lc-rs,default,ring,std"
+        ],
+        "transport_closure_count": 221
+      }
+    },
+    "provenance": {
+      "registry_archive_sha256": "4f78ca359466657b380e469fe8c04df2f4447d1430838e6c3cef4a1c51ccb2ee",
+      "upstream_base_revision": "7171dce2f90c05ba7892d4ba926abb1881db27c7",
+      "upstream_diff_sha256": "70bcf353a43adf946424c40b663fe02e871a1b0b6ad346c2f19ecfbb5c92973c",
+      "vendored_files": {
+        "CHANGELOG.md": "ec9c42468c4c30d2514a6d78441611888fbc29f2ad148fa7dab49644db95eefc",
+        "Cargo.toml": "06427459bb2204548838c3b82c9066b5e989656951833749c046627f64177272",
+        "src/config.rs": "987a9e2e316efc0ff5d2c4948b587b3dcf8601f3443fb18ccfc9de646953375e",
+        "src/connection.rs": "007266c5491d3e2155f996ab31c255eaa94fcb284459f9ced30b40520068fa2b",
+        "src/connection/connecting.rs": "f23d4309ef22599bff3ef7de414e38fbfb62e1c2ea8fe1337e632833ed6e701e",
+        "src/connection/stream.rs": "381e9faefc20b82238bb40fa9f46d43111b2687af5c767e29d9ec48cfd2d01a0",
+        "src/hole_punching.rs": "0fd5efe2eb146d402127aae2b8958783c3a666cb5d2f05c23a22c77bbd053ceb",
+        "src/incoming.rs": "7935bf1a0e78943f02fd661534869580812d7374f4972c0db27c8f30f98bf50d",
+        "src/lib.rs": "67c080ba1e0da4f60f85167b4e32cb394a7d14be0d19d63a634a62c0a785f1be",
+        "src/provider.rs": "7a13653e3996ce0771267bcaee04c0465bb80f50a9c6a0572fcd9e423a3bd4b2",
+        "src/provider/tokio.rs": "5e1cc55e6fb3e8045676cad73830bc5715fb0b7212f6f80843c82a87d80dbfb3",
+        "src/transport.rs": "a51dda8513fc1de7bddd11f6dab6cec88f6ebfcd9957a6c31171b59e42732ebe",
+        "tests/smoke.rs": "bd891d3cba6d0efea978b1f84bc6eb1379d975b0668bafd0f3681e3feaca71bf"
+      },
+      "vendored_tree_sha256": "51fa07a9f61861af00723b4b96f8e68deece21a021b5cee870903ebf669d5f26"
+    },
+    "status": "passed"
+  },
+  "tested_commit": "d3d0c056f6937918b40933c6391c40356020f6dc",
+  "transport_job_conclusion": "success",
+  "transport_job_url": "https://github.com/Telcoin-Association/telcoin-network/actions/runs/36767437360/job/110065036388"
+}

@@ -413,7 +413,7 @@ async fn test_leader_schedule_from_store() {
     let committee = fixture.committee();
     let authority_ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
     let temp_dir = TempDir::new().unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     // Create a leader schedule with a default swap table, so no authority will be swapped and find
@@ -444,7 +444,7 @@ async fn test_leader_schedule_from_store() {
     consensus_chain.write_subdag_for_test(1, sub_dag).await;
 
     // WHEN
-    let schedule = LeaderSchedule::from_store(committee, &mut consensus_chain, 33).await.unwrap();
+    let schedule = LeaderSchedule::from_store(committee, &consensus_chain, 33).await.unwrap();
 
     // THEN the stored schedule should be returned and eventually the low score leader should be
     // swapped with a high score one.

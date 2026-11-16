@@ -2,8 +2,9 @@
 //!
 //! Peers that score poorly are eventually banned.
 
+use crate::diagnostics::bounded_warn;
 use libp2p::PeerId;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::peer::Peer;
 use std::{
@@ -83,7 +84,7 @@ impl BannedPeers {
         for ip in ip_addresses {
             debug!(target: "peer-manager", ?ip, "removing banned ip for validator");
             if self.banned_peers_by_ip.remove(&ip).is_some() {
-                warn!(target: "peer-manager", ?peer_id, "removed banned ip address associated with validator");
+                bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "removed banned ip address associated with validator");
             }
         }
     }

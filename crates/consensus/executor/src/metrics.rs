@@ -23,6 +23,14 @@ pub(crate) struct ExecutorMetrics {
     /// Protocol violations detected while assembling consensus outputs
     /// (certified batch missing from the certificate signers' workers).
     pub(crate) protocol_violations_total: Counter,
+    // bench5 f1-commit-lag
+    /// Time a committed sub-dag waited for local execution to reach its leader's execution block
+    /// (and every earlier leader's) and pass the fork check, before its batches were fetched.
+    pub(crate) execution_wait_seconds: Histogram,
+    // bench5 land-path-obs
+    /// Time the current consensus pack's sync took after the subscriber saved an output it
+    /// assembled from a committed sub-dag, before publishing it and forwarding it to execution.
+    pub(crate) consensus_pack_persist_seconds: Histogram,
 }
 
 #[cfg(test)]
@@ -43,6 +51,8 @@ mod tests {
             metrics.output_batches.record(5.0);
             metrics.batch_fetch_failures_total.increment(1);
             metrics.protocol_violations_total.increment(1);
+            metrics.execution_wait_seconds.record(0.25);
+            metrics.consensus_pack_persist_seconds.record(0.002);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -60,5 +70,9 @@ mod tests {
         find("tn_executor.output_transactions");
         find("tn_executor.output_batches");
         find("tn_executor.batch_fetch_failures_total");
+        let (_, _, _, value) = find("tn_executor.execution_wait_seconds");
+        assert!(matches!(value, DebugValue::Histogram(samples) if samples.len() == 1));
+        let (_, _, _, value) = find("tn_executor.consensus_pack_persist_seconds");
+        assert!(matches!(value, DebugValue::Histogram(samples) if samples.len() == 1));
     }
 }

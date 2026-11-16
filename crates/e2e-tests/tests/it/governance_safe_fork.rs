@@ -67,7 +67,7 @@
 
 use crate::common::{
     acquire_test_permit, config_committee, start_nodes, wait_for_epoch_at_least, wait_for_rpc,
-    ProcessGuard, NODE_PASSWORD,
+    GenesisConfig, ProcessGuard, NODE_PASSWORD,
 };
 use alloy::providers::{Provider, ProviderBuilder};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, GOVERNANCE_SAFE_ADDRESS};
@@ -78,13 +78,9 @@ use tn_types::{
         GOVERNANCE_SAFE_FORK_CANONICAL_SUITE, GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
         SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH, SAFE_SINGLETON_PRE_FORK_CODE_HASH,
     },
-    keccak256, Address, Epoch, Genesis, B256, U256,
+    keccak256, Address, Epoch, Genesis, ADIRI_CHAIN_ID, B256, U256,
 };
 use tracing::{info, warn};
-
-/// Chain id every node on this lane runs. `adiri` builds accept no other
-/// (`telcoin-network-cli::node`), which is also why no other lane may use it.
-const ADIRI_CHAIN_ID: u64 = 2017;
 
 /// Epoch duration (seconds) for this lane. 5s is the consensus minimum, the same cadence
 /// `epochs.rs` and `basefee.rs` run at, so the fork boundary arrives within the test budget.
@@ -259,7 +255,7 @@ fn assert_pre_fork_alloc(genesis: &Genesis) -> eyre::Result<()> {
             .alloc
             .get(&address)
             .and_then(|account| account.code.as_ref())
-            .map(|code| keccak256(code))
+            .map(keccak256)
             .unwrap_or(B256::ZERO)
     };
 
@@ -451,14 +447,18 @@ async fn test_governance_safe_fork_boundary() -> eyre::Result<()> {
     let genesis = config_committee(
         temp_path,
         &shared_genesis_dir,
-        Some(NODE_PASSWORD.to_string()),
-        // registry owner is never used by this test; a distinct address keeps it from
-        // entangling with the governance Safe whose state the fork rewrites
-        Address::from_slice(&[0xAA; 20]),
-        vec![],
-        &committee,
-        EPOCH_DURATION,
-        Some(ADIRI_CHAIN_ID),
+        GenesisConfig {
+            passphrase: Some(NODE_PASSWORD.to_string()),
+            // registry owner is never used by this test; a distinct address keeps it from
+            // entangling with the governance Safe whose state the fork rewrites
+            consensus_registry_owner: Address::from_slice(&[0xAA; 20]),
+            accounts: vec![],
+            validators: &committee,
+            epoch_duration: EPOCH_DURATION,
+            // every node on this lane runs the adiri chain id: `adiri` builds accept no other
+            // (`telcoin-network-cli::node`), which is also why no other lane may use it
+            chain_id: Some(ADIRI_CHAIN_ID),
+        },
     )?;
 
     // rewrite the shared genesis, then redistribute it: copying one rewritten file is what makes

@@ -1,32 +1,84 @@
 # Warms the dependency caches that .github/workflows/pr.yaml restores.
 #
-# main is the only writer. A cache saved by a pull_request run is scoped to that PR's
-# branch and one saved by a merge_group run lands on the queue's throwaway branch, so no
-# other run ever reads either. pr.yaml therefore only restores (`save-if: "false"`), on
-# both events, and reads what this workflow wrote on main. A lane's cold dependency build
-# is paid once here, off the critical path, instead of on every queue entry.
+# main is the only writer of the entries the lanes restore. A cache saved by a
+# pull_request run is scoped to that PR's branch and one saved by a merge_group run lands
+# on the queue's throwaway branch, so no other run ever reads either. pr.yaml therefore
+# only restores (`save-if: "false"`), on both events, and reads what this workflow wrote
+# on main. A lane's cold dependency build is paid once here, off the critical path,
+# instead of on every queue entry.
 #
-# Two jobs, two entries, one per toolchain pr.yaml uses:
+# main-compiles.yaml also runs on main and could save, but it restores only, so this
+# workflow stays the single writer. It is not in the `cache-deps` concurrency group below,
+# and on a Cargo.lock push that the merge queue did not make (it skips the queue's) it
+# would race a warm here to save the same key.
 #
-#   clippy-cache  both clippy passes (default and --all-features) under the nightly pin;
-#                 read by pr.yaml's `clippy` job
-#   test-cache    dependencies for both test lanes (default and adiri features) under
-#                 the stable pin; read by `test` and `adiri-test`. Workspace test binaries
-#                 are rebuilt per run because rust-cache does not save workspace crates.
+# Two warm jobs, two entries, one per toolchain pr.yaml uses:
 #
-# rust-cache's key is <prefix-key>-<shared-key>-<os>-<hash of the rustc version and every
-# CARGO*/RUST* variable in the environment>-<hash of relevant Cargo manifests, lockfiles and toolchain/config files>. For a restore in
-# pr.yaml to hit, the env block and every step before the cache step must match this file:
-# the same six variables, plus RUST_NIGHTLY written to GITHUB_ENV before the cache step in
-# the clippy jobs. Keep the two files in lockstep by hand; there is no shared definition
-# yet. A `rust-nightly` bump changes RUST_NIGHTLY, so the whole key, which is why that file
-# is in `paths` below. The computed key is printed in each cache step's "Cache
-# Configuration" log group.
+#   clippy-cache  the clippy passes (etc/ci-lanes.sh), the release graph and every target
+#                 under --all-features and without `mdbx`, under the nightly pin; read by
+#                 pr.yaml's `clippy` job and main-compiles.yaml's `fmt-clippy`
+#   test-cache    dependencies for the test lanes (default, adiri, vendored reth)
+#                 under the stable pin; read by pr.yaml's `test`, `adiri-test` and
+#                 `vendor-reth-test` and by main-compiles.yaml's `build-tests`. Workspace test
+#                 binaries are rebuilt per run because rust-cache does not save workspace crates.
+#
+# A third job, prune-caches, runs after both warms on main and deletes the superseded
+# generations of these two entries and of durable-e2e.yaml's, which would otherwise stay
+# until they went 7 days unread. The comment above the job has the rule and what it never
+# touches.
+#
+# rust-cache builds the key as follows (checked against v2.9.2; a later release can
+# change it, and the paragraph on such releases below says how one that does can move):
+#
+#   <prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo manifests,
+#   lockfiles and toolchain/config files>
+#
+# so the entries here start with v2-rust-clippy-cache-Linux-x64- and
+# v1-rust-test-cache-Linux-x64-: the prefix-key is per entry. The env hash covers
+# `rustc -vV` of every toolchain that `rustup toolchain list` reports, plus every variable
+# whose name starts with CARGO, CC, CFLAGS, CXX, CMAKE or RUST and whose value is
+# non-empty. For a restore in pr.yaml or main-compiles.yaml to hit, the env block and
+# every step before the cache step must match this file: the same six variables, plus
+# RUST_NIGHTLY written to GITHUB_ENV before the cache step in the clippy jobs, and the
+# same steps that install a toolchain, because the set of installed toolchains is hashed.
+# The four evidence jobs that restore test-cache (quic-observations.yaml's `metrics`,
+# consensus-liveness.yaml's `regression` and both committee-convergence.yaml jobs) must
+# hash the same six variables and the same toolchains too, with steps of their own.
+# The ubuntu-latest image brings a stable Rust of its own, which this repository does not
+# control and which differs between runners (1.99.0 and 1.99.1 were both in the fleet in
+# October 2026), so every job that restores or saves an entry removes it (`rustup
+# toolchain uninstall stable`) after its last toolchain install and before its cache step.
+# The clippy jobs also install the stable pin explicitly, which rust-cache's `rustc -vV`
+# probe would otherwise install as a side effect, since rust-toolchain.toml applies in the
+# repository. The hashed set is then the stable pin, plus the nightly pin in the clippy
+# jobs, whichever image a job lands on. With no default toolchain left, a bare `cargo` or
+# `rustc` outside the repository fails, so every later step runs in it or names its
+# toolchain (`cargo +1.94`). Keep these files in lockstep by hand; there is no shared
+# definition yet. A `rust-nightly` bump changes RUST_NIGHTLY and the installed nightly, so
+# the whole key, which is why that file is in `paths` below. Each cache step prints the
+# computed key in its "Cache Configuration" log group, with a "Rust Versions:" list of
+# every toolchain it hashed.
 #
 # Entries are immutable and an exact key hit skips the save. A change to WHAT a job here
 # builds (a lane added, a feature set changed) is therefore never written while the key
-# stays the same: bump `prefix-key` in both workflows, here first and in pr.yaml once main
-# has written the new entries (or delete the entries under Settings > Actions > Caches).
+# stays the same: bump that entry's `prefix-key` here and in every workflow that names
+# its shared-key, in the same pull request (or delete the entries under Settings >
+# Actions > Caches). clippy-cache moved from v1-rust to v2-rust when the clippy lane's two
+# library-only passes became the release-graph pass and the all-targets --all-features
+# pass; its v1-rust-clippy-cache-* entries are a superseded generation, which prune-caches
+# deletes.
+#
+# A rust-cache release that changes how the key is computed is a change of key too, and
+# moves the same way, here, in pr.yaml and in main-compiles.yaml together. The merge queue
+# then restores keys nothing has written yet and builds every dependency cold, from that
+# pull request's own queue run until the warm its merge triggers here has finished;
+# .github/ACTIONS.md ("Caches") has the cold timings measured. Moving this file first no
+# longer keeps the queue warm: prune-caches counts the old key's entries as a superseded
+# generation and deletes them at the end of the first warm that saves the new ones, so
+# pr.yaml would restore nothing until it moved too. To tell whether a release is one of
+# these, read the release notes of every release between the old pin and the new one for
+# anything about the key or hashing, or compare the "Cache Key" a warm prints before and
+# after the bump.
 #
 # No `cache-on-failure`: a warm job that died mid-build would freeze a partial target dir
 # under the exact key, permanently. A failed warm saves nothing; fix it and re-dispatch.
@@ -44,7 +96,8 @@ on:
       - ".cargo/config.toml"
       - "etc/ci-lanes.sh"
       - ".github/workflows/cache-deps.yaml"
-  # Re-warm by hand: after deleting entries, or when a warm failed.
+  # Re-warm by hand: after deleting entries, when a warm failed, or when a point release of
+  # the stable pin changed every key (.github/ACTIONS.md, "Caches").
   workflow_dispatch:
   # GitHub deletes an entry not accessed for 7 days, so a quiet week would leave the queue
   # cold. Twice a week keeps the entries alive; on an exact hit the run restores, rebuilds
@@ -53,7 +106,8 @@ on:
   schedule:
     - cron: "23 5 * * 1,4"
 
-# Only reads the repository; cache writes go through the cache service, not the token.
+# The warm jobs only read the repository; their cache writes go through the cache
+# service, not the token. prune-caches sets its own permissions.
 permissions:
   contents: read
 
@@ -73,43 +127,62 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  # Steps up to the cache step mirror pr.yaml's `clippy` job.
+  # Steps up to the cache step mirror pr.yaml's `clippy` job and main-compiles.yaml's
+  # `fmt-clippy` job.
   warm-clippy-cache:
     runs-on: ubuntu-latest
-    # Both passes from cold, after a heavy dependency bump; the --all-features pass alone
-    # took 11.5 min with a partial cache.
+    # The release-graph and --all-features passes from cold, after a heavy dependency bump or
+    # a prefix-key bump: 10 m 21 s with no entry to restore (2026-10-29; 5 m 21 s release
+    # graph, 5 m 00 s all targets under --all-features); the pass without `mdbx` reuses the
+    # second's dependencies. The older three-pass lane those replaced took 16.5 min cold, and one
+    # library-only pass 11.5 min with a partial cache.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
           fetch-depth: 1
 
       # Before the cache step: RUST_NIGHTLY is part of the key.
       - name: Read nightly version
-        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
+        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> "$GITHUB_ENV"
 
       - name: Install nightly toolchain
-        run: rustup toolchain install $RUST_NIGHTLY -c clippy,rust-src --profile minimal
+        run: rustup toolchain install "$RUST_NIGHTLY" -c clippy,rust-src --profile minimal
+
+      # rust-cache's `rustc -vV` probe runs in the repository, where rust-toolchain.toml
+      # makes rustup install the stable pin if it is missing, so the pin is hashed either
+      # way. Installing it here makes the hashed set the two pins by construction.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-rust
           shared-key: clippy-cache
 
       # The same lane the queue runs, so the same artifacts.
       - name: Build both clippy passes
         run: ./etc/ci-lanes.sh clippy
 
-  # Steps up to the cache step mirror pr.yaml's `test` and `adiri-test` jobs.
+  # Steps up to the cache step mirror pr.yaml's `test`, `adiri-test` and `vendor-reth-test` jobs
+  # and main-compiles.yaml's `build-tests` job.
   warm-test-cache:
     runs-on: ubuntu-latest
-    # Both lanes' test binaries from cold; the default lane alone took 9.5 min with a
+    # All three lanes' test binaries from cold; the default lane alone took 9.5 min with a
     # partial cache after a heavy dependency bump.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
           fetch-depth: 1
@@ -118,22 +191,83 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-nextest
 
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
+
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v1-rust
           shared-key: test-cache
 
-      # Both test lanes into one target dir. The adiri feature set unifies differently
+      # All three test lanes into one target dir. The adiri feature set unifies differently
       # (tn-reth/adiri pulls in faucet and tn-types/adiri, and resolver-2 unification is
       # per selected package), so its dependency artifacts are distinct from the default
-      # lane's; the two sets coexist in target/, and rust-cache keeps every variant of a
+      # lane's; the sets coexist in target/, and rust-cache keeps every variant of a
       # dependency it finds there. One entry keeps the quota predictable.
-      - name: Build the test binaries of both test lanes
+      # The vendored reth lane builds the nested vendor/reth workspace into target/vendor-reth,
+      # inside the same target dir, so its dependencies land in the same entry.
+      - name: Build the test binaries of the test lanes
         run: |
           ./etc/ci-lanes.sh test-default --build-only
           ./etc/ci-lanes.sh test-adiri --build-only
+          ./etc/ci-lanes.sh test-vendor-reth --build-only
+
+  # Deletes the superseded cache generations, through .github/scripts/prune_caches.sh,
+  # whose header has the rule in full. A family is every entry on refs/heads/main whose
+  # key starts v<N>-rust-clippy-cache-, v<N>-rust-test-cache- or
+  # v<N>-rust-durable-e2e-cache-, whatever its prefix-key version, architecture and
+  # hashes. The live entries of a family are those created since this run began, else
+  # those accessed since, else the single most recently accessed one; the rest are
+  # deleted, so a family is never left empty. Nothing outside the three families is ever
+  # touched: not CodeQL's entries, not another ref's, not another workflow's shared key.
+  # Without this job each Cargo.lock change on main leaves the previous generation behind
+  # until it goes 7 days unread, or until GitHub evicts the least recently used entries
+  # past the quota, which can take a live one with it.
+  #
+  # It sits after the warms because they have just restored or saved the live clippy and
+  # test entries, which is what marks them as touched since the run began. "Began" is the
+  # first attempt's start: the run's own run_started_at is the latest attempt's, and
+  # re-running this job alone would move it past the warms and leave the live entries
+  # unmarked. Only on main: a warm dispatched on another branch writes that branch's own
+  # scope and must not prune main's. With no status function in `if`, the job also runs
+  # only when both warms succeeded.
+  #
+  # This is the first job in these workflows to use the token for more than reading.
+  # `actions: write` is what deleting a cache entry needs. For this repository, and until
+  # the job ends, it would also let the token cancel, re-run, approve or delete workflow
+  # runs, delete logs and artifacts, and enable, disable or dispatch workflows. What runs
+  # with it is the pinned checkout and the script as it stands in this commit on main.
+  prune-caches:
+    needs: [warm-clippy-cache, warm-test-cache]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # There is no run start in the `github` context; the REST API has it.
+      - name: Delete superseded cache generations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          this_run="repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          started=$(gh api "${this_run}/attempts/1" --jq .run_started_at)
+          RUN_STARTED_AT="${started:?no start time for this run}" \
+            .github/scripts/prune_caches.sh

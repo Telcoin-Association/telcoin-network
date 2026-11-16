@@ -1,6 +1,9 @@
 # Transport
 
 Telcoin Network nodes speak libp2p over QUIC and nothing else.
+
+The [validated handshake-start accounting contract](handshake-starts.md) describes the
+process budget API and the transport integration and calibration required before enabling it.
 This page states what a node opens on the wire, the two keys that identify it, where its listener addresses come from, and the full set of chain-namespaced protocol IDs its substreams negotiate.
 
 It is written for RPC providers, dapp and indexer operators, bridge partners, and validators who need to predict what a node dials, what it accepts, and why a peer that looks reachable can still never exchange a message.
@@ -47,6 +50,7 @@ The per-peer connection ceiling is not a config field: it is fixed in code and i
 | Max connection data | 100 MiB | Unacknowledged bytes in flight across all streams of a connection |
 | Swarm idle connection timeout | 65 s | How long the swarm keeps an idle connection alive |
 | Established connections per peer | 8 | Concurrent connections one peer may hold, inbound and outbound combined |
+| Inbound accept task | inline | Where a listener decides on inbound attempts and accepts them; the spawned mode with a capacity is a measurement prototype (issue #1741), see [Inbound capacity qualification](inbound-capacity-qualification.md) |
 
 The effective handshake ceiling is the smaller of the handshake timeout and the max idle timeout, so a handshake in practice has 30 seconds, not 65.
 The keep-alive interval is set well below the idle timeout on purpose: a healthy but quiet connection is refreshed roughly six times before it would expire.
@@ -89,23 +93,27 @@ Do not append a `/p2p/` component: the tool derives it from the network public k
 When either flag is omitted, the address defaults to `/ip4/127.0.0.1/udp/PORT/quic-v1` on a free port, which is useful only for local test networks.
 The result is written to the node's info file and is the address advertised to peers.
 
+A node that binds that default accepts connections only from its own host, but it still dials other hosts.
+A QUIC dial reuses a listener's UDP socket, but a dial to another host never reuses one bound to a loopback IP, which cannot send there: it leaves from a socket bound to every interface instead.
+
 Two environment variables override the address a node **binds** at runtime: `PRIMARY_LISTENER_MULTIADDR` and `WORKER_LISTENER_MULTIADDR`.
 Each is read once, when its swarm first starts listening, and the node appends the `/p2p/` component the same way key generation does.
-`WORKER_LISTENER_MULTIADDR` applies to worker 0 only.
-Higher worker ids always bind their configured address, because one variable cannot name several distinct listeners.
+`WORKER_LISTENER_MULTIADDR` applies to worker 0 only; worker N above 0 reads `WORKER_N_LISTENER_MULTIADDR`.
 
 These variables change only what the node binds.
 The external address advertised to peers still comes from the node's info file, so an override that does not match what was generated makes the node reachable at one address and discoverable at another.
+
+An observer generated with the default addresses joins a public network as it is: its advertised address is the generated loopback one, so peers cannot dial it, and it needs none to, because its own outbound connections are enough.
 
 ## Listener settings and bootstrap peers
 
 Operators arriving from other clients go looking for `--p2p-port` or `--listen-addr`.
 Neither flag exists; `--bootstrap-peers` is available to override bootstrap dial hints for the current process.
-The node command's flags cover the named chain, bootstrap dial hints, a consensus-metrics socket, an instance number, state export and its retention limit, the re-pack monitor, unused-port mode, a healthcheck port, a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
+The node command's flags cover the named chain, bootstrap dial hints, a consensus-metrics socket, an instance number, state export and its retention limit, the re-pack monitor, unused-port mode, a healthcheck bind (port or socket address), a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
 
 Listener addresses come from the generated node info and the two override variables above.
-Bootstrap peers come from the network config's `bootstrap_peers` map, falling back to the genesis committee when the map is empty.
-The `--bootstrap-peers` flag replaces that map for the current process; an explicit `{}` selects the genesis fallback.
+Bootstrap peers come from the network config's `bootstrap_peers` map, falling back to the default set when the map is empty: the list built into the binary for `--chain`, or else the genesis committee file's.
+The `--bootstrap-peers` flag replaces that map for the current process; an explicit `{}` selects the default set.
 See [Bootstrap peers](../getting-started/bootstrap-peers.md) for the map format and examples.
 The transport settings in the table above are read from the network config file in the data directory, where any field may be omitted to take its default.
 The chain id is not an operator tunable at all: it is stamped onto the network config from genesis at startup and is deliberately never written to the config file.
@@ -160,6 +168,7 @@ Worker `k` of one validator reaches only worker `k` of the others.
 
 The failure mode is quiet by design.
 There is no error message describing the mismatch, because there is nothing to reject — the two peers simply have no protocol in common.
+Outbound substreams negotiate optimistically (multistream-select `V1Lazy`), so a dialer that proposes one protocol sends its first request bytes in the same flight as the proposal, and a listener with no protocol in common answers `na` and drops the stream without any handler seeing those bytes.
 
 ## Source of truth
 

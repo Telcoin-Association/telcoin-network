@@ -2,15 +2,18 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt,
     time::Duration,
 };
 
+use eyre::{bail, WrapErr as _};
 use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, ShutdownNotifier, TaskSpawner, TnReceiver as _, TnSender as _,
+    AuthorityIdentifier, BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch,
+    EpochCertificate, EpochRecord, EpochVote, ShutdownNotifier, TaskError, TaskSpawner,
+    TnReceiver as _, TnSender as _,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -45,29 +48,31 @@ const EPOCH_CERT_RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
 /// The local collector is still seeded immediately; only the outbound gossip is staggered.
 const INITIAL_VOTE_PUBLISH_DELAY: Duration = Duration::from_millis(500);
 
-/// Both save and persist an epoch record and cert with logging.
+/// Save and persist a peer's verified epoch record and cert. A refused save is logged; our own
+/// store failing to save or persist is returned (see `EpochDbError::stop_on_local_failure`),
+/// so the round ends with an error that stops the node (see [`spawn_epoch_vote_collector`]).
 async fn save_and_persist_with_logs(
     db: &EpochRecordDb,
     epoch_record: EpochRecord,
     cert: EpochCertificate,
-) {
+) -> eyre::Result<()> {
     let epoch = epoch_record.epoch;
     if let Err(e) = db.save(epoch_record, cert).await {
-        error!(
-            target: "epoch-manager",
-            ?e,
-            "failed to save epoch record/cert after retrieval for epoch {epoch}",
-        );
-    } else if let Err(e) = db.persist().await {
-        error!(
-            target: "epoch-manager",
-            ?e,
-            "failed to persist epoch record/cert after retrieval for epoch {epoch}",
-        );
+        return e.stop_on_local_failure(format!(
+            "failed to save epoch record/cert after retrieval for epoch {epoch}"
+        ));
     }
+    // A persist writes only our own files, so any failure is local.
+    db.persist().await.wrap_err_with(|| {
+        format!("failed to persist epoch record/cert after retrieval for epoch {epoch}")
+    })
 }
 
 /// Collect and manage votes for a specific epoch record.
+///
+/// Returns `Err` only when our own epoch store fails to save or persist the certificate (see
+/// `EpochDbError::stop_on_local_failure`), or when the network certified a different record for
+/// the epoch than ours (a fork); every other way a round ends is `Ok`.
 async fn manage_epoch_votes(
     epoch_rec: EpochRecord,
     key_config: KeyConfig,
@@ -75,7 +80,7 @@ async fn manage_epoch_votes(
     mut vote_rx: Receiver<EpochVote>,
     consensus_chain: ConsensusChain,
     node_shutdown: ShutdownNotifier,
-) {
+) -> eyre::Result<()> {
     let epoch_hash = epoch_rec.digest();
     let mut committee_keys: HashSet<BlsPublicKey> = epoch_rec.committee.iter().copied().collect();
     let committee_index: HashMap<BlsPublicKey, usize> =
@@ -99,7 +104,7 @@ async fn manage_epoch_votes(
     let shutdown = node_shutdown.subscribe();
     loop {
         tokio::select! {
-            _ = &shutdown => return,
+            _ = &shutdown => return Ok(()),
             result = tokio::time::timeout(timeout, vote_rx.recv()) => {
                 match result {
                     Ok(None) => {
@@ -161,12 +166,23 @@ async fn manage_epoch_votes(
         }
     }
 
+    // signers when the round ended; members still in `committee_keys` had not voted by then
+    let signers = signed_authorities.len();
+    let missing = missing_signers(&epoch_rec.committee, &committee_keys);
+
     // Aggregate signatures and save the cert
     if reached_quorum {
         info!(
             target: "epoch-manager",
-            "reached quorum on epoch close for {}/{epoch_hash}", epoch_rec.epoch
+            epoch = epoch_rec.epoch,
+            signers,
+            committee = committee_size,
+            timeouts,
+            missing = %SignerList(&missing),
+            %epoch_hash,
+            "epoch record quorum"
         );
+        record_epoch_record_quorum(&epoch_rec.committee, &committee_keys, signers);
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();
@@ -176,19 +192,14 @@ async fn manage_epoch_votes(
                     if let Err(e) =
                         consensus_chain.epochs().save_certificate(cert.epoch_hash, cert).await
                     {
-                        error!(
-                            target: "epoch-manager",
-                            ?e,
-                            "failed to save epoch cert after reaching quorum {epoch}",
-                        );
+                        e.stop_on_local_failure(format!(
+                            "failed to save epoch cert after reaching quorum {epoch}"
+                        ))?;
                     }
-                    if let Err(e) = consensus_chain.epochs().persist().await {
-                        error!(
-                            target: "epoch-manager",
-                            ?e,
-                            "failed to persist epoch cert after reaching quorum {epoch}",
-                        );
-                    }
+                    // A persist writes only our own files, so any failure is local.
+                    consensus_chain.epochs().persist().await.wrap_err_with(|| {
+                        format!("failed to persist epoch cert after reaching quorum {epoch}")
+                    })?;
                 } else {
                     error!(
                         target: "epoch-manager",
@@ -220,8 +231,12 @@ async fn manage_epoch_votes(
     } else {
         error!(
             target: "epoch-manager",
+            signers,
+            timeouts,
+            missing = %SignerList(&missing),
             "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
         );
+        record_epoch_record_signers(signers);
         let db = consensus_chain.epochs().clone();
         let network = primary_network.clone();
         // Try to recover by downloading the epoch record and cert from a peer. This needs only the
@@ -271,14 +286,19 @@ async fn manage_epoch_votes(
                                     // We generated a different record than the network certified, so we
                                     // have forked. A fork is not something a node can safely recover from
                                     // (records are deterministic, so ours is simply wrong) — fail-stop
-                                    // rather than adopt the network's record and pretend to recover.
-                                    node_shutdown.notify();
+                                    // rather than adopt the network's record and pretend to recover. The
+                                    // error stops the node through the collector, so it exits non-zero.
+                                    bail!(
+                                        "epoch {}: the network certified epoch record {new_epoch_hash} \
+                                         where this node computed {epoch_hash}; this node has forked",
+                                        epoch_rec.epoch
+                                    );
                                 } else {
                                     info!(
                                         target: "epoch-manager",
                                         "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
                                     );
-                                    save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
+                                    save_and_persist_with_logs(&db, new_epoch_rec, cert).await?;
                                 }
                                 got_epoch_record = true;
                                 break;
@@ -308,9 +328,11 @@ async fn manage_epoch_votes(
             );
         }
     }
+    Ok(())
 }
 
 /// Direct a newly received vote to its task.
+#[allow(clippy::too_many_arguments)]
 async fn handle_new_vote(
     vote: EpochVote,
     vote_queues: &mut VoteQueue,
@@ -319,6 +341,7 @@ async fn handle_new_vote(
     primary_network: PrimaryNetworkHandle,
     task_spawner: &TaskSpawner,
     node_shutdown: ShutdownNotifier,
+    round_failed: &Sender<TaskError>,
 ) {
     let mut remove = None;
     let mut found = false;
@@ -361,8 +384,12 @@ async fn handle_new_vote(
         };
         // Spawn the vote collector in response to a vote if it was missing.
         // This allows the possibility of recovering a cert with a republished vote even if stale.
+        // A round is not critical (it ends once its epoch is certified or given up), so its
+        // errors, our own store failing or a fork, go to the critical collector, which stops the
+        // node.
+        let round_failed = round_failed.clone();
         task_spawner.spawn_task(format!("epoch votes for epoch {}", epoch_rec.epoch), async move {
-            manage_epoch_votes(
+            if let Err(e) = manage_epoch_votes(
                 epoch_rec,
                 key_config,
                 primary_network,
@@ -370,7 +397,10 @@ async fn handle_new_vote(
                 consensus_chain,
                 node_shutdown,
             )
-            .await;
+            .await
+            {
+                let _ = round_failed.send(TaskError::from_message(format!("{e:#}"))).await;
+            }
             Ok(())
         });
         if epoch_vote_tx.send(vote).await.is_ok() {
@@ -402,6 +432,10 @@ fn new_epoch_vote(consensus_bus: &ConsensusBusApp, epoch_vote: EpochVote) {
 /// This actor subscribes once to the `new_epoch_votes` channel and never drops the receiver,
 /// eliminating the gap at epoch boundaries where votes could be lost. It watches for new
 /// `EpochRecord`s via a `watch` channel and collects votes for each epoch.
+///
+/// A round that finds our own epoch store failing (see `EpochDbError::stop_on_local_failure`) or
+/// our record forked from the one the network certified reports it here, and this critical task
+/// returns the error, so the node exits, non-zero, for operator intervention.
 pub(crate) fn spawn_epoch_vote_collector(
     consensus_chain: ConsensusChain,
     consensus_bus: ConsensusBusApp,
@@ -415,6 +449,8 @@ pub(crate) fn spawn_epoch_vote_collector(
     let task_spawner = node_task_spawner.clone();
     let mut vote_queues: VoteQueue = VecDeque::with_capacity(5);
     let shutdown = node_shutdown.subscribe();
+    // The first failure is enough to stop the node.
+    let (round_failed_tx, mut round_failed_rx) = mpsc::channel(1);
 
     node_task_spawner.spawn_critical_task("Epoch Vote Collector", async move {
         loop {
@@ -422,6 +458,7 @@ pub(crate) fn spawn_epoch_vote_collector(
             let epoch_rec = loop {
                 tokio::select! {
                     _ = &shutdown => return Ok(()),
+                    Some(err) = round_failed_rx.recv() => return Err(err),
                     _ = epoch_rx.changed() => {
                         if let Some(rec) = epoch_rx.borrow_and_update().clone() {
                             break rec;
@@ -432,7 +469,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                             None => return Ok(()),  // Channel closed- we are done.
                             Some(vote) => {
                                 handle_new_vote(vote, &mut vote_queues, consensus_chain.clone(), key_config.clone(),
-                                    primary_network.clone(), &task_spawner, node_shutdown.clone()).await;
+                                    primary_network.clone(), &task_spawner, node_shutdown.clone(), &round_failed_tx).await;
                             }
                         }
                     }
@@ -547,6 +584,71 @@ pub(crate) async fn revote_uncertified_epoch_record_on_startup(
     }
 }
 
+/// Log rendering of a list of authority ids: `[id1,id2]`, or `[]` when empty.
+///
+/// Comma-separated with no spaces and no quotes, so a `key=value` log parser that reads the value
+/// up to the next whitespace captures the whole list. `Debug` of a `Vec<String>` would quote each
+/// id and put a space after every comma.
+struct SignerList<'a>(&'a [AuthorityIdentifier]);
+
+impl fmt::Display for SignerList<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (i, id) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{id}")?;
+        }
+        f.write_str("]")
+    }
+}
+
+/// Committee members whose vote was not counted in this round, as authority ids in committee
+/// order.
+///
+/// `remaining` is the set of committee keys that have not voted yet. The walk follows the
+/// committee `Vec`, never the set, so the order is the same on every node and every run.
+fn missing_signers(
+    committee: &[BlsPublicKey],
+    remaining: &HashSet<BlsPublicKey>,
+) -> Vec<AuthorityIdentifier> {
+    committee
+        .iter()
+        .filter(|key| remaining.contains(*key))
+        .map(|key| AuthorityIdentifier::from(*key))
+        .collect()
+}
+
+/// Set `tn_node.epoch_record_signers` to the number of committee members whose vote was counted
+/// when a vote round ended, whether or not it reached quorum.
+///
+/// A round that fails to reach quorum sets it too, so during that failure the gauge shows the
+/// failed round's count, not the count of the last round that reached quorum. A round cut short
+/// by eviction or shutdown leaves it alone.
+fn record_epoch_record_signers(signers: u64) {
+    metrics::gauge!("tn_node.epoch_record_signers").set(signers as f64);
+}
+
+/// Record a vote round that reached quorum: the signer count, and one missed vote per committee
+/// member that did not sign.
+///
+/// Every member's `signer` series is touched (by 0 when it signed), so the series exists before
+/// its first miss and that miss shows up in a Prometheus `increase()`. Runs once per epoch, so the
+/// unresolved macro handles are fine here.
+fn record_epoch_record_quorum(
+    committee: &[BlsPublicKey],
+    remaining: &HashSet<BlsPublicKey>,
+    signers: u64,
+) {
+    record_epoch_record_signers(signers);
+    for key in committee {
+        let signer = AuthorityIdentifier::from(*key).to_string();
+        metrics::counter!("tn_node.epoch_record_missing_signers_total", "signer" => signer)
+            .increment(u64::from(remaining.contains(key)));
+    }
+}
+
 #[cfg(test)]
 mod epoch_vote_collector_tests {
     use super::*;
@@ -564,7 +666,7 @@ mod epoch_vote_collector_tests {
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::wait_until;
     use tn_test_utils_committee::CommitteeFixture;
-    use tn_types::{encode, BlsKeypair, TaskManager};
+    use tn_types::{encode, BlsKeypair, TaskJoinError, TaskManager};
 
     /// #1198 startup re-vote: a persisted-but-uncertified latest record re-fires the watch.
     #[tokio::test]
@@ -932,7 +1034,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // After reaching quorum the collector waits up to 1s for more votes before aggregating
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        wait_until(Duration::from_secs(9), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
 
         // The cert must exist and verify: a corrupted aggregate (duplicate self-signature)
         // fails verify_with_cert and is never stored
@@ -1049,7 +1155,11 @@ mod epoch_vote_collector_tests {
 
         // Wait for collector to aggregate and store.
         // After reaching quorum the collector waits up to 1s for more votes before aggregating.
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        wait_until(Duration::from_secs(9), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
 
         // Verify cert IS stored for the correct epoch hash
         // Quorum is kp1 (self-sign) + kp3 + kp4 = 3 >= 3
@@ -1156,7 +1266,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
 
         // After reaching quorum the collector waits up to 1s for more votes before aggregating
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        wait_until(Duration::from_secs(9), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
 
         let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
         assert_eq!(cert.epoch_hash, epoch_hash);
@@ -1252,7 +1366,11 @@ mod epoch_vote_collector_tests {
 
         // Quorum (3 of 4) reached without a fourth vote: collector waits its 1s straggler
         // window before aggregating
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        wait_until(Duration::from_secs(9), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
 
         let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
         assert_eq!(cert.epoch_hash, epoch_hash);
@@ -1380,15 +1498,18 @@ mod epoch_vote_collector_tests {
 
     /// Fail-stop on fork: after a failed local vote quorum, the peer-recovery download returns a
     /// record that validates against our locally-trusted anchor but whose digest differs from the
-    /// one we computed. That is an unrecoverable fork (records are deterministic), so the collector
-    /// must call `node_shutdown.notify()` rather than silently adopt the peer's record.
+    /// one we computed. That is an unrecoverable fork (records are deterministic), so the round
+    /// must end with the fork as its error rather than silently adopt the peer's record. The
+    /// error reaches the critical collector, which stops the node with it (the path
+    /// `test_failed_epoch_store_stops_the_collector` follows), so the node exits non-zero; the
+    /// round itself leaves the node's shutdown to that error.
     ///
     /// Paused clock: `manage_epoch_votes` reaches the recovery path only after
     /// `MAX_EPOCH_VOTE_TIMEOUTS` vote windows of `EPOCH_VOTE_RECV_TIMEOUT` each (~60s of real
     /// time), and the recovery loop bails if the vote channel is closed, so the sender is held
     /// open and the windows are fast-forwarded.
     #[tokio::test(start_paused = true)]
-    async fn test_fork_digest_mismatch_triggers_shutdown() {
+    async fn test_fork_digest_mismatch_fails_the_round() {
         let mut rng = StdRng::from_os_rng();
         let kp1 = BlsKeypair::generate(&mut rng);
         let kp2 = BlsKeypair::generate(&mut rng);
@@ -1470,11 +1591,9 @@ mod epoch_vote_collector_tests {
         let node_shutdown = ShutdownNotifier::new();
         let noticer = node_shutdown.subscribe();
 
-        // Drive the collector directly: the vote windows auto-advance under the paused clock and
-        // the recovery download returns the mismatched record, so the fork is detected and fires
-        // `node_shutdown.notify()`. The call then returns because the recovery loop breaks after
-        // the download — nothing on that path awaits the notifier.
-        manage_epoch_votes(
+        // Drive the round directly: the vote windows auto-advance under the paused clock and the
+        // recovery download returns the mismatched record, so the fork is detected and returned.
+        let err = manage_epoch_votes(
             local_rec,
             kc1,
             primary_network,
@@ -1482,9 +1601,13 @@ mod epoch_vote_collector_tests {
             consensus_chain.clone(),
             node_shutdown,
         )
-        .await;
-
-        assert!(noticer.noticed(), "digest mismatch must trigger node shutdown");
+        .await
+        .expect_err("a digest mismatch must end the round with the fork");
+        assert!(err.to_string().contains("this node has forked"), "unexpected error: {err:#}");
+        assert!(
+            !noticer.noticed(),
+            "the round leaves the stop to its error, which the collector returns",
+        );
         // Fail-stop, NOT adopt: the peer's forked record must be neither certified nor stored.
         assert!(
             consensus_chain.epochs().cert_by_digest(alt_rec.digest()).await.is_none(),
@@ -1539,6 +1662,7 @@ mod epoch_vote_collector_tests {
         let task_manager = TaskManager::default();
         let spawner = task_manager.get_spawner();
         let node_shutdown = ShutdownNotifier::new();
+        let (round_failed, _round_failed_rx) = mpsc::channel(1);
 
         // Seed the queue with a DEAD collector entry: receiver dropped, so a forward send fails.
         let (dead_tx, dead_rx) = mpsc::channel::<EpochVote>(1);
@@ -1555,6 +1679,7 @@ mod epoch_vote_collector_tests {
             primary_network,
             &spawner,
             node_shutdown,
+            &round_failed,
         )
         .await;
 
@@ -1607,6 +1732,7 @@ mod epoch_vote_collector_tests {
         let task_manager = TaskManager::default();
         let spawner = task_manager.get_spawner();
         let node_shutdown = ShutdownNotifier::new();
+        let (round_failed, _round_failed_rx) = mpsc::channel(1);
 
         // `EpochVote` is `Copy`, so the same vote drives both cases.
         let vote = epoch_rec.sign_vote(&kc1);
@@ -1621,6 +1747,7 @@ mod epoch_vote_collector_tests {
             primary_network.clone(),
             &spawner,
             node_shutdown.clone(),
+            &round_failed,
         )
         .await;
         assert!(vote_queues.is_empty(), "vote for an unknown record must be dropped");
@@ -1641,6 +1768,7 @@ mod epoch_vote_collector_tests {
             primary_network,
             &spawner,
             node_shutdown,
+            &round_failed,
         )
         .await;
         assert!(vote_queues.is_empty(), "vote for a certified record must be dropped");
@@ -1731,6 +1859,95 @@ mod epoch_vote_collector_tests {
         assert_eq!(publishes.load(Ordering::SeqCst), 2, "exactly two publishes reach the network");
 
         node_shutdown.notify();
+    }
+
+    /// Our own epoch store failing to save the quorum certificate ends the critical collector
+    /// with an error, so the node exits. The store here is closed under the round (a dead actor,
+    /// `SendFailed`): nothing a peer sends can cause that.
+    #[tokio::test]
+    async fn test_failed_epoch_store_stops_the_collector() {
+        let mut rng = StdRng::from_os_rng();
+        let kps: Vec<BlsKeypair> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let keys: Vec<BlsPublicKey> = kps.iter().map(|kp| *kp.public()).collect();
+        let mut kcs: Vec<KeyConfig> =
+            kps.into_iter().map(KeyConfig::new_with_testing_key).collect();
+        let key_config = kcs.remove(0);
+
+        // Committee of 4: super_quorum = 3, so our vote and two peers' certify it.
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            ..Default::default()
+        };
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("failed_epoch_store_stops_collector").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+
+        // Counting mock network: the first publish is our delayed initial vote gossip.
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        {
+            let publishes = publishes.clone();
+            tokio::spawn(async move {
+                while let Some(cmd) = net_rx.recv().await {
+                    if let NetworkCommand::Publish { reply, .. } = cmd {
+                        publishes.fetch_add(1, Ordering::SeqCst);
+                        let _ = reply.send(Ok(MessageId::new(b"test")));
+                    }
+                }
+            });
+        }
+
+        let mut task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::new();
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.clone(),
+        );
+
+        // Our self-vote starts the round (its record read needs the live store); the initial
+        // gossip goes out INITIAL_VOTE_PUBLISH_DELAY later, by when the round is running.
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+        wait_until(Duration::from_secs(5), "initial vote gossip", || async {
+            Ok(publishes.load(Ordering::SeqCst) >= 1)
+        })
+        .await
+        .unwrap();
+
+        // The store fails under the round, then the peer votes bring it to quorum.
+        consensus_chain.clone().close().await;
+        for kc in &kcs {
+            consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(kc)).await.unwrap();
+        }
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            task_manager.until_task_ends(node_shutdown),
+        )
+        .await
+        .expect("the collector must stop on a failed epoch store");
+        let Err(TaskJoinError::CriticalExitError(name, err)) = ended else {
+            panic!("expected the collector's error, got {ended:?}");
+        };
+        assert_eq!(name, "Epoch Vote Collector");
+        assert!(
+            err.to_string().contains("failed to save epoch cert after reaching quorum"),
+            "unexpected error: {err}",
+        );
     }
 
     /// `my_vote` capture + timeout republish: our own vote is captured from the stream and, with
@@ -1828,7 +2045,8 @@ mod epoch_vote_collector_tests {
             consensus_chain,
             node_shutdown,
         )
-        .await;
+        .await
+        .expect("no local store failure");
 
         // Every republish must carry our matching vote; an unguarded capture would republish the
         // decoy (a self-vote for a different record) instead.
@@ -1914,5 +2132,209 @@ mod epoch_vote_collector_tests {
         .await;
 
         assert!(result.is_ok(), "shutdown must cancel recovery so manage_epoch_votes returns");
+    }
+
+    /// Four deterministic committee keys, in committee order.
+    fn committee_of_four() -> Vec<BlsPublicKey> {
+        let mut rng = StdRng::seed_from_u64(7);
+        (0..4).map(|_| *BlsKeypair::generate(&mut rng).public()).collect()
+    }
+
+    /// `missing_signers` walks the committee, not the set: the result is in committee order no
+    /// matter how `remaining` was filled, and members that voted are left out.
+    #[test]
+    fn test_missing_signers_follow_committee_order() {
+        let committee = committee_of_four();
+        let id = |i: usize| AuthorityIdentifier::from(committee[i]);
+
+        // insert out of committee order
+        let remaining: HashSet<BlsPublicKey> = [committee[3], committee[1]].into_iter().collect();
+        assert_eq!(missing_signers(&committee, &remaining), vec![id(1), id(3)]);
+
+        let everyone: HashSet<BlsPublicKey> = committee.iter().rev().copied().collect();
+        assert_eq!(missing_signers(&committee, &everyone), vec![id(0), id(1), id(2), id(3)]);
+
+        assert!(missing_signers(&committee, &HashSet::new()).is_empty());
+    }
+
+    /// The `missing=` field renders as `[id,id]`: brackets, bs58 ids, comma with no space, no
+    /// quotes; `[]` when nobody is missing.
+    #[test]
+    fn test_signer_list_renders_bracketed_ids() {
+        assert_eq!(SignerList(&[]).to_string(), "[]");
+
+        let one = AuthorityIdentifier::from_bytes([1; 32]);
+        assert_eq!(
+            SignerList(std::slice::from_ref(&one)).to_string(),
+            "[4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi]"
+        );
+
+        let two = AuthorityIdentifier::from_bytes([2; 32]);
+        assert_eq!(
+            SignerList(&[one, two]).to_string(),
+            "[4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi,8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR]"
+        );
+    }
+
+    /// A quorum round sets the signer gauge and counts one miss for each member that did not sign;
+    /// members that signed get a zero-valued series under the same name and label.
+    #[test]
+    fn test_epoch_record_quorum_metrics() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let committee = committee_of_four();
+        let remaining: HashSet<BlsPublicKey> = [committee[2]].into_iter().collect();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_epoch_record_quorum(&committee, &remaining, 3);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        let (_, _, _, gauge) = snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.epoch_record_signers")
+            .expect("signer gauge registered");
+        assert!(matches!(gauge, DebugValue::Gauge(g) if g.0 == 3.0), "got {gauge:?}");
+
+        let mut misses: Vec<(String, u64)> = snapshot
+            .iter()
+            .filter(|(key, ..)| key.key().name() == "tn_node.epoch_record_missing_signers_total")
+            .map(|(key, _, _, value)| {
+                let labels: Vec<_> = key.key().labels().collect();
+                assert_eq!(labels.len(), 1, "only the signer label");
+                assert_eq!(labels[0].key(), "signer");
+                let DebugValue::Counter(n) = value else {
+                    panic!("counter expected, got {value:?}")
+                };
+                (labels[0].value().to_string(), *n)
+            })
+            .collect();
+        misses.sort();
+
+        let mut expected: Vec<(String, u64)> = committee
+            .iter()
+            .map(|key| {
+                (AuthorityIdentifier::from(*key).to_string(), u64::from(*key == committee[2]))
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(misses, expected);
+    }
+
+    /// A round that fails to reach quorum replaces the signer count the last quorum round left in
+    /// the gauge, and counts no missed votes.
+    ///
+    /// `manage_epoch_votes` is driven through the failed-quorum branch as in
+    /// `test_shutdown_cancels_recovery`: two of four members vote, short of the quorum of three,
+    /// the vote windows time out, and the mock answers the recovery request by signalling
+    /// shutdown so the round returns. Only the quorum path and the failure branch set the gauge,
+    /// and two votes cannot reach quorum, so the failure branch is the only way the gauge can read
+    /// two.
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_round_sets_signer_gauge() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        // neither vote is ours, so the timed-out windows republish nothing
+        let votes = [
+            epoch_rec.sign_vote(&KeyConfig::new_with_testing_key(kp2)),
+            epoch_rec.sign_vote(&KeyConfig::new_with_testing_key(kp3)),
+        ];
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("failed_round_signer_gauge").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+
+        let node_shutdown = ShutdownNotifier::new();
+
+        // Mock network: on the recovery request, signal shutdown and hold the reply, so the
+        // recovery loop's shutdown arm ends the round right after the failure branch ran.
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        {
+            let node_shutdown = node_shutdown.clone();
+            tokio::spawn(async move {
+                // Own the held reply senders so their oneshots stay unresolved.
+                let mut held = Vec::new();
+                while let Some(cmd) = net_rx.recv().await {
+                    if let NetworkCommand::SendRequestAny { reply, .. } = cmd {
+                        node_shutdown.notify();
+                        held.push(reply);
+                    }
+                }
+            });
+        }
+
+        // The round runs on this thread (current-thread runtime, awaited below, not spawned), so
+        // the local recorder sees its gauge write.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+
+        // the last quorum round left three signers and one missed vote
+        let remaining: HashSet<BlsPublicKey> = [pk4].into_iter().collect();
+        record_epoch_record_quorum(&epoch_rec.committee, &remaining, 3);
+
+        // Hold the vote sender open so the round reaches the failure branch via timeout
+        // exhaustion rather than a closed channel.
+        let (vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+        for vote in votes {
+            vote_tx.send(vote).await.unwrap();
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            manage_epoch_votes(
+                epoch_rec,
+                key_config,
+                primary_network,
+                vote_rx,
+                consensus_chain,
+                node_shutdown,
+            ),
+        )
+        .await
+        .expect("the recovery request signals shutdown, so the round returns")
+        .expect("no local store failure");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        let (_, _, _, gauge) = snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.epoch_record_signers")
+            .expect("signer gauge registered");
+        assert!(matches!(gauge, DebugValue::Gauge(g) if g.0 == 2.0), "got {gauge:?}");
+
+        let misses: u64 = snapshot
+            .iter()
+            .filter(|(key, ..)| key.key().name() == "tn_node.epoch_record_missing_signers_total")
+            .map(|(.., value)| match value {
+                DebugValue::Counter(n) => *n,
+                other => panic!("counter expected, got {other:?}"),
+            })
+            .sum();
+        assert_eq!(misses, 1, "only the quorum round counts a missed vote");
     }
 }

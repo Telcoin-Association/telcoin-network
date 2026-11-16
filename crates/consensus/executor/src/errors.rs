@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use thiserror::Error;
 use tn_primary::consensus::ConsensusError;
 use tn_storage::StoreError;
-use tn_types::{AuthorityIdentifier, BlockHash, HeaderDigest, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, HeaderDigest, Round, WorkerId};
 
 /// Returns an error if the given condition is false.
 ///
@@ -148,7 +148,44 @@ pub enum SubscriberError {
     #[error("Consensus chain read failure: {0}")]
     ConsensusChainRead(String),
 
+    /// A sync output skipped past the next consensus number.
+    ///
+    /// State sync only sends contiguous runs and the latest saved number only moves when the
+    /// subscriber saves, so a number past `latest + 1` means the outputs in between were lost on
+    /// the way. Saving it would leave a hole in the consensus chain, so the subscriber refuses it
+    /// and fails, and state sync resumes from the last saved output when the epoch restarts.
+    #[error("sync output gap: expected consensus number {expected} but received {received}")]
+    SyncOutputGap {
+        /// The only number the chain can take next (latest saved + 1).
+        expected: u64,
+        /// The number that arrived.
+        received: u64,
+    },
+
     /// An error from spawning consensus.
     #[error("Consensus error (from spawn): {0}")]
     Consensus(#[from] ConsensusError),
+
+    /// The leader of a committed sub-dag references an execution block this node did not execute
+    /// at that height.
+    ///
+    /// Once local execution reached the block's number, this node held a different block at that
+    /// number, in its recently executed blocks or as canonical in its execution database: this
+    /// node's execution has forked from the leader's. The output is never saved; the subscriber
+    /// goes inactive and shuts the epoch down.
+    #[error(
+        "execution fork at consensus output {number}: leader's execution block {base_block} ({base_hash}) is not on the local chain"
+    )]
+    ExecutionFork {
+        /// The consensus number the output would have had.
+        number: u64,
+        /// The number of the leader's execution block.
+        base_block: u64,
+        /// The hash of the leader's execution block.
+        base_hash: BlockHash,
+        /// The author of the leader certificate that named the block.
+        leader: AuthorityIdentifier,
+        /// The round of the leader certificate.
+        leader_round: Round,
+    },
 }

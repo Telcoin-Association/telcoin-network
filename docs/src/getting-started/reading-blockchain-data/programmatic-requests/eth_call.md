@@ -4,7 +4,7 @@ Here we demonstrate how to use `eth_call` using TypeScript scripts.
 
 ### Method Parameters
 
-From the [RPC method reference](../../../rpc-methods/eth_call.md) we see `eth_call` takes a number of arguments, some of which are optional. These are recreated below:
+From the [RPC method reference](../../../rpc-methods/eth/eth_call.md) we see `eth_call` takes a number of arguments, some of which are optional. These are recreated below:
 
 `Object` - The transaction call object:
 

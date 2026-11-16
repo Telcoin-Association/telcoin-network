@@ -123,18 +123,22 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
     ) -> impl Future<Output = Vec<Batch>> + Send + 'a;
 
     /// Count leaders in the current pack's rewards counter that are below
-    /// `last_executed_round`.
+    /// `last_executed_round`. Errors, counting nothing, unless the current pack is
+    /// `expected_epoch`'s.
     fn count_leaders(
         &self,
+        expected_epoch: Epoch,
         last_executed_round: Round,
         rewards_counter: RewardsCounter,
     ) -> impl Future<Output = eyre::Result<()>> + Send;
 
-    /// Open a verified read stream over the data file for `epoch`.
+    /// Open a verified read stream over the data file for `epoch`, together with its logical length
+    /// (the number of bytes the caller should stream: `[0, len)`, excluding any mmap capacity
+    /// padding).
     fn get_epoch_stream(
         &self,
         epoch: Epoch,
-    ) -> impl Future<Output = eyre::Result<Box<dyn ReadStream>>> + Send;
+    ) -> impl Future<Output = eyre::Result<(Box<dyn ReadStream>, u64)>> + Send;
 
     /// Return true if this process is already streaming `epoch`.
     fn already_streaming_epoch(&self, epoch: Epoch) -> bool;
@@ -154,8 +158,9 @@ pub trait ConsensusChainWriter: ConsensusChainReader {
     ) -> impl Future<Output = eyre::Result<u64>> + Send;
 
     /// Rotate the current pack file to a new epoch.  The previous pack is
-    /// persisted and moved into the recent-packs cache before the new pack
-    /// is opened.
+    /// persisted before the new pack is opened, then evicted from the
+    /// recent-packs cache and sealed (later reads reopen it read-only).  A call
+    /// for the epoch of the current writable pack is a no-op that keeps it.
     fn new_epoch(
         &self,
         previous_epoch: EpochRecord,
@@ -163,8 +168,10 @@ pub trait ConsensusChainWriter: ConsensusChainReader {
     ) -> impl Future<Output = eyre::Result<()>> + Send;
 
     /// Import an epoch's pack file from a peer stream.  Returns once the
-    /// stream is fully consumed and the resulting pack file has been moved
-    /// into the canonical epoch directory.
+    /// stream is fully consumed and the resulting pack file has been sealed,
+    /// checked, and moved into the canonical epoch directory.  Returns `Ok`
+    /// early, without reading the stream, when the chain already holds the
+    /// record's final output or this process is already importing the epoch.
     fn stream_import<R: AsyncRead + Unpin + Send>(
         &self,
         stream: R,

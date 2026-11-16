@@ -6,13 +6,18 @@
 //! since validator RPC endpoints may be publicly reachable:
 //!
 //! - Transport: at most 500 concurrent connections (`--rpc.max-connections`), 15 MB request and 160
-//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), and 1024
-//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`). These cap memory held
-//!   per connection and the fan-out of websocket subscriptions.
+//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), 128 subscriptions
+//!   per WS or IPC connection (`--rpc.max-subscriptions-per-connection`) and 100 calls per batch
+//!   request (`--rpc.max-batch-requests`). These cap memory held per connection, the fan-out of
+//!   subscriptions, and how many calls one request can queue. The subscription limit also keeps one
+//!   connection to an eighth of the 1,024 pool listener slots of each kind that
+//!   `newPendingTransactions` subscriptions take.
 //! - Execution work: `eth_call`/tracing gas is capped (`--rpc.gascap`), concurrent tracing requests
 //!   default to a CPU-core-derived limit (`--rpc.max-tracing-requests`, tracing is CPU bound),
-//!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
-//!   count and a historical proof window.
+//!   `trace_filter`/log filters have block-scan windows, `eth_getProof` has a historical proof
+//!   window, and `eth_getProof`, `eth_simulateV1`, `eth_callMany` and `eth_callBundle` share a
+//!   permit count (`--rpc.proof-permits`). Each request of the last three keeps at most 32 MiB of
+//!   call output for its response, so those permits bound that memory too.
 //! - Spend: transactions submitted through this RPC are refused above a fee cap (`--rpc.txfeecap`,
 //!   in native-token units; 0 disables the cap). The default is 0: reth's 1.0 was calibrated for
 //!   ether, and 1.0 in TEL is too small a bound to separate honest fees from runaway ones, so the
@@ -35,15 +40,18 @@ use clap::{
     builder::{PossibleValue, RangedU64ValueParser, TypedValueParser},
     Arg, Args, Command,
 };
-use reth::{
-    args::{
-        types::{MaxOr, MaxU32, ZeroAsNoneU64},
-        RpcStateCacheArgs,
-    },
-    rpc::builder::{constants, RethRpcModule, RpcModuleSelection},
-};
 use reth_cli_util::parse_ether_value;
+use reth_node_core::args::{
+    types::{MaxOr, MaxU32, ZeroAsNoneU64},
+    RpcStateCacheArgs,
+};
+use reth_rpc_builder::{constants, RpcModuleSelection};
 use reth_rpc_eth_types::builder::config::PendingBlockKind;
+
+use crate::{
+    cli::SELECTABLE_MODULE_NAMES,
+    rpc_tx_forward::{parse_forward_targets, ForwardTargets},
+};
 
 /// The default IPC endpoint
 #[cfg(windows)]
@@ -53,8 +61,17 @@ pub const DEFAULT_IPC_ENDPOINT: &str = r"\\.\pipe\tn.ipc";
 #[cfg(not(windows))]
 pub const DEFAULT_IPC_ENDPOINT: &str = "/tmp/tn.ipc";
 
+/// The most permits a tokio semaphore can hold; a larger permit flag panics while the RPC
+/// server is built.
+const MAX_PERMITS: u64 = tokio::sync::Semaphore::MAX_PERMITS as u64;
+
 /// Default max number of subscriptions per connection.
-pub(crate) const RPC_DEFAULT_MAX_SUBS_PER_CONN: u32 = 1024;
+///
+/// An eighth of the pool's 1,024 listener slots of each kind
+/// (`reth_transaction_pool::MAX_RPC_TX_LISTENERS`), which every `newPendingTransactions`
+/// subscription takes one of: one connection cannot hold them all, and 128 is still far more
+/// than a dapp opens on one connection. reth's default is 1,024.
+pub(crate) const RPC_DEFAULT_MAX_SUBS_PER_CONN: u32 = 128;
 
 /// Default max request size in MB.
 pub(crate) const RPC_DEFAULT_MAX_REQUEST_SIZE_MB: u32 = 15;
@@ -90,9 +107,10 @@ pub struct RpcServerArgs {
 
     /// Rpc Modules to be configured for the HTTP server
     ///
-    /// `all` enables eth, net, web3, rpc; name debug and trace explicitly to enable them.
-    /// A list whose first entry is `all` parses as plain `all` and the rest is ignored, so
-    /// list every module by name instead.
+    /// `all`, or no flag, enables eth, net, web3, rpc, tn. An explicit list is served as
+    /// written, so include `tn` to keep the `tn_*` namespace, and `none` serves nothing. Name
+    /// debug and trace explicitly to enable them. A list whose first entry is `all` parses as
+    /// plain `all` and the rest is ignored, so list every module by name instead.
     #[arg(long = "http.api", value_parser = RpcModuleSelectionValueParser::default())]
     pub http_api: Option<RpcModuleSelection>,
 
@@ -118,9 +136,10 @@ pub struct RpcServerArgs {
 
     /// Rpc Modules to be configured for the WS server
     ///
-    /// `all` enables eth, net, web3, rpc; name debug and trace explicitly to enable them.
-    /// A list whose first entry is `all` parses as plain `all` and the rest is ignored, so
-    /// list every module by name instead.
+    /// `all`, or no flag, enables eth, net, web3, rpc, tn. An explicit list is served as
+    /// written, so include `tn` to keep the `tn_*` namespace, and `none` serves nothing. Name
+    /// debug and trace explicitly to enable them. A list whose first entry is `all` parses as
+    /// plain `all` and the rest is ignored, so list every module by name instead.
     #[arg(long = "ws.api", value_parser = RpcModuleSelectionValueParser::default())]
     pub ws_api: Option<RpcModuleSelection>,
 
@@ -128,7 +147,11 @@ pub struct RpcServerArgs {
     #[arg(long)]
     pub ipcdisable: bool,
 
-    /// Filename for IPC socket/pipe within the datadir
+    /// Path of the IPC socket (or named pipe on Windows).
+    ///
+    /// The path is host-global, not inside the datadir: `--instance N` appends `-N`, and each
+    /// worker above 0 appends `-wN`. A node refuses to start when another process is already
+    /// serving the socket; a stale socket file left by a crash is replaced.
     #[arg(long, default_value_t = DEFAULT_IPC_ENDPOINT.to_string())]
     pub ipcpath: String,
 
@@ -148,9 +171,34 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.max-response-size", alias = "rpc-max-response-size", visible_alias = "rpc.returndata.limit", default_value_t = RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into())]
     pub rpc_max_response_size: MaxU32,
 
-    /// Set the maximum concurrent subscriptions per connection.
+    /// Set the maximum concurrent subscriptions per WS or IPC connection.
+    ///
+    /// Each `newPendingTransactions` subscription takes one of the 1,024 listener slots of its
+    /// kind (transaction hashes or full transactions) on the worker's transaction pool; the
+    /// node's own listeners take a few. The default, 128, is an eighth of them, so one connection
+    /// cannot take them all. The slots stay first come across connections: a client with eight
+    /// connections can take them, and pending-transaction filters, which belong to no
+    /// connection, take the same slots bounded only by `--rpc.max-active-filters`.
     #[arg(long = "rpc.max-subscriptions-per-connection", alias = "rpc-max-subscriptions-per-connection", default_value_t = RPC_DEFAULT_MAX_SUBS_PER_CONN.into())]
     pub rpc_max_subscriptions_per_connection: MaxU32,
+
+    /// Maximum number of calls in one JSON-RPC batch request, on HTTP, WS and IPC.
+    ///
+    /// A larger batch is refused whole. Each call in a batch holds its parsed parameters until it
+    /// runs, so this bounds what one request can queue (vendored TN-0055).
+    #[arg(long = "rpc.max-batch-requests", value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..), default_value_t = constants::DEFAULT_MAX_BATCH_REQUESTS)]
+    pub rpc_max_batch_requests: u32,
+
+    /// Maximum number of installed filters (`eth_newFilter`, `eth_newBlockFilter`,
+    /// `eth_newPendingTransactionFilter`) on each worker's RPC server, across all its clients,
+    /// first come, first served.
+    ///
+    /// Filters outlive the connection that made them and are removed only when uninstalled or
+    /// left unpolled for five minutes, so this bounds what polling clients can hold (vendored
+    /// TN-0056). Each log filter names at most 1,000 addresses and 1,000 values per topic
+    /// position (vendored TN-0155).
+    #[arg(long = "rpc.max-active-filters", value_name = "COUNT", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), default_value_t = constants::DEFAULT_MAX_ACTIVE_FILTERS)]
+    pub rpc_max_active_filters: usize,
 
     /// Maximum number of RPC server connections.
     #[arg(long = "rpc.max-connections", alias = "rpc-max-connections", value_name = "COUNT", default_value_t = RPC_DEFAULT_MAX_CONNECTIONS.into())]
@@ -162,7 +210,10 @@ pub struct RpcServerArgs {
     /// Tracing requests are generally CPU bound.
     /// Choosing a value that is higher than the available CPU cores can have a negative impact on
     /// the performance of the node and affect the node's ability to maintain sync.
-    #[arg(long = "rpc.max-tracing-requests", alias = "rpc-max-tracing-requests", value_name = "COUNT", default_value_t = constants::default_max_tracing_requests())]
+    ///
+    /// At least 2: `trace_filter` takes two permits at once, so with one permit it would wait
+    /// forever holding the only one, and every other tracing method with it.
+    #[arg(long = "rpc.max-tracing-requests", alias = "rpc-max-tracing-requests", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(2..=MAX_PERMITS), default_value_t = constants::default_max_tracing_requests())]
     pub rpc_max_tracing_requests: usize,
 
     /// Maximum number of blocks for `trace_filter` requests.
@@ -216,8 +267,13 @@ pub struct RpcServerArgs {
     )]
     pub rpc_eth_proof_window: u64,
 
-    /// Maximum number of concurrent getproof requests.
-    #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", default_value_t = constants::DEFAULT_PROOF_PERMITS)]
+    /// Maximum number of concurrent `eth_getProof`, `eth_simulateV1`, `eth_callMany` and
+    /// `eth_callBundle` requests on each worker's RPC server, which share these permits. A request
+    /// keeps its permit until its work ends, even after its client disconnects. An
+    /// `eth_simulateV1`, `eth_callMany` or `eth_callBundle` request keeps at most 32 MiB of call
+    /// output for its response, so these permits also bound that memory: 32 MiB each. At least 1:
+    /// with none, every such request would wait forever.
+    #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", value_parser = RangedU64ValueParser::<usize>::new().range(1..=MAX_PERMITS), default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
 
     /// The pending block behavior for `pending`-tag RPC queries.
@@ -230,6 +286,30 @@ pub struct RpcServerArgs {
     /// [`BuildPendingEnv`]: reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv
     #[arg(long = "rpc.pending-block", default_value = "none", value_name = "KIND")]
     pub rpc_pending_block: PendingBlockKind,
+
+    /// Forward eth_sendRawTransaction(Sync) to these validator RPC targets instead of the local
+    /// pool.
+    ///
+    /// Ordered failover list: the next target is tried only on a transport failure (unreachable,
+    /// timeout, a non-2xx status other than 413, an oversized or malformed reply), never on a
+    /// JSON-RPC error reply. Accepts a URL, ip:port, a bare IPv6 address, [IPv6]:port, or
+    /// host[:port]; no scheme means http://, and no port means 8545 (a URL keeps its scheme's
+    /// default port). Reads and every other method are served locally. Targets are never shown
+    /// to clients.
+    #[arg(
+        long = "forward-txs",
+        value_name = "TARGET[,TARGET...]",
+        env = "TN_FORWARD_TXS",
+        hide_env_values = true,
+        value_parser = parse_forward_targets
+    )]
+    pub forward_txs: Option<ForwardTargets>,
+
+    /// Before forwarding, decode the transaction, recover its signer, and check the TN type
+    /// allowlist and chain id; reject locally with reth's errors. Off: bytes are forwarded
+    /// untouched.
+    #[arg(long = "sanitize-txs", requires = "forward_txs", default_value_t = false)]
+    pub sanitize_txs: bool,
 
     /// State cache configuration.
     #[command(flatten)]
@@ -257,6 +337,8 @@ impl Default for RpcServerArgs {
             rpc_max_response_size: RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into(),
             rpc_max_subscriptions_per_connection: RPC_DEFAULT_MAX_SUBS_PER_CONN.into(),
             rpc_max_connections: RPC_DEFAULT_MAX_CONNECTIONS.into(),
+            rpc_max_batch_requests: constants::DEFAULT_MAX_BATCH_REQUESTS,
+            rpc_max_active_filters: constants::DEFAULT_MAX_ACTIVE_FILTERS,
             rpc_max_tracing_requests: constants::default_max_tracing_requests(),
             rpc_max_trace_filter_blocks: constants::DEFAULT_MAX_TRACE_FILTER_BLOCKS,
             rpc_max_blocks_per_filter: constants::DEFAULT_MAX_BLOCKS_PER_FILTER.into(),
@@ -266,15 +348,20 @@ impl Default for RpcServerArgs {
             rpc_max_simulate_blocks: constants::DEFAULT_MAX_SIMULATE_BLOCKS,
             rpc_eth_proof_window: constants::DEFAULT_ETH_PROOF_WINDOW,
             rpc_pending_block: PendingBlockKind::None,
+            forward_txs: None,
+            sanitize_txs: false,
             rpc_state_cache: RpcStateCacheArgs::default(),
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
         }
     }
 }
 
-impl From<RpcServerArgs> for reth::args::RpcServerArgs {
+/// `forward_txs` and `sanitize_txs` are TN-only and have no reth counterpart: they travel
+/// through `TxForwardConfig`, which `RethConfig::new` takes out of the args before this
+/// conversion.
+impl From<RpcServerArgs> for reth_node_core::args::RpcServerArgs {
     fn from(v: RpcServerArgs) -> Self {
-        reth::args::RpcServerArgs {
+        reth_node_core::args::RpcServerArgs {
             http: v.http,
             http_addr: v.http_addr,
             http_port: v.http_port,
@@ -293,6 +380,8 @@ impl From<RpcServerArgs> for reth::args::RpcServerArgs {
             rpc_max_response_size: v.rpc_max_response_size,
             rpc_max_subscriptions_per_connection: v.rpc_max_subscriptions_per_connection,
             rpc_max_connections: v.rpc_max_connections,
+            rpc_max_batch_requests: v.rpc_max_batch_requests,
+            rpc_max_active_filters: v.rpc_max_active_filters,
             rpc_max_tracing_requests: v.rpc_max_tracing_requests,
             rpc_max_trace_filter_blocks: v.rpc_max_trace_filter_blocks,
             rpc_max_blocks_per_filter: v.rpc_max_blocks_per_filter,
@@ -327,7 +416,7 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
             value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
         val.parse::<RpcModuleSelection>().map_err(|err| {
             let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
-            let possible_values = RethRpcModule::all_variant_names().to_vec().join(",");
+            let possible_values = SELECTABLE_MODULE_NAMES.join(",");
             let msg = format!(
                 "Invalid value '{val}' for {arg}: {err}.\n    [possible values: {possible_values}]"
             );
@@ -336,7 +425,7 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
     }
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
-        let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
+        let values = SELECTABLE_MODULE_NAMES.iter().map(PossibleValue::new);
         Some(Box::new(values))
     }
 }
@@ -346,7 +435,37 @@ mod tests {
     use super::*;
     use crate::cli::RethCommand;
     use clap::Parser;
-    use reth::rpc::builder::config::RethRpcServerConfig as _;
+    use reth_rpc_builder::config::RethRpcServerConfig as _;
+
+    /// A permit count the semaphores cannot serve is refused at parse time: zero permits (or
+    /// one for tracing, which `trace_filter` needs two of) would hang the methods behind
+    /// them, and a count above tokio's maximum panics while the RPC server is built.
+    #[test]
+    fn permit_flags_are_bounded() {
+        let parse = |flag: &str, value: &str| {
+            RethCommand::try_parse_from(["tn-reth", flag, value]).map(|cmd| cmd.rpc)
+        };
+        let too_many = (MAX_PERMITS + 1).to_string();
+
+        assert!(parse("--rpc.max-tracing-requests", "0").is_err());
+        assert!(parse("--rpc.max-tracing-requests", "1").is_err());
+        assert!(parse("--rpc.max-tracing-requests", &too_many).is_err());
+        assert_eq!(parse("--rpc.max-tracing-requests", "2").unwrap().rpc_max_tracing_requests, 2);
+
+        assert!(parse("--rpc.proof-permits", "0").is_err());
+        assert!(parse("--rpc.proof-permits", &too_many).is_err());
+        assert_eq!(parse("--rpc.proof-permits", "1").unwrap().rpc_proof_permits, 1);
+
+        assert!(parse("--rpc-cache.max-concurrent-db-requests", "0").is_err());
+        assert!(parse("--rpc-cache.max-concurrent-db-requests", &too_many).is_err());
+        assert_eq!(
+            parse("--rpc-cache.max-concurrent-db-requests", "1")
+                .unwrap()
+                .rpc_state_cache
+                .max_concurrent_db_requests,
+            1
+        );
+    }
 
     /// The manual `Default` impl and the clap CLI default must agree on TN's own
     /// IPC endpoint, not reth's `/tmp/reth.ipc`.
@@ -391,8 +510,72 @@ mod tests {
 
         let full = RethCommand::try_parse_from(["tn-reth", "--rpc.pending-block", "full"])?;
         assert_eq!(full.rpc.rpc_pending_block, PendingBlockKind::Full);
-        let config = reth::args::RpcServerArgs::from(full.rpc).eth_config();
+        let config = reth_node_core::args::RpcServerArgs::from(full.rpc).eth_config();
         assert_eq!(config.pending_block_kind, PendingBlockKind::Full);
         Ok(())
+    }
+
+    /// Forwarding is off unless asked for: a bare parse and the manual `Default` agree on no
+    /// targets and no sanitizing, and an explicit list parses into the ordered targets.
+    #[test]
+    fn cli_forward_txs_defaults_disabled_and_matches_default_impl() -> eyre::Result<()> {
+        let parsed = RethCommand::try_parse_from(["tn-reth"])?;
+        assert_eq!(parsed.rpc.forward_txs, None);
+        assert!(!parsed.rpc.sanitize_txs);
+        assert_eq!(parsed.rpc.forward_txs, RpcServerArgs::default().forward_txs);
+        assert_eq!(parsed.rpc.sanitize_txs, RpcServerArgs::default().sanitize_txs);
+
+        let parsed = RethCommand::try_parse_from([
+            "tn-reth",
+            "--forward-txs",
+            "10.0.0.1:8545,https://validator.example.com",
+            "--sanitize-txs",
+        ])?;
+        let expected = parse_forward_targets("10.0.0.1:8545,https://validator.example.com")?;
+        assert_eq!(parsed.rpc.forward_txs, Some(expected));
+        assert!(parsed.rpc.sanitize_txs);
+        Ok(())
+    }
+
+    /// `--sanitize-txs` only means something on a forwarding node, so it needs `--forward-txs`.
+    #[test]
+    fn cli_sanitize_txs_requires_forward_txs() {
+        let err = RethCommand::try_parse_from(["tn-reth", "--sanitize-txs"])
+            .expect_err("--sanitize-txs without --forward-txs is refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// The list is one value: a second `--forward-txs` is an error rather than a silent
+    /// replacement or append, and a bad entry fails the parse instead of being skipped.
+    #[test]
+    fn cli_forward_txs_rejects_repeated_flag() {
+        let err = RethCommand::try_parse_from([
+            "tn-reth",
+            "--forward-txs",
+            "10.0.0.1",
+            "--forward-txs",
+            "10.0.0.2",
+        ])
+        .expect_err("a repeated --forward-txs is refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = RethCommand::try_parse_from(["tn-reth", "--forward-txs", "10.0.0.1,10.0.0.1"])
+            .expect_err("duplicate targets are refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// `TN_FORWARD_TXS` supplies the list, which keeps the private targets out of the process
+    /// command line, and `--help` never prints its value. Checked on the clap definition rather
+    /// than by setting the variable, which would leak into parses running on other threads.
+    #[test]
+    fn cli_forward_txs_reads_env_var() {
+        use clap::CommandFactory as _;
+        let command = RethCommand::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "forward_txs")
+            .expect("--forward-txs is registered");
+        assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new("TN_FORWARD_TXS")));
+        assert!(arg.is_hide_env_values_set(), "--help must not print the target list");
     }
 }

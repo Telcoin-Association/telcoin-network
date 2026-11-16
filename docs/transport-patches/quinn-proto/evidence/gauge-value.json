@@ -1,0 +1,16 @@
+{
+  "source_sha256": "697dc2b7f74c6057cfbb95c6cdebe58d45e4e772ea0d54866b42aea64c9efaf1",
+  "fixture_sha256": "a68813658292df953d9ad0699b3eca20af4624c15a5455d6180ab7552ce6f4bd",
+  "results": [
+    {
+      "variant": "original",
+      "exit_code": 0,
+      "assertion_failed": false
+    },
+    {
+      "variant": "mutant",
+      "exit_code": 101,
+      "assertion_failed": true
+    }
+  ]
+}

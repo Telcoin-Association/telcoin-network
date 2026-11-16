@@ -12,6 +12,7 @@ use generate::GenerateKeys;
 use std::path::{Path, PathBuf};
 use tn_config::{create_keys_dir, TelcoinDirs as _};
 use tracing::warn;
+use zeroize::Zeroizing;
 
 /// Generate keypairs and node info to go with them and save them to a file.
 #[derive(Debug, Args)]
@@ -43,7 +44,11 @@ pub enum KeySubcommand {
 
 impl KeyArgs {
     /// Execute command
-    pub fn execute(&self, datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
+    pub fn execute(
+        &self,
+        datadir: PathBuf,
+        passphrase: Option<Zeroizing<String>>,
+    ) -> eyre::Result<()> {
         match &self.command {
             // generate keys
             KeySubcommand::Generate(args) => match &args.node_type {
@@ -72,11 +77,11 @@ impl KeyArgs {
     /// Test-only twin of [`Self::execute`]: `generate validator|observer` wrap the fresh BLS
     /// key with an intentionally weak PBKDF2 round count; every other subcommand never writes
     /// keys and behaves exactly like [`Self::execute`]. NEVER call this outside tests.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn execute_insecure(
         &self,
         datadir: PathBuf,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         rounds: u32,
     ) -> eyre::Result<()> {
         if let KeySubcommand::Generate(args) = &self.command {
@@ -138,15 +143,23 @@ impl KeyArgs {
 mod tests {
     use super::{
         export_staking_args::ExportStakingArgs, generate::KeygenArgs, pop::PopArgs,
-        set_rpc::SetRpcArgs,
+        set_rpc::SetRpcArgs, KeyArgs,
     };
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
     use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo};
     use tn_types::{
-        hex, verify_proof_of_possession_bls, Address, BlsPublicKey, RpcInfo, DEFAULT_WORKER_ID,
+        hex, test_utils::CommandParser, verify_proof_of_possession_bls, Address, BlsPublicKey,
+        RpcInfo, DEFAULT_WORKER_ID,
     };
     use url::Url;
+    use zeroize::Zeroizing;
+
+    /// PBKDF2 rounds for tests that do not pin the BLS key-wrap work factor.
+    ///
+    /// Must stay 1: the keyfile does not store its round count, and the loader tries only
+    /// 1 round and then the production count.
+    const TEST_KDF_ROUNDS: u32 = 1;
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -171,8 +184,10 @@ mod tests {
         ])
         .expect("cli parsed");
 
-        tn.run(Some("gen_keys_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
-            .expect("generate keys command");
+        tn.run(Some(Zeroizing::new("gen_keys_test".to_string())), |_, _, _, _, _| {
+            tokio::spawn(async { Ok(()) })
+        })
+        .expect("generate keys command");
 
         Config::load_from_path_or_default::<NodeInfo>(
             temp_path.join("node-info.yaml").as_path(),
@@ -216,12 +231,12 @@ mod tests {
             "ftp://127.0.0.1:8545",
         ])
         .expect("cli parsed");
-        let run = tn.run(Some("abort_mode_test".to_string()), |_, _, _, _, _| {
+        let run = tn.run(Some(Zeroizing::new("abort_mode_test".to_string())), |_, _, _, _, _| {
             tokio::spawn(async { Ok(()) })
         });
         assert!(run.is_err(), "an invalid worker RPC scheme must abort key generation");
         assert!(
-            !KeyConfig::keys_exist(&temp_path.to_path_buf()),
+            !KeyConfig::keys_exist(&temp_path.to_path_buf()).expect("keys dir readable"),
             "no keys may be written on the aborted run"
         );
 
@@ -241,6 +256,10 @@ mod tests {
     /// library's owner-only directory mode into a no-op for every fresh CLI install. The
     /// pre-created case seeds an explicit 0755 (an older build's layout, or a packaging
     /// script's mkdir), so the check does not depend on the ambient umask.
+    ///
+    /// The keytool path is the same as `generate validator` (`init_path`, then the key
+    /// writer), but the BLS key is wrapped with the test KDF: this test pins the directory
+    /// mode, not the work factor.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_keytool_generate_key_dir_is_owner_only() {
@@ -257,23 +276,24 @@ mod tests {
                     .expect("loosen keys dir");
             }
 
-            let tn = Cli::<NoArgs>::try_parse_from([
-                "telcoin-network",
-                "keytool",
+            let keys_command = CommandParser::<KeyArgs>::try_parse_from([
+                "tn",
                 "generate",
                 "validator",
                 "--workers",
                 "1",
-                "--datadir",
-                temp_path.to_str().expect("tempdir path clean"),
                 "--address",
                 "0",
             ])
             .expect("cli parsed");
-            tn.run(Some("key_dir_mode_test".to_string()), |_, _, _, _, _| {
-                tokio::spawn(async { Ok(()) })
-            })
-            .expect("generate keys command");
+            keys_command
+                .args
+                .execute_insecure(
+                    temp_path.to_path_buf(),
+                    Some(Zeroizing::new("key_dir_mode_test".to_string())),
+                    TEST_KDF_ROUNDS,
+                )
+                .expect("generate keys command");
 
             let mode = std::fs::metadata(&keys_dir).expect("keys dir").permissions().mode();
             assert_eq!(
@@ -305,8 +325,10 @@ mod tests {
             "0",
         ])
         .expect("cli parsed");
-        tn.run(Some("export_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
-            .expect("generate keys command");
+        tn.run(Some(Zeroizing::new("export_test".to_string())), |_, _, _, _, _| {
+            tokio::spawn(async { Ok(()) })
+        })
+        .expect("generate keys command");
 
         // load node info and verify byte lengths directly
         let node_info = Config::load_from_path::<NodeInfo>(
@@ -367,8 +389,10 @@ mod tests {
             "0",
         ])
         .expect("cli parsed");
-        tn.run(Some("calldata_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
-            .expect("generate keys command");
+        tn.run(Some(Zeroizing::new("calldata_test".to_string())), |_, _, _, _, _| {
+            tokio::spawn(async { Ok(()) })
+        })
+        .expect("generate keys command");
 
         let args =
             ExportStakingArgs { node_info: temp_path.to_path_buf(), json: false, calldata: true };
@@ -457,6 +481,48 @@ mod tests {
             Some(&RpcInfo { http, ws: None })
         );
         assert!(info.p2p_info.worker(1).is_some_and(|worker| worker.rpc.is_none()));
+        Ok(())
+    }
+
+    /// The listen addresses (without the peer ID) of the primary and every worker that
+    /// `keytool generate` wrote to `datadir`.
+    fn generated_listen_addresses(
+        datadir: &std::path::Path,
+    ) -> eyre::Result<Vec<tn_types::Multiaddr>> {
+        Config::load_from_path(datadir.join("node-info.yaml"), ConfigFmt::YAML).map(
+            |info: NodeInfo| {
+                std::iter::once(&info.p2p_info.primary)
+                    .chain(info.p2p_info.workers.iter())
+                    .map(|node| {
+                        node.network_address
+                            .iter()
+                            .filter(|protocol| !matches!(protocol, tn_types::Protocol::P2p(_)))
+                            .collect()
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// Validators that one process generates never share a UDP listen port. The e2e harness
+    /// generates all of its validators in one process, and a shared port makes one node fail
+    /// to bind at startup (`Address already in use`).
+    #[tokio::test]
+    async fn test_generate_validators_get_distinct_udp_ports() -> eyre::Result<()> {
+        let tempdirs = (0..4).map(|_| tempfile::TempDir::new()).collect::<Result<Vec<_>, _>>()?;
+        let datadirs: Vec<std::path::PathBuf> =
+            tempdirs.iter().map(|dir| dir.path().to_path_buf()).collect();
+        datadirs.iter().try_for_each(|datadir| {
+            KeygenArgs { workers: 2, ..keygen_args(None) }.execute(datadir, None)
+        })?;
+        let listeners = datadirs
+            .iter()
+            .map(|datadir| generated_listen_addresses(datadir))
+            .collect::<eyre::Result<Vec<_>>>()?
+            .concat();
+        let distinct: std::collections::HashSet<&tn_types::Multiaddr> = listeners.iter().collect();
+        assert_eq!(listeners.len(), 12, "4 validators with a primary and 2 workers each");
+        assert_eq!(distinct.len(), listeners.len(), "every listen socket must be distinct");
         Ok(())
     }
 
@@ -904,15 +970,16 @@ mod tests {
     /// generate keys (which would be wrong and destructive).
     #[tokio::test]
     async fn test_generate_pop_wrong_passphrase_hint() {
-        // Generate an encrypted keyfile (bls.kw) with the correct passphrase.
+        // Generate an encrypted keyfile (bls.kw) with the correct passphrase. The test KDF
+        // is enough: the assert is on the error text, not on the work factor.
         let dir = tempfile::TempDir::new().expect("tempdir created");
         let path = dir.path().to_path_buf();
         keygen_args(None)
-            .execute(&path, Some("correct".to_string()))
+            .execute_insecure(&path, Some(Zeroizing::new("correct".to_string())), TEST_KDF_ROUNDS)
             .expect("generate keys with passphrase");
 
         let err = PopArgs { address: new_test_address() }
-            .execute(&path, Some("wrong".to_string()))
+            .execute(&path, Some(Zeroizing::new("wrong".to_string())))
             .expect_err("generate pop must error on a wrong passphrase");
         let msg = format!("{err:#}");
         assert!(msg.contains("passphrase"), "hint should mention the passphrase, got: {msg}");
@@ -1209,6 +1276,80 @@ mod tests {
                 assert!(keytool.needs_passphrase(), "generate pop must require the BLS passphrase")
             }
             _ => panic!("expected a keytool command"),
+        }
+    }
+
+    /// A passphrase against a cleartext-only key dir is refused rather than silently ignored, and
+    /// `generate pop` points the operator at the passphrase source that loads a cleartext key.
+    #[tokio::test]
+    async fn test_generate_pop_cleartext_key_with_passphrase_hint() {
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None).execute(&path, None).expect("generate cleartext keys");
+
+        let err = PopArgs { address: new_test_address() }
+            .execute(&path, Some(Zeroizing::new("unused".to_string())))
+            .expect_err("a passphrase must not load the cleartext key");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to load the cleartext bls.key"), "got: {msg}");
+        assert!(msg.contains("--bls-passphrase-source no-passphrase"), "got: {msg}");
+        assert!(!msg.contains("generate keys first"), "got: {msg}");
+
+        PopArgs { address: new_test_address() }
+            .execute(&path, None)
+            .expect("the cleartext key loads without a passphrase");
+    }
+
+    /// An encrypted-only key dir read without a passphrase names the encrypted file and points
+    /// at the passphrase source, not at a wrong passphrase or at key generation.
+    #[tokio::test]
+    async fn test_generate_pop_encrypted_key_without_passphrase_hint() {
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None)
+            .execute(&path, Some(Zeroizing::new("correct".to_string())))
+            .expect("generate keys with passphrase");
+
+        let err = PopArgs { address: new_test_address() }
+            .execute(&path, None)
+            .expect_err("the encrypted key needs its passphrase");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bls.kw"), "got: {msg}");
+        assert!(msg.contains("--bls-passphrase-source"), "got: {msg}");
+        assert!(!msg.contains("verify the BLS passphrase is correct"), "got: {msg}");
+        assert!(!msg.contains("generate keys first"), "got: {msg}");
+    }
+
+    /// When `node-keys/` cannot be searched, `generate pop` points at the directory's access
+    /// rather than saying that no keys exist and should be generated, with or without a
+    /// passphrase.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_generate_pop_unsearchable_keys_dir_hint() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tn_config::TelcoinDirs as _;
+
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None).execute(&path, None).expect("generate cleartext keys");
+        let keys_dir = path.node_keys_path();
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("lock keys dir");
+        // root reads through a mode 000 directory, so there is nothing to check as root
+        let locked = std::fs::exists(keys_dir.join(tn_config::BLS_KEYFILE)).is_err();
+        let results = [None, Some(Zeroizing::new("unused".to_string()))]
+            .map(|passphrase| PopArgs { address: new_test_address() }.execute(&path, passphrase));
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock keys dir");
+        if !locked {
+            return;
+        }
+        for result in results {
+            let msg = format!("{:#}", result.expect_err("unsearchable keys dir"));
+            assert!(msg.contains("cannot check key file"), "got: {msg}");
+            assert!(msg.contains("owner and permissions"), "got: {msg}");
+            assert!(!msg.contains("no BLS keys found"), "got: {msg}");
+            assert!(!msg.contains("generate keys first"), "got: {msg}");
         }
     }
 }

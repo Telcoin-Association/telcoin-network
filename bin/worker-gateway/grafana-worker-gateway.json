@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Telcoin Network worker gateway metrics: traffic, rejections, latency, upstream readiness, and process resource use. Scraped from the gateway's --metrics endpoint; node/instance labels are attached externally by the collector.",
+  "description": "Telcoin Network worker gateway metrics: traffic, rejections, latency, upstream readiness, and process resource use. Scraped from the gateway's --metrics endpoint. Every panel is scoped to the Prometheus job picked in the Job variable, so the process panels do not also draw a node scraped by the same Prometheus; per-replica panels tell the gateways apart by the instance label the collector attaches.",
   "editable": true,
   "graphTooltip": 1,
   "links": [],
@@ -25,7 +25,7 @@
       "title": "Request rate by outcome",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -37,9 +37,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "sum by (outcome) (rate(tn_worker_gateway_requests_total[5m]))",
+          "expr": "sum by (outcome) (rate(tn_worker_gateway_requests_total{job=\"$job\"}[5m]))",
           "refId": "A",
           "legendFormat": "{{outcome}}"
         }
@@ -52,7 +52,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Proxied requests per second split by terminal outcome (forwarded vs rejected)."
+      "description": "Proxied requests per second split by terminal outcome: forwarded, rejected, upstream_error (an upstream error status without a JSON body), or cancelled (the connection closed before the gateway answered: a client disconnect, --max-connection-duration or shutdown)."
     },
     {
       "id": 3,
@@ -60,7 +60,7 @@
       "title": "In-flight requests (autoscaling signal)",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -72,11 +72,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "tn_worker_gateway_inflight_requests",
+          "expr": "tn_worker_gateway_inflight_requests{job=\"$job\"}",
           "refId": "A",
-          "legendFormat": "in-flight"
+          "legendFormat": "in-flight {{instance}}"
         }
       ],
       "fieldConfig": {
@@ -87,7 +87,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Concurrent proxied requests in flight. This is the gauge the HorizontalPodAutoscaler targets."
+      "description": "Concurrent proxied requests in flight, a relayed response counting until its body has finished streaming. The reference HorizontalPodAutoscaler targets this gauge for read load and the Worker requests in flight gauge (tn_worker_gateway_upstream_inflight) for submission load."
     },
     {
       "id": 4,
@@ -107,7 +107,7 @@
       "title": "Rejections by reason",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -119,9 +119,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "sum by (reason) (rate(tn_worker_gateway_rejections_total[5m]))",
+          "expr": "sum by (reason) (rate(tn_worker_gateway_rejections_total{job=\"$job\"}[5m]))",
           "refId": "A",
           "legendFormat": "{{reason}}"
         }
@@ -140,7 +140,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Rejected requests per second by reason (no_upstream_ready, upstream_unreachable, upstream_timeout, request_too_large, loop_detected, request_timeout, rate_limited, invalid_transaction, unsupported_transaction_type, unreadable_body)."
+      "description": "Rejected and upstream-error requests per second by reason. The panel plots every reason label the gateway emits; the worker-gateway README's \"Behaviour on failure\" table lists them and what each means."
     },
     {
       "id": 6,
@@ -148,7 +148,7 @@
       "title": "Reject ratio",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -160,9 +160,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "sum(rate(tn_worker_gateway_requests_total{outcome=\"rejected\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total[5m])), 1)",
+          "expr": "sum(rate(tn_worker_gateway_requests_total{job=\"$job\",outcome=~\"rejected|upstream_error\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total{job=\"$job\"}[5m])), 1e-9)",
           "refId": "A",
           "legendFormat": "reject ratio"
         }
@@ -183,7 +183,7 @@
           ]
         }
       },
-      "description": "Fraction of proxied requests rejected. Denominator is clamped to >= 1 req/s so the ratio reads 0 (not NaN) when there is no traffic."
+      "description": "Fraction of proxied requests rejected by the gateway or answered with an upstream error status without a JSON body. The clamp on the denominator only avoids a division by zero, so the ratio reads 0 (not NaN) when there is no traffic and is exact at any traffic level. The denominator counts every outcome, cancelled requests included."
     },
     {
       "id": 7,
@@ -203,7 +203,7 @@
       "title": "Request duration p50/p90/p99",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -215,27 +215,27 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket{job=\"$job\"}[5m])))",
           "refId": "A",
           "legendFormat": "p50"
         },
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.9, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket{job=\"$job\"}[5m])))",
           "refId": "B",
           "legendFormat": "p90"
         },
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket{job=\"$job\"}[5m])))",
           "refId": "C",
           "legendFormat": "p99"
         }
@@ -248,7 +248,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "End-to-end proxied-request latency quantiles derived from the request duration histogram."
+      "description": "Proxied-request latency quantiles from the request duration histogram, timed from the buffered request body to the end of the response body streamed to the client (or the gateway's own error). Not end-to-end: the request body read and rate-limited requests are left out. The histogram's top finite bucket is 30 s, so p99 cannot show values between 30 s and the 45 s request deadline (--upstream-request-timeout 35 s + --header-read-timeout 10 s): a quantile above 30 s reads as 30 s."
     },
     {
       "id": 9,
@@ -268,7 +268,7 @@
       "title": "Upstream readiness",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -280,11 +280,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "tn_worker_gateway_upstream_ready",
+          "expr": "tn_worker_gateway_upstream_ready{job=\"$job\"}",
           "refId": "A",
-          "legendFormat": "worker {{worker_id}}"
+          "legendFormat": "worker {{worker_id}} @ {{upstream}} ({{instance}})"
         }
       ],
       "fieldConfig": {
@@ -296,7 +296,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Per-worker upstream readiness (1 ready / 0 not ready). No worker at 1 means /ready returns 503 and requests reject with no_upstream_ready."
+      "description": "Per-worker upstream readiness (1 ready / 0 not ready), one series per worker id and upstream RPC origin. No worker at 1 means /ready returns 503 and requests reject with no_upstream_ready."
     },
     {
       "id": 11,
@@ -316,7 +316,7 @@
       "title": "CPU",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -328,11 +328,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "rate(reth_process_cpu_seconds_total[5m])",
+          "expr": "rate(reth_process_cpu_seconds_total{job=\"$job\"}[5m])",
           "refId": "A",
-          "legendFormat": "cpu cores"
+          "legendFormat": "cpu cores {{instance}}"
         }
       ],
       "fieldConfig": {
@@ -351,7 +351,7 @@
       "title": "Resident memory",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -363,11 +363,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "reth_process_resident_memory_bytes",
+          "expr": "reth_process_resident_memory_bytes{job=\"$job\"}",
           "refId": "A",
-          "legendFormat": "rss"
+          "legendFormat": "rss {{instance}}"
         }
       ],
       "fieldConfig": {
@@ -379,6 +379,298 @@
       },
       "options": {},
       "description": "Resident set size of the gateway process. From the shared recorder's process metrics."
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "Saturation",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 45
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Worker requests in flight",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "tn_worker_gateway_upstream_inflight{job=\"$job\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Requests each gateway is forwarding to a worker right now, against its --max-upstream-inflight cap (100 worker slots by default; the reference manifest sets 45). A replica at its cap answers further requests for the worker at once with a 503 overload error."
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Class slots in flight by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (route) (tn_worker_gateway_route_inflight{job=\"$job\"})",
+          "refId": "A",
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Requests holding a slot on their class's in-flight cap, by route (submission or query), summed over the selected job's replicas. Each gateway caps submissions at --max-inflight-submissions and every other request at --max-inflight-queries (256 each by default; without --redirect-queries the query cap is lowered below --max-upstream-inflight); a request over its class's cap is answered at once with a 503 overload error."
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "In-flight request bytes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "tn_worker_gateway_inflight_request_bytes{job=\"$job\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Request-body bytes each gateway holds against its in-flight byte budget (--max-inflight-request-bytes, 512 MiB by default): what admitted requests reserved before their bodies were read, until they are forwarded or rejected. A request that does not fit is refused with 503 / -32010 (reason inflight_bytes_exhausted)."
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Connections refused by reason",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason) (rate(tn_worker_gateway_connections_refused_total{job=\"$job\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Inbound connections closed at accept without being served, per second, by reason: per_ip_cap (the client's prefix already held --max-connections-per-ip connections, 32 per prefix by default) or proxy_header (a --proxy-protocol peer's PROXY header was missing, malformed or late). These connections never reach the request counters, so no other panel shows them."
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Forward attempts by route and result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 62
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (route, result) (rate(tn_worker_gateway_routed_requests_total{job=\"$job\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{route}} {{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Forward attempts per second by route (worker or query) and result (forwarded, upstream_error, unreachable, timeout, or body_failed for a forwarded response whose body then failed mid-stream). Shows which upstream is failing when the reject ratio rises."
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Upstream DNS resolutions by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 62
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (result) (rate(tn_worker_gateway_dns_lookups_total{job=\"$job\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Name resolutions per second by the upstream clients' caching resolvers, by result: hit (answered from the cache), miss (a lookup was started), error (a started lookup failed) or rejected (a lookup was needed but every lookup slot was busy)."
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Mixed batches sent to the query upstream",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(tn_worker_gateway_mixed_batches_total{job=\"$job\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "mixed batches"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Batches per second sent whole to the query upstream because they mixed transaction submissions with other calls, so their submissions went to the query upstream instead of the worker. This is the evidence for or against the deferred split-and-merge of mixed batches (#1611): a flat zero means clients do not send them."
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Open client connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "tn_worker_gateway_open_connections{job=\"$job\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Client-listener connections holding a --max-connections slot, per gateway. Compared with --max-connections (500 by default), a flat line at the cap means new connections are waiting in the kernel's accept backlog."
     }
   ],
   "refresh": "30s",
@@ -388,7 +680,45 @@
     "worker-gateway"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(tn_worker_gateway_upstream_ready, job)",
+          "refId": "job"
+        },
+        "definition": "label_values(tn_worker_gateway_upstream_ready, job)",
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1
+      }
+    ]
   },
   "time": {
     "from": "now-1h",
