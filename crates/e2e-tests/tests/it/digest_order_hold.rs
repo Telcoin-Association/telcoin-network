@@ -14,9 +14,10 @@
 //! its next header: what a far validator sees on a fleet. [`SLOWED`] executes every output with
 //! batches late (the engine's execution-delay hook), so execution is uneven across the fleet and
 //! the execution block each header names follows a quorum, not the fastest node. Senders spread
-//! over all four validators submit consecutive nonces, up to [`WINDOW`] unexecuted each, and never
-//! send an accepted transaction again; the load runs across epoch boundaries. At the end every
-//! node's chain is walked block by block.
+//! over all four validators submit consecutive nonces in bursts of [`WINDOW`], each burst once the
+//! last one has executed and the sender's offset ([`STAGGER`]) has passed, and never send an
+//! accepted transaction again; the load runs across epoch boundaries. At the end every node's
+//! chain is walked block by block.
 
 use super::{
     common::{
@@ -70,11 +71,28 @@ const GC_DEPTH: u32 = 50;
 /// Senders per validator.
 const SENDERS_PER_NODE: usize = 6;
 
-/// The most transactions a sender has accepted and not yet executed: enough that one sender's
-/// transactions spread over several batches of the same worker, and that the hooked node's
-/// senders keep sending while its lane is held (with 16 their windows filled during a held
-/// stretch, no batch arrived to be held, and `tn_primary_headers_held_total` stayed 0).
+/// Transactions a sender submits in one burst, back to back. A burst usually fills one batch; when
+/// a build starts while it is still arriving, the rest follows in batches built right after, so
+/// one sender's consecutive nonces sit in several batches of the same worker.
+///
+/// A sender's next burst waits until the last one has executed: a validator's pool queues a
+/// sender's transactions behind a nonce gap while the sender's last batch is sealed and not yet
+/// executed (each insertion resets the pool's view of the sender to its executed nonce), so what a
+/// sender submits after its batch is sealed waits for that batch to execute, however it is paced.
 const WINDOW: u64 = 48;
+
+/// How much later than the one before it each of a validator's senders starts a burst once its
+/// last one has executed: sender `i` waits `i` steps, so the [`SENDERS_PER_NODE`] senders spread
+/// over 1.5 s, more than a round at [`PRODUCTION_CADENCE`].
+///
+/// Senders that start together share one batch, and while that batch's header holds the hooked
+/// node's lane, none of them can get a transaction into a new batch (see [`WINDOW`]), so no digest
+/// arrives to be held. With every sender in step, `tn_primary_headers_held_total` stayed 0; it
+/// also stayed 0 with each sender paced to a transaction every 100 ms, because the pool queued
+/// the paced transactions until the last batch executed and then released every sender's at
+/// once. Staggered, the bursts land in different batches and headers, so senders whose batch is
+/// not in the held header send during the held stretch and their batches are held.
+const STAGGER: Duration = Duration::from_millis(300);
 
 /// Gas price of every transfer, in wei.
 const GAS_PRICE: u128 = 1_000;
@@ -437,21 +455,27 @@ fn kill_and_restart(fleet: &mut Fleet, load: &HoldLoad) -> eyre::Result<(Counter
     Ok((run0, KillSeen { accepted_at_kill, down_at, back_at, back_epoch, active_epoch }))
 }
 
-/// One load sender: the word its key derives from and the validator it submits to.
+/// One load sender: the word its key derives from, the validator it submits to and its offset.
 #[derive(Clone, Debug)]
 struct Sender {
     /// The key word ([`get_key`], [`address_from_word`]).
     word: String,
     /// Index of the validator it submits to.
     target: usize,
+    /// How long it waits before each burst once its last one executed: [`STAGGER`] times its index
+    /// among the validator's senders.
+    offset: Duration,
 }
 
 /// Every sender, [`SENDERS_PER_NODE`] per validator.
 fn senders() -> Vec<Sender> {
     (0..4)
         .flat_map(|target| {
-            (0..SENDERS_PER_NODE)
-                .map(move |i| Sender { word: format!("hd4b-sender-{target}-{i}"), target })
+            (0u32..).take(SENDERS_PER_NODE).map(move |i| Sender {
+                word: format!("hd4b-sender-{target}-{i}"),
+                target,
+                offset: STAGGER * i,
+            })
         })
         .collect()
 }
@@ -512,6 +536,7 @@ impl HoldLoad {
             states.push(Arc::clone(&state));
             tasks.push(runtime.spawn(run_sender(
                 sender.word,
+                sender.offset,
                 clients[sender.target].clone(),
                 state,
                 Arc::clone(&stop),
@@ -568,10 +593,12 @@ impl Drop for HoldLoad {
     }
 }
 
-/// One sender: sign the next nonce once it has fewer than [`WINDOW`] unexecuted, submit the bytes
-/// until a node accepts them, repeat until `stop`. An accepted transaction is never sent again.
+/// One sender: wait until every transaction it sent has executed on its validator, then its
+/// `offset`, then submit a burst of [`WINDOW`] consecutive nonces, each sent until a node accepts
+/// it; repeat until `stop`. An accepted transaction is never sent again.
 async fn run_sender(
     word: String,
+    offset: Duration,
     client: HttpClient,
     state: Arc<SenderState>,
     stop: Arc<AtomicBool>,
@@ -581,19 +608,25 @@ async fn run_sender(
     let sink = address_from_word(SINK);
     let mut hashes = Vec::new();
     let mut refusals = BTreeMap::new();
-    let mut executed = 0u64;
+    // transactions left in the current burst; 0 while the sender waits for its last burst to
+    // execute and then for its offset
+    let mut burst_left = 0u64;
     while !stop.load(Ordering::Relaxed) {
         if paused[state.target].load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
         let next = u64::try_from(hashes.len())?;
-        if next.saturating_sub(executed) >= WINDOW {
-            executed = executed_nonce(&client, state.address).await.unwrap_or(executed);
-            if next.saturating_sub(executed) >= WINDOW {
+        if burst_left == 0 {
+            let executed = executed_nonce(&client, state.address).await;
+            if !executed.is_ok_and(|executed| executed >= next) {
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 continue;
             }
+            // a pause or `stop` during the offset is seen before the burst starts
+            tokio::time::sleep(offset).await;
+            burst_left = WINDOW;
+            continue;
         }
         let (raw, hash) = sign_transfer(&key, sink, next)?;
         let encoded = const_hex::encode_prefixed(&raw);
@@ -627,6 +660,7 @@ async fn run_sender(
         }
         hashes.push(hash);
         state.accepted.store(u64::try_from(hashes.len())?, Ordering::Relaxed);
+        burst_left -= 1;
     }
     Ok(SenderReport { address: state.address, target: state.target, hashes, refusals })
 }
