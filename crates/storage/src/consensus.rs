@@ -57,7 +57,7 @@ use crate::{
 };
 
 mod at_rest_import;
-pub use at_rest_import::{EpochImport, EpochImportError, EpochPackState};
+pub use at_rest_import::{EpochImport, EpochImportError, EpochPackState, PastPackCheck};
 
 /// Simple enum for which of two saved consensus states we are using.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -508,6 +508,21 @@ impl ConsensusChain {
     /// How many recently opened pack files to maintain.
     const PACK_CACHE_SIZE: usize = 10;
 
+    /// The record the pack of epoch 0 chains to. No record precedes epoch 0, so the node opens
+    /// epoch 0 with this stand-in, built from the genesis committee `committee_zero`: epoch 0,
+    /// that committee as both its committee and its next committee, and the rest default (no
+    /// final state, no final output). Epoch 0's pack meta is checked against it, as every other
+    /// epoch's is against the record before it (`verify_epoch_meta`).
+    pub(crate) fn epoch_zero_previous(committee_zero: &Committee) -> EpochRecord {
+        let keys: Vec<_> = committee_zero.bls_keys().into_iter().collect();
+        EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            ..Default::default()
+        }
+    }
+
     /// Create a new empty consensus chain.
     pub fn new(
         base_path: PathBuf,
@@ -524,17 +539,9 @@ impl ConsensusChain {
         // If we have a pack for the last epoch open it so we can read data early.
         let current_pack = if latest_consensus.number() == 0 && latest_consensus.epoch() == 0 {
             // If we are just starting then we need to pre-open the epoch 0 pack.
-            let previous_epoch = EpochRecord {
-                // If we can't find the record then we should be starting at epoch 0- use
-                // this filler.
-                epoch: 0,
-                committee: committee_zero.bls_keys().into_iter().collect(),
-                next_committee: committee_zero.bls_keys().into_iter().collect(),
-                ..Default::default()
-            };
             Arc::new(Mutex::new(ConsensusPack::open_append(
                 &base_path,
-                previous_epoch,
+                Self::epoch_zero_previous(&committee_zero),
                 committee_zero,
             )?))
         } else {
@@ -1401,13 +1408,25 @@ impl ConsensusChain {
     /// ([`Self::recover_incomplete_installs`]). For the tools that judge a datadir at rest. A
     /// failed look is an error, never "absent".
     pub fn pack_data_at_start(base_path: &Path, epoch: Epoch) -> io::Result<bool> {
+        match Self::pack_dir_at_start(base_path, epoch)? {
+            Some((dir, _)) => dir.join(DATA_NAME).try_exists(),
+            None => Ok(false),
+        }
+    }
+
+    /// The directory the node's next start on the epochs directory `base_path` reads `epoch`'s
+    /// pack from (see [`Self::pack_data_at_start`]), and whether it is an interrupted install's
+    /// `epoch-N.replaced`: `epoch-N`, else `epoch-N.replaced`; `None` when neither exists.
+    pub(crate) fn pack_dir_at_start(
+        base_path: &Path,
+        epoch: Epoch,
+    ) -> io::Result<Option<(PathBuf, bool)>> {
         let live = base_path.join(format!("epoch-{epoch}"));
-        let dir = if live.try_exists()? {
-            live
-        } else {
-            base_path.join(format!("epoch-{epoch}.replaced"))
-        };
-        dir.join(DATA_NAME).try_exists()
+        if live.try_exists()? {
+            return Ok(Some((live, false)));
+        }
+        let aside = base_path.join(format!("epoch-{epoch}.replaced"));
+        Ok(aside.try_exists()?.then_some((aside, true)))
     }
 
     /// Atomically install a freshly-imported `epoch-{epoch}` directory at `base_path`, replacing
