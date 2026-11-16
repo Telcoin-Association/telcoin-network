@@ -95,6 +95,10 @@ struct RethEnvInner {
     node_config: NodeConfig<RethChainSpec>,
     /// Type that fetches data from the database.
     blockchain_provider: BlockchainProvider<TelcoinNode>,
+    /// The execution store's environment (the handle the provider factory holds), kept to read
+    /// the store's used size for the `persisted output` line.
+    #[cfg(not(feature = "mdbx"))]
+    store_env: RethDb,
     /// The type to configure the EVM for execution.
     evm_config: TnEvmConfig,
     /// The type to spawn tasks.
@@ -213,6 +217,8 @@ impl RethEnv {
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
         let provider_factory =
             Self::init_provider_factory(&node_config, database, reth_config.new_datadir_layout())?;
+        #[cfg(not(feature = "mdbx"))]
+        let store_env = provider_factory.db_ref().clone();
         let blockchain_provider = BlockchainProvider::new(provider_factory)?;
         let task_spawner = task_manager.get_spawner();
         let restored_state_floor = Self::read_restored_state_floor(&node_config)?;
@@ -226,6 +232,8 @@ impl RethEnv {
             inner: Arc::new(RethEnvInner {
                 node_config,
                 blockchain_provider,
+                #[cfg(not(feature = "mdbx"))]
+                store_env,
                 evm_config,
                 task_spawner,
                 restored_state_floor,

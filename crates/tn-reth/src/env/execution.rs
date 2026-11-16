@@ -548,7 +548,8 @@ impl RethEnv {
     ///
     /// A successful commit logs one `persisted output` debug line (target `engine`) with the
     /// block range, what was written and the per-phase wall time (`open_ms`, `save_blocks_ms`,
-    /// `markers_ms`, `commit_ms`), and records four series (see [`record_persisted_output`]):
+    /// `markers_ms`, `commit_ms`) and, on the tn-lmdb build, the store's used size after the commit
+    /// (`store_bytes`), and records four series (see [`record_persisted_output`]):
     /// the histograms `tn_reth.persist_save_blocks_seconds` and `tn_reth.persist_commit_seconds`
     /// and the counters `tn_reth.persisted_accounts_total` and
     /// `tn_reth.persisted_storage_slots_total`. A failed attempt records nothing.
@@ -596,8 +597,27 @@ impl RethEnv {
         provider_rw.commit()?;
         let commit = lap(&mut stamp);
 
-        record_persisted_output(blocks, PersistPhases { open, save_blocks, markers, commit });
+        record_persisted_output(
+            blocks,
+            PersistPhases { open, save_blocks, markers, commit },
+            self.store_bytes(),
+        );
         Ok(())
+    }
+
+    /// Bytes of the execution store in use after the newest commit: the newest committed state's
+    /// page count times the page size, read from the environment's in-memory meta (no I/O, no tree
+    /// walk, no second handle). `None` on the MDBX build, whose line leaves the field out.
+    #[cfg(not(feature = "mdbx"))]
+    fn store_bytes(&self) -> Option<u64> {
+        let stat = self.inner.store_env.env().stat();
+        Some(u64::from(stat.page_count) * u64::from(stat.page_size))
+    }
+
+    /// The MDBX build does not report the store's used size.
+    #[cfg(feature = "mdbx")]
+    fn store_bytes(&self) -> Option<u64> {
+        None
     }
 
     /// Announce a durably committed round of consensus output: report the new tip over
@@ -886,13 +906,18 @@ impl PersistedCounts {
     }
 }
 
-/// Log and record one successful persist of `blocks`.
+/// Log and record one successful persist of `blocks`; `store_bytes` (the store's used size after
+/// the commit, absent when `None`) goes last on the line.
 ///
 /// The series use per-call `metrics::histogram!`/`counter!` macros rather than handles on
 /// `RethEnvMetrics`: a persist runs about once per consensus output (~1/s), so resolving the
 /// handle per call is cheap, and the macros bind to whichever recorder is current, which keeps
 /// the unit test independent of test ordering (see the `metrics` module docs).
-fn record_persisted_output(blocks: &[ExecutedBlock], phases: PersistPhases) {
+fn record_persisted_output(
+    blocks: &[ExecutedBlock],
+    phases: PersistPhases,
+    store_bytes: Option<u64>,
+) {
     let counts = PersistedCounts::of(blocks);
     ::metrics::histogram!(PERSIST_SAVE_BLOCKS_SECONDS).record(phases.save_blocks);
     ::metrics::histogram!(PERSIST_COMMIT_SECONDS).record(phases.commit);
@@ -913,6 +938,7 @@ fn record_persisted_output(blocks: &[ExecutedBlock], phases: PersistPhases) {
         save_blocks_ms = duration_ms(phases.save_blocks),
         markers_ms = duration_ms(phases.markers),
         commit_ms = duration_ms(phases.commit),
+        store_bytes,
         "persisted output"
     );
 }
@@ -1054,6 +1080,7 @@ mod tests {
                     markers: Duration::from_millis(2),
                     commit: Duration::from_millis(500),
                 },
+                None,
             );
         });
 
