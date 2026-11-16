@@ -4742,6 +4742,44 @@ async fn test_header_proposed_reports_bench8_fields() {
     }
 }
 
+/// `exec_quorum` and `exec_floor` on the rendered `header proposed` line with the quorum rule on
+/// every header, over a ring of twelve outputs: blocks 100, 103, ..., 133, so the tip is 133 and
+/// the floor, the entry eight back, is 109. Parents naming 112 put the quorum value above the floor
+/// and the header names 112 (`exec_basis=quorum`); parents naming 100 put it below the floor and
+/// the header names 109 (`exec_basis=floor`). Each case has two values that differ from each other
+/// and from the tip, in the opposite order to the other case.
+///
+/// Catches: the two fields swapped, either one taken from the tip or the chosen block, and a value
+/// lost between the rule's trace and the line.
+#[tokio::test]
+async fn test_header_proposed_reports_exec_quorum_and_floor() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let task_manager = TaskManager::default();
+
+    // (parents' block, exec_block, exec_basis, exec_quorum, exec_floor)
+    let cases = [(112, 112, "quorum", 112, 109), (100, 109, "floor", 100, 109)];
+    for (named, block, basis, quorum, floor) in cases {
+        let fixture = exec_fixture(tn_config::Parameters {
+            quorum_exec_block: true,
+            ..tn_config::Parameters::default()
+        });
+        let cb = exec_bus();
+        let _rx_headers = cb.subscribe_headers();
+        let parents = exec_parents(&fixture, 1, named);
+        let mut proposer = exec_proposer(&fixture, &cb, &task_manager, parents);
+        let (header, line) = exec_propose(&mut proposer, &capture).await;
+        assert_eq!(header.latest_execution_block().number, block, "parents name {named}");
+        assert_eq!(line.field("exec_policy"), Some("always"));
+        assert_eq!(line.field("exec_basis"), Some(basis), "parents name {named}");
+        let values = ["exec_block", "exec_tip", "exec_quorum", "exec_floor"]
+            .map(|name| line.u64_field(name));
+        assert_eq!(values, [Some(block), Some(133), Some(quorum), Some(floor)], "parents {named}");
+    }
+}
+
 // ---- bench8 order-hold-released ----
 
 /// The `round`, `lanes`, `digests` and `cause` of an `order hold released` line.
