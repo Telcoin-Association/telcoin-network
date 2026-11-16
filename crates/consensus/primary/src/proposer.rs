@@ -282,6 +282,19 @@ struct HoldReport {
     blockers: usize,
 }
 
+impl ProposalTrigger {
+    /// Of the digests pending when the header was triggered ([`Self::pending_before`]), those the
+    /// order hold did not keep back: the digests this header could carry.
+    ///
+    /// Exact without a pass over the queue: the drain skips a held lane whole, and the pending
+    /// count, the plan and the drain run in one synchronous step, so [`HoldReport::held`] counts
+    /// every digest that was pending in a held lane. Equal to `pending_before` when the hold keeps
+    /// nothing back.
+    fn pending_unheld(&self) -> usize {
+        self.pending_before.saturating_sub(self.hold.held)
+    }
+}
+
 impl<DB: Database> Proposer<DB> {
     /// Create a new instance of Self.
     ///
@@ -495,7 +508,7 @@ impl<DB: Database> Proposer<DB> {
         let created_at = now_ms().max(min_created_at.unwrap_or_default());
 
         // synchronous: the ring's read guard is released before the next await
-        let exec = exec_inputs.choose(consensus_bus);
+        let (exec, exec_trace) = exec_inputs.choose(consensus_bus);
 
         let header = Header::new(
             author,
@@ -551,6 +564,10 @@ impl<DB: Database> Proposer<DB> {
             held = trigger.hold.held,
             held_lanes = trigger.hold.held_lanes,
             blockers = trigger.hold.blockers,
+            exec_quorum = exec_trace.quorum,
+            exec_floor = exec_trace.floor,
+            parents = %HeaderParents::new(&parents),
+            pending_unheld = trigger.pending_unheld(),
             "header proposed"
         );
         trigger.proposed.increment(1);
@@ -1816,6 +1833,35 @@ impl fmt::Display for HeaderDigests<'_> {
     }
 }
 
+/// The authors of a new header's parent certificates for its `header proposed` line: `[a,b,…]`,
+/// each the base58 authority id the other consensus lines log, in ascending id order.
+///
+/// One entry per parent, as `num_parents` counts them; a round holds one certificate per authority,
+/// so the list is at most the committee's size. Formatted only when the line is written.
+struct HeaderParents<'a>(Vec<&'a AuthorityIdentifier>);
+
+impl<'a> HeaderParents<'a> {
+    /// The authors of `parents`, sorted so that one parent set always renders alike.
+    fn new(parents: impl IntoIterator<Item = &'a Certificate>) -> Self {
+        let mut authors: Vec<_> = parents.into_iter().map(Certificate::origin).collect();
+        authors.sort_unstable();
+        Self(authors)
+    }
+}
+
+impl fmt::Display for HeaderParents<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (i, author) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{author}")?;
+        }
+        f.write_str("]")
+    }
+}
+
 /// The order bookkeeping behind `tn_primary_requeued_out_of_order_total` (issue #1807): each worker
 /// lane's sequence of reported digests, and which drained digests are out of the queue.
 ///
@@ -2347,11 +2393,12 @@ impl ExecBlockInputs {
     ///
     /// Synchronous on purpose: the ring is read once per proposal and the watch's read guard is
     /// dropped on return, before the caller reaches an await.
-    fn choose(&self, consensus_bus: &ConsensusBus) -> ExecBlockChoice {
+    fn choose(&self, consensus_bus: &ConsensusBus) -> (ExecBlockChoice, ExecRuleTrace) {
         if self.policy == ExecPolicy::Off {
             // the switch is off: the call headers have always used, so their bytes do not change
             let tip = consensus_bus.app().latest_execution_block_num_hash();
-            return ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+            let choice = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+            return (choice, ExecRuleTrace::default());
         }
         let ring = consensus_bus.app().recent_blocks().borrow();
         choose_exec_block(&ring, self)
@@ -2367,6 +2414,23 @@ pub(crate) struct ExecBlockChoice {
     pub(crate) tip: BlockNumHash,
     /// Why this block.
     pub(crate) basis: ExecBasis,
+}
+
+/// What the quorum rule saw for a header before the floor and the bounds shaped its choice: the
+/// `exec_quorum` and `exec_floor` fields of `header proposed`.
+///
+/// Observability only: the header names [`ExecBlockChoice::block`]. Both numbers are 0 when the
+/// rule did not run (the policy off, the tip policy outside a window, an empty ring).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExecRuleTrace {
+    /// The quorum value: the highest number that the own tip and the counted parents holding at
+    /// least the quorum threshold of voting power reached, before the cap at the own tip, the
+    /// floor and the opening-block bound. 0 when the usable power falls short of the
+    /// threshold.
+    pub(crate) quorum: BlockNumber,
+    /// The number of the floor entry, [`ExecBlockInputs::floor_entries`] back from the own tip
+    /// (the oldest entry of a shorter ring).
+    pub(crate) floor: BlockNumber,
 }
 
 /// Choose the execution block for a header from this node's recent-blocks `ring` (its newest
@@ -2410,29 +2474,40 @@ pub(crate) struct ExecBlockChoice {
 ///
 /// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
 /// An empty ring names the default block, as the tip read did before the switch existed.
-pub(crate) fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -> ExecBlockChoice {
+///
+/// Returns the choice with the [`ExecRuleTrace`] of what the rule saw (zeros when it did not run).
+pub(crate) fn choose_exec_block(
+    ring: &RecentBlocks,
+    inputs: &ExecBlockInputs,
+) -> (ExecBlockChoice, ExecRuleTrace) {
     let tip = ring.latest_execution_block_num_hash();
     if !inputs.policy.applies_quorum_rule() || ring.is_empty() {
-        return ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+        let choice = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+        return (choice, ExecRuleTrace::default());
     }
     // the epoch's opening block, while the ring still holds it; once the ring holds only this
     // epoch's blocks, every entry is above it
     let opening = ring.newest_before_epoch(inputs.epoch);
-    let choice = quorum_rule_choice(ring, inputs, opening);
+    let (choice, trace) = quorum_rule_choice(ring, inputs, opening);
     let bounded = bound_to_opening(choice, opening);
     debug_assert_eq!(bounded, choice, "the quorum rule chose a block before the epoch opened");
-    bounded
+    (bounded, trace)
 }
 
-/// The quorum rule's choice for a header, before the final bound of [`choose_exec_block`]:
-/// `opening` is the epoch's opening block if the ring still holds it.
+/// The quorum rule's choice for a header, before the final bound of [`choose_exec_block`], and
+/// its [`ExecRuleTrace`]: `opening` is the epoch's opening block if the ring still holds it.
 fn quorum_rule_choice(
     ring: &RecentBlocks,
     inputs: &ExecBlockInputs,
     opening: Option<BlockNumHash>,
-) -> ExecBlockChoice {
+) -> (ExecBlockChoice, ExecRuleTrace) {
     let tip = ring.latest_execution_block_num_hash();
     let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+    // read before the quorum value so that every header under the rule reports its floor entry;
+    // only an empty ring has none
+    let Some(floor) = ring.nth_newest(inputs.floor_entries) else {
+        return (own_tip, ExecRuleTrace::default());
+    };
     // the own tip and every counted parent value are at or above the opening block, so the
     // quorum value is too; the block named for that value is the newest entry at or below it (the
     // opening entry is a candidate) or the floor entry above it, so on a ring whose numbers rise
@@ -2456,22 +2531,21 @@ fn quorum_rule_choice(
         holders = holders.saturating_add(*power);
         (holders >= inputs.quorum_threshold).then_some(*number)
     });
+    let trace = ExecRuleTrace { quorum: quorum_value.unwrap_or_default(), floor: floor.number };
     let Some(quorum_value) = quorum_value.filter(|value| *value < tip.number) else {
         // too little usable power, or the cap: the own tip
-        return own_tip;
+        return (own_tip, trace);
     };
 
-    let Some(floor) = ring.nth_newest(inputs.floor_entries) else {
-        return own_tip;
-    };
     if quorum_value < floor.number {
-        return ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor };
+        return (ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor }, trace);
     }
     // the floor entry is at or below the value, so the lookup always finds an entry
-    match ring.newest_at_or_below(quorum_value) {
+    let choice = match ring.newest_at_or_below(quorum_value) {
         Some(block) => ExecBlockChoice { block, tip, basis: ExecBasis::Quorum },
         None => ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor },
-    }
+    };
+    (choice, trace)
 }
 
 /// `choice`, or the epoch's `opening` block when `choice` names a block before it.

@@ -3078,7 +3078,7 @@ fn test_quorum_exec_block_bound_holds_on_a_ring_whose_numbers_drop() {
 
     for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
         let inputs = table_inputs(policy, table_parents(1, 6, 160));
-        let raw = quorum_rule_choice(&ring, &inputs, Some(opening));
+        let (raw, _) = quorum_rule_choice(&ring, &inputs, Some(opening));
         assert_eq!(
             raw,
             ExecBlockChoice { block: dropped, tip, basis: ExecBasis::Quorum },
@@ -3820,11 +3820,13 @@ async fn test_header_proposed_reports_own_parent_and_hold_fields() {
             assert_eq!(line.u64_field(field), Some(0), "{field} at round {}", header.round());
         }
         let names: Vec<_> = line.fields.iter().map(|(name, _)| *name).collect();
-        let tail = names.len() - 5;
+        // bench 8's fields follow these (see `test_header_proposed_reports_bench8_fields`)
+        let start = names.iter().position(|name| *name == "exec_policy").expect("exec_policy");
+        assert_eq!(start, names.len() - 9, "after every earlier field");
         assert_eq!(
-            names[tail..],
+            names[start..start + 5],
             ["exec_policy", "own_parent", "held", "held_lanes", "blockers"],
-            "the new fields close the line"
+            "the order-hold fields follow the earlier fields"
         );
     }
 }
@@ -4503,10 +4505,17 @@ async fn test_order_hold_warns_once_per_requeue_out_of_order() {
 // ---- bench8 quorum-exec-block-floor ----
 
 /// One row of the golden table: what it reaches, the index of its ring in [`golden_exec_rings`],
-/// the header's policy and parents, and the expected (block number, own tip number, basis) at the
-/// default floor of [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] entries.
-type GoldenExecRow =
-    (&'static str, usize, ExecPolicy, Vec<ParentExecBlock>, (BlockNumber, BlockNumber, ExecBasis));
+/// the header's policy and parents, the expected (block number, own tip number, basis) at the
+/// default floor of [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] entries, and the expected (`exec_quorum`,
+/// `exec_floor`) there.
+type GoldenExecRow = (
+    &'static str,
+    usize,
+    ExecPolicy,
+    Vec<ParentExecBlock>,
+    (BlockNumber, BlockNumber, ExecBasis),
+    (BlockNumber, BlockNumber),
+);
 
 /// The rings of the golden table:
 /// 0. 40 outputs: blocks 100, 103, ..., 217; the entry eight back is 193, sixteen back 169;
@@ -4533,40 +4542,85 @@ fn golden_exec_rows() -> Vec<GoldenExecRow> {
     let mut below_opening = table_parents(1, 6, 160);
     below_opening.extend(table_parents(7, 3, 190));
     vec![
-        ("tip: policy off", 0, Off, Vec::new(), (217, 217, Tip)),
-        ("tip: adaptive policy outside a window", 0, ExecPolicy::Tip, Vec::new(), (217, 217, Tip)),
-        ("tip: in step", 0, Always, nine(217), (217, 217, Tip)),
-        ("tip: cap, parents above the tip", 0, Always, nine(300), (217, 217, Tip)),
-        ("tip: too little usable power", 0, Always, table_parents(1, 5, 190), (217, 217, Tip)),
-        ("tip: empty ring", 1, Always, nine(150), (0, 0, Tip)),
-        ("quorum: one entry back", 0, Always, nine(214), (214, 217, Quorum)),
-        ("quorum: between two entries", 0, Always, nine(195), (193, 217, Quorum)),
-        ("quorum: eight entries back, at the floor", 0, Always, nine(193), (193, 217, Quorum)),
-        ("floor: nine entries back", 0, Always, nine(190), (193, 217, Floor)),
-        ("floor: twelve entries back", 0, Always, nine(181), (193, 217, Floor)),
-        ("floor: sixteen entries back", 0, Always, nine(169), (193, 217, Floor)),
-        ("floor: seventeen entries back", 0, Always, nine(166), (193, 217, Floor)),
-        ("floor: the oldest entry", 0, Always, nine(100), (193, 217, Floor)),
-        ("floor: starved window, nine entries back", 0, Starved, nine(190), (193, 217, Floor)),
-        ("short ring: five entries back", 2, Always, nine(118), (118, 133, Quorum)),
-        ("short ring: ten entries back", 2, Always, nine(103), (109, 133, Floor)),
-        ("short ring: the oldest entry", 2, Always, nine(100), (109, 133, Floor)),
-        ("opening: parents name the opening block", 3, Always, nine(187), (187, 199, Quorum)),
-        ("opening: parents below it are not counted", 3, Always, below_opening, (199, 199, Tip)),
+        ("tip: policy off", 0, Off, Vec::new(), (217, 217, Tip), (0, 0)),
+        (
+            "tip: adaptive policy outside a window",
+            0,
+            ExecPolicy::Tip,
+            Vec::new(),
+            (217, 217, Tip),
+            (0, 0),
+        ),
+        ("tip: in step", 0, Always, nine(217), (217, 217, Tip), (217, 193)),
+        ("tip: cap, parents above the tip", 0, Always, nine(300), (217, 217, Tip), (300, 193)),
+        (
+            "tip: too little usable power",
+            0,
+            Always,
+            table_parents(1, 5, 190),
+            (217, 217, Tip),
+            (0, 193),
+        ),
+        ("tip: empty ring", 1, Always, nine(150), (0, 0, Tip), (0, 0)),
+        ("quorum: one entry back", 0, Always, nine(214), (214, 217, Quorum), (214, 193)),
+        ("quorum: between two entries", 0, Always, nine(195), (193, 217, Quorum), (195, 193)),
+        (
+            "quorum: eight entries back, at the floor",
+            0,
+            Always,
+            nine(193),
+            (193, 217, Quorum),
+            (193, 193),
+        ),
+        ("floor: nine entries back", 0, Always, nine(190), (193, 217, Floor), (190, 193)),
+        ("floor: twelve entries back", 0, Always, nine(181), (193, 217, Floor), (181, 193)),
+        ("floor: sixteen entries back", 0, Always, nine(169), (193, 217, Floor), (169, 193)),
+        ("floor: seventeen entries back", 0, Always, nine(166), (193, 217, Floor), (166, 193)),
+        ("floor: the oldest entry", 0, Always, nine(100), (193, 217, Floor), (100, 193)),
+        (
+            "floor: starved window, nine entries back",
+            0,
+            Starved,
+            nine(190),
+            (193, 217, Floor),
+            (190, 193),
+        ),
+        ("short ring: five entries back", 2, Always, nine(118), (118, 133, Quorum), (118, 109)),
+        ("short ring: ten entries back", 2, Always, nine(103), (109, 133, Floor), (103, 109)),
+        ("short ring: the oldest entry", 2, Always, nine(100), (109, 133, Floor), (100, 109)),
+        (
+            "opening: parents name the opening block",
+            3,
+            Always,
+            nine(187),
+            (187, 199, Quorum),
+            (187, 175),
+        ),
+        (
+            "opening: parents below it are not counted",
+            3,
+            Always,
+            below_opening,
+            (199, 199, Tip),
+            (0, 175),
+        ),
     ]
 }
 
 /// Assert that [`choose_exec_block`] on `ring` and `inputs` names `expected` (block number, own
-/// tip number, basis), and that the named block carries the own ring's hash (an empty ring's: the
-/// default block the tip read names).
+/// tip number, basis), that the named block carries the own ring's hash (an empty ring's: the
+/// default block the tip read names), and that its trace reports `trace` (`exec_quorum`,
+/// `exec_floor`).
 fn assert_golden_choice(
     ring: &RecentBlocks,
     inputs: &ExecBlockInputs,
     name: &str,
     expected: (BlockNumber, BlockNumber, ExecBasis),
+    trace: (BlockNumber, BlockNumber),
 ) {
-    let choice = choose_exec_block(ring, inputs);
+    let (choice, seen) = super::choose_exec_block(ring, inputs);
     assert_eq!((choice.block.number, choice.tip.number, choice.basis), expected, "{name}");
+    assert_eq!((seen.quorum, seen.floor), trace, "{name}: exec_quorum and exec_floor");
     let own_entry = ring
         .newest_at_or_below(expected.0)
         .unwrap_or_else(|| ring.latest_execution_block_num_hash());
@@ -4581,8 +4635,8 @@ fn assert_golden_choice(
 #[test]
 fn test_quorum_exec_block_floor_golden_table() {
     let rings = golden_exec_rings();
-    for (name, ring, policy, parents, expected) in golden_exec_rows() {
-        assert_golden_choice(&rings[ring], &table_inputs(policy, parents), name, expected);
+    for (name, ring, policy, parents, expected, trace) in golden_exec_rows() {
+        assert_golden_choice(&rings[ring], &table_inputs(policy, parents), name, expected, trace);
     }
 }
 
@@ -4608,13 +4662,85 @@ fn test_quorum_exec_block_floor_parameter_sixteen() {
         ("short ring: ten entries back", (103, 133, Quorum)),
         ("short ring: the oldest entry", (100, 133, Quorum)),
     ]);
+    // the entry sixteen back on each ring (the 12-output ring's oldest): every row's `exec_floor`
+    // where the rule runs, while `exec_quorum` does not depend on the floor
+    let floor_sixteen = [169, 0, 100, 151];
     let rings = golden_exec_rings();
     let mut differing = 0;
-    for (name, ring, policy, parents, at_eight) in golden_exec_rows() {
+    for (name, ring, policy, parents, at_eight, (quorum, floor)) in golden_exec_rows() {
         let inputs = ExecBlockInputs { floor_entries: 16, ..table_inputs(policy, parents) };
         let expected = changed.get(name).copied().unwrap_or(at_eight);
         differing += usize::from(expected != at_eight);
-        assert_golden_choice(&rings[ring], &inputs, name, expected);
+        let floor = if floor == 0 { 0 } else { floor_sixteen[ring] };
+        assert_golden_choice(&rings[ring], &inputs, name, expected, (quorum, floor));
     }
     assert_eq!(differing, changed.len(), "every changed row is a row of the table and differs");
+}
+
+// ---- bench8 header-proposed-fields ----
+
+/// [`super::choose_exec_block`]'s choice without the trace of what the rule saw: what the
+/// exec-block tests compare. The golden table checks the trace.
+fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -> ExecBlockChoice {
+    super::choose_exec_block(ring, inputs).0
+}
+
+/// The fields appended to `header proposed`, on issue #1807's canceled case with the order hold off
+/// and on. Round 2 finds worker 0's digest 3 and worker 1's digest 101 pending; the hold keeps
+/// worker 0 back, so one of the two could go into the header (both without the hold). Round 3 finds
+/// the canceled round's digests 1 and 2 back in the queue, and digest 3 with the hold on; nothing
+/// is held. `parents` lists the authors of the parent certificates in ascending id order;
+/// `exec_quorum` and `exec_floor` are 0 because the exec policy is off.
+///
+/// Catches: a field missing or ahead of the order-hold fields, `pending_unheld` read after the
+/// drain or equal to the held count, and a parent list in arrival order or of the wrong round.
+#[tokio::test]
+async fn test_header_proposed_reports_bench8_fields() {
+    use crate::log_capture::LogCapture;
+
+    for on in [false, true] {
+        let capture = LogCapture::new("consensus::metrics");
+        let _capture_guard = tracing::subscriber::set_default(capture.clone());
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let fixture = hold_fixture(on);
+        let task_manager = TaskManager::default();
+        let (_rx_headers, mut proposer) = hold_proposer(&fixture, &recorder, &task_manager);
+
+        report_fixed(&mut proposer, 0, &[1, 2]);
+        let h1 = propose_and_track(&mut proposer).await;
+        report_fixed(&mut proposer, 0, &[3]);
+        report_fixed(&mut proposer, 1, &[101]);
+        let round_one = hold_parents(&fixture, 1, None);
+        let h2 = build_on(&mut proposer, round_one.clone()).await;
+        proposer.process_uncertified_header(h1.round(), h1.digest());
+        let round_two = hold_parents(&fixture, 2, Some(&h2));
+        build_on(&mut proposer, round_two.clone()).await;
+
+        // (pending_before, held, pending_unheld) per round
+        let queue = if on { [(2, 1, 1), (3, 0, 3)] } else { [(2, 0, 2), (2, 0, 2)] };
+        for ((round, parents), (pending, held, unheld)) in
+            [(2, &round_one), (3, &round_two)].into_iter().zip(queue)
+        {
+            let line = proposed_line(&capture, round);
+            let names: Vec<&str> = line.fields.iter().map(|(name, _)| *name).collect();
+            assert_eq!(
+                names[names.len() - 5..],
+                ["blockers", "exec_quorum", "exec_floor", "parents", "pending_unheld"],
+                "round {round}: the new fields end the line"
+            );
+            let counts = ["pending_before", "held", "pending_unheld", "exec_quorum", "exec_floor"]
+                .map(|name| line.u64_field(name).unwrap());
+            assert_eq!(counts, [pending, held, unheld, 0, 0], "round {round}, hold {on}");
+            let mut authors: Vec<AuthorityIdentifier> =
+                parents.iter().map(|cert| cert.origin().clone()).collect();
+            authors.sort();
+            let listed: Vec<String> = authors.iter().map(ToString::to_string).collect();
+            assert_eq!(line.u64_field("num_parents"), Some(listed.len() as u64));
+            let expected = format!("[{}]", listed.join(","));
+            assert_eq!(line.field("parents"), Some(expected.as_str()), "round {round}");
+            if on && round == 2 {
+                println!("B8-1b sample line: {line:?}");
+            }
+        }
+    }
 }
