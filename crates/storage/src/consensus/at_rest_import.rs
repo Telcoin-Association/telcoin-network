@@ -18,14 +18,16 @@ use std::{
     time::Duration,
 };
 
-use tn_types::{Committee, Epoch, EpochDigest, EpochRecord};
+use tn_types::{
+    Committee, ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochDigest, EpochRecord,
+};
 use tokio::io::AsyncReadExt as _;
 
 use super::{ConsensusChain, ConsensusChainError};
 use crate::{
     consensus_pack::{
-        legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, PackError, DATA_NAME,
-        SENTINEL_MIN_VERSION,
+        legacy_migration_dry_run_last, pack_unsealed_version, wal_consistent_end, PackError,
+        DATA_NAME, SENTINEL_MIN_VERSION,
     },
     epoch_records::{EpochRecordDb, CERTS_NAME, RECORDS_NAME},
     pack_validate::{classify_physical_corruption, validate_pack_file, Verdict},
@@ -501,8 +503,9 @@ impl ConsensusChain {
 /// pack (v0 or v1, [`SENTINEL_MIN_VERSION`]) predates the sentinel, so its absence says nothing:
 /// the node reads such a pack only through its migration to v2, which for a past epoch refuses
 /// any damage in the log, so the dry run of that migration judges it. A v0 (batches-first) pack
-/// is read by nothing else, so its outputs are counted against the record's; a v1 pack has v2's
-/// layout and is then walked as a v2 pack is.
+/// is read by nothing else, so its outputs are counted against the record's and its last output,
+/// from the same walk, must be the certified final; a v1 pack has v2's layout and is then walked
+/// as a v2 pack is.
 fn pack_damage(data: &Path, record: &EpochRecord, previous: &EpochRecord) -> Option<String> {
     let epoch = record.epoch;
     if !data.exists() {
@@ -516,18 +519,23 @@ fn pack_damage(data: &Path, record: &EpochRecord, previous: &EpochRecord) -> Opt
             return Some("its data log is not sealed".to_string());
         }
     } else {
-        match legacy_migration_dry_run(data, epoch) {
+        match legacy_migration_dry_run_last(data, epoch) {
             Err(why) => return Some(format!("its migration to v2 refuses: {why}")),
             // the epoch's outputs run from the one after the previous epoch's final to its own
-            Ok(outputs) if version == 0 => {
+            Ok((outputs, last)) if version == 0 => {
                 let expected =
                     record.final_consensus.number.saturating_sub(previous.final_consensus.number);
-                return (outputs != expected).then(|| {
-                    format!(
+                if outputs != expected {
+                    return Some(format!(
                         "it holds {outputs} output(s), but the epoch's certified record has \
                          {expected}"
-                    )
-                });
+                    ));
+                }
+                return not_the_certified_final(
+                    last.map(|last| last.number),
+                    last.map(|last| last.hash),
+                    record.final_consensus,
+                );
             }
             Ok(_) => {}
         }
@@ -548,14 +556,30 @@ fn pack_damage(data: &Path, record: &EpochRecord, previous: &EpochRecord) -> Opt
     };
     // A pack whose last outputs are gone (a backup taken before the epoch closed, then sealed by
     // `db repair`) still validates as far as it goes: its final output must be the certified one.
-    let last = (report.last_consensus_number, report.last_consensus_digest);
-    let certified = record.final_consensus;
-    (last != (Some(certified.number), Some(certified.hash))).then(|| match last {
-        (Some(number), _) => format!(
+    not_the_certified_final(
+        report.last_consensus_number,
+        report.last_consensus_digest,
+        record.final_consensus,
+    )
+}
+
+/// Why a pack whose last output has `number` and `digest` (`None` when it holds none) does not
+/// end with the epoch's certified final output `certified`, or `None` when it does.
+fn not_the_certified_final(
+    number: Option<u64>,
+    digest: Option<ConsensusHeaderDigest>,
+    certified: ConsensusNumHash,
+) -> Option<String> {
+    ((number, digest) != (Some(certified.number), Some(certified.hash))).then(|| match number {
+        Some(number) if number == certified.number => format!(
+            "its last output {number} is not the epoch's certified final output {number} (another \
+             digest)"
+        ),
+        Some(number) => format!(
             "it ends at output {number}, not at the epoch's certified final output {}",
             certified.number
         ),
-        _ => format!(
+        None => format!(
             "it holds no output, not the epoch's certified final output {}",
             certified.number
         ),
@@ -1041,6 +1065,15 @@ mod test {
             );
             assert_holds(&base, &epoch1.outputs).await;
         }
+
+        // A whole v0 pack is judged by its last output, not by its output count alone: one whose
+        // last output is not the certified final is damaged.
+        rebuild_epoch1(&base, &epoch1, 0, 3).await;
+        let (mut record, previous) = super::local_records(&base, 1).unwrap();
+        record.final_consensus.hash = ConsensusHeaderDigest::default();
+        let why = super::pack_damage(&base.join("epoch-1").join(DATA_NAME), &record, &previous)
+            .expect("its last output is not the certified final");
+        assert!(why.contains("certified final output 6"), "{why}");
 
         // The copy's own version: a v1 copy imports as it is, while a v0 (batches-first) copy is
         // refused by its format, not as corrupt, and imports once `db migrate --force` converted
