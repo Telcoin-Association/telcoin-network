@@ -26,9 +26,9 @@ use std::{
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs};
 use tn_reth::{
     db_check, db_table_stats, iter_static_files, migrate_reth_db, refuse_pending_migration,
-    snapshot::SnapshotRestorer, DatabaseArgs, DbCheckReport, DbTableStat, RethCommand, RethConfig,
-    RethEnv, StaticFileProvider, TNPrimitives, DB_CHECK_NEEDS_STOPPED_NODE,
-    DB_TABLE_STATS_NEEDS_STOPPED_NODE,
+    snapshot::{check_scaffold_window, SnapshotRestorer},
+    DatabaseArgs, DbCheckReport, DbTableStat, RethCommand, RethConfig, RethEnv, StaticFileProvider,
+    TNPrimitives, DB_CHECK_NEEDS_STOPPED_NODE, DB_TABLE_STATS_NEEDS_STOPPED_NODE,
 };
 use tn_storage::{
     consensus::ConsensusChain,
@@ -37,7 +37,7 @@ use tn_storage::{
         EpochMigrate, EpochRepair, DATA_NAME, SENTINEL_MIN_VERSION,
     },
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
-    exec_state_pack::ExecStatePackReader,
+    exec_state_pack::{ExecStatePackReader, VerifyReport},
     pack_validate::{
         classify_physical_corruption, incomplete_trailing_output, recovery_refusal,
         validate_pack_file, validate_pack_file_bounded, Verdict,
@@ -180,7 +180,8 @@ enum DbSubcommand {
     /// record. The import can run for hours on a large state. A failed run removes the chain data
     /// it created (never keys or config); a stopped one (killed, power lost) leaves a marker the
     /// node refuses, and a rerun with the same bundle removes what it created and restores again.
-    /// `--verify-only` runs those checks and the consensus pack's import (in the system temp
+    /// `--verify-only` runs those checks and the ones the restore makes as it writes (the state
+    /// data read whole, its header window, the consensus pack's import in the system temp
     /// directory) on the bundle and stops, writing nothing to the datadir.
     ///
     /// The database gets the format new datadirs get: it holds no transaction up to the pack's
@@ -1361,17 +1362,22 @@ pub struct DbLoadStateArgs {
     /// its first write (the bundle's parts and closed epoch, that the datadir holds no pack of
     /// that epoch and no unfinished `db load-state` the restore would refuse, its whole
     /// certificate chain against the genesis committee, and its state against the last epoch
-    /// record), and the restore's import of the consensus pack (`consensus_data`) against the
-    /// last epoch records, then exit 0 if all pass. The consensus pack is imported into a
-    /// directory under the temp directory (`$TMPDIR` when set, else the system's: `/tmp` on
-    /// Linux; an empty `TMPDIR` or one inside the datadir is refused), which needs the pack's
-    /// size plus the node's import floor (one default growth step of the execution database
-    /// plus a margin) free there, since a running node may share that filesystem: it refuses
-    /// to start without that room, and the import stops before free space drops below the
-    /// floor. The directory, printed to stderr, is removed on every normal exit; a killed run
-    /// leaves `$TMPDIR/tn-load-state-verify-*` to remove by hand. On many Linux hosts `/tmp`
-    /// is a RAM-backed tmpfs or a small root partition: set `TMPDIR` to a directory on a disk
-    /// with room. The state data's own records are read only by the restore itself.
+    /// record), then what the restore checks only as it writes: the state data read whole
+    /// (every record's checksum, its footer and counts), its header window (contiguous, linked
+    /// to the record's final state, covering the `BLOCKHASH` lookback), and the restore's
+    /// import of the consensus pack (`consensus_data`) against the last epoch records. It
+    /// exits 0 if all pass. It reads the whole bundle, so it takes time on a large one; only
+    /// the restore recomputes the state root from the accounts and checks that the bundle's
+    /// block closed its epoch. The consensus pack is imported into a directory under the temp
+    /// directory (`$TMPDIR` when set, else the system's: `/tmp` on Linux; an empty `TMPDIR` or
+    /// one inside the datadir is refused), which needs the pack's size plus the node's import
+    /// floor (one default growth step of the execution database plus a margin) free there,
+    /// since a running node may share that filesystem: it refuses to start without that room,
+    /// and the import stops before free space drops below the floor. The directory, printed to
+    /// stderr, is removed on every normal exit; a killed run leaves
+    /// `$TMPDIR/tn-load-state-verify-*` to remove by hand. On many Linux hosts `/tmp` is a
+    /// RAM-backed tmpfs or a small root partition: set `TMPDIR` to a directory on a disk with
+    /// room.
     ///
     /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
     /// is used, as a restore would), never written. It takes no datadir lock, so it can vet a
@@ -1498,18 +1504,24 @@ impl DbLoadStateArgs {
         // target is still untouched, instead of after a multi-GB import has already committed.
         check_state_pack_matches_record(&self.pack, last_epoch_record)?;
         if self.verify_only {
-            // The restore imports the consensus pack only after the state, which can take hours:
-            // check it now, as the restore will, outside the datadir.
             let staging = staging_root(&datadir, &std::env::temp_dir())?;
+            // The restore reads the state data and checks the header window only once it writes,
+            // and imports the consensus pack only after the state, which can take hours: check
+            // them now, as the restore will, outside the datadir.
+            let state = verify_bundle_state(&self.pack)?;
             verify_bundle_consensus(&staging, &bundle_consensus, &records)?;
             println!(
-                "verified: the bundle at {} restores epoch {} (block {}): its certificate chain \
-                 verifies against the genesis committee, its state matches the epoch record, and \
-                 its consensus pack imports up to the epoch's certified final output; nothing was \
-                 written to the datadir",
+                "verified: the bundle at {} for epoch {} (block {}): its certificate chain \
+                 verifies against the genesis committee, its state data reads whole ({} accounts, \
+                 {} storage slots) and its header window links to the epoch record's final state, \
+                 and its consensus pack imports up to the epoch's certified final output; the \
+                 restore itself recomputes the state root and checks that the block closed the \
+                 epoch; nothing was written to the datadir",
                 self.pack.display(),
                 last_epoch_record.epoch,
                 last_epoch_record.final_state.number,
+                state.account_count,
+                state.storage_slots,
             );
             return Ok(());
         }
@@ -1908,6 +1920,24 @@ fn check_state_pack_matches_record(pack: &Path, record: &EpochRecord) -> eyre::R
         );
     }
     Ok(())
+}
+
+/// `db load-state --verify-only`'s check of the bundle's state data at `pack`, which the restore
+/// makes only once it writes: the header window it scaffolds (`check_scaffold_window`, on the
+/// window [`restore_pack`] builds), then every record read with its CRC, the footer and its counts,
+/// and the snapshot header against the meta (`ExecStatePackReader::verify`). The state root is
+/// recomputed by the restore alone.
+fn verify_bundle_state(pack: &Path) -> eyre::Result<VerifyReport> {
+    let checked = (|| {
+        let reader =
+            ExecStatePackReader::open(pack).map_err(|e| eyre!("failed to open it: {e}"))?;
+        let final_state = BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash);
+        check_scaffold_window(&scaffold_window(reader.headers()), final_state)?;
+        ExecStatePackReader::verify(pack).map_err(|e| eyre!("failed to read it whole: {e}"))
+    })();
+    checked.map_err(|e| {
+        e.wrap_err(format!("the bundle's state data in {} does not restore", pack.display()))
+    })
 }
 
 /// Build a fresh reth DB from `reth_config` and restore the exec-state pack at `pack` into it,
@@ -4431,20 +4461,30 @@ mod tests {
     }
 
     /// A bundle of epoch `last_epoch` (1 or more) signed by `signers`, whose state pack and
-    /// consensus pack are bound to its tip record: one every check of `db load-state` accepts
-    /// against a genesis committee of `signers`.
+    /// consensus pack are bound to its tip record: one every check of `db load-state
+    /// --verify-only` accepts against a genesis committee of `signers` (the restore itself
+    /// refuses its state root). Its state data holds a few accounts with storage after the
+    /// headers.
     fn write_verifiable_bundle(bundle: &Path, signers: &[TestSigner], last_epoch: u32) {
         use tn_storage::{
             epoch_records::{CERTS_NAME, RECORDS_NAME},
-            exec_state_pack::{ExecStatePackReader, ExecStatePackWriter},
+            exec_state_pack::{ExecStateAccount, ExecStatePackReader, ExecStatePackWriter},
         };
-        use tn_types::{BlockNumHash, ExecHeader, B256};
+        use tn_types::{Address, BlockNumHash, ExecHeader, GenesisAccount, B256, U256};
         let root = B256::from([7u8; 32]);
         let snapshot = ExecHeader { number: 1, state_root: root, ..Default::default() };
-        ExecStatePackWriter::create(bundle, root, std::slice::from_ref(&snapshot))
-            .expect("create pack")
-            .finish()
-            .expect("finish pack");
+        let mut state = ExecStatePackWriter::create(bundle, root, std::slice::from_ref(&snapshot))
+            .expect("create pack");
+        for seed in 1..=8_u8 {
+            let storage = (1..=4_u8).map(|slot| (B256::repeat_byte(slot), B256::repeat_byte(seed)));
+            let account = GenesisAccount::default()
+                .with_balance(U256::from(seed))
+                .with_storage(Some(storage.collect()));
+            state
+                .append_account(&ExecStateAccount { address: Address::repeat_byte(seed), account })
+                .expect("append account");
+        }
+        state.finish().expect("finish pack");
         let pack_final_state = {
             let reader = ExecStatePackReader::open(bundle).expect("open pack");
             BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash)
@@ -4543,6 +4583,17 @@ mod tests {
             assert_eq!(tree_listing(&datadir_path), before, "{what}: the datadir changed");
         }
         fs::write(&consensus_data, &real).expect("restore consensus data");
+
+        // state data cut short after its headers: the restore would fail only inside its import
+        let state_data = bundle.path().join("state_data");
+        let real = fs::read(&state_data).expect("read state data");
+        fs::write(&state_data, &real[..real.len() - 100]).expect("cut the state data");
+        let err = args(Some(super::NamedChain::Adiri))
+            .execute(datadir_path.clone())
+            .expect_err("a cut state data");
+        assert!(format!("{err:#}").contains("state data in"), "{err:#}");
+        assert_eq!(tree_listing(&datadir_path), before, "cut state data: the datadir changed");
+        fs::write(&state_data, &real).expect("restore state data");
 
         // no committee in the datadir: the bundled one, held in memory, refuses another chain's
         // bundle, and no committee is written
