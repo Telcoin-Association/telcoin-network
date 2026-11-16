@@ -1359,19 +1359,19 @@ pub struct DbLoadStateArgs {
 
     /// Check the bundle and stop, writing nothing to the datadir: the checks a restore runs before
     /// its first write (the bundle's parts and closed epoch, that the datadir holds no pack of
-    /// that epoch, its whole certificate chain against the genesis committee, and its state
-    /// against the last epoch record), and the restore's import of the consensus pack
-    /// (`consensus_data`) against the last epoch records, then exit 0 if all pass. The
-    /// consensus pack is imported into a directory under the temp directory (`$TMPDIR` when
-    /// set, else the system's: `/tmp` on Linux; an empty `TMPDIR` or one inside the datadir is
-    /// refused), which needs the pack's size plus the node's import floor (one default growth
-    /// step of the execution database plus a margin) free there, since a running node may
-    /// share that filesystem: it refuses to start without that room, and the import stops
-    /// before free space drops below the floor. The directory, printed to stderr, is removed
-    /// on every normal exit; a killed run leaves `$TMPDIR/tn-load-state-verify-*` to remove by
-    /// hand. On many Linux hosts `/tmp` is a RAM-backed tmpfs or a small root partition: set
-    /// `TMPDIR` to a directory on a disk with room. The state data's own records are read only
-    /// by the restore itself.
+    /// that epoch and no unfinished `db load-state` the restore would refuse, its whole
+    /// certificate chain against the genesis committee, and its state against the last epoch
+    /// record), and the restore's import of the consensus pack (`consensus_data`) against the
+    /// last epoch records, then exit 0 if all pass. The consensus pack is imported into a
+    /// directory under the temp directory (`$TMPDIR` when set, else the system's: `/tmp` on
+    /// Linux; an empty `TMPDIR` or one inside the datadir is refused), which needs the pack's
+    /// size plus the node's import floor (one default growth step of the execution database
+    /// plus a margin) free there, since a running node may share that filesystem: it refuses
+    /// to start without that room, and the import stops before free space drops below the
+    /// floor. The directory, printed to stderr, is removed on every normal exit; a killed run
+    /// leaves `$TMPDIR/tn-load-state-verify-*` to remove by hand. On many Linux hosts `/tmp`
+    /// is a RAM-backed tmpfs or a small root partition: set `TMPDIR` to a directory on a disk
+    /// with room. The state data's own records are read only by the restore itself.
     ///
     /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
     /// is used, as a restore would), never written. It takes no datadir lock, so it can vet a
@@ -1441,12 +1441,13 @@ impl DbLoadStateArgs {
         let records =
             reject_non_resumable_bundle(&bundle_consensus, &bundle_records, &bundle_certs)?;
 
-        // The datadir's own refusal, before anything is written (the committee included): a pack of
-        // the bundle's epoch already in `consensus-db`, which the restore would meet only after the
-        // state import. `--verify-only` makes it too, so it predicts the restore.
+        // The datadir's own refusals, before anything is written (the committee included): an
+        // unfinished `db load-state` the rerun cannot clear, and a pack of the bundle's epoch
+        // already in `consensus-db`, which the restore would meet only after the state
+        // import. `--verify-only` makes them too, so it predicts the restore.
         let bundle_epoch =
             records.last().ok_or_else(|| eyre!("bundle epoch_records contains no records"))?.epoch;
-        refuse_bundle_epoch_in_place(&datadir, bundle_epoch).map_err(|e| {
+        refuse_restore_datadir(&datadir, bundle_epoch).map_err(|e| {
             if self.verify_only {
                 e.wrap_err("the restore will refuse this datadir")
             } else {
@@ -1460,8 +1461,16 @@ impl DbLoadStateArgs {
         // pre-import chain walk below needs it — and a datadir missing its committee should fail
         // before the import, not after it.
         let genesis_committee = match self.chain {
-            // the committee `write_committee` would write, held in memory instead
-            Some(chain) if self.verify_only && !datadir.committee_path().exists() => {
+            // the committee `write_committee` would write, held in memory instead; only when
+            // nothing is at its path: `write_committee` keeps one that is there and fails on a
+            // dangling link, which `load_genesis_committee` fails on as well
+            Some(chain)
+                if self.verify_only
+                    && matches!(
+                        datadir.committee_path().symlink_metadata(),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                    ) =>
+            {
                 chain.bundled_committee()?
             }
             Some(chain) if !self.verify_only => {
@@ -1518,8 +1527,8 @@ impl DbLoadStateArgs {
 
         // Everything below creates chain data under the datadir (the reth db + its static files,
         // then the consensus db). `db load-state` targets a FRESH node — `SnapshotRestorer::open`
-        // refuses a datadir that already holds reth chain data, and `refuse_bundle_epoch_in_place`
-        // one that holds the bundle epoch's pack — so any chain-data dir this import creates is
+        // refuses a datadir that already holds reth chain data, and `refuse_restore_datadir` one
+        // that holds the bundle epoch's pack — so any chain-data dir this import creates is
         // ours to remove if it fails. Snapshot which already exist first, so a failure removes only
         // what we created, never a real node's pre-existing data, and never the operator's
         // keys/config/genesis (which live in sibling subdirectories).
@@ -1627,17 +1636,20 @@ fn chain_data_dirs(datadir: &Path) -> [PathBuf; 3] {
     [datadir.join("db"), datadir.join("static_files"), datadir.join("consensus-db")]
 }
 
-/// Refuse a restore into a datadir whose `consensus-db/epochs` already holds the pack of the
-/// bundle's epoch `epoch`, or an interrupted install of it (`epoch-N.replaced`): the restore
-/// rebuilds that pack and never replaces one, so it would fail on it only after the state import,
-/// which can run for hours. Only that epoch is refused: a datadir a node started on once holds an
-/// `epoch-0` pack, which the restore leaves. Nor is a pack an unfinished `db load-state` left in a
-/// `consensus-db` it created (its marker lists it): the rerun removes it before it restores.
-fn refuse_bundle_epoch_in_place(datadir: &Path, epoch: Epoch) -> eyre::Result<()> {
+/// The refusals of `datadir` a restore of the bundle's epoch `epoch` makes before its first write,
+/// changing nothing. First those of the rerun of an unfinished `db load-state`
+/// ([`load_state_marker::check_interrupted_load_state`]), which the restore clears first. Then a
+/// datadir whose `consensus-db/epochs` already holds the pack of `epoch`, or an interrupted install
+/// of it (`epoch-N.replaced`): the restore rebuilds that pack and never replaces one, so it would
+/// fail on it only after the state import, which can run for hours. Only that epoch is refused: a
+/// datadir a node started on once holds an `epoch-0` pack, which the restore leaves. Nor is a pack
+/// an unfinished `db load-state` left in a `consensus-db` it created (its marker lists it): the
+/// rerun removes it before it restores.
+fn refuse_restore_datadir(datadir: &Path, epoch: Epoch) -> eyre::Result<()> {
     let dirs = chain_data_dirs(datadir);
     let [_, _, consensus_db] = &dirs;
-    if load_state_marker::listed(datadir, &dirs)?
-        .is_some_and(|listed| listed.contains(&consensus_db))
+    if load_state_marker::check_interrupted_load_state(datadir, &dirs)?
+        .is_some_and(|cleared| cleared.contains(&consensus_db))
     {
         return Ok(());
     }
@@ -2045,7 +2057,7 @@ fn restore_consensus_and_records(
 /// (the record of epoch N - 1) up to `final_record`'s certified final output, and confirm that the
 /// pack's tip reads back as that output. A failed import or check removes the `epoch-N` directory
 /// when this call created it, and leaves one that was there before (the restore refuses such a
-/// datadir up front: `refuse_bundle_epoch_in_place`). The import stops before free space under
+/// datadir up front: `refuse_restore_datadir`). The import stops before free space under
 /// `epochs_dir` drops below `min_free`. The restore and `--verify-only` both run this, so the check
 /// a verify-only run makes is the restore's own.
 async fn import_bundle_consensus(
@@ -4342,8 +4354,8 @@ mod tests {
         let _ = fs::remove_dir_all(&datadir);
     }
 
-    /// Every file under `dir` with its size and a CRC of its bytes, for the tests that prove a
-    /// command left a datadir as it found it.
+    /// Every file under `dir` with its size and a CRC of its bytes (a link: of its target's name,
+    /// unfollowed), for the tests that prove a command left a datadir as it found it.
     fn tree_listing(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (u64, u32)> {
         let mut listing = std::collections::BTreeMap::new();
         let mut pending = vec![dir.to_path_buf()];
@@ -4351,7 +4363,11 @@ mod tests {
             for entry in fs::read_dir(&at).expect("read dir") {
                 let path = entry.expect("dir entry").path();
                 let relative = path.strip_prefix(dir).expect("under dir").to_path_buf();
-                if path.is_dir() {
+                if path.is_symlink() {
+                    let target = fs::read_link(&path).expect("read link");
+                    let name = target.as_os_str().as_encoded_bytes();
+                    listing.insert(relative, (name.len() as u64, crc32fast::hash(name)));
+                } else if path.is_dir() {
                     listing.insert(relative, (u64::MAX, 0));
                     pending.push(path);
                 } else {
@@ -4682,6 +4698,59 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("state import failed"), "it restored past the pack: {msg}");
         assert!(!pack.exists(), "the rerun removed the stopped run's pack");
+    }
+
+    /// `--verify-only` makes the refusals the restore makes before its first write: the rerun's of
+    /// an unfinished `db load-state` that wrote into chain data that was there before it, and with
+    /// `--chain` a dangling committee link, which the restore cannot write over. Each leaves the
+    /// datadir byte-identical, and the restore refuses the same datadir.
+    #[cfg(unix)]
+    #[test]
+    fn load_state_verify_only_makes_the_restores_datadir_refusals() {
+        use tn_config::TelcoinDirs as _;
+        let signers = test_signers(33, 4);
+        let bundle = tempfile::tempdir().expect("bundle");
+        write_verifiable_bundle(bundle.path(), &signers, 2);
+        let args = |verify_only| super::DbLoadStateArgs {
+            pack: bundle.path().to_path_buf(),
+            chain: Some(super::NamedChain::Adiri),
+            allow_faucet_on_chain: false,
+            verify_only,
+        };
+
+        // a stopped run that created `db` and wrote into a `static_files` that was there
+        let datadir = load_state_datadir(&signers);
+        let datadir_path = datadir.path().to_path_buf();
+        fs::create_dir_all(datadir_path.join("db")).expect("the stopped run's db");
+        fs::create_dir_all(datadir_path.join("static_files")).expect("static files");
+        super::load_state_marker::write(&datadir_path, &[datadir_path.join("db")])
+            .expect("the stopped run's marker");
+        let before = tree_listing(&datadir_path);
+        for verify_only in [true, false] {
+            let err = args(verify_only).execute(datadir_path.clone()).expect_err("refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("did not finish"), "{msg}");
+            assert!(
+                msg.contains(&datadir_path.join("static_files").display().to_string()),
+                "{msg}"
+            );
+            assert_eq!(msg.contains("the restore will refuse this datadir"), verify_only, "{msg}");
+            assert_eq!(tree_listing(&datadir_path), before, "the datadir changed");
+        }
+
+        // a dangling committee link, with `--chain`
+        let datadir = load_state_datadir(&signers);
+        let datadir_path = datadir.path().to_path_buf();
+        fs::remove_file(datadir_path.committee_path()).expect("remove the committee");
+        std::os::unix::fs::symlink(datadir_path.join("gone.yaml"), datadir_path.committee_path())
+            .expect("dangling committee link");
+        let before = tree_listing(&datadir_path);
+        let err = args(true).execute(datadir_path.clone()).expect_err("a dangling committee link");
+        assert!(format!("{err:#}").contains("failed to load genesis committee"), "{err:#}");
+        assert_eq!(tree_listing(&datadir_path), before, "the datadir changed");
+        let err = args(false).execute(datadir_path.clone()).expect_err("the restore refuses it");
+        assert!(!format!("{err:#}").contains("state import failed"), "{err:#}");
+        assert_eq!(tree_listing(&datadir_path), before, "the datadir changed");
     }
 
     /// A sealed v2 pack of `epoch` under `epochs` holding only its meta: one that validates.

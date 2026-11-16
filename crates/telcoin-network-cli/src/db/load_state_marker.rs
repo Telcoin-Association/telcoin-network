@@ -102,10 +102,13 @@ pub(crate) fn refuse_interrupted_load_state(datadir: &Path) -> eyre::Result<()> 
     Ok(())
 }
 
-/// The entries of `chain_data_dirs` that the marker of an unfinished `db load-state` in `datadir`
-/// lists: the ones that run created, which a rerun removes before it restores. `None` when there is
-/// no marker. Refuses a marker naming anything else, as a rerun does.
-pub(crate) fn listed<'dirs>(
+/// What [`clear_interrupted_load_state`] would do to `datadir`, changing nothing: the entries of
+/// `chain_data_dirs` an unfinished `db load-state` there created, which the clear removes (`None`
+/// when no restore is unfinished), or the clear's refusal. It refuses a marker naming anything but
+/// a chain-data directory, and one of `chain_data_dirs` that is there but not on the marker's list:
+/// the stopped run wrote into data that was there before it, and only the operator can say what it
+/// is. `db load-state --verify-only` makes these refusals too.
+pub(crate) fn check_interrupted_load_state<'dirs>(
     datadir: &Path,
     chain_data_dirs: &'dirs [PathBuf],
 ) -> eyre::Result<Option<Vec<&'dirs PathBuf>>> {
@@ -130,22 +133,6 @@ pub(crate) fn listed<'dirs>(
             })?;
         created.push(dir);
     }
-    Ok(Some(created))
-}
-
-/// Before a restore into `datadir`: if an earlier `db load-state` there did not finish, remove the
-/// chain data it created (the `chain_data_dirs` its marker lists, the restored-state floor marker
-/// it wrote) and then the marker, so this run starts on the datadir that one started on. Refuses,
-/// removing nothing, when one of `chain_data_dirs` is there but not on the marker's list: the
-/// stopped run wrote into data that was there before it, and only the operator can say what it is.
-/// Returns whether there was an unfinished restore.
-pub(crate) fn clear_interrupted_load_state(
-    datadir: &Path,
-    chain_data_dirs: &[PathBuf],
-) -> eyre::Result<bool> {
-    let Some(created) = listed(datadir, chain_data_dirs)? else {
-        return Ok(false);
-    };
     let mut not_created = Vec::new();
     for dir in chain_data_dirs {
         if !created.contains(&dir) && exists(dir)? {
@@ -171,6 +158,21 @@ pub(crate) fn clear_interrupted_load_state(
             names.join(", "),
         );
     }
+    Ok(Some(created))
+}
+
+/// Before a restore into `datadir`: if an earlier `db load-state` there did not finish, remove the
+/// chain data it created (the `chain_data_dirs` its marker lists, the restored-state floor marker
+/// it wrote) and then the marker, so this run starts on the datadir that one started on. Refuses,
+/// removing nothing, as [`check_interrupted_load_state`] does. Returns whether there was an
+/// unfinished restore.
+pub(crate) fn clear_interrupted_load_state(
+    datadir: &Path,
+    chain_data_dirs: &[PathBuf],
+) -> eyre::Result<bool> {
+    let Some(created) = check_interrupted_load_state(datadir, chain_data_dirs)? else {
+        return Ok(false);
+    };
     for dir in created {
         remove_entry(dir)?;
     }
