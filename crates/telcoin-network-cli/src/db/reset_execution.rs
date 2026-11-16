@@ -97,7 +97,8 @@ pub(crate) fn refuse_interrupted_reset(datadir: &Path) -> eyre::Result<()> {
         }
         bail!(
             "an execution reset of {} did not finish: {} holds part of the execution database. \
-             Run `telcoin-network db reset-execution --force` to finish it, or move its entries \
+             Run the `telcoin-network db reset-execution --force` that started it again, with \
+             `--for-swap` if it was the side-observer swap's, to finish it, or move its entries \
              back into the datadir to undo it (an empty one blocks nothing)",
             datadir.display(),
             partial.display(),
@@ -430,12 +431,26 @@ pub(crate) fn reset_execution(
     let _pid_lock = PidLock::acquire(&datadir.to_path_buf())?;
     // the node refuses this datadir until `db load-state` is rerun, which redoes the restore
     refuse_interrupted_load_state(datadir)?;
+    let partials = partial_resets(datadir)?;
     if mode == ResetMode::Rebuild {
-        refuse_missing_packs(datadir)?;
+        if let Err(refusal) = refuse_missing_packs(datadir) {
+            // a swap's reset stopped between its moves is finished by a swap's rerun, which skips
+            // this check: the node's refusal sends the operator here first
+            for partial in &partials {
+                if !is_empty_dir(partial)? {
+                    bail!(
+                        "{refusal:#}. This datadir also holds the unfinished reset {}: if it was \
+                         started with `--for-swap`, `db reset-execution --for-swap --force` \
+                         finishes it",
+                        partial.display(),
+                    );
+                }
+            }
+            return Err(refusal);
+        }
     }
 
     let entries = execution_entries(datadir)?;
-    let partials = partial_resets(datadir)?;
     if partials.len() > 1 {
         bail!(
             "{} holds more than one unfinished execution reset ({}): resolve them by hand",
@@ -1015,6 +1030,44 @@ mod tests {
         let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
         assert_eq!(plan.target, root.join("execution-reset-20261109T163205Z"));
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+        refuse_interrupted_reset(root).unwrap();
+    }
+
+    /// An interrupted side-observer swap's reset on a datadir whose rebuild the pack check refuses:
+    /// the node's refusal names `--for-swap`, a rerun without it refuses naming the unfinished
+    /// reset and how to finish it, and a swap's rerun finishes it.
+    #[test]
+    fn an_interrupted_swap_reset_is_finished_by_a_swap_rerun() {
+        let dir = datadir();
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        // the shape `db load-state` leaves, which only the swap resets
+        fs::remove_dir_all(epochs.join("epoch-0")).unwrap();
+        ConsensusChain::write_latest_consensus_hint(&epochs, 1, 10).unwrap();
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        fs::rename(root.join("db"), partial.join("db")).unwrap();
+
+        let node = refuse_interrupted_reset(root).unwrap_err().to_string();
+        assert!(node.contains("with `--for-swap` if it was the side-observer swap's"), "{node}");
+        for force in [false, true] {
+            let err =
+                format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
+            assert!(err.contains("lacks the pack of epoch(s) 0,"), "{err}");
+            assert!(
+                err.contains(&format!(
+                    "This datadir also holds the unfinished reset {}",
+                    partial.display()
+                )),
+                "{err}"
+            );
+            assert!(err.contains("`db reset-execution --for-swap --force` finishes it"), "{err}");
+            assert_eq!(names(&partial), ["db"], "nothing moved");
+        }
+
+        let plan = reset_execution(root, true, ResetMode::Swap).unwrap();
+        assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
         assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
         refuse_interrupted_reset(root).unwrap();
     }

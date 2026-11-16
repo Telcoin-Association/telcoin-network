@@ -3125,6 +3125,11 @@ mod tests {
                 .execute(datadir.clone())
                 .expect_err("an unfinished reset");
             assert!(format!("{err:#}").contains("did not finish"), "{name}: {err:#}");
+            // a swap's reset is finished by a swap's rerun, which skips the pack check
+            assert!(
+                format!("{err:#}").contains("with `--for-swap` if it was the side-observer swap's"),
+                "{name}: {err:#}"
+            );
         }
     }
 
