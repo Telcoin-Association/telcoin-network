@@ -1136,6 +1136,45 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   so it cannot change a block, a root or a stored row. *Tests*: tn-reth startup tests; reth-provider
   suite. *Upstream*: n/a (upstream commit).
 
+- **TN-0206** — Backport 168b0a477 and the `delete_segment` half of 6cb04766e: TN-0083's resume
+  of a torn first launch works under storage v2, and refuses static files past genesis.
+  *Kind*: backport (ported by hand).
+  *Files*: `crates/storage/db-common/src/init.rs` (`init_genesis_with_settings`: the resume
+  branch refuses static files that hold any block but genesis or any transaction, then deletes the
+  `AccountChangeSets` and `StorageChangeSets` segments; tests `v2_init_genesis_resumes_after_a_torn_first_launch`,
+  `init_genesis_refuses_static_files_past_genesis`),
+  `crates/storage/provider/src/providers/static_file/manager.rs` (`delete_segment` drops the
+  segment's cached writer first), `crates/storage/provider/src/providers/static_file/writer.rs`
+  (`StaticFileWriters::remove`).
+  *Why*: under storage v2 genesis commits block 0 of both changeset segments to static files with
+  the header, before the database transaction. A first launch stopped between the two commits
+  left them there, and TN-0083's resumed `insert_genesis_state` failed appending block 0 again
+  (`UnexpectedStaticFileBlockNumber(StorageChangeSets, 0, 1)`) at every start, until the operator
+  deleted the datadir. The resume now deletes both segments first, so genesis writes them once.
+  `delete_segment` must drop the segment's cached writer, or the next append goes through a writer
+  that still holds the deleted file's block range (the same failure, in the process that tore).
+  Deleting is destructive, so the resume first takes upstream's check: every segment ends and
+  starts at the genesis block and holds no transaction, or initialization returns
+  `UninitializedDatabase` before anything is removed (a synced node whose database was deleted
+  keeps its static files). TN-0083's own check, no stage checkpoint at all, stays beside it.
+  Not a whole `vendor.py pick`: 168b0a477 sits on upstream's `init_genesis_with_settings_and_validate`
+  (the `--debug.skip-genesis-validation` flag, which TN does not carry) and conflicted in three
+  places, and 6cb04766e is mostly v2 state-import code TN removed (TN-0028); only the two lines of
+  `delete_segment` and `StaticFileWriters::remove` were needed, and they are upstream's text.
+  *Storage path*: yes, genesis init and static-file segment deletion. An uninterrupted genesis
+  never enters the resume branch, so it writes the same bytes as before (the format-freeze
+  writer test's fixtures, v1 and v2, are unchanged). The only other caller of `delete_segment`
+  is TN's `layout::remove_unfinished_genesis`, which deletes every segment of a creation stopped
+  inside genesis's commit and then writes genesis again; dropping a cached writer of a deleted
+  segment can only remove stale state there. No manifest or feature change.
+  *Tests*: `v2_init_genesis_resumes_after_a_torn_first_launch` (storage v2, header and changesets
+  in static files, database transaction dropped; init resumes with one changeset row per segment,
+  in the same process and over a reopened static-file provider; the next init is the ordinary
+  skip), `init_genesis_refuses_static_files_past_genesis` (a header past genesis: refused, both
+  changeset segments kept). Mutation-checked, each failing a test: no writer drop in
+  `delete_segment`, no segment deletion, no static-file check. reth-db-common suite; tn-reth's
+  layout and format-freeze tests. *Upstream*: n/a (upstream commits).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
@@ -1469,11 +1508,12 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   holds no stage checkpoint at all, nothing was ever committed to it, so initialization now
   resumes: `insert_genesis_header` keeps the header already in static files and the MDBX half is
   written. A database with any checkpoint but not the Headers one is still refused.
-  The resume holds for storage v1 only, where the header is genesis's one static-file row (the
-  transactions and receipts segments get only a block range, which the resumed path sets again).
-  Under storage v2 genesis also commits block 0 of both changeset segments to static files, and
-  the resumed `insert_genesis_state` fails appending it again (`UnexpectedStaticFileBlockNumber`)
-  at every start. TN's node never reaches the resume in either layout: `layout::settle`
+  Under storage v1 the header is genesis's one static-file row (the transactions and receipts
+  segments get only a block range, which the resumed path sets again). Under storage v2 genesis
+  also commits block 0 of both changeset segments to static files, and the resumed
+  `insert_genesis_state` failed appending it again (`UnexpectedStaticFileBlockNumber`) at every
+  start, until TN-0206 removed them before the resume. TN's node never reaches the resume in
+  either layout: `layout::settle`
   (`crates/tn-reth/src/env/layout.rs`), the only path to `init_genesis_with_settings`, runs
   first; it removes the static files of a creation stopped inside genesis's commit (TN's marker,
   no `storage_settings` row, static files holding only genesis), so genesis writes them from
@@ -3078,6 +3118,60 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Upstream*: no; upstream takes only a blocking-IO permit for `eth_callMany` and none for
   `eth_callBundle`.
 
+- **TN-0192** — The thread-local zstd decompressors keep at most 128 KiB of buffer between calls.
+  *Kind*: fix (security). *Files*: `crates/storage/zstd-compressors/src/lib.rs`
+  (`MAX_RETAINED_BUFFER_CAPACITY`, `ReusableDecompressor::release_oversized_buffer`, called by
+  `with_tx_decompressor` and `with_receipt_decompressor` after their closure returns; test
+  `thread_local_decompressors_release_oversized_buffers`).
+  *Why*: a `ReusableDecompressor`'s buffer grows to the largest item decompressed into it and never
+  shrank, and the thread-local ones live as long as their thread. Every receipt and transaction read
+  from static files is decoded through them, on whichever thread reads it: for RPC, the blocking
+  pool's threads (up to 512 in TN's RPC pool). A receipt can be a few MB, so a pool that had
+  decoded such receipts kept that much per thread for as long as the thread lived. A buffer that grew past 128 KiB is now shrunk back to 128 KiB once the closure that used it
+  returns (its result cannot borrow the buffer), so a thread keeps at most 128 KiB per
+  decompressor. 128 KiB is the pool's default limit on a transaction's encoded size
+  (`DEFAULT_MAX_TX_INPUT_BYTES`); every transaction the default pool admits and the receipt of any
+  ordinary transaction (a few KiB) decodes without a reallocation, and a larger item pays one
+  allocation, small beside decoding it. *Can reach execution or storage*: no change to what is
+  computed or stored. The decompressed bytes and every decoded value are unchanged; only the
+  capacity of a scratch buffer between calls moves. Compression, the stored bytes and the
+  dictionaries are untouched, and no dependency or feature changes.
+  *Tests*: `thread_local_decompressors_release_oversized_buffers` (a 512 KiB receipt and a 512 KiB
+  transaction decode correctly and leave each buffer at or under 128 KiB; a 64 KiB item's buffer is
+  kept; a shrunk buffer decodes a large item again). Mutation-checked: never shrinking (fails,
+  the receipt buffer keeps about 1 MB). *Upstream*: yes.
+
+- **TN-0193** — A log range scan reads at most 50 receipts and logs for each log its response may
+  return. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`SCAN_READS_PER_RESPONSE_LOG`, the read count in
+  `get_logs_in_block_range_inner`, which serves `eth_getLogs`, `eth_getFilterLogs`,
+  `eth_getFilterChanges` and `EngineEthFilter::logs`; `EthFilterError::QueryExceedsMaxReads`,
+  -32602 like `QueryExceedsMaxResults`; test `range_scan_reads_are_bounded`).
+  *Why*: a range scan reads every receipt of each block whose logs bloom matches the filter and
+  compares each of its logs, and only the logs that match count against
+  `--rpc.max-logs-per-response`. Blocks whose blooms match a filter that none of their logs
+  match were read in full for nothing, so a scan's work was bounded only by
+  `--rpc.max-blocks-per-filter` (100,000 blocks) and by what those blocks hold. The scan now
+  counts each block's receipts and logs as it reads them and ends, once a multi-block range has
+  read more than 50 times the response limit (1,000,000 at the default of 20,000), with an error
+  whose retry range ends at the block before the one that passed the bound, as
+  `QueryExceedsMaxResults` does (TN-0076): retrying that range fits, and a single-block range is
+  never refused. No response limit (`0`, or `QueryLimits::no_limits()`) means no read bound, so
+  an operator who turned the limit off keeps unbounded scans. A lower default for
+  `--rpc.max-blocks-per-filter` was not taken: TN's docs promise 100,000, it would refuse long
+  ranges over quiet history that cost little, and it would still not bound a range of blocks that
+  each hold many receipts; the read bound follows the work instead. 50 reads per returnable log
+  leaves room for blocks whose blooms match a filter by chance. Queries within the bound return
+  the same logs in the same order. Upstream reth has no such bound.
+  *Can reach execution or storage*: no. RPC only: the count runs inside the log query after the
+  receipts are read, and nothing on the block execution or storage path calls it.
+  *Tests*: `range_scan_reads_are_bounded` (five blocks whose blooms match everything, one receipt
+  of 30 non-matching logs each: a limit of one log ends the scan at the second block with the
+  retry range 100-100, a limit of four reads all 155, a single block and no limit are not
+  bounded, 60 matching logs are returned); `test_log_limit_retry_range_excludes_overflow_block`,
+  `test_range_scan_across_windows` and the other filter tests unchanged. Mutation-checked: the
+  bound never ending a scan (fails, the first range returns no error). *Upstream*: yes.
+
 - **TN-0200** — NippyJar format version 3: version 2 with a tag byte at the start of every
   value. *Kind*: feature (storage format; nothing creates one until TN-0201's policy asks).
   *Files*: `crates/storage/nippy-jar/src/{lib.rs, writer.rs}` (`NippyJar::with_tagged_values`,
@@ -3259,3 +3353,34 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `transactions_by_block_range`, a block's rows split wrongly or resolved one call per row, the
   tag ignored, a second resolver accepted silently, no check that the indexed block holds the
   transaction, and an undecodable row read as no row. *Upstream*: no.
+
+- **TN-0204** — `eth_getLogs` reads a block's batch once: a per-thread read scope that the log
+  path enters and TN's transaction resolver answers from. *Kind*: perf (RPC reads).
+  *Files*: `crates/rpc/rpc-eth-types/src/{tx_read_scope.rs, logs_utils.rs, lib.rs}`
+  (`tx_read_scope.rs` new).
+  *Why*: `append_matching_block_logs`, on a block the RPC cache does not hold, reads the
+  transaction of each matching receipt by id, one `transaction_by_id` call each. On a datadir
+  that stores transactions by batch position (TN-0201, TN-0202) every such call resolves the
+  block's batch: from TN's decoded-batch cache when it holds the batch, else from a consensus pack
+  (a read, a decode and a digest check of the whole batch), so a block with k matching
+  transactions could read its batch k times (about 80 ms for a block of 587 matches against
+  1.7 ms from the cache) whenever the cache cannot keep it, as under many concurrent scans of
+  old blocks. `TxReadScope` is a guard (`enter`, ended by its drop; nested scopes share the
+  outermost one) over a thread-local slot holding one value under a `B256` key (`keep`, `get`;
+  nothing outside a scope). `append_matching_block_logs` enters it for the provider path; TN's
+  resolver keeps each batch it resolves there and answers from it first, so a block's batch is
+  read at most once per call. The slot holds one batch while one block's logs are matched, then
+  drops it.
+  *Can reach execution or storage*: no. Nothing is written; RPC reads only. The resolver keys the
+  slot by batch digest and keeps only batches it already digest-checked or took from its cache,
+  so a read answers the same transaction from it. Inline rows and providers without a resolver
+  never touch it.
+  *Tests*: the module's own (`nothing_is_kept_outside_a_scope`,
+  `a_scope_keeps_one_value_until_it_ends`, `an_inner_scope_shares_the_outer_one`,
+  `a_scope_is_its_threads_own`); TN's `a_blocks_logs_read_its_batch_once`
+  (`crates/tn-reth/src/env/tx_bodies/pack_tests.rs`) matches a block's logs through
+  `append_matching_block_logs` on real packs with no decoded-batch cache and requires one pack
+  read for the block, the other reads answered from the scope, and one pack read per transaction
+  for the same reads outside a scope. Mutation-checked: without the scope in
+  `append_matching_block_logs`, or with the resolver keeping nothing in it, the block's batch is
+  read once per transaction and the test fails. *Upstream*: no (TN's format).

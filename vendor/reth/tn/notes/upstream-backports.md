@@ -98,6 +98,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 8d97ab63c, 1b09bf5a2, 3fba6ad70 | TN-0141 | `StoredNibblesSubKey` encodes to a stack `[u8; 65]` (one allocation less per storage-trie seek and write, same bytes); the storage-root span is trace-level and records its root lazily. Performance on the state-root path | upstream tests (array equals `to_compact` at every length); trie and db-api suites; format-freeze writer bytes unchanged |
 | 3fa855645 | TN-0142 | test only: `hash_builder_state_roundtrip` draws `HashBuilderState` from per-field strategies, not the arbitrary interop whose buffer ran out (about one aborted run in ten with `--features arbitrary`); the `state.rs` half, `e2e-test-utils` is not vendored | 50 runs in a row; reth-trie-common suite |
 | 7bf9241fe | TN-0159 | `check_consistency` runs its heal outside the read transaction timeout: a long heal at startup no longer fails each start (both backends time out a read transaction after five minutes) | tn-reth startup tests; reth-provider suite |
+| 168b0a477, 6cb04766e (`delete_segment` half) | TN-0206 | a first launch stopped between genesis's two commits resumes under storage v2 too (the changeset segments are deleted first, with their cached writers), and static files past genesis are refused before anything is deleted; ported by hand (168b0a477 sits on the genesis-validation flag TN lacks, 6cb04766e is mostly state-import code TN removed) | reproducing test fails before, passes after; three mutations each fail a test; reth-db-common suite; format-freeze fixtures unchanged |
 
 ## Open
 
@@ -208,4 +209,5 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
   returns empty code for a hash the `Bytecodes` table lacks; roots unchanged for a
   healthy database.
 - **A torn first launch resumes (TN-0083, 2026-11-10).** Genesis init with the header in static
-  files and an empty database writes the MDBX half instead of failing forever.
+  files and an empty database writes the MDBX half instead of failing forever. Storage v2 since
+  TN-0206 (upstream 168b0a477, 2026-11-10, made the same fix).

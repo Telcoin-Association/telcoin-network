@@ -150,7 +150,11 @@ the subtries, then the walk on one thread computed again the storage roots they 
 block the split composed). `tn_reth_storage_walk_fallbacks_total{reason}` counts the hot storage
 tries the storage split did not use: `small_trie` (not tried) and `shape` (tried, computed
 serially) are expected; `stored_root_node` is an alert, and so is `mismatch` (a sampled check found
-a wrong result on a block with a composed storage root).
+a wrong result on a block with a composed storage root). Read each against its success count:
+`tn_reth_account_walk_splits_total` counts the blocks whose root the split account walk composed,
+and `tn_reth_storage_walk_splits_total` the hot storage tries whose storage root was composed from
+the split's pieces (once per trie and block). A split count flat at zero on a busy chain means the
+split never runs: its trie is still small, or the off switch is set.
 `tn_reth_parallel_state_root_task_failures_total{reason}` counts the pieces of parallel work (a
 storage-root task, a walk helper, an account subtrie, a storage piece) that failed and left their
 part to the serial computation, on this node only; the block also logs the first error. Read it
@@ -900,7 +904,11 @@ as its index in the consensus batch its block executed ("Transactions stored by 
   direction, the database ahead of the static files (an unwind target: static files lost, removed
   or swapped for an older copy), is refused too: TN has no stage pipeline to unwind the database,
   so the start stops with "storage consistency check found the database ahead of the static
-  files", saying to restore the datadir from a snapshot or backup.
+  files", saying to restore the execution database (`db/`, `static_files/` and any
+  `restored-state-floor`, all from one stop) from a backup or to rebuild it (`db
+  reset-execution`); a restore of the whole datadir, or into a new one from a snapshot, replaces
+  `consensus-db/` too, and a validator restored that way stays stopped until the network has
+  closed the epoch it was last in.
 
 - **Logs:** `new reth datadir: storage format` (with `layout`, `tx_bodies` and the marker's
   `version`) or `reth datadir: storage format` (with `layout` and `tx_bodies`) at each start; an
@@ -996,6 +1004,13 @@ CHANGES.md TN-0200..0203.
 
   At most 4 pack reads run at once. Each position is checked against the batch's length and its
   transaction decoded (EIP-2718). A read by hash checks the resolved transaction's hash too.
+
+  `eth_getLogs`, on a block the RPC cache does not hold, reads the transaction of each matching
+  receipt by id, one call each (`append_matching_block_logs`), inside a read scope
+  (`TxReadScope`, vendor/reth CHANGES.md TN-0204). The resolver looks there before the cache and
+  keeps each batch it finds there, so one call reads a block's batch at most once even when the
+  cache cannot keep it (many concurrent scans of old blocks evicting the cold part); the scope
+  drops the batch when the block is done.
 - **Failures.** A row that cannot be resolved fails the read with an error naming the block, the
   epoch and the batch digest: an RPC call reading it answers an error, never `null` and never
   another transaction. Each failed block counts in `tn_reth_tx_body_resolve_failures_total` by
@@ -1003,10 +1018,10 @@ CHANGES.md TN-0200..0203.
   pack read failed, its digest check included), `position_out_of_range`, `decode`,
   `batch_too_large`, `handoff_timeout`. A read by hash that resolves another transaction fails as
   well (TN-0202's `TxBodyMismatch`), outside that counter. The other series:
-  `tn_reth_tx_body_resolves_total` by `source` (`recent`, `cold`, `live_pack`, `closed_pack`;
-  `memory` in test builds), `tn_reth_tx_body_pack_opens_total`, the gauge
-  `tn_reth_tx_body_cache_bytes` by `part`, and the histogram `tn_reth_tx_body_resolve_seconds` of
-  resolves that read a pack.
+  `tn_reth_tx_body_resolves_total` by `source` (`recent`, `cold`, `live_pack`, `closed_pack`,
+  `scoped` for a read answered from the read scope; `memory` in test builds),
+  `tn_reth_tx_body_pack_opens_total`, the gauge `tn_reth_tx_body_cache_bytes` by `part`, and the
+  histogram `tn_reth_tx_body_resolve_seconds` of resolves that read a pack.
 - **Who reads what.** Each jar's own version decides how its rows read (3: tagged; 1 and 2: as
   upstream). The marker decides the startup checks and whether the node attaches its consensus
   packs to the resolver (`RethEnv::attach_tx_packs`, at startup before the engine and RPC; an
@@ -1031,7 +1046,12 @@ CHANGES.md TN-0200..0203.
   (`TxPackCoverageError`, from `RethEnv::attach_tx_packs`), naming the blocks, the epochs they
   point into, the missing ones and the recovery below.
 - **Recovery.**
-  - A missing pack (the start refused): restore `consensus-db/` from a backup. The node cannot
+  - A missing pack (the start refused): put back each missing `consensus-db/epochs/epoch-N/` from
+    a backup taken after that epoch closed (a sealed epoch's pack never changes; check the copy
+    with `db validate` first). A whole `consensus-db/` from an older backup lacks the packs of the
+    epochs since it was taken, so it fixes the gap only with the execution database restored from
+    the same stop or rebuilt, and a validator restored that way stays stopped until the network
+    has closed the epoch it was last in (its later votes are not in the backup). The node cannot
     rebuild a lost pack itself: it fetches no pack below the epoch its consensus database is at,
     and a rebuild of the execution database (`db reset-execution`) re-executes from its own packs,
     so it stops at the same gap. Without a backup the node starts over as a new one: move the
@@ -1046,8 +1066,8 @@ CHANGES.md TN-0200..0203.
     log is rebuilt from the data log in the background, as a consensus read of the epoch rebuilds
     it, and its reads answer again once that is done. With the node stopped, `telcoin-network db
     validate` reports the pack's damage and `db repair` fixes what it can
-    (crates/storage/README.md); otherwise restore `consensus-db/` from a backup, or start over as
-    above.
+    (crates/storage/README.md); otherwise put back that epoch's directory from a backup taken
+    after it closed, or start over as above.
   - `handoff_timeout`: a closed epoch's pack stayed unsealed or mid-install for a second. During
     an epoch handoff it passes; if it stays, a past epoch's pack was left unsealed: `db
     validate`.
@@ -1223,11 +1243,16 @@ until `execution-reset-*` is deleted, and the rebuild (or the swap's copy) needs
 again. The moves are staged in `execution-reset-<UTC time>.partial/`, renamed once every entry is in it; a node
 refuses to start while a `.partial` directory holding an entry is there, and running the command
 again finishes it. An empty one (left when the entries are moved back to undo it) blocks nothing.
-It refuses, and moves nothing, a datadir whose consensus database holds a later epoch's pack and none
-for epoch 0, as a datadir bootstrapped with `db load-state` does (it holds consensus only from the
-restored epoch on). The rebuild replays epoch 0 from the node's own packs, and the node fetches no
-pack below the epoch its consensus database is at, so it could not start. Such a node rebuilds as a
-new one: move `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
+It refuses, dry run included, and moves nothing, a datadir whose consensus database lacks the pack
+of an epoch below the latest one it holds, at or below the epoch the node resumes from (its
+latest-consensus hint; a pack counts as the node's start finds it, its `data` log, an interrupted
+install's aside included), as a datadir bootstrapped with `db load-state` does (it holds consensus
+only from the restored epoch on) and one that lost a past pack does. The rebuild re-executes every
+epoch from 0 from the node's own packs, and the node fetches only the packs of the epochs after the
+one it resumes from, so every start would stop at the gap. A pack missing after that epoch does not
+refuse: the next start fetches it from peers. Such a node puts back
+each missing `epoch-N/` from a backup taken after that epoch closed, or rebuilds as a new one: move
+`consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
 A validator rebuilt that way stays stopped until the network has closed the last epoch it took part
 in: its votes and proposals for that epoch leave with `consensus-db/`. A validator takes the
 side-observer swap below instead, which keeps its `consensus-db/`: `--for-swap` skips this refusal,
@@ -1325,7 +1350,7 @@ because the copied execution database replaces the rebuild.
   3. Stop the validator, then move its execution database aside:
      `telcoin-network db reset-execution --datadir <validator-datadir> --force --for-swap`.
      `--for-swap` lets a validator bootstrapped with `db load-state` through: the start in step 5
-     executes only the consensus output past the copy's tip, so it needs no epoch-0 pack. A copy
+     executes only the consensus output past the copy's tip, so it needs no pack below it. A copy
      that stores transactions by position needs, at that start, the validator's packs of every
      epoch its rows point into ("Startup check" above): an observer synced from genesis points
      into epoch 0, so for such a validator bootstrap the observer with `db load-state` too, from

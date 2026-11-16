@@ -481,6 +481,10 @@ pub struct ConsensusChain {
     /// Stream serving refuses the replaced handle meanwhile (its data log is not the one at the
     /// path).
     pending_swap: Arc<Mutex<Option<Epoch>>>,
+    /// The free space a peer import leaves on the filesystem
+    /// ([`import_min_free`](crate::consensus_pack::import_min_free) of the execution database's
+    /// growth step; [`Self::with_execution_growth_step`]).
+    import_min_free: u64,
 }
 
 /// A header [`ConsensusChain`] remembers, with the epoch and digest it is looked up by, computed
@@ -561,7 +565,24 @@ impl ConsensusChain {
             staging_import: Arc::new(tokio::sync::Mutex::new(())),
             recent_headers: Arc::new(Mutex::new(VecDeque::new())),
             pending_swap: Arc::new(Mutex::new(None)),
+            import_min_free: crate::consensus_pack::IMPORT_MIN_FREE_BYTES,
         })
+    }
+
+    /// Size the free-space floor of this chain's peer imports for an execution database whose
+    /// largest single growth step is `step` bytes (the node's `--db.growth-step`, or its backend's
+    /// default): the floor keeps that step free beside the consensus stores' own
+    /// ([`import_min_free`](crate::consensus_pack::import_min_free)). Without it the floor is
+    /// sized for tn-lmdb's default step
+    /// ([`DEFAULT_EXECUTION_GROWTH_STEP`](crate::consensus_pack::DEFAULT_EXECUTION_GROWTH_STEP)).
+    pub fn with_execution_growth_step(mut self, step: u64) -> Self {
+        self.import_min_free = crate::consensus_pack::import_min_free(step);
+        self
+    }
+
+    /// The free space a peer import leaves on the filesystem.
+    pub fn import_min_free(&self) -> u64 {
+        self.import_min_free
     }
 
     /// Remember `header`, just read from a pack (see `recent_headers`).
@@ -954,7 +975,7 @@ impl ConsensusChain {
             previous_epoch,
             epoch_record.final_consensus,
             timeout,
-            crate::consensus_pack::IMPORT_MIN_FREE_BYTES,
+            self.import_min_free,
             import_path,
         )
         .await?;
@@ -1270,7 +1291,10 @@ impl ConsensusChain {
     /// past epoch; if `epoch-N` EXISTS, the aside is a stale backup from a completed install
     /// and is removed. Deleting `.replaced` unconditionally (the old behavior) could brick
     /// startup or lose an epoch.
-    fn recover_incomplete_installs(base_path: &Path) {
+    ///
+    /// Public so that `db repair --force` runs this same step at rest; a failed restore is only
+    /// logged, so a caller that must know checks [`Self::interrupted_installs`] afterwards.
+    pub fn recover_incomplete_installs(base_path: &Path) {
         let Ok(entries) = std::fs::read_dir(base_path) else { return };
         for entry in entries.flatten() {
             let file_name = entry.file_name();
@@ -1305,6 +1329,47 @@ impl ConsensusChain {
                 }
             }
         }
+    }
+
+    /// The epochs of the interrupted installs under the epochs directory `base_path`, lowest first:
+    /// an `epoch-N.replaced` with no `epoch-N` beside it (a stop between an install's two renames).
+    /// The node's next start puts each back ([`Self::recover_incomplete_installs`]); the at-rest
+    /// tools, which do not, report them. A failed look is an error, never "none".
+    pub fn interrupted_installs(base_path: &Path) -> io::Result<Vec<Epoch>> {
+        let mut epochs = Vec::new();
+        for entry in std::fs::read_dir(base_path)? {
+            let file_name = entry?.file_name();
+            let Some(live_name) = file_name.to_str().and_then(|n| n.strip_suffix(".replaced"))
+            else {
+                continue;
+            };
+            let Some(epoch) =
+                live_name.strip_prefix("epoch-").and_then(|n| n.parse::<Epoch>().ok())
+            else {
+                continue;
+            };
+            if !base_path.join(live_name).try_exists()? {
+                epochs.push(epoch);
+            }
+        }
+        epochs.sort_unstable();
+        Ok(epochs)
+    }
+
+    /// Whether the node's next start on the epochs directory `base_path` finds the data log of
+    /// `epoch`'s pack, the test the startup coverage check and [`Self::epoch_absent`] apply once
+    /// the start has run: `epoch-N/data`, or, with no `epoch-N`, the data log in an interrupted
+    /// install's `epoch-N.replaced`, which the start puts back before it opens anything
+    /// ([`Self::recover_incomplete_installs`]). For the tools that judge a datadir at rest. A
+    /// failed look is an error, never "absent".
+    pub fn pack_data_at_start(base_path: &Path, epoch: Epoch) -> io::Result<bool> {
+        let live = base_path.join(format!("epoch-{epoch}"));
+        let dir = if live.try_exists()? {
+            live
+        } else {
+            base_path.join(format!("epoch-{epoch}.replaced"))
+        };
+        dir.join(DATA_NAME).try_exists()
     }
 
     /// Atomically install a freshly-imported `epoch-{epoch}` directory at `base_path`, replacing
@@ -1353,13 +1418,14 @@ impl ConsensusChain {
         std::fs::create_dir_all(&staging_base)?;
         // The import authenticates the prefix's final output against `epoch_record`, and every
         // earlier one through the parent links back from it, so the staged data is trustworthy.
-        let pack = match ConsensusPack::stream_import(
+        let pack = match ConsensusPack::stream_import_with_floor(
             &staging_base,
             stream,
             epoch,
             previous_epoch,
             epoch_record.final_consensus,
             timeout,
+            self.import_min_free,
         )
         .await
         {
@@ -3085,6 +3151,45 @@ mod test {
         // epoch-6 untouched, its stale aside removed.
         assert!(base.join("epoch-6").is_dir(), "existing epoch-6 must be left in place");
         assert!(!base.join("epoch-6.replaced").exists(), "a stale aside must be removed");
+    }
+
+    /// The at-rest view (`interrupted_installs`, `pack_data_at_start`) answers before a start what
+    /// the start's `recover_incomplete_installs` then makes true: an aside with no live directory
+    /// is an interrupted install whose data log counts as present, an aside beside a live
+    /// directory is not (the start removes it, so only the live data log counts), and a directory
+    /// without a data log is no pack.
+    #[test]
+    fn test_at_rest_pack_view_matches_the_start() {
+        let temp_dir = TempDir::with_prefix("at_rest_view").expect("temp dir");
+        let base = temp_dir.path();
+        let data = crate::consensus_pack::DATA_NAME;
+        // 1: live with its data log. 2: only an aside holding one (an interrupted install).
+        // 3: live without a data log, beside an aside holding one (a stale aside). 4: an aside
+        // without a data log. 5: nothing.
+        for dir in
+            ["epoch-1", "epoch-2.replaced", "epoch-3", "epoch-3.replaced", "epoch-4.replaced"]
+        {
+            std::fs::create_dir(base.join(dir)).expect("mkdir");
+        }
+        for dir in ["epoch-1", "epoch-2.replaced", "epoch-3.replaced"] {
+            std::fs::write(base.join(dir).join(data), b"pack").expect("data log");
+        }
+        let present = |base: &std::path::Path| -> Vec<Epoch> {
+            (0..=5)
+                .filter(|epoch| ConsensusChain::pack_data_at_start(base, *epoch).expect("look"))
+                .collect()
+        };
+
+        assert_eq!(ConsensusChain::interrupted_installs(base).expect("list"), vec![2, 4]);
+        let before = present(base);
+        assert_eq!(before, vec![1, 2]);
+
+        ConsensusChain::recover_incomplete_installs(base);
+        assert!(ConsensusChain::interrupted_installs(base).expect("list").is_empty());
+        assert_eq!(present(base), before, "the start finds what the at-rest view predicted");
+        for epoch in &before {
+            assert!(base.join(format!("epoch-{epoch}")).join(data).is_file(), "epoch {epoch}");
+        }
     }
 
     #[tokio::test]
@@ -6624,6 +6729,65 @@ mod test {
         // The chain is still usable (the error path did not poison a lock or leave the dest
         // wedged).
         assert!(dest.get_consensus_output_current(1).await.is_err());
+    }
+
+    /// A staging import whose stream stops making progress in what it writes is stopped as
+    /// `ImportStalled` (charged to the peer by the fetcher), leaves nothing staged, and removes its
+    /// staging directory only after the import stopped writing into it. The chain's imports keep
+    /// the execution database's growth step free (`with_execution_growth_step`).
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_staging_import_is_stopped_and_cleaned_up() {
+        use crate::consensus_pack::{
+            import_min_free,
+            test::{drip_into, fabricated_chain, peer_stream_bytes, test_previous_epoch},
+            IMPORT_MIN_FREE_BYTES,
+        };
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let (records, last) = fabricated_chain(&committee, 3, 8, |_, _| vec![0_u8; 999_000]);
+        let src_dir = TempDir::with_prefix("test_staging_stall_src").expect("temp dir");
+        let bytes = peer_stream_bytes(src_dir.path(), &committee, &previous_epoch, &records);
+        let mut record = previous_epoch.clone();
+        record.final_consensus = last;
+
+        let dst_dir = TempDir::with_prefix("test_staging_stall_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned(), committee.clone()).unwrap();
+        assert_eq!(dest.import_min_free(), IMPORT_MIN_FREE_BYTES);
+        let dest = dest.with_execution_growth_step(4 << 30);
+        assert_eq!(dest.import_min_free(), import_min_free(4 << 30));
+        dest.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let (peer, stream) = tokio::io::duplex(64 << 10);
+        let importer = dest.clone();
+        let import = tokio::spawn(async move {
+            importer
+                .import_partial_to_staging(
+                    stream,
+                    &record,
+                    &previous_epoch,
+                    Duration::from_secs(3600),
+                )
+                .await
+        });
+        let err = drip_into(peer, &bytes, 64, Duration::from_secs(10), import)
+            .await
+            .expect_err("a stalled staging import is stopped");
+        assert!(
+            matches!(
+                err,
+                ConsensusChainError::PackError(
+                    crate::consensus_pack::PackError::ImportStalled { .. }
+                )
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(dest.staging_final(), None, "a stopped import must not leave a staged pack");
+        assert!(
+            staging_dirs(dst_dir.path(), 0).is_empty(),
+            "a stopped import must remove its staging dir"
+        );
     }
 
     /// With the in-progress epoch open as `current_pack` but only built up to `k`, reads for

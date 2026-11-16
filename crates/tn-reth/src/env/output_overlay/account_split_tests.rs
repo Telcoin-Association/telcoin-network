@@ -211,25 +211,33 @@ impl Fixture {
     }
 }
 
-/// `f`'s result and the account-walk fallbacks this thread counted while it ran, by reason.
-fn counting_fallbacks<T>(f: impl FnOnce() -> T) -> (T, HashMap<String, u64>) {
+/// `f`'s result, the account-walk fallbacks this thread counted while it ran (by reason), and the
+/// blocks whose root the split composed, as the node's metrics count them.
+fn counting_splits<T>(f: impl FnOnce() -> T) -> (T, HashMap<String, u64>, u64) {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     let result = metrics::with_local_recorder(&recorder, f);
-    let counts = snapshotter
-        .snapshot()
-        .into_vec()
-        .into_iter()
-        .filter(|(key, ..)| key.key().name() == "tn_reth.account_walk_fallbacks_total")
-        .filter_map(|(key, _, _, value)| {
-            let reason = key.key().labels().find(|l| l.key() == "reason")?.value().to_string();
-            match value {
-                DebugValue::Counter(n) => Some((reason, n)),
-                _ => None,
+    let mut fallbacks = HashMap::new();
+    let mut splits = 0;
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        let DebugValue::Counter(n) = value else { continue };
+        match key.key().name() {
+            "tn_reth.account_walk_fallbacks_total" => {
+                if let Some(reason) = key.key().labels().find(|l| l.key() == "reason") {
+                    fallbacks.insert(reason.value().to_string(), n);
+                }
             }
-        })
-        .collect();
-    (result, counts)
+            "tn_reth.account_walk_splits_total" => splits = n,
+            _ => {}
+        }
+    }
+    (result, fallbacks, splits)
+}
+
+/// `f`'s result and the account-walk fallbacks this thread counted while it ran, by reason.
+fn counting_fallbacks<T>(f: impl FnOnce() -> T) -> (T, HashMap<String, u64>) {
+    let (result, fallbacks, _) = counting_splits(f);
+    (result, fallbacks)
 }
 
 /// `count` EOAs (existing ones and new ones) whose hashed address starts with `nibble`, updated.
@@ -320,8 +328,9 @@ async fn small_trie_falls_back() -> eyre::Result<()> {
         );
     }
     let fixture = Fixture::new(base)?;
-    let (composed, fallbacks) = counting_fallbacks(|| fixture.check_output(&[block]));
+    let (composed, fallbacks, splits) = counting_splits(|| fixture.check_output(&[block]));
     assert_eq!(composed?, 0, "a small trie's root was composed");
+    assert_eq!(splits, 0, "the split counter moved on a `small_trie` fallback");
     assert_eq!(fallbacks.get("small_trie"), Some(&2), "fallbacks: {fallbacks:?}");
     assert_eq!(fallbacks.get("shape"), None, "the subtries ran: {fallbacks:?}");
     Ok(())
@@ -352,8 +361,9 @@ async fn block_that_leaves_a_leaf_child_falls_back() -> eyre::Result<()> {
     for address in &under[1..] {
         block.accounts.insert(*address, None);
     }
-    let (composed, fallbacks) = counting_fallbacks(|| fixture.check_output(&[block]));
+    let (composed, fallbacks, splits) = counting_splits(|| fixture.check_output(&[block]));
     assert_eq!(composed?, 0, "a root over a leaf child was composed");
+    assert_eq!(splits, 0, "the split counter moved on a `shape` fallback");
     assert_eq!(fallbacks.get("shape"), Some(&2), "fallbacks: {fallbacks:?}");
     assert_eq!(fallbacks.get("small_trie"), None, "fallbacks: {fallbacks:?}");
     Ok(())
@@ -420,13 +430,15 @@ async fn few_and_many_changes() -> eyre::Result<()> {
     let few = HashedPostState::default()
         .with_accounts((0..SPLIT_MIN_ACCOUNTS as u64 - 1).map(|i| (eoa(i), account(i + 1))));
     assert!(!worth_splitting(&few.construct_prefix_sets().freeze()));
-    let (composed, fallbacks) = counting_fallbacks(|| fixture.check_output(&[few]));
+    let (composed, fallbacks, splits) = counting_splits(|| fixture.check_output(&[few]));
     assert_eq!(composed?, 0, "a block with few changes was split");
+    assert_eq!(splits, 0, "the split counter moved on a `few_changes` fallback");
     assert_eq!(fallbacks.get("few_changes"), Some(&2), "fallbacks: {fallbacks:?}");
     let many =
         HashedPostState::default().with_accounts((0..EOAS + 500).map(|i| (eoa(i), account(i + 2))));
-    let (composed, fallbacks) = counting_fallbacks(|| fixture.check_output(&[many]));
+    let (composed, fallbacks, splits) = counting_splits(|| fixture.check_output(&[many]));
     assert_eq!(composed?, 2, "a block with many changes was not split");
+    assert_eq!(splits, 2, "the split counter counts every composed block");
     assert!(fallbacks.values().all(|n| *n == 0), "fallbacks: {fallbacks:?}");
     Ok(())
 }

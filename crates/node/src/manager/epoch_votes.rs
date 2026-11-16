@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use eyre::WrapErr as _;
+use eyre::{bail, WrapErr as _};
 use parking_lot::Mutex;
 use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
@@ -138,12 +138,13 @@ async fn certify_record(
 /// A round whose vote windows run out short of a quorum asks peers for the epoch's certified
 /// record. When the record a peer returns validates against the committee this node trusts for
 /// the epoch (see `EpochRecordDb::validate_downloaded_record`) and its digest differs from this
-/// node's own, the round logs the fork and calls `node_shutdown`, whatever the record's epoch: a
-/// round for an older record (a re-certify round) stops the node as the previous record's round
-/// does.
+/// node's own, the round logs the fork, forgets the signatures kept for its own record and ends
+/// with the fork as its error, whatever the record's epoch: a round for an older record (a
+/// re-certify round) stops the node as the previous record's round does.
 ///
 /// Returns `Err` only when our own epoch store fails to save or persist the certificate (see
-/// `EpochDbError::stop_on_local_failure`); every other way a round ends is `Ok`.
+/// `EpochDbError::stop_on_local_failure`), or when the network certified a different record for
+/// the epoch than ours (a fork); every other way a round ends is `Ok`.
 async fn manage_epoch_votes(
     epoch_rec: EpochRecord,
     key_config: KeyConfig,
@@ -176,7 +177,6 @@ async fn manage_epoch_votes(
     // set once a certificate for this record is stored or found stored
     let mut certified = false;
     // set when this round's peer recovery validated a certified record that differs from ours
-    let mut conflict = false;
     // set when the peer recovery failed for real; the alarm waits for the kept quorum below
     let mut missing_cert_alarm = false;
     // a round of a record older than the previous one leaves the signer gauge to the rounds of
@@ -392,7 +392,9 @@ async fn manage_epoch_votes(
                             {
                                 let new_epoch_hash = new_epoch_rec.digest();
                                 if new_epoch_hash != epoch_hash {
-                                    conflict = true;
+                                    // a record known to differ from the network's certified one is never built
+                                    // from kept votes, in this round or a later one
+                                    retained.forget_record(epoch_rec.epoch, epoch_hash);
                                     error!(
                                         target: "epoch-manager",
                                         "Network came to consensus on epoch record {new_epoch_hash} we expected epoch record {epoch_hash}, we have forked!",
@@ -400,8 +402,13 @@ async fn manage_epoch_votes(
                                     // We generated a different record than the network certified, so we
                                     // have forked. A fork is not something a node can safely recover from
                                     // (records are deterministic, so ours is simply wrong) — fail-stop
-                                    // rather than adopt the network's record and pretend to recover.
-                                    node_shutdown.notify();
+                                    // rather than adopt the network's record and pretend to recover. The
+                                    // error stops the node through the collector, so it exits non-zero.
+                                    bail!(
+                                        "epoch {}: the network certified epoch record {new_epoch_hash} \
+                                         where this node computed {epoch_hash}; this node has forked",
+                                        epoch_rec.epoch
+                                    );
                                 } else {
                                     info!(
                                         target: "epoch-manager",
@@ -438,10 +445,6 @@ async fn manage_epoch_votes(
     }
     if certified {
         retained.forget_epoch(epoch_rec.epoch);
-    } else if conflict {
-        // a record known to differ from the network's certified one is never built from kept
-        // votes, in this round or a later one
-        retained.forget_record(epoch_rec.epoch, epoch_hash);
     } else {
         // votes forwarded after the vote loop ended (during peer recovery) were not counted,
         // and the handler drops their repeats for the rest of its epoch: keep them
@@ -526,7 +529,7 @@ async fn handle_new_vote(
     primary_network: PrimaryNetworkHandle,
     task_spawner: &TaskSpawner,
     node_shutdown: ShutdownNotifier,
-    store_failed: &Sender<TaskError>,
+    round_failed: &Sender<TaskError>,
     retained: RetainedEpochVotes,
 ) {
     let mut remove = None;
@@ -570,9 +573,10 @@ async fn handle_new_vote(
         };
         // Spawn the vote collector in response to a vote if it was missing.
         // This allows the possibility of recovering a cert with a republished vote even if stale.
-        // A round is not critical (it ends once its epoch is certified or given up), so its one
-        // error, our own store failing, goes to the critical collector, which stops the node.
-        let store_failed = store_failed.clone();
+        // A round is not critical (it ends once its epoch is certified or given up), so its
+        // errors, our own store failing or a fork, go to the critical collector, which stops the
+        // node.
+        let round_failed = round_failed.clone();
         task_spawner.spawn_task(format!("epoch votes for epoch {}", epoch_rec.epoch), async move {
             if let Err(e) = manage_epoch_votes(
                 epoch_rec,
@@ -585,7 +589,7 @@ async fn handle_new_vote(
             )
             .await
             {
-                let _ = store_failed.send(TaskError::from_message(format!("{e:#}"))).await;
+                let _ = round_failed.send(TaskError::from_message(format!("{e:#}"))).await;
             }
             Ok(())
         });
@@ -629,9 +633,9 @@ fn new_epoch_vote(consensus_bus: &ConsensusBusApp, epoch_vote: EpochVote) {
 /// eliminating the gap at epoch boundaries where votes could be lost. It watches for new
 /// `EpochRecord`s via a `watch` channel and collects votes for each epoch.
 ///
-/// A round that finds our own epoch store failing (see `EpochDbError::stop_on_local_failure`)
-/// reports it here, and this critical task returns the error, so the node exits for operator
-/// intervention.
+/// A round that finds our own epoch store failing (see `EpochDbError::stop_on_local_failure`) or
+/// our record forked from the one the network certified reports it here, and this critical task
+/// returns the error, so the node exits, non-zero, for operator intervention.
 ///
 /// Every record that arrives also prunes the [`RetainedEpochVotes`] every round shares and
 /// re-votes one older uncertified record of this node's own (see [`recertify_older_record`]), so
@@ -651,7 +655,7 @@ pub(crate) fn spawn_epoch_vote_collector(
     let retained = RetainedEpochVotes::default();
     let shutdown = node_shutdown.subscribe();
     // The first failure is enough to stop the node.
-    let (store_failed_tx, mut store_failed_rx) = mpsc::channel(1);
+    let (round_failed_tx, mut round_failed_rx) = mpsc::channel(1);
 
     node_task_spawner.spawn_critical_task("Epoch Vote Collector", async move {
         loop {
@@ -659,7 +663,7 @@ pub(crate) fn spawn_epoch_vote_collector(
             let epoch_rec = loop {
                 tokio::select! {
                     _ = &shutdown => return Ok(()),
-                    Some(err) = store_failed_rx.recv() => return Err(err),
+                    Some(err) = round_failed_rx.recv() => return Err(err),
                     _ = epoch_rx.changed() => {
                         if let Some(rec) = epoch_rx.borrow_and_update().clone() {
                             break rec;
@@ -670,7 +674,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                             None => return Ok(()),  // Channel closed- we are done.
                             Some(vote) => {
                                 handle_new_vote(vote, &mut vote_queues, consensus_chain.clone(), key_config.clone(),
-                                    primary_network.clone(), &task_spawner, node_shutdown.clone(), &store_failed_tx,
+                                    primary_network.clone(), &task_spawner, node_shutdown.clone(), &round_failed_tx,
                                     retained.clone()).await;
                             }
                         }
@@ -856,12 +860,13 @@ async fn pick_recertify_record(db: &EpochRecordDb, epoch: Epoch) -> Option<Epoch
 /// A re-vote can find this node's own record in conflict with the network's certified one. When the
 /// round for the picked record falls short, its peer recovery fetches the certified record from a
 /// peer; when that record validates and its digest differs from this node's, the round logs at
-/// error a line ending in `we have forked!` and calls the node's shutdown, as it does for the
-/// newest record and the previous one. The stored record stays as it is, uncertified. After a
-/// restart, [`revote_uncertified_epoch_record_on_startup`] arms the latest record again while a
-/// record of the [`MAX_RECERTIFY_LOOKBACK`] epochs before it is uncertified, and with the same
-/// records stored the pick chooses the same record again, so the node stops again until an operator
-/// acts.
+/// error a line ending in `we have forked!` and ends with the fork as its error, which the
+/// collector returns to stop the node, as it does for the newest record and the previous one. Such
+/// a round counts no outcome in `tn_node.epoch_record_recertify_rounds_total`. The stored record
+/// stays as it is, uncertified. After a restart, [`revote_uncertified_epoch_record_on_startup`]
+/// arms the latest record again while a record of the [`MAX_RECERTIFY_LOOKBACK`] epochs before it
+/// is uncertified, and with the same records stored the pick chooses the same record again, so the
+/// node stops again until an operator acts.
 async fn recertify_older_record(
     db: &EpochRecordDb,
     consensus_bus: &ConsensusBusApp,
@@ -2043,15 +2048,18 @@ mod epoch_vote_collector_tests {
 
     /// Fail-stop on fork: after a failed local vote quorum, the peer-recovery download returns a
     /// record that validates against our locally-trusted anchor but whose digest differs from the
-    /// one we computed. That is an unrecoverable fork (records are deterministic), so the collector
-    /// must call `node_shutdown.notify()` rather than silently adopt the peer's record.
+    /// one we computed. That is an unrecoverable fork (records are deterministic), so the round
+    /// must end with the fork as its error rather than silently adopt the peer's record. The
+    /// error reaches the critical collector, which stops the node with it (the path
+    /// `test_failed_epoch_store_stops_the_collector` follows), so the node exits non-zero; the
+    /// round itself leaves the node's shutdown to that error.
     ///
     /// Paused clock: `manage_epoch_votes` reaches the recovery path only after
     /// `MAX_EPOCH_VOTE_TIMEOUTS` vote windows of `EPOCH_VOTE_RECV_TIMEOUT` each (~60s of real
     /// time), and the recovery loop bails if the vote channel is closed, so the sender is held
     /// open and the windows are fast-forwarded.
     #[tokio::test(start_paused = true)]
-    async fn test_fork_digest_mismatch_triggers_shutdown() {
+    async fn test_fork_digest_mismatch_fails_the_round() {
         let mut rng = StdRng::from_os_rng();
         let kp1 = BlsKeypair::generate(&mut rng);
         let kp2 = BlsKeypair::generate(&mut rng);
@@ -2133,11 +2141,9 @@ mod epoch_vote_collector_tests {
         let node_shutdown = ShutdownNotifier::new();
         let noticer = node_shutdown.subscribe();
 
-        // Drive the collector directly: the vote windows auto-advance under the paused clock and
-        // the recovery download returns the mismatched record, so the fork is detected and fires
-        // `node_shutdown.notify()`. The call then returns because the recovery loop breaks after
-        // the download — nothing on that path awaits the notifier.
-        manage_epoch_votes(
+        // Drive the round directly: the vote windows auto-advance under the paused clock and the
+        // recovery download returns the mismatched record, so the fork is detected and returned.
+        let err = manage_epoch_votes(
             local_rec,
             kc1,
             primary_network,
@@ -2147,9 +2153,12 @@ mod epoch_vote_collector_tests {
             RetainedEpochVotes::default(),
         )
         .await
-        .expect("no local store failure");
-
-        assert!(noticer.noticed(), "digest mismatch must trigger node shutdown");
+        .expect_err("a digest mismatch must end the round with the fork");
+        assert!(err.to_string().contains("this node has forked"), "unexpected error: {err:#}");
+        assert!(
+            !noticer.noticed(),
+            "the round leaves the stop to its error, which the collector returns",
+        );
         // Fail-stop, NOT adopt: the peer's forked record must be neither certified nor stored.
         assert!(
             consensus_chain.epochs().cert_by_digest(alt_rec.digest()).await.is_none(),
@@ -2204,7 +2213,7 @@ mod epoch_vote_collector_tests {
         let task_manager = TaskManager::default();
         let spawner = task_manager.get_spawner();
         let node_shutdown = ShutdownNotifier::new();
-        let (store_failed, _store_failed_rx) = mpsc::channel(1);
+        let (round_failed, _round_failed_rx) = mpsc::channel(1);
 
         // Seed the queue with a DEAD collector entry: receiver dropped, so a forward send fails.
         let (dead_tx, dead_rx) = mpsc::channel::<EpochVote>(1);
@@ -2221,7 +2230,7 @@ mod epoch_vote_collector_tests {
             primary_network,
             &spawner,
             node_shutdown,
-            &store_failed,
+            &round_failed,
             RetainedEpochVotes::default(),
         )
         .await;
@@ -2275,7 +2284,7 @@ mod epoch_vote_collector_tests {
         let task_manager = TaskManager::default();
         let spawner = task_manager.get_spawner();
         let node_shutdown = ShutdownNotifier::new();
-        let (store_failed, _store_failed_rx) = mpsc::channel(1);
+        let (round_failed, _round_failed_rx) = mpsc::channel(1);
 
         // `EpochVote` is `Copy`, so the same vote drives both cases.
         let vote = epoch_rec.sign_vote(&kc1);
@@ -2290,7 +2299,7 @@ mod epoch_vote_collector_tests {
             primary_network.clone(),
             &spawner,
             node_shutdown.clone(),
-            &store_failed,
+            &round_failed,
             RetainedEpochVotes::default(),
         )
         .await;
@@ -2312,7 +2321,7 @@ mod epoch_vote_collector_tests {
             primary_network,
             &spawner,
             node_shutdown,
-            &store_failed,
+            &round_failed,
             RetainedEpochVotes::default(),
         )
         .await;
@@ -3780,7 +3789,7 @@ mod epoch_vote_collector_tests {
             record_chain("vote_queue_eviction", &committee).await;
         let (primary_network, _published) = spawn_quiet_network();
         let task_manager = TaskManager::default();
-        let (store_failed, _store_failed_rx) = mpsc::channel(1);
+        let (round_failed, _round_failed_rx) = mpsc::channel(1);
         let mut receivers = Vec::new();
         let mut vote_queues: VoteQueue = VecDeque::new();
         for epoch in [10, 4, 6, 7, 8] {
@@ -3798,7 +3807,7 @@ mod epoch_vote_collector_tests {
             primary_network,
             &task_manager.get_spawner(),
             ShutdownNotifier::new(),
-            &store_failed,
+            &round_failed,
             RetainedEpochVotes::default(),
         )
         .await;
@@ -4373,7 +4382,8 @@ mod epoch_vote_collector_tests {
     struct ConflictingRound {
         /// The kind the round was given when it started.
         kind: RoundKind,
-        /// Whether the round called the node's shutdown.
+        /// Whether the round ended with the fork as its error, which the collector returns to stop
+        /// the node.
         stopped: bool,
         /// Whether the store holds a certificate for the network's record afterwards.
         adopted: bool,
@@ -4453,7 +4463,7 @@ mod epoch_vote_collector_tests {
 
         // no vote arrives and the sender stays open, so the windows time out into recovery
         let (_vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
-        manage_epoch_votes(
+        let fork = manage_epoch_votes(
             ours,
             keys[0].clone(),
             primary_network,
@@ -4463,18 +4473,24 @@ mod epoch_vote_collector_tests {
             retained,
         )
         .await
-        .expect("no local store failure");
+        .expect_err("a conflicting record must end the round with the fork");
+        assert!(
+            !noticer.noticed(),
+            "the round leaves the stop to its error, which the collector returns"
+        );
+        let stopped = fork.to_string().contains("this node has forked");
 
         let adopted = db.cert_by_digest(theirs_digest).await.is_some();
         let lines = lines.lock().clone();
-        ConflictingRound { kind, stopped: noticer.noticed(), adopted, lines }
+        ConflictingRound { kind, stopped, adopted, lines }
     }
 
     /// A re-certify round whose peer recovery validates a certified record that differs from this
     /// node's own record of the epoch stops the node, as the previous record's round does: it
-    /// logs the fork at error, calls the node's shutdown and does not adopt the network's
-    /// record, whether this node picked the record to re-certify or another member's re-vote
-    /// started the round. The previous record's round is run the same way.
+    /// logs the fork at error, ends with the fork as its error (which the collector returns to
+    /// stop the node) and does not adopt the network's record, whether this node picked the
+    /// record to re-certify or another member's re-vote started the round. The previous record's
+    /// round is run the same way.
     #[tokio::test(start_paused = true)]
     async fn test_recertify_round_stops_on_a_conflicting_record() {
         for (latest, mark, expected) in [

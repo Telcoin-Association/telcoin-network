@@ -2,10 +2,7 @@
 
 use eyre::{eyre, WrapErr as _};
 use futures::TryStreamExt as _;
-use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 use tn_config::EndpointMapping;
 use tn_network_libp2p::{validate_advertised_addresses, MAX_ADVERTISED_MULTIADDRS};
 use tn_types::{Multiaddr, NetworkPublicKey, Protocol, WorkerId, DEFAULT_WORKER_ID};
@@ -41,44 +38,6 @@ pub(super) fn worker_listener_env_var(worker_id: WorkerId) -> String {
     } else {
         format!("WORKER_{worker_id}_LISTENER_MULTIADDR")
     }
-}
-
-/// Whether `address` starts with a loopback IP; a DNS name or any other host is not loopback.
-fn is_loopback(address: &Multiaddr) -> bool {
-    match address.iter().next() {
-        Some(Protocol::Ip4(ip)) => ip.is_loopback(),
-        Some(Protocol::Ip6(ip)) => ip.is_loopback(),
-        _ => false,
-    }
-}
-
-/// The listeners that bind a loopback IP while some peer is elsewhere, each as
-/// `(override variable, listener, suggested bind)`.
-///
-/// A QUIC dial leaves from its listener's UDP socket, and a socket bound to a loopback IP
-/// cannot send to another host, so every dial from such a listener to a remote peer times out.
-/// The suggested bind keeps the port and binds every interface of the same IP family.
-pub(super) fn loopback_listeners_with_remote_peers<'a>(
-    listeners: impl IntoIterator<Item = (String, &'a Multiaddr)>,
-    mut peers: impl Iterator<Item = &'a Multiaddr>,
-) -> Vec<(String, Multiaddr, Multiaddr)> {
-    let remote_peer = peers.any(|peer| !is_loopback(peer));
-    listeners
-        .into_iter()
-        .filter(|(_, listener)| remote_peer && is_loopback(listener))
-        .map(|(env_var, listener)| {
-            let suggested = listener
-                .iter()
-                .filter(|protocol| !matches!(protocol, Protocol::P2p(_)))
-                .map(|protocol| match protocol {
-                    Protocol::Ip4(_) => Protocol::Ip4(Ipv4Addr::UNSPECIFIED),
-                    Protocol::Ip6(_) => Protocol::Ip6(Ipv6Addr::UNSPECIFIED),
-                    other => other,
-                })
-                .collect();
-            (env_var, listener.clone(), suggested)
-        })
-        .collect()
 }
 
 /// Resolve a mapping once, serially, without DNS names in records or background refresh tasks.

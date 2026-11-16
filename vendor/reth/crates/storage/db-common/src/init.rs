@@ -156,16 +156,33 @@ where
                     // genesis header in static files and nothing in the database, and every
                     // restart failed here until the operator deleted the datadir.
                     // With no stage checkpoint at all the database is empty, so the launch
-                    // resumes: `insert_genesis_header` keeps the header already there. Storage v1
-                    // only: under v2 genesis also committed block 0 of the changeset segments,
-                    // which the resumed `insert_genesis_state` fails to append again. TN's
-                    // `layout::settle` removes such a genesis, or refuses the datadir, first.
-                    if database_is_empty(factory)? {
-                        warn!(target: "reth::storage", "Genesis header found on static files with an empty database; resuming an interrupted first launch.");
-                    } else {
+                    // resumes: `insert_genesis_header` keeps the header already there.
+                    // TN(TN-0206): only when the static files hold genesis and nothing past it
+                    // (upstream 168b0a477's check), so a synced node whose database was deleted
+                    // is refused before anything is removed. Under storage v2 genesis also
+                    // committed block 0 of both changeset segments; they are removed so the
+                    // resumed `insert_genesis_state` writes them once.
+                    let static_files = factory.static_file_provider();
+                    let has_non_genesis_static_files = StaticFileSegment::iter().any(|segment| {
+                        static_files
+                            .get_highest_static_file_block(segment)
+                            .is_some_and(|block| block != genesis_block_number) ||
+                            static_files
+                                .get_lowest_range_start(segment)
+                                .is_some_and(|block| block != genesis_block_number) ||
+                            (segment.is_tx_based() &&
+                                static_files.get_highest_static_file_tx(segment).is_some())
+                    });
+                    if has_non_genesis_static_files || !database_is_empty(factory)? {
                         error!(target: "reth::storage", "Genesis header found on static files, but database is uninitialized.");
                         return Err(InitStorageError::UninitializedDatabase)
                     }
+                    for segment in
+                        [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
+                    {
+                        static_files.delete_segment(segment)?;
+                    }
+                    warn!(target: "reth::storage", "Genesis header found on static files with an empty database; resuming an interrupted first launch.");
                 } else {
                     let stored = factory.storage_settings()?.unwrap_or_else(StorageSettings::v1);
                     if stored != genesis_storage_settings {
@@ -693,6 +710,7 @@ mod tests {
         Database,
     };
     use reth_provider::{
+        providers::StaticFileProvider,
         test_utils::{create_test_provider_factory_with_chain_spec, MockNodeTypesWithDB},
         ProviderFactory, RocksDBProviderFactory,
     };
@@ -754,6 +772,124 @@ mod tests {
         assert_eq!(factory.block_hash(0).unwrap(), Some(SEPOLIA_GENESIS_HASH));
         // the next start is the ordinary "already written" path
         assert_eq!(init_genesis(&factory).unwrap(), SEPOLIA_GENESIS_HASH);
+    }
+
+    /// TN(TN-0206): a chain whose genesis has one account with code and one storage slot, so a
+    /// storage v2 genesis writes one row to each changeset segment.
+    fn one_account_chain_spec() -> Arc<ChainSpec> {
+        Arc::new(ChainSpec {
+            chain: Chain::from_id(1),
+            genesis: Genesis {
+                alloc: BTreeMap::from([(
+                    Address::with_last_byte(2),
+                    GenesisAccount {
+                        balance: U256::from(1),
+                        code: Some(Bytes::from_static(&[0x00])),
+                        storage: Some(BTreeMap::from([(
+                            B256::with_last_byte(1),
+                            B256::with_last_byte(0x2a),
+                        )])),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            hardforks: Default::default(),
+            paris_block_and_final_difficulty: None,
+            deposit_contract: None,
+            ..Default::default()
+        })
+    }
+
+    /// TN(TN-0206): a storage v2 first launch that committed genesis's static files (the header
+    /// and block 0 of both changeset segments) but not its database transaction.
+    fn torn_v2_first_launch(
+        factory: &ProviderFactory<MockNodeTypesWithDB>,
+        chain_spec: &Arc<ChainSpec>,
+    ) {
+        factory.set_storage_settings_cache(StorageSettings::v2());
+        let provider_rw = factory.database_provider_rw().unwrap();
+        insert_genesis_header(&provider_rw, chain_spec).unwrap();
+        insert_genesis_state(&provider_rw, chain_spec.genesis.alloc.iter()).unwrap();
+        provider_rw.static_file_provider().commit().unwrap();
+        // the database transaction is dropped uncommitted: the crash between the two commits
+    }
+
+    /// TN(TN-0206): under storage v2 a torn first launch also left genesis's changesets in the
+    /// static files; the resume writes block 0's changesets once, both in the process that tore
+    /// (its cached static-file writers are stale) and in a fresh one.
+    #[test]
+    fn v2_init_genesis_resumes_after_a_torn_first_launch() {
+        use reth_provider::{ChangeSetReader, StorageChangeSetReader};
+
+        let chain_spec = one_account_chain_spec();
+        let settings = StorageSettings::v2();
+        for restarted in [false, true] {
+            let mut factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
+            torn_v2_first_launch(&factory, &chain_spec);
+            assert!(factory.get_stage_checkpoint(StageId::Headers).unwrap().is_none());
+            if restarted {
+                // a new static-file provider over the same files, without cached writers
+                let static_files =
+                    StaticFileProvider::read_write(factory.static_file_provider().directory())
+                        .unwrap();
+                let rocksdb = factory.rocksdb_provider();
+                factory = ProviderFactory::new(
+                    factory.into_db(),
+                    chain_spec.clone(),
+                    static_files,
+                    rocksdb,
+                    reth_tasks::Runtime::test(),
+                )
+                .unwrap();
+            }
+
+            assert_eq!(
+                init_genesis_with_settings(&factory, settings).unwrap(),
+                chain_spec.genesis_hash(),
+                "restarted: {restarted}"
+            );
+            let provider = factory.provider().unwrap();
+            assert_eq!(provider.account_block_changeset(0).unwrap().len(), 1, "{restarted}");
+            assert_eq!(provider.storage_changeset(0).unwrap().len(), 1, "{restarted}");
+            drop(provider);
+            assert!(factory.get_stage_checkpoint(StageId::Headers).unwrap().is_some());
+            // the next start is the ordinary "already written" path
+            assert_eq!(
+                init_genesis_with_settings(&factory, settings).unwrap(),
+                chain_spec.genesis_hash()
+            );
+        }
+    }
+
+    /// TN(TN-0206): static files that hold a block past genesis beside an empty database (a
+    /// synced node whose database was deleted) are refused before the resume removes anything.
+    #[test]
+    fn init_genesis_refuses_static_files_past_genesis() {
+        let chain_spec = one_account_chain_spec();
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
+        torn_v2_first_launch(&factory, &chain_spec);
+        let static_files = factory.static_file_provider();
+        {
+            let header = alloy_consensus::Header {
+                number: 1,
+                parent_hash: chain_spec.genesis_hash(),
+                ..Default::default()
+            };
+            let mut writer = static_files.latest_writer(StaticFileSegment::Headers).unwrap();
+            writer.append_header(&header, &header.hash_slow()).unwrap();
+            writer.commit().unwrap();
+        }
+        assert_eq!(static_files.get_highest_static_file_block(StaticFileSegment::Headers), Some(1));
+
+        assert!(matches!(
+            init_genesis_with_settings(&factory, StorageSettings::v2()).unwrap_err(),
+            InitStorageError::UninitializedDatabase
+        ));
+        for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
+        {
+            assert_eq!(static_files.get_highest_static_file_block(segment), Some(0), "{segment}");
+        }
     }
 
     /// TN(TN-0083): a database that holds any checkpoint without the Headers one is still

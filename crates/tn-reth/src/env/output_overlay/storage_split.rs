@@ -44,7 +44,9 @@
 //! Counted in `tn_reth.storage_walk_fallbacks_total` ([`crate::metrics::StorageWalkFallback`]): a
 //! hot trie the pre-check refused (`small_trie`, not tried), a split that composed nothing
 //! (`shape`, paid and then computed serially), a stored root node (`stored_root_node`), and a
-//! sampled serial check that found a block with a composed storage root wrong (`mismatch`).
+//! sampled serial check that found a block with a composed storage root wrong (`mismatch`). The
+//! storage roots the walk took composed are counted in `tn_reth.storage_walk_splits_total`, once
+//! per trie and block, on the calling thread after the walk.
 //!
 //! # Off switch
 //!
