@@ -4850,6 +4850,8 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
 
     let output_executed = captured_engine_events("output executed");
     assert_eq!(output_executed.len(), 1);
+    // the thread cpu clock is read from procfs: a host without it logs no `cpu_ms`
+    let cpu_clock = std::path::Path::new("/proc/thread-self/schedstat").exists();
     assert_eq!(
         field_names(&output_executed[0]),
         [
@@ -4870,13 +4872,18 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
             "max_block_evm_ms",
             "cpu_ms",
         ]
+        .into_iter()
+        .filter(|name| cpu_clock || *name != "cpu_ms")
+        .collect::<Vec<_>>()
     );
     assert_eq!(field_value(&output_executed[0], "txs"), Some(expected_txs.to_string().as_str()));
-    let cpu_ms: u64 = field_value(&output_executed[0], "cpu_ms").expect("cpu_ms").parse()?;
-    let execute_ms: u64 =
-        field_value(&output_executed[0], "execute_ms").expect("execute_ms").parse()?;
-    // the thread's cpu time stays within the span's wall time, give or take a scheduler tick
-    assert!(cpu_ms <= execute_ms + 25, "cpu_ms {cpu_ms} vs execute_ms {execute_ms}");
+    if cpu_clock {
+        let cpu_ms: u64 = field_value(&output_executed[0], "cpu_ms").expect("cpu_ms").parse()?;
+        let execute_ms: u64 =
+            field_value(&output_executed[0], "execute_ms").expect("execute_ms").parse()?;
+        // the thread's cpu time stays within the span's wall time, give or take a scheduler tick
+        assert!(cpu_ms <= execute_ms + 25, "cpu_ms {cpu_ms} vs execute_ms {execute_ms}");
+    }
 
     // each persist logs the store's used size after its commit, last on the line
     let persisted = captured_engine_events("persisted output");
