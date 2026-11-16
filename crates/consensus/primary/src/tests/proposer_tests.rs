@@ -4490,3 +4490,89 @@ async fn test_order_hold_warns_once_per_requeue_out_of_order() {
     assert_eq!(warnings[0].field("cause"), Some("committed"));
     assert_eq!(order_totals(&snapshotter), [Some(0), Some(2), Some(0), Some(0)]);
 }
+
+// ---- bench8 quorum-exec-block-floor ----
+
+/// One row of the golden table: what it reaches, the index of its ring in [`golden_exec_rings`],
+/// the header's policy and parents, and the expected (block number, own tip number, basis) at the
+/// default floor of [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] entries.
+type GoldenExecRow =
+    (&'static str, usize, ExecPolicy, Vec<ParentExecBlock>, (BlockNumber, BlockNumber, ExecBasis));
+
+/// The rings of the golden table:
+/// 0. 40 outputs: blocks 100, 103, ..., 217; the entry eight back is 193, sixteen back 169;
+/// 1. empty;
+/// 2. 12 outputs: blocks 100, 103, ..., 133, shorter than sixteen entries (eight back: 109);
+/// 3. outputs 0..=29 of epoch 2, then 30..=33 of epoch 3: the epoch opened on block 187, the tip is
+///    199, and the entry eight back (175) lies below the opening block.
+fn golden_exec_rings() -> [RecentBlocks; 4] {
+    let mut opened = RecentBlocks::new(50);
+    for output in 0..30 {
+        push_epoch_output(&mut opened, EXEC_MODEL_EPOCH - 1, output);
+    }
+    for output in 30..34 {
+        push_exec_output(&mut opened, output);
+    }
+    [exec_ring(40), RecentBlocks::new(50), exec_ring(12), opened]
+}
+
+/// The golden table's rows; nine parents naming one number put the quorum value at that number.
+fn golden_exec_rows() -> Vec<GoldenExecRow> {
+    use ExecBasis::{Floor, Quorum, Tip};
+    use ExecPolicy::{Always, Off, Starved};
+    let nine = |number| table_parents(1, 9, number);
+    let mut below_opening = table_parents(1, 6, 160);
+    below_opening.extend(table_parents(7, 3, 190));
+    vec![
+        ("tip: policy off", 0, Off, Vec::new(), (217, 217, Tip)),
+        ("tip: adaptive policy outside a window", 0, ExecPolicy::Tip, Vec::new(), (217, 217, Tip)),
+        ("tip: in step", 0, Always, nine(217), (217, 217, Tip)),
+        ("tip: cap, parents above the tip", 0, Always, nine(300), (217, 217, Tip)),
+        ("tip: too little usable power", 0, Always, table_parents(1, 5, 190), (217, 217, Tip)),
+        ("tip: empty ring", 1, Always, nine(150), (0, 0, Tip)),
+        ("quorum: one entry back", 0, Always, nine(214), (214, 217, Quorum)),
+        ("quorum: between two entries", 0, Always, nine(195), (193, 217, Quorum)),
+        ("quorum: eight entries back, at the floor", 0, Always, nine(193), (193, 217, Quorum)),
+        ("floor: nine entries back", 0, Always, nine(190), (193, 217, Floor)),
+        ("floor: twelve entries back", 0, Always, nine(181), (193, 217, Floor)),
+        ("floor: sixteen entries back", 0, Always, nine(169), (193, 217, Floor)),
+        ("floor: seventeen entries back", 0, Always, nine(166), (193, 217, Floor)),
+        ("floor: the oldest entry", 0, Always, nine(100), (193, 217, Floor)),
+        ("floor: starved window, nine entries back", 0, Starved, nine(190), (193, 217, Floor)),
+        ("short ring: five entries back", 2, Always, nine(118), (118, 133, Quorum)),
+        ("short ring: ten entries back", 2, Always, nine(103), (109, 133, Floor)),
+        ("short ring: the oldest entry", 2, Always, nine(100), (109, 133, Floor)),
+        ("opening: parents name the opening block", 3, Always, nine(187), (187, 199, Quorum)),
+        ("opening: parents below it are not counted", 3, Always, below_opening, (199, 199, Tip)),
+    ]
+}
+
+/// Assert that [`choose_exec_block`] on `ring` and `inputs` names `expected` (block number, own
+/// tip number, basis), and that the named block carries the own ring's hash (an empty ring's: the
+/// default block the tip read names).
+fn assert_golden_choice(
+    ring: &RecentBlocks,
+    inputs: &ExecBlockInputs,
+    name: &str,
+    expected: (BlockNumber, BlockNumber, ExecBasis),
+) {
+    let choice = choose_exec_block(ring, inputs);
+    assert_eq!((choice.block.number, choice.tip.number, choice.basis), expected, "{name}");
+    let own_entry = ring
+        .newest_at_or_below(expected.0)
+        .unwrap_or_else(|| ring.latest_execution_block_num_hash());
+    assert_eq!(choice.block, own_entry, "{name}: the own ring's block");
+}
+
+/// The quorum-exec-block choice at the default floor, row by row over four rings, against numbers
+/// written here: every basis (`tip` for each of its reasons, `quorum`, `floor`, the floor of a ring
+/// shorter than the floor, and the epoch's opening block as the lowest usable value). Making the
+/// floor a parameter must leave every row as it is, so a header at the default floor names the
+/// block it named before.
+#[test]
+fn test_quorum_exec_block_floor_golden_table() {
+    let rings = golden_exec_rings();
+    for (name, ring, policy, parents, expected) in golden_exec_rows() {
+        assert_golden_choice(&rings[ring], &table_inputs(policy, parents), name, expected);
+    }
+}
