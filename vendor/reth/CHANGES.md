@@ -3453,3 +3453,31 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   (each keep in a scope counts, a replaced value and an inner scope's too; a keep outside a scope
   and another thread's keeps do not); `range_scan_reads_are_bounded` and the other filter tests
   unchanged. *Upstream*: no (TN's format).
+
+- **TN-0210** — `debug_getRawBlock` and `debug_getRawTransactions` read the provider on the RPC
+  blocking pool. *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/debug.rs` (`raw_block`, `raw_transactions`; tests
+  `raw_block_reads_the_provider_off_the_runtime`,
+  `raw_transactions_read_the_provider_off_the_runtime`).
+  *Why*: both handlers read the block (`block_by_id`, `block_with_senders_by_id`) inside the
+  async method, on the runtime that drives the RPC server, which in TN also runs the node's other
+  async tasks. On a datadir that stores transactions by batch position (TN-0201, TN-0202) the
+  block's transactions go through TN's resolver, which can wait for a decode permit and then read
+  and decode a consensus pack, so a few such requests could hold every worker of that runtime
+  while other clients' reads kept the permits busy. Each handler now runs its read through the eth
+  API's `spawn_blocking_io` on the server's blocking pool, as `debug_getRawTransaction`
+  (`raw_transaction_by_hash`) runs its own, and like it takes no blocking-IO permit. The read is
+  the same call, and the closure returns the provider's result unconverted, so the handler turns
+  it into the answer as before (`to_rpc_result`, then `HeaderNotFound` for a missing block, or no
+  transactions) and every answer and error is the same; a lost blocking task answers
+  `InternalEthError`, as `debug_getRawTransaction`'s does. The encoding stays on the async side.
+  `debug_getRawHeader`, `debug_getRawReceipts`, `debug_codeByHash` and `debug_dbGet` still read
+  inline: headers, receipts and state, none of which goes through the resolver.
+  *Can reach execution or storage*: no. RPC only: the same reads, on another thread.
+  *Tests*: `raw_block_reads_the_provider_off_the_runtime` and
+  `raw_transactions_read_the_provider_off_the_runtime` (on a one-thread runtime, while another
+  thread holds the mock provider's block store until released or for 10 s, a request by hash must
+  leave the runtime's thread free to release it; before the change it blocked that thread until
+  the holder gave up; also the answers by hash and by number, for a missing block and for the
+  `finalized` tag, which the mock answers with a provider error, each equal to what the inline
+  read answered). *Upstream*: no; upstream has the same shape, where those reads are short.
