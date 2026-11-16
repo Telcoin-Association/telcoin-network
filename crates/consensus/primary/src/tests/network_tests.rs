@@ -1844,18 +1844,29 @@ async fn test_vote_cached_across_stale_headers() -> eyre::Result<()> {
     };
     store_vote_digest(&committee, &header, VoteDigest::default())?;
 
-    for (stale, what) in [(header_at(2, 3), "same round"), (header_at(1, 1), "older round")] {
-        let res = handler.vote(peer, stale, vec![]).await;
-        assert_matches!(
-            res,
-            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
-            "a different header for the {what} must still be refused"
-        );
-        assert!(
-            handler.author_guard_holds_vote(&author_id, header.digest()).await,
-            "refusing a header for the {what} must keep the cached vote"
-        );
-    }
+    // a different header for the same round is refused under the author lock
+    let same_round = handler.vote(peer, header_at(2, 3), vec![]).await;
+    assert_matches!(
+        same_round,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "a different header for the same round must still be refused"
+    );
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "refusing a header for the same round must keep the cached vote"
+    );
+    // the round-2 request is the author's newest, so a header for an older round is refused on
+    // arrival, before the author lock
+    let older_round = handler.vote(peer, header_at(1, 1), vec![]).await;
+    assert_matches!(
+        older_round,
+        Err(PrimaryNetworkError::SupersededRequest { round: 1, newest_round: 2, .. }),
+        "a header for an older round must be refused as superseded"
+    );
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "refusing a header for an older round must keep the cached vote"
+    );
 
     let repeat = handler.vote(peer, header.clone(), vec![]).await;
     assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
@@ -1902,10 +1913,11 @@ async fn test_vote_cached_across_refused_header() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A vote is answered from memory after a request from the same author was dropped while it was
-/// evaluated, as the network layer drops it when the requester cancels (issue #1836). The decision
-/// entry is put back before the evaluation awaits, and the vote is kept apart from it, so each
-/// covers the other here.
+/// A cast vote stays cached after a newer request from the same author was dropped while it waited
+/// for execution before the author lock, as the network layer drops it when the requester cancels
+/// (issue #1836). That request became the author's newest on arrival, so a repeat of the older
+/// header is then refused as superseded instead of getting its vote back, and the refusal keeps
+/// the cached vote.
 #[tokio::test]
 async fn test_vote_cached_across_dropped_request() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
@@ -1916,10 +1928,8 @@ async fn test_vote_cached_across_dropped_request() -> eyre::Result<()> {
     let peer = *author.authority().protocol_key();
 
     let header = votable_header(&committee, &parent, 1);
-    let vote = match handler.vote(peer, header.clone(), vec![]).await {
-        Ok(PrimaryResponse::Vote(vote)) => vote,
-        other => panic!("the first request must get a vote, got {other:?}"),
-    };
+    let first = handler.vote(peer, header.clone(), vec![]).await;
+    assert_matches!(first, Ok(PrimaryResponse::Vote(_)), "the first request must get a vote");
     store_vote_digest(&committee, &header, VoteDigest::default())?;
 
     // a newer header waiting for an execution block that never comes; polled once, then dropped
@@ -1937,7 +1947,15 @@ async fn test_vote_cached_across_dropped_request() -> eyre::Result<()> {
     );
 
     let repeat = handler.vote(peer, header.clone(), vec![]).await;
-    assert_matches!(repeat, Ok(PrimaryResponse::Vote(again)) if again == vote);
+    assert_matches!(
+        repeat,
+        Err(PrimaryNetworkError::SupersededRequest { round: 1, newest_round: 2, .. }),
+        "a repeat of the older header after the newer request must be refused as superseded"
+    );
+    assert!(
+        handler.author_guard_holds_vote(&author_id, header.digest()).await,
+        "refusing the repeat must keep the cached vote"
+    );
 
     Ok(())
 }
@@ -2236,7 +2254,11 @@ async fn test_vote_rejects_default_seed_signature() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Test that voting for older round after voting for newer round is rejected.
+/// A vote request for an older round of an author is refused. While this node holds a vote for the
+/// author's round-2 header only on disk, as after a restart, and has seen no newer request of the
+/// author, the round-1 header is refused by the stored vote as `AlreadyVotedForLaterRound`. Once
+/// the round-2 request has arrived it is the author's newest, and the round-1 header is refused as
+/// superseded on arrival, before the author lock.
 #[tokio::test]
 async fn test_vote_older_round_rejected() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
@@ -2254,10 +2276,6 @@ async fn test_vote_older_round_rejected() -> eyre::Result<()> {
         .created_at(2)
         .build();
 
-    // Vote for round 2 (may fail for other reasons but registers the round)
-    let _res1 = handler.vote(peer, header_round2, parents.clone()).await;
-
-    // Now try to vote for round 1 (should be rejected - already voted for later round)
     let header_round1 = committee
         .header_builder_last_authority()
         .round(1)
@@ -2265,12 +2283,25 @@ async fn test_vote_older_round_rejected() -> eyre::Result<()> {
         .created_at(1)
         .build();
 
+    // a vote this node cast for the round-2 header before a restart, with no request of the
+    // author seen since: the stored vote refuses the older round
+    store_vote_digest(&committee, &header_round2, header_round2.digest().into())?;
+    let res = handler.vote(peer, header_round1.clone(), parents.clone()).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "without a newer request, the stored vote must refuse the older round"
+    );
+
+    // Vote for round 2 (may fail for other reasons but registers the round)
+    let _res1 = handler.vote(peer, header_round2, parents.clone()).await;
+
+    // Now try to vote for round 1 (refused before the author lock - superseded by round 2)
     let res2 = handler.vote(peer, header_round1, parents).await;
-    // This should be rejected because we already processed a header for a later round
     assert_matches!(
         res2,
-        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
-        "Vote for older round should be rejected"
+        Err(PrimaryNetworkError::SupersededRequest { round: 1, newest_round: 2, .. }),
+        "Vote for older round should be refused as superseded"
     );
 
     Ok(())
@@ -3135,54 +3166,73 @@ async fn test_vote_tier_two_lead_is_deferred_before_seed_signature_check() -> ey
 
 /// A tier-three header is rejected before the voter waits for its execution block.
 ///
-/// The header leads the local clock by more than the drift tolerance plus the vote timeout and
-/// names execution block 1, which this node has not reached (the fixture stops at block 0). The
-/// execution wait would suspend on that block until the vote timeout fired and end the request as
-/// a `Timeout`, which carries no penalty (see `test_vote_inner_timeout`). The drift tier is decided
-/// first instead: the answer is `InvalidTimestamp`, without scoring clock skew. The paused clock
-/// moves only while every task waits, so a call that never waits takes no virtual time.
+/// A header that leads the local clock by more than the drift tolerance plus the vote timeout is
+/// refused with `InvalidTimestamp`, without scoring clock skew. The drift tier is decided under the
+/// author lock, after the wait for execution before it, so how soon the refusal comes depends on
+/// the header's execution block. A header naming block 1, which this node has not reached (the
+/// fixture stops at block 0), waits out the whole `VOTE_EXECUTION_WAIT` first; one naming the block
+/// this node holds does not wait and is refused at once. The paused clock moves only while every
+/// task waits, so a call that never waits takes no virtual time.
 #[tokio::test(start_paused = true)]
-async fn test_vote_tier_three_lead_is_rejected_before_execution_wait() -> eyre::Result<()> {
+async fn test_vote_tier_three_lead_waits_only_for_an_unexecuted_block() -> eyre::Result<()> {
     pin_subsecond_fork(true);
-    let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path()).await;
-    let (tolerance, vote_timeout) = drift_limits(&committee);
-    let peer = *committee.last_authority().authority().protocol_key();
+    for executed in [true, false] {
+        // a fresh voter per case: a refused header is cached for its author and round
+        let temp_dir = TempDir::new().unwrap();
+        let TestTypes {
+            committee,
+            handler,
+            consensus_bus,
+            parent,
+            task_manager: _task_manager,
+            ..
+        } = create_test_types(temp_dir.path()).await;
+        let (tolerance, vote_timeout) = drift_limits(&committee);
+        let peer = *committee.last_authority().authority().protocol_key();
 
-    let unexecuted = BlockNumHash::new(1, BlockHash::random());
-    // anti-vacuity: the execution wait would suspend on this block rather than fail at once
-    assert!(
-        consensus_bus.latest_execution_block_num_hash().number < unexecuted.number,
-        "the voter must not have executed the header's block yet"
-    );
-    let lead = tolerance + vote_timeout + Duration::from_secs(1);
-    let header = committee
-        .header_builder_last_authority()
-        .latest_execution_block(unexecuted)
-        .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
-        .build();
-    let created_at = header.created_at_ms();
+        let block = if executed {
+            BlockNumHash::new(parent.number(), parent.hash())
+        } else {
+            BlockNumHash::new(1, BlockHash::random())
+        };
+        // anti-vacuity: the execution wait would suspend on block 1 rather than fail at once
+        assert_eq!(
+            consensus_bus.latest_execution_block_num_hash().number < block.number,
+            !executed,
+            "the voter must hold the header's block exactly when executed is {executed}"
+        );
+        let lead = tolerance + vote_timeout + Duration::from_secs(1);
+        let header = committee
+            .header_builder_last_authority()
+            .latest_execution_block(block)
+            .created_at_ms(now_ms().saturating_add_millis(whole_millis(lead)))
+            .build();
+        let created_at = header.created_at_ms();
 
-    let start = tokio::time::Instant::now();
-    let err = handler
-        .vote(peer, header, vec![])
-        .await
-        .expect_err("a header beyond the vote window must be rejected");
-    let waited = start.elapsed();
+        let start = tokio::time::Instant::now();
+        let err = handler
+            .vote(peer, header, vec![])
+            .await
+            .expect_err("a header beyond the vote window must be rejected");
+        let waited = start.elapsed();
 
-    assert_matches!(
-        &err,
-        PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
-            if *created == created_at,
-        "the drift tier must reject the header before the execution wait; the request ended \
-         after {waited:?}"
-    );
-    assert_eq!(waited, Duration::ZERO, "the voter must not wait for the header's execution block");
-    assert!(
-        Option::<Penalty>::from(&err).is_none(),
-        "clock skew must reject the header without scoring its author"
-    );
+        assert_matches!(
+            &err,
+            PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
+                if *created == created_at,
+            "the drift tier must reject the header (executed {executed}); the request ended \
+             after {waited:?}"
+        );
+        let expected = if executed { Duration::ZERO } else { tn_config::VOTE_EXECUTION_WAIT };
+        assert_eq!(
+            waited, expected,
+            "executed {executed}: the voter waits for the header's block only when it lacks it"
+        );
+        assert!(
+            Option::<Penalty>::from(&err).is_none(),
+            "clock skew must reject the header without scoring its author"
+        );
+    }
 
     Ok(())
 }
