@@ -22,7 +22,8 @@ use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs, BLS_KEYFILE};
 use tn_node::{engine::TnBuilder, HealthcheckBind};
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
 use tn_types::{
-    BlsPublicKey, BootstrapServer, Genesis, ADIRI_CHAIN_ID, B256, MAINNET_CHAIN_ID, MAINNET_GENESIS,
+    BlsPublicKey, BootstrapServer, Committee, Genesis, ADIRI_CHAIN_ID, B256, MAINNET_CHAIN_ID,
+    MAINNET_GENESIS,
 };
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -81,6 +82,18 @@ impl NamedChain {
             Self::Adiri | Self::TestNet => Config::write_adiri_committee(tn_datadir),
             Self::Mainnet => Config::write_mainnet_committee(tn_datadir),
         }
+    }
+
+    /// This chain's bundled genesis committee, parsed in memory: what [`Self::write_committee`]
+    /// writes to a datadir that has none.
+    pub(crate) fn bundled_committee(self) -> eyre::Result<Committee> {
+        let yaml = match self {
+            Self::Adiri | Self::TestNet => tn_types::TESTNET_COMMITTEE,
+            Self::Mainnet => tn_types::MAINNET_COMMITTEE,
+        };
+        serde_yaml::from_str(yaml).map_err(|e| {
+            eyre::eyre!("the genesis committee built in for {self:?} does not parse: {e}")
+        })
     }
 }
 

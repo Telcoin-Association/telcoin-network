@@ -221,16 +221,19 @@ impl CorruptionKind {
 /// what repair can fix: every report of one ends with it (`db validate`, `db repair`, `db migrate`
 /// and the pack opens). `epoch_dir` names the pack's `epoch-N` directory.
 ///
-/// Nothing brings a lost pack back: the node fetches no pack below the epoch its consensus database
-/// is at, no command fetches one, and a rebuild of the execution database re-executes from the same
-/// packs. Removing the directory makes it worse: a datadir that stores transactions by position
-/// refuses every start without the pack of each epoch its rows point into (tn-reth's
-/// `TxPackCoverageError`).
+/// Nothing fetches a lost pack back: the node fetches no pack below the epoch its consensus
+/// database is at, no command fetches one, and a rebuild of the execution database re-executes from
+/// the same packs. A copy puts it back: `db import-epoch` verifies one against the node's certified
+/// records before it installs it (`ConsensusChain::import_epoch_at_rest`). Removing the directory
+/// makes it worse: a datadir that stores transactions by position refuses every start without the
+/// pack of each epoch its rows point into (tn-reth's `TxPackCoverageError`).
 pub fn lost_pack_remedy(epoch_dir: impl Display) -> String {
     format!(
         "No node or command fetches a past epoch's pack again. A sealed past epoch's pack never \
          changes, so with the node stopped put back only `{epoch_dir}` from a backup taken after \
-         its epoch closed (check the copy with `telcoin-network db validate` first). A whole \
+         its epoch closed, or from another node's sealed copy of it: `telcoin-network db \
+         import-epoch --epoch <N> --from <copy>` verifies the copy against this node's certified \
+         epoch records, and with `--force` installs it in place. A whole \
          `consensus-db` from an older backup lacks the packs of the epochs since it was taken, \
          and a validator restored that way stays stopped until the network has closed the epoch \
          it was last in. Without a backup, start the node over as the recovery steps for a \
@@ -356,6 +359,9 @@ pub struct PackValidationReport {
     pub first_consensus_number: Option<u64>,
     /// Consensus number of the last header in the file, if any.
     pub last_consensus_number: Option<u64>,
+    /// Digest of the last header in the file, if any: with `last_consensus_number`, what a caller
+    /// compares against a certified epoch record's `final_consensus`.
+    pub last_consensus_digest: Option<ConsensusHeaderDigest>,
     /// Every issue found, in file order (capped at `MAX_ISSUES`; see `dropped_issues`).
     pub issues: Vec<PackIssue>,
     /// Count of issues found beyond `MAX_ISSUES` and therefore not retained in `issues` (a
@@ -1036,6 +1042,7 @@ fn verify_v1_data(
     let mut meta_overflow_reported = false;
     let mut first_consensus_number: Option<u64> = None;
     let mut last_consensus_number: Option<u64> = None;
+    let mut last_consensus_digest: Option<ConsensusHeaderDigest> = None;
 
     // Persistent, never-cleared set of every batch digest seen anywhere in the file: it lets the
     // deferred `MissingBatch` classification tell an *absent* digest (a real gap) apart from a
@@ -1118,7 +1125,9 @@ fn verify_v1_data(
                         });
                     }
                 }
-                expected_parent = Some(consensus_header.digest());
+                let digest = consensus_header.digest();
+                expected_parent = Some(digest);
+                last_consensus_digest = Some(digest);
                 open_header = Some(consensus_header);
             }
         }
@@ -1135,6 +1144,7 @@ fn verify_v1_data(
         consensus_count,
         first_consensus_number,
         last_consensus_number,
+        last_consensus_digest,
         issues,
         &all_batch_digests,
     ))
@@ -1206,6 +1216,7 @@ fn finalize_report(
     consensus_count: u64,
     first_consensus_number: Option<u64>,
     last_consensus_number: Option<u64>,
+    last_consensus_digest: Option<ConsensusHeaderDigest>,
     mut issues: BoundedIssues,
     all_batch_digests: &HashSet<BlockHash>,
 ) -> PackValidationReport {
@@ -1228,6 +1239,7 @@ fn finalize_report(
         consensus_count,
         first_consensus_number,
         last_consensus_number,
+        last_consensus_digest,
         issues,
         dropped_issues: dropped,
         // Filled in by `validate_pack_file` after the data-stream walk (the builder only sees the
@@ -1913,6 +1925,10 @@ mod test {
             assert!(!text.contains("from peers"), "{kind:?}: no fetch from peers: {text}");
             assert!(text.contains("from a backup"), "{kind:?}: must name a backup: {text}");
             assert!(
+                text.contains("db import-epoch --epoch <N> --from <copy>"),
+                "{kind:?}: must name the verified import of a copy: {text}"
+            );
+            assert!(
                 text.contains("crates/tn-reth/README.md"),
                 "{kind:?}: must point at the recovery steps: {text}"
             );
@@ -1950,6 +1966,7 @@ mod test {
             consensus_count: 1,
             first_consensus_number: Some(1),
             last_consensus_number: Some(1),
+            last_consensus_digest: None,
             issues: Vec::new(),
             dropped_issues: 0,
             index_scan: Some(IndexBucketScan {
@@ -1975,6 +1992,7 @@ mod test {
             consensus_count: 0,
             first_consensus_number: None,
             last_consensus_number: None,
+            last_consensus_digest: None,
             issues,
             dropped_issues: 0,
             index_scan: None,
