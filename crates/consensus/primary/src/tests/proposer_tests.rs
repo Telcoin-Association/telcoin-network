@@ -1801,8 +1801,6 @@ async fn test_requeue_causes_move_each_header_once() {
     assert_eq!(requeued_totals(&snapshotter), [Some(2), Some(1)]);
 }
 
-// ---- bench6 bench6-obs ----
-
 /// Build `proposer`'s next header and track it, as the run loop does with the proposal's result.
 async fn propose_and_track(proposer: &mut Proposer<MemDatabase>) -> Header {
     let header = proposer
@@ -1958,7 +1956,7 @@ async fn test_header_without_requeued_digest_reports_zero_requeue_wait() {
     assert_eq!(empty_line.u64_field("oldest_digest_wait_ms"), Some(0));
 }
 
-// ---- bench6 quorum-exec-block ----
+// ---- the quorum execution block ----
 
 /// [`ExecBlockInputs`] with no parents, for tests that drive [`Proposer::propose_header`]
 /// directly: with only its own tip to rank, the header names the own tip.
@@ -2202,27 +2200,27 @@ fn self_feeding_fleet(rounds: Round) -> Vec<FleetRound> {
     out
 }
 
-/// I-4 item 1: the choice function fed its own outputs as the next round's parents. An in-step
-/// ten-node fleet over 20 rounds settles exactly [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] outputs
-/// below its tip (the quorum value can only rise through the floor).
+/// The choice function fed its own outputs as the next round's parents. An in-step ten-node fleet
+/// over 20 rounds settles exactly [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] outputs below its tip (the
+/// quorum value can only rise through the floor).
 ///
 /// Catches: a rule that ranks the parents' tips it does not have (the model would show lag 0),
 /// and a floor that does not hold the ratchet at N.
 #[test]
 fn test_quorum_exec_block_self_feeding_fleet() {
     let n = QUORUM_EXEC_BLOCK_FLOOR_ENTRIES;
-    let always = self_feeding_fleet(20);
-    for (round, nodes) in (1..).zip(&always) {
+    let fleet = self_feeding_fleet(20);
+    for (round, nodes) in (1..).zip(&fleet) {
         // round r trails by r - 1 outputs until the floor holds it at N
         let expected = usize::min(round - 1, n);
         for (node, (lag, basis)) in nodes.iter().enumerate() {
-            assert_eq!(*lag, expected, "always: round {round}, node {node}");
+            assert_eq!(*lag, expected, "round {round}, node {node}");
             if round > n + 1 {
-                assert_eq!(*basis, ExecBasis::Floor, "always: round {round} sits on the floor");
+                assert_eq!(*basis, ExecBasis::Floor, "round {round} sits on the floor");
             }
         }
     }
-    assert!(always[n..].iter().flatten().all(|(lag, ..)| *lag == n), "lag exactly N from round 9");
+    assert!(fleet[n..].iter().flatten().all(|(lag, ..)| *lag == n), "lag exactly N from round 9");
 }
 
 /// A fixture of four authorities (quorum 3) whose consensus config carries `params`.
@@ -2296,8 +2294,8 @@ async fn exec_propose(
     (header, line)
 }
 
-/// I-4 item 9: a header names the quorum block, resolved from the own ring (never the parents'
-/// hash), and its `header proposed` line reports `exec_block`, `exec_tip` and `exec_basis`.
+/// A header names the quorum block, resolved from the own ring (never the parents' hash), and its
+/// `header proposed` line reports `exec_block`, `exec_tip` and `exec_basis`.
 ///
 /// Catches: a parent's hash in a header, and the fields missing or misnamed.
 #[tokio::test]
@@ -2320,15 +2318,12 @@ async fn test_quorum_exec_block_header_names_the_own_ring_block() {
     assert_eq!(line.field("exec_basis"), Some("quorum"));
 }
 
-// ---- bench7 quorum-exec-block ----
-
-/// Review item I1: the final bound of [`choose_exec_block`] holds on a ring whose numbers do not
-/// rise. The ring holds twenty outputs of the epoch before (blocks 100 to 157; 157 opened the
-/// header's epoch), then an entry of the header's epoch numbered 130, below the opening block,
-/// then 163 and 166. A quorum at 160 resolves through that entry, so the rule alone names 130, a
-/// block a voter restored at the opening block refuses for good. The bound names the opening block
-/// instead, under both forms that apply the rule; a debug build stops at the assertion first, so
-/// the tests catch any choice that needs the bound.
+/// The final bound of [`choose_exec_block`] holds on a ring whose numbers do not rise. The ring
+/// holds twenty outputs of the epoch before (blocks 100 to 157; 157 opened the header's epoch),
+/// then an entry of the header's epoch numbered 130, below the opening block, then 163 and 166. A
+/// quorum at 160 resolves through that entry, so the rule alone names 130, a block a voter restored
+/// at the opening block refuses for good. The bound names the opening block instead; a debug build
+/// stops at the assertion first, so the tests catch any choice that needs the bound.
 ///
 /// Catches: a missing bound, a bound read from anything but the ring's previous-epoch entries, a
 /// raised choice that names a block this node did not execute, a bound that moves a choice at or
@@ -2377,15 +2372,14 @@ fn test_quorum_exec_block_bound_holds_on_a_ring_whose_numbers_drop() {
     assert_eq!(bound_to_opening(below, None), below);
 }
 
-/// Review finding V3: f faulty parents (one of four equal members) name a block far above what
-/// the honest members executed and then withhold their votes. The proposer's own tip is 157; its
-/// parents name 10,000 (faulty), 151 and 136 (honest, each holding the blocks up to its own tip).
-/// The rule ranks the faulty value first, so the quorum value is 151 where the honest parents
-/// alone give 136: the member at 136 cannot vote for 151, the faulty member withholds, and the
-/// header gets two of the three votes it needs. Naming 136 it would have certified; naming the
-/// tip it fails too. Over a sweep of honest tips and faulty values, the rule never names a block
-/// that fewer honest members hold than hold the tip, so its header certifies whenever the tip
-/// header would have.
+/// `f` faulty parents (one of four equal members) name a block far above what the honest members
+/// executed and then withhold their votes. The proposer's own tip is 157; its parents name 10,000
+/// (faulty), 151 and 136 (honest, each holding the blocks up to its own tip). The rule ranks the
+/// faulty value first, so the quorum value is 151 where the honest parents alone give 136: the
+/// member at 136 cannot vote for 151, the faulty member withholds, and the header gets two of the
+/// three votes it needs. Naming 136 it would have certified; naming the tip it fails too. Over a
+/// sweep of honest tips and faulty values, the rule never names a block that fewer honest members
+/// hold than hold the tip, so its header certifies whenever the tip header would have.
 ///
 /// Catches: a faulty value that moves the choice past the own tip, a choice that is not an own
 /// ring entry, and a header under the rule that loses an honest vote the tip header would have
@@ -2456,11 +2450,11 @@ fn test_quorum_exec_block_faulty_high_parents_cost_the_gain_only() {
     }
 }
 
-/// The quorum rule in an epoch's first rounds, under both forms that apply it: the ring holds
-/// twenty outputs of the epoch before (blocks 100 to 157; 157 closed that epoch) and three of the
-/// header's epoch (160, 163, 166), so the floor entry eight back (142) lies before the epoch's
-/// opening block. A parent naming a block below 157 is not counted, so nothing below 157 is named:
-/// a voter restored from that epoch's export (floor 157) would refuse such a header for good.
+/// The quorum rule in an epoch's first rounds: the ring holds twenty outputs of the epoch before
+/// (blocks 100 to 157; 157 closed that epoch) and three of the header's epoch (160, 163, 166), so
+/// the floor entry eight back (142) lies before the epoch's opening block. A parent naming a block
+/// below 157 is not counted, so nothing below 157 is named: a voter restored from that epoch's
+/// export (floor 157) would refuse such a header for good.
 ///
 /// Catches: a quorum value or a floor below the epoch's opening block, a low parent still counted
 /// toward the quorum, and an opening block read from anything but the ring's previous-epoch
@@ -2585,7 +2579,7 @@ fn test_quorum_exec_block_inputs_carry_the_committee_epoch() {
     assert_eq!(choose([136, 103]), ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip });
 }
 
-// ---- bench7 digest-order-hold ----
+// ---- the digest order hold ----
 
 /// A batch digest numbered `n`, the same on every run, so a payload can be pinned as a list.
 fn fixed_digest(n: u8) -> BlockHash {
@@ -2664,6 +2658,11 @@ fn order_proposer(
 /// a cancel re-queue and a commit re-queue. A digest of a header this proposer re-sent from the
 /// store after a restart has no number, and its re-queue counts as `unknown_seq`, not as out of
 /// order.
+///
+/// The cancel report of round 1 is an input the certifier never sends: round 2 cites round 1 as its
+/// own parent, so round 1 is certified. The test keeps it because it is the only test that makes
+/// the `canceled` cause of `requeued_out_of_order_total` non-zero (the cancel returns 1, 2 and 3
+/// behind 4, which round 2 drained).
 ///
 /// Catches: one sequence shared across workers, a sequence lost or renumbered when `push_payload`
 /// rebuilds a re-queued digest from the bare header, and a restart's digests judged as if they had
@@ -3057,8 +3056,8 @@ async fn test_order_hold_releases_the_lane_when_the_notice_settles_the_blocker()
 
 /// While the own chain is intact, the hold changes nothing: a script of rounds that each cite the
 /// previous own header drains every lane in rotation, every line reports zero held, and
-/// `headers_held_total` stays 0. That is the hold's cost on a healthy node. The payloads are
-/// pinned as a golden list, the order this script drained without the hold.
+/// `headers_held_total` stays 0. That is the hold's cost on a healthy node. The payloads are pinned
+/// as a golden list worked out by hand: the drain's rotation over every lane, with no lane held.
 ///
 /// Catches: a hold that reads a proven own parent as a blocker, or a held-lane filter that moves
 /// the drain's cursor when nothing is held.
@@ -3108,7 +3107,7 @@ async fn test_order_hold_holds_nothing_on_an_intact_own_chain() {
             entries.iter().map(|(n, worker_id)| (fixed_digest(*n), *worker_id)).collect()
         })
         .collect();
-    assert_eq!(payloads, golden, "an intact own chain drains exactly as without the hold");
+    assert_eq!(payloads, golden, "an intact own chain drains exactly the hand-worked list");
 }
 
 /// `unproven` carries through the own chain: once round 2 is built without its own parent, round 1

@@ -3164,7 +3164,7 @@ async fn test_vote_tier_two_lead_is_deferred_before_seed_signature_check() -> ey
     Ok(())
 }
 
-/// A tier-three header is rejected before the voter waits for its execution block.
+/// A tier-three lead waits for its execution block only when the voter has not reached it.
 ///
 /// A header that leads the local clock by more than the drift tolerance plus the vote timeout is
 /// refused with `InvalidTimestamp`, without scoring clock skew. The drift tier is decided under the
@@ -5558,8 +5558,6 @@ async fn vote_below_restore_floor_is_refused_without_penalty() -> eyre::Result<(
     Ok(())
 }
 
-// ---- bench6 tracker-drain ----
-
 /// `tn_primary_epoch_entry_rounds_behind` holds the highest round of a certificate from the epoch
 /// after the one this node last executed, without changing the decision: the node stays active up
 /// to the activity window and is demoted past it, as before. A certificate of the executed epoch
@@ -5651,9 +5649,7 @@ async fn epoch_entry_gauge_records_rounds_behind() -> eyre::Result<()> {
     Ok(())
 }
 
-// ---- bench7 voter-lock ----
-
-// ---- bench7 vote-queue: review follow-ups ----
+// ---- the voter's per-author lock ----
 
 /// A header from `author` at `round` that names `block` and carries one batch on a worker the
 /// committee does not run: inside the vote window, but refused by `Header::validate` as
@@ -5723,7 +5719,7 @@ async fn malformed_header_is_refused_without_the_wait() -> eyre::Result<()> {
     Ok(())
 }
 
-// ---- bench7 voter-lock (continued) ----
+// ---- the voter's per-author lock (continued) ----
 
 /// A header from `author` at `round` that names `block`, created `round` ms after the UNIX epoch,
 /// far behind the wall clock, so the vote path's drift check never defers it.
@@ -6845,7 +6841,7 @@ async fn vote_request_cancelled_by_requester_still_runs_on_the_voter() -> eyre::
     Ok(())
 }
 
-// ---- bench7 quorum-exec-block: the voter's answers to an old execution block ----
+// ---- the voter's answers to an old execution block ----
 
 use crate::{proposer::QUORUM_EXEC_BLOCK_FLOOR_ENTRIES, ExecutionCheck};
 
