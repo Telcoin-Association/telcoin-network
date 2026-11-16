@@ -1,8 +1,7 @@
 //! Two epoch closes with validators held behind by the engine's execution-delay test hook.
 //!
-//! Every test starts four validators as processes with every runtime switch of
-//! [`STACK_SWITCHES_ON`] on every node, and drives light transfers through all four across the
-//! closes they test.
+//! Every test starts four validators as processes and drives light transfers through all four
+//! across the closes they test.
 //!
 //! - [`test_held_member_two_closes`]: one member trails the others by more than the proposer's
 //!   floor of 8 outputs at the close of epoch 0, then is released before the close of epoch 1;
@@ -29,8 +28,8 @@ use super::{
         start_validator_with_overrides, EpochSnapshot, ProcessGuard,
     },
     fleet::{
-        assert_switches, expected_switches, log_str_field, node_epoch, wait_for_epoch_on_all, Load,
-        CANARY_LOG, EXECUTION_DELAY_ENV, FATAL_LOGS, STACK_SWITCHES_ON,
+        log_str_field, node_epoch, wait_for_epoch_on_all, Load, CANARY_LOG, EXECUTION_DELAY_ENV,
+        FATAL_LOGS,
     },
 };
 use alloy::{
@@ -64,7 +63,7 @@ const FLOOR_OUTPUTS: usize = 8;
 /// for nearly every output to carry batches (and so a block).
 const CLOSE_LOAD_GAP: Duration = Duration::from_millis(50);
 
-/// The garbage-collection depth of every fleet here, as in the mixed-switch fleet test.
+/// The garbage-collection depth of every fleet here.
 const CLOSE_GC_DEPTH: u32 = 50;
 
 /// The passphrase [`start_validator_with_overrides`] gives every node.
@@ -248,14 +247,6 @@ const ROUND_GIVE_UP_TIMEOUT: Duration = Duration::from_secs(150);
 /// Time limit for every node to close epoch 1 once the held members were released.
 const ROUND_SECOND_CLOSE_TIMEOUT: Duration = Duration::from_secs(ROUND_EPOCH_SECS as u64 * 4);
 
-/// The switches on every node, with nothing else set: every switch of [`STACK_SWITCHES_ON`], as in
-/// the benchmark.
-fn stack_overrides() -> FleetOverrides {
-    STACK_SWITCHES_ON.into_iter().fold(FleetOverrides::default(), |fleet, (key, value)| {
-        fleet.parameter((1..=4).map(|i| format!("validator-{i}")), key, value)
-    })
-}
-
 /// One validator trails the others by more than the floor at the close of epoch 0; see
 /// [`held_member_two_closes`].
 #[test]
@@ -295,7 +286,7 @@ fn test_missed_record_round() -> eyre::Result<()> {
 fn held_member_two_closes() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
     let test = String::from("held_member_two_closes");
-    let release = stack_overrides();
+    let release = FleetOverrides::default();
     let held = release.clone().env(
         [format!("validator-{}", HELD_MEMBER + 1)],
         EXECUTION_DELAY_ENV,
@@ -319,11 +310,7 @@ fn check_held_member(
 ) -> eyre::Result<String> {
     let urls = fleet.urls.clone();
     let test = fleet.test.clone();
-    let expected = expected_switches(&STACK_SWITCHES_ON)?;
     network_advancing(&urls)?;
-    for node in 0..4 {
-        assert_switches(&test, node, 0, &expected)?;
-    }
 
     // the load starts a fixed lead before the epoch-0 boundary, which bounds the held member's lag
     let snapshot = epoch_snapshot(&urls[0])?;
@@ -373,7 +360,6 @@ fn check_held_member(
 
     // the release: the held member restarts without the delay and catches up inside epoch 1
     fleet.restart(HELD_MEMBER, release)?;
-    assert_switches(&test, HELD_MEMBER, 1, &expected)?;
     let target = get_block_number(&urls[0])?;
     wait_until_blocking(
         CATCH_UP_TIMEOUT,
@@ -451,7 +437,7 @@ fn check_held_member(
 fn missed_record_round() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
     let test = String::from("missed_record_round");
-    let release = stack_overrides();
+    let release = FleetOverrides::default();
     let names = ROUND_HELD.map(|i| format!("validator-{}", i + 1));
     let held = release
         .clone()
@@ -475,12 +461,8 @@ fn check_missed_round(
 ) -> eyre::Result<String> {
     let urls = fleet.urls.clone();
     let test = fleet.test.clone();
-    let expected = expected_switches(&STACK_SWITCHES_ON)?;
     let (missed, next) = (MISSED_EPOCH, MISSED_EPOCH + 1);
     network_advancing(&urls)?;
-    for node in 0..4 {
-        assert_switches(&test, node, 0, &expected)?;
-    }
     load.insert(Load::start(&urls, CLOSE_LOAD_GAP)).wait_started()?;
 
     // the fast members close the epoch; the held members stop at their close before the record
@@ -529,7 +511,6 @@ fn check_missed_round(
     // the release: the held members restart without the delay and without the hook
     for node in ROUND_HELD {
         fleet.restart(node, release)?;
-        assert_switches(&test, node, 1, &expected)?;
     }
     let released_at = Instant::now();
 

@@ -7,8 +7,8 @@
 use super::{
     common::{log_field, log_line_matches, network_advancing, node_log_lines, scrape_metric_value},
     fleet::{
-        all_validators, assert_switches, expected_switches, log_str_field, Fleet, Load, CANARY_LOG,
-        EXECUTION_DELAY_ENV, LOAD_START_TIMEOUT, PRODUCTION_CADENCE, SLOW_EXECUTION_DELAY_MS,
+        all_validators, log_str_field, Fleet, Load, CANARY_LOG, EXECUTION_DELAY_ENV,
+        LOAD_START_TIMEOUT, PRODUCTION_CADENCE, SLOW_EXECUTION_DELAY_MS,
     },
 };
 use e2e_tests::FleetOverrides;
@@ -62,11 +62,10 @@ const MIN_WINDOW_HEADERS: usize = 20;
 /// headers in the second half of the window are `exec_basis=floor`.
 ///
 /// Every node runs at [`PRODUCTION_CADENCE`] under light transfers ([`EXEC_LOAD_GAP`]) through all
-/// four nodes. Each node's `node switches` line shows every switch at its default, every node
-/// proposes at least [`MIN_WINDOW_HEADERS`] headers in the window, no voter logs the execution
-/// canary [`CANARY_LOG`], no node logs a line of [`FATAL_LOGS`], and all four nodes hold the same
-/// blocks. The summary line also gives how many vote requests each slow voter refused as execution
-/// behind ([`REFUSED_BEHIND`]) in the window.
+/// four nodes. Every node proposes at least [`MIN_WINDOW_HEADERS`] headers in the window, no voter
+/// logs the execution canary [`CANARY_LOG`], no node logs a line of [`FATAL_LOGS`], and all four
+/// nodes hold the same blocks. The summary line also gives how many vote requests each slow voter
+/// refused as execution behind ([`REFUSED_BEHIND`]) in the window.
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
 fn test_fast_executor_is_certified() -> eyre::Result<()> {
@@ -145,14 +144,10 @@ impl ExecMeasure {
 }
 
 /// The measuring part of [`run_fast_executor`], with the fleet already started: the window under
-/// load, then the checks that end the run at once (switches, canary, fatal lines, one chain).
+/// load, then the checks that end the run at once (canary, fatal lines, one chain).
 fn measure_fast_executor(fleet: &Fleet) -> eyre::Result<ExecMeasure> {
     let test = fleet.test.as_str();
     network_advancing(&fleet.urls)?;
-    let expected = expected_switches(&[])?;
-    for node in 0..4 {
-        assert_switches(test, node, 0, &expected)?;
-    }
     let load = Load::start(&fleet.urls, EXEC_LOAD_GAP);
     let window = load.wait_started().and_then(|()| {
         // the window opens once the fast node has proposed a header with batches after the load

@@ -1,9 +1,8 @@
 //! Fleet helpers the stack's e2e tests share.
 //!
 //! [`Fleet`] starts four validators as processes, each with an RPC and a metrics endpoint, and
-//! [`Load`] drives transfers through every node. [`assert_switches`] checks the `node switches`
-//! line of a node against [`expected_switches`], which reads the switch lists here, and
-//! [`Fleet::assert_no_fatal_log`] checks a node's log for the lines of [`FATAL_LOGS`].
+//! [`Load`] drives transfers through every node. [`Fleet::assert_no_fatal_log`] checks a node's
+//! log for the lines of [`FATAL_LOGS`].
 //! [`node_epoch`], [`wait_for_epoch_on_all`] and [`assert_epoch_records`] read the epochs and their
 //! certified records.
 
@@ -51,9 +50,6 @@ pub(crate) const LOAD_START_TIMEOUT: Duration = Duration::from_secs(60);
 /// Time limit for every node to execute up to the highest head seen when the load stopped.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Time limit for a node's `node switches` line to appear once it was started.
-const SWITCHES_LINE_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// The error a voter logs when a header names a block its own execution contradicts: the canary
 /// the proposer fix must keep alive and silent.
 pub(crate) const CANARY_LOG: &str = "unexpected execution result received";
@@ -93,37 +89,6 @@ pub(crate) const FATAL_LOGS: [&str; 5] =
 
 /// The passphrase [`start_validator_with_overrides`] gives every node.
 pub(crate) const PASSPHRASE: &str = "restart_test";
-
-/// Every runtime switch of the node turned on, as `parameters.yaml` entries, in the order of the
-/// node's `runtime_switches!` list (`crates/config/src/node.rs`).
-///
-/// A switch that arrives later adds its entry at the end, here and in [`STACK_SWITCHES_OFF`].
-pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 0] = [];
-
-/// Every runtime switch of the node at its default, as the `node switches` line renders it, in the
-/// order of [`STACK_SWITCHES_ON`].
-pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 0] = [];
-
-/// What the `node switches` line of a node given the switch entries `given` must show: every
-/// switch of [`STACK_SWITCHES_OFF`], with the value of `given` where it names the switch.
-///
-/// An entry of `given` that names no switch of the list is an error: the node would ignore the key
-/// and the test would check nothing for it.
-pub(crate) fn expected_switches(
-    given: &[(&'static str, &'static str)],
-) -> eyre::Result<Vec<(&'static str, &'static str)>> {
-    let unknown = given
-        .iter()
-        .filter(|(key, _)| STACK_SWITCHES_OFF.iter().all(|(k, _)| k != key))
-        .collect::<Vec<_>>();
-    eyre::ensure!(unknown.is_empty(), "entries {unknown:?} name no switch of STACK_SWITCHES_OFF");
-    Ok(STACK_SWITCHES_OFF
-        .iter()
-        .map(|(key, default)| {
-            given.iter().find(|(k, _)| k == key).copied().unwrap_or((*key, *default))
-        })
-        .collect())
-}
 
 /// The node's own defaults for its header and batch cadence, in place of the e2e harness's quick
 /// one (headers every 250 to 500 ms, batches every 250 ms).
@@ -312,90 +277,6 @@ fn block_hash(url: &str, height: u64) -> eyre::Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| eyre::eyre!("block {height} on {url} has no hash"))
-}
-
-/// The message of the line a node logs once at start with every runtime switch and its value.
-const SWITCHES_LOG: &str = "node switches";
-
-/// Wait until node `node`'s run-`run` log of `test` has a `node switches` line, then check that it
-/// shows every `(key, value)` of `expected` and no other switch. A duration is compared by value.
-///
-/// A switch the line shows that `expected` does not name fails the check: the switch lists here
-/// must name every switch the node has, or a fleet meant to run all of them silently runs one at
-/// its default.
-pub(crate) fn assert_switches(
-    test: &str,
-    node: usize,
-    run: u32,
-    expected: &[(&str, &str)],
-) -> eyre::Result<()> {
-    let find = |lines: Vec<String>| lines.into_iter().find(|l| l.contains(SWITCHES_LOG));
-    wait_until_blocking(SWITCHES_LINE_TIMEOUT, "a `node switches` line", || {
-        Ok(find(node_log_lines(test, node, run)?).is_some())
-    })
-    .wrap_err_with(|| format!("node {node} run {run} of {test}"))?;
-    let line = find(node_log_lines(test, node, run)?)
-        .ok_or_else(|| eyre::eyre!("node {node} run {run} lost its `node switches` line"))?;
-    let fields = line.split_once(SWITCHES_LOG).map_or("", |(_, fields)| fields);
-    let shown = switch_fields(fields);
-    for (key, value) in expected {
-        let (_, shown) = shown
-            .iter()
-            .find(|(k, _)| k == key)
-            .ok_or_else(|| eyre::eyre!("node {node} run {run} shows no `{key}` in: {line}"))?;
-        let same = match (duration_nanos(value), duration_nanos(shown)) {
-            (Some(want), Some(got)) => want == got,
-            _ => shown == value,
-        };
-        eyre::ensure!(same, "node {node} run {run} shows {key}={shown}, it was given {value}");
-    }
-    let unlisted =
-        shown.iter().filter(|(key, _)| expected.iter().all(|(k, _)| k != key)).collect::<Vec<_>>();
-    eyre::ensure!(
-        unlisted.is_empty(),
-        "node {node} run {run} runs switches the lists here do not name: {unlisted:?}; add them to \
-         STACK_SWITCHES_ON and STACK_SWITCHES_OFF"
-    );
-    Ok(())
-}
-
-/// The `key=value` fields of a `node switches` line after its message, each value running to the
-/// next field, so a humantime duration printed in parts (`2s 500ms`) reads whole.
-fn switch_fields(fields: &str) -> Vec<(String, String)> {
-    let mut parsed: Vec<(String, String)> = Vec::new();
-    for token in fields.split_whitespace() {
-        match (token.split_once('='), parsed.last_mut()) {
-            (Some((key, value)), _) => parsed.push((key.to_owned(), value.to_owned())),
-            (None, Some((_, value))) => {
-                value.push(' ');
-                value.push_str(token);
-            }
-            (None, None) => {}
-        }
-    }
-    parsed
-}
-
-/// Nanoseconds of a humantime duration made of `<number><unit>` parts (`150ms`, `2s 500ms`,
-/// `1m`), `None` for any other text.
-fn duration_nanos(text: &str) -> Option<u128> {
-    const UNITS: [(&str, u128); 6] = [
-        ("ns", 1),
-        ("us", 1_000),
-        ("ms", 1_000_000),
-        ("s", 1_000_000_000),
-        ("m", 60_000_000_000),
-        ("h", 3_600_000_000_000),
-    ];
-    text.split_whitespace()
-        .map(|part| {
-            let digits = part.find(|c: char| !c.is_ascii_digit()).filter(|&at| at > 0)?;
-            let (number, unit) = part.split_at(digits);
-            let scale = UNITS.iter().find(|(name, _)| *name == unit)?.1;
-            number.parse::<u128>().ok()?.checked_mul(scale)
-        })
-        .try_fold(0u128, |total, part| total.checked_add(part?))
-        .filter(|_| !text.trim().is_empty())
 }
 
 /// The value of the `name=value` field of a plain log line, without the quotes of a string field.

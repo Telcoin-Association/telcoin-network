@@ -30,9 +30,7 @@
 //! [`get_previous_telcoin_network_binary`]). When that binary was built at another commit, as
 //! `upgrade.rs` requires, it ignores a key its `Parameters` lacks without a word, so a lane that
 //! sets the variable runs the test as a mixed fleet with the setting on the current nodes only;
-//! the migration lane's previous binary is this tree's MDBX build, which reads the same keys. A
-//! test that relies on a setting asserts it on each node's `node switches` line, which an older
-//! release does not print.
+//! the migration lane's previous binary is this tree's MDBX build, which reads the same keys.
 
 // ignore for IT test
 #![allow(unused_crate_dependencies)]

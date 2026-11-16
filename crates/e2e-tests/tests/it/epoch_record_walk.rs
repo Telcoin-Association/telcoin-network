@@ -20,8 +20,8 @@ use super::{
         node_log_lines, scrape_metric_value, scrape_metrics, start_validator_with_overrides,
     },
     fleet::{
-        assert_epoch_records, assert_switches, expected_switches, log_str_field, node_epoch,
-        wait_for_epoch_on_all, Fleet, Load, PASSPHRASE,
+        assert_epoch_records, log_str_field, node_epoch, wait_for_epoch_on_all, Fleet, Load,
+        PASSPHRASE,
     },
 };
 use alloy::providers::{Provider as _, ProviderBuilder};
@@ -289,11 +289,6 @@ impl Observers {
         let test = fleet.test.clone();
         let mut timeline = Vec::new();
         network_advancing(&fleet.urls)?;
-        let expected = expected_switches(&[])?;
-        for node in 0..4 {
-            assert_switches(&test, node, 0, &expected)?;
-        }
-        assert_switches(&test, OWN_OBSERVER, 0, &expected)?;
         load.wait_started()?;
         let mut heads = vec![head_numbers(&fleet.urls)?];
 
@@ -374,8 +369,6 @@ impl Observers {
         let child = self.spawn(fleet, FRESH_OBSERVER, 0)?;
         self.slots[1] = Some(fleet.guard.push(child));
         let observers_started = Instant::now();
-        assert_switches(&test, OWN_OBSERVER, 1, &expected)?;
-        assert_switches(&test, FRESH_OBSERVER, 0, &expected)?;
         let [own_url, fresh_url] = self.urls.clone();
         let window_end = observers_started + OBSERVER_WINDOW;
         match arm {

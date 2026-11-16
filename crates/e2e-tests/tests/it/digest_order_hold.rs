@@ -25,9 +25,8 @@ use super::{
         WEI_PER_TEL,
     },
     fleet::{
-        all_validators, assert_switches, expected_switches, node_epoch, wait_for_epoch_on_all,
-        Fleet, Load, EXECUTION_DELAY_ENV, PRODUCTION_CADENCE, SLOW_EXECUTION_DELAY_MS,
-        STACK_SWITCHES_ON,
+        all_validators, node_epoch, wait_for_epoch_on_all, Fleet, Load, EXECUTION_DELAY_ENV,
+        PRODUCTION_CADENCE, SLOW_EXECUTION_DELAY_MS,
     },
 };
 use e2e_tests::FleetOverrides;
@@ -150,7 +149,7 @@ const ORPHAN_RESULTS: [&str; 5] =
 const CAUSES: [&str; 2] = ["canceled", "committed"];
 
 /// With the hold on, every transaction a validator accepted lands exactly once while the own chain
-/// of one validator keeps breaking, with every stack switch on and the hook at `before_store` (see
+/// of one validator keeps breaking, with the hook at `before_store` (see
 /// [`Form::hook`]). See [`check_form`] for the assertions.
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
@@ -168,11 +167,10 @@ fn test_hold_keeps_every_transaction_after_store() -> eyre::Result<()> {
     run_form(Form::AfterStore)
 }
 
-/// Every stack switch on ([`STACK_SWITCHES_ON`]), with the hook at
-/// `after_store` so a lane waits on a commit notice when the kill lands: the hooked validator is
-/// killed by SIGKILL under load once an epoch boundary has passed, and restarted on its datadir
-/// with the same overrides while the load to the other three continues. Its senders pause
-/// [`SEAL_WAIT`] before the kill, so what the node accepted is sealed in batches (held or in
+/// The hook at `after_store` so a lane waits on a commit notice when the kill lands: the hooked
+/// validator is killed by SIGKILL under load once an epoch boundary has passed, and restarted on
+/// its datadir with the same overrides while the load to the other three continues. Its senders
+/// pause [`SEAL_WAIT`] before the kill, so what the node accepted is sealed in batches (held or in
 /// uncommitted headers) and comes back through the orphan re-pool; a submission the node refuses
 /// while down or inactive is sent again with the same bytes until it is accepted. The run goes on
 /// until the restarted node accepts its senders again and one more epoch boundary has closed.
@@ -183,12 +181,12 @@ fn test_hold_survives_a_kill_of_the_far_validator() -> eyre::Result<()> {
     run_form(Form::Kill)
 }
 
-/// One test's fleet: the switches every node gets and what happens to the hooked node.
+/// One test's fleet: what happens to the hooked node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
-    /// Every stack switch on, the hook at `before_store`.
+    /// The hook at `before_store`.
     BeforeStore,
-    /// Every stack switch on, the hook at `after_store`.
+    /// The hook at `after_store`.
     AfterStore,
     /// [`Self::AfterStore`], with the hooked node killed and restarted under load.
     Kill,
@@ -202,11 +200,6 @@ impl Form {
             Self::AfterStore => "hold_after_store",
             Self::Kill => "hold_kill",
         }
-    }
-
-    /// The `parameters.yaml` switch entries every node gets: [`STACK_SWITCHES_ON`].
-    fn switches(self) -> Vec<(&'static str, &'static str)> {
-        STACK_SWITCHES_ON.to_vec()
     }
 
     /// The hook settings of the hooked node: `(stage, milliseconds, every)`.
@@ -237,7 +230,7 @@ impl Form {
         }
     }
 
-    /// Every node's switch entries, the hook on [`HOOKED`], the execution delay on [`SLOWED`],
+    /// The hook on [`HOOKED`], the execution delay on [`SLOWED`],
     /// and the production cadence on every node.
     fn overrides(self) -> FleetOverrides {
         let (stage, ms, every) = self.hook();
@@ -251,9 +244,8 @@ impl Form {
                 EXECUTION_DELAY_ENV,
                 SLOW_EXECUTION_DELAY_MS.to_string(),
             );
-        self.switches()
+        PRODUCTION_CADENCE
             .into_iter()
-            .chain(PRODUCTION_CADENCE)
             .fold(fleet, |fleet, (key, value)| fleet.parameter(all_validators(), key, value))
     }
 }
@@ -277,10 +269,6 @@ fn run_form(form: Form) -> eyre::Result<()> {
 fn drive(form: Form, fleet: &mut Fleet, runtime: &Runtime) -> eyre::Result<String> {
     let test = fleet.test.clone();
     network_advancing(&fleet.urls)?;
-    let expected = expected_switches(&form.switches())?;
-    for node in 0..4 {
-        assert_switches(&test, node, 0, &expected)?;
-    }
     let clients = {
         let _entered = runtime.enter();
         fleet.urls.iter().map(|url| client(url)).collect::<eyre::Result<Vec<_>>>()?
@@ -290,7 +278,7 @@ fn drive(form: Form, fleet: &mut Fleet, runtime: &Runtime) -> eyre::Result<Strin
     let mut counters = Vec::new();
     let kill = match form {
         Form::Kill => {
-            let (run0, kill) = kill_and_restart(fleet, &load, &expected)?;
+            let (run0, kill) = kill_and_restart(fleet, &load)?;
             counters.push((HOOKED, 0, run0));
             Some(kill)
         }
@@ -386,11 +374,7 @@ struct KillSeen {
 /// Run the load past one epoch boundary, kill [`HOOKED`] with SIGKILL, let the others advance,
 /// restart it on its datadir with the same overrides, and run on until an epoch boundary closes
 /// with it back. Returns its run-0 counters, read just before the kill.
-fn kill_and_restart(
-    fleet: &mut Fleet,
-    load: &HoldLoad,
-    expected: &[(&str, &str)],
-) -> eyre::Result<(Counters, KillSeen)> {
+fn kill_and_restart(fleet: &mut Fleet, load: &HoldLoad) -> eyre::Result<(Counters, KillSeen)> {
     let url = fleet.urls[FUNDER].clone();
     let start = node_epoch(&url)?;
     let started = Instant::now();
@@ -431,7 +415,6 @@ fn kill_and_restart(
     )?;
     let restarted = fleet.spawn(HOOKED, 1)?;
     fleet.guard.replace(HOOKED, restarted);
-    assert_switches(&fleet.test, HOOKED, 1, expected)?;
     let back_at = get_block_number(&url)?;
     wait_until_blocking(
         Duration::from_secs(180),
@@ -1190,8 +1173,7 @@ impl Measured {
 
 /// The checks of every form.
 ///
-/// Every form: every node's `node switches` line shows the switches it was given (checked at
-/// start), no node logged a line of `fleet::FATAL_LOGS`, all four validators hold the same
+/// Every form: no node logged a line of `fleet::FATAL_LOGS`, all four validators hold the same
 /// block at every height up to the lowest head (the chain walk), the hook held own certificates
 /// on the hooked node and nowhere else, and its digests were re-queued. Then:
 /// - every accepted transaction is in exactly one block, with no resend by the test;
