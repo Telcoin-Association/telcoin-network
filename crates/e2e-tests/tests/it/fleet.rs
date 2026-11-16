@@ -8,8 +8,8 @@
 //! certified records.
 
 use super::common::{
-    address_from_word, call_rpc, get_block, get_block_number, get_key, node_log_lines,
-    scrape_metric_value, send_tel, start_validator_with_overrides, ProcessGuard,
+    address_from_word, call_rpc, get_block, get_block_number, get_key, node_log_lines, send_tel,
+    start_validator_with_overrides, ProcessGuard,
 };
 use alloy::{primitives::utils::parse_ether, providers::ProviderBuilder};
 use e2e_tests::{
@@ -42,8 +42,7 @@ pub(crate) const EXECUTION_DELAY_ENV: &str = "TN_TEST_EXECUTION_DELAY_MS";
 /// header names only after the fast node has moved on, and shorter than the commit interval, so
 /// the slow nodes keep pace and trail the fast node by one or two outputs, inside the quorum rule's
 /// floor of eight ring entries. A delay longer than the commit interval makes the slow nodes' lag
-/// grow without bound; past the floor the fix cannot help by design (measured at the quick cadence:
-/// the adaptive arm then certified 0.59 of the fast node's headers, nearly all named at the floor).
+/// grow without bound; past the floor the quorum rule cannot help by design.
 pub(crate) const SLOW_EXECUTION_DELAY_MS: u64 = 1750;
 
 /// Time limit for the first transfers of every load thread to be accepted.
@@ -99,19 +98,11 @@ pub(crate) const PASSPHRASE: &str = "restart_test";
 /// node's `runtime_switches!` list (`crates/config/src/node.rs`).
 ///
 /// A switch that arrives later adds its entry at the end, here and in [`STACK_SWITCHES_OFF`].
-pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 3] = [
-    ("quorum_exec_block", "true"),
-    ("quorum_exec_block_starved_rounds", "4"),
-    ("digest_order_hold", "true"),
-];
+pub(crate) const STACK_SWITCHES_ON: [(&str, &str); 1] = [("digest_order_hold", "true")];
 
 /// Every runtime switch of the node at its default, as the `node switches` line renders it, in the
 /// order of [`STACK_SWITCHES_ON`].
-pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 3] = [
-    ("quorum_exec_block", "false"),
-    ("quorum_exec_block_starved_rounds", "0"),
-    ("digest_order_hold", "false"),
-];
+pub(crate) const STACK_SWITCHES_OFF: [(&str, &str); 1] = [("digest_order_hold", "false")];
 
 /// What the `node switches` line of a node given the switch entries `given` must show: every
 /// switch of [`STACK_SWITCHES_OFF`], with the value of `given` where it names the switch.
@@ -302,14 +293,6 @@ impl Fleet {
             hits.len(),
             hits.first()
         );
-        Ok(())
-    }
-
-    /// Node `node`'s epoch-record collector has found no certified record of the network that
-    /// differs from its own ([`RECORD_CONFLICTS`] is zero) since the node last started.
-    pub(crate) fn assert_no_record_conflicts(&self, node: usize) -> eyre::Result<()> {
-        let conflicts = scrape_metric_value(&self.metrics[node], RECORD_CONFLICTS)?;
-        eyre::ensure!(conflicts == 0.0, "node {node} counted {conflicts} epoch record conflicts");
         Ok(())
     }
 
@@ -566,7 +549,3 @@ pub(crate) fn assert_epoch_records(
         Ok(())
     })
 }
-
-/// The prometheus counter of the certified records of the network a node's epoch-record collector
-/// found to differ from its own stored record.
-const RECORD_CONFLICTS: &str = "tn_state_sync_epoch_record_conflicts_total";

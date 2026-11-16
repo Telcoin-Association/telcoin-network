@@ -1,19 +1,16 @@
-//! Two epoch closes under each form of the proposer's vote fix (`quorum_exec_block`), with
-//! validators held behind by the engine's execution-delay test hook.
+//! Two epoch closes with validators held behind by the engine's execution-delay test hook.
 //!
 //! Every test starts four validators as processes with every runtime switch of
-//! [`STACK_SWITCHES_ON`] on every node (the vote fix, the vote queue fix and the epoch-record
-//! switches), in the always form (`quorum_exec_block_starved_rounds: 0`) or the adaptive form
-//! (`4`), and drives light transfers through all four across the closes they test.
+//! [`STACK_SWITCHES_ON`] on every node, and drives light transfers through all four across the
+//! closes they test.
 //!
-//! - [`test_held_member_two_closes_always`] and [`test_held_member_two_closes_adaptive`]: one
-//!   member trails the others by more than the fix's floor of 8 outputs at the close of epoch 0,
-//!   then is released before the close of epoch 1; every node holds both certified records, the
-//!   held member did not sign the first, and each record's `final_state` is the block in which the
-//!   chain concluded the epoch.
-//! - [`test_missed_record_round_always`] and [`test_missed_record_round_adaptive`]: two of the four
-//!   members miss the vote round of epoch 1's record, which gives up without a quorum; the chain
-//!   goes on and the close of epoch 2 certifies that record.
+//! - [`test_held_member_two_closes`]: one member trails the others by more than the proposer's
+//!   floor of 8 outputs at the close of epoch 0, then is released before the close of epoch 1;
+//!   every node holds both certified records, the held member did not sign the first, and each
+//!   record's `final_state` is the block in which the chain concluded the epoch.
+//! - [`test_missed_record_round`]: two of the four members miss the vote round of epoch 1's record,
+//!   which gives up without a quorum; the chain goes on and the close of epoch 2 certifies that
+//!   record.
 //!
 //! The closing block is established from the chain, not from the record path: `concludeEpoch`
 //! records block N + 1 as the next epoch's first block (`getEpochInfo(E + 1).blockHeight`), and the
@@ -33,7 +30,7 @@ use super::{
     },
     fleet::{
         assert_switches, expected_switches, log_str_field, node_epoch, wait_for_epoch_on_all, Load,
-        CANARY_LOG, EXECUTION_DELAY_ENV, FATAL_LOGS, STACK_SWITCHES_OFF, STACK_SWITCHES_ON,
+        CANARY_LOG, EXECUTION_DELAY_ENV, FATAL_LOGS, STACK_SWITCHES_ON,
     },
 };
 use alloy::{
@@ -251,97 +248,27 @@ const ROUND_GIVE_UP_TIMEOUT: Duration = Duration::from_secs(150);
 /// Time limit for every node to close epoch 1 once the held members were released.
 const ROUND_SECOND_CLOSE_TIMEOUT: Duration = Duration::from_secs(ROUND_EPOCH_SECS as u64 * 4);
 
-/// A form of the proposer's vote fix.
-#[derive(Clone, Copy, Debug)]
-enum VoteForm {
-    /// `quorum_exec_block_starved_rounds: 0`: the quorum rule on every header.
-    Always,
-    /// `quorum_exec_block_starved_rounds: 4`: the own tip until an own header is cancelled.
-    Adaptive,
+/// The switches on every node, with nothing else set: every switch of [`STACK_SWITCHES_ON`], as in
+/// the benchmark.
+fn stack_overrides() -> FleetOverrides {
+    STACK_SWITCHES_ON.into_iter().fold(FleetOverrides::default(), |fleet, (key, value)| {
+        fleet.parameter((1..=4).map(|i| format!("validator-{i}")), key, value)
+    })
 }
 
-impl VoteForm {
-    /// The form's name in test-log directories.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Always => "always",
-            Self::Adaptive => "adaptive",
-        }
-    }
-
-    /// The `parameters.yaml` entries every node gets, as in the benchmark's arms of this form:
-    /// every switch of [`STACK_SWITCHES_ON`], with [`STARVED_ROUNDS`] set to the form's count.
-    ///
-    /// A switch added to the shared list is on in both forms with no change here.
-    fn switches(self) -> eyre::Result<Vec<(&'static str, &'static str)>> {
-        let starved = match self {
-            Self::Always => "0",
-            Self::Adaptive => "4",
-        };
-        eyre::ensure!(
-            STACK_SWITCHES_ON.iter().any(|(key, _)| *key == STARVED_ROUNDS),
-            "STACK_SWITCHES_ON has no `{STARVED_ROUNDS}` entry for the form to set"
-        );
-        // a switch only in the defaults' list would run at its default in both forms unnoticed
-        eyre::ensure!(
-            STACK_SWITCHES_ON
-                .iter()
-                .map(|(key, _)| key)
-                .eq(STACK_SWITCHES_OFF.iter().map(|(key, _)| key)),
-            "STACK_SWITCHES_ON and STACK_SWITCHES_OFF name different switches"
-        );
-        Ok(STACK_SWITCHES_ON
-            .iter()
-            .map(|&(key, on)| (key, if key == STARVED_ROUNDS { starved } else { on }))
-            .collect())
-    }
-
-    /// The switches on every node, with nothing else set.
-    fn overrides(self) -> eyre::Result<FleetOverrides> {
-        Ok(self.switches()?.into_iter().fold(FleetOverrides::default(), |fleet, (key, value)| {
-            fleet.parameter((1..=4).map(|i| format!("validator-{i}")), key, value)
-        }))
-    }
-
-    /// What the `node switches` line of every node must show.
-    fn expected_switches(self) -> eyre::Result<Vec<(&'static str, &'static str)>> {
-        expected_switches(&self.switches()?)
-    }
-}
-
-/// The switch whose value tells the two forms of the vote fix apart.
-const STARVED_ROUNDS: &str = "quorum_exec_block_starved_rounds";
-
-/// One validator trails the others by more than the floor at the close of epoch 0 under the always
-/// form; see [`held_member_two_closes`].
+/// One validator trails the others by more than the floor at the close of epoch 0; see
+/// [`held_member_two_closes`].
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_held_member_two_closes_always() -> eyre::Result<()> {
-    held_member_two_closes(VoteForm::Always)
+fn test_held_member_two_closes() -> eyre::Result<()> {
+    held_member_two_closes()
 }
 
-/// One validator trails the others by more than the floor at the close of epoch 0 under the
-/// adaptive form; see [`held_member_two_closes`].
+/// Two of four validators miss the first vote round; see [`missed_record_round`].
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_held_member_two_closes_adaptive() -> eyre::Result<()> {
-    held_member_two_closes(VoteForm::Adaptive)
-}
-
-/// Two of four validators miss the first vote round under the always form; see
-/// [`missed_record_round`].
-#[test]
-#[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_missed_record_round_always() -> eyre::Result<()> {
-    missed_record_round(VoteForm::Always)
-}
-
-/// Two of four validators miss the first vote round under the adaptive form; see
-/// [`missed_record_round`].
-#[test]
-#[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_missed_record_round_adaptive() -> eyre::Result<()> {
-    missed_record_round(VoteForm::Adaptive)
+fn test_missed_record_round() -> eyre::Result<()> {
+    missed_record_round()
 }
 
 /// A member held more than [`FLOOR_OUTPUTS`] outputs behind at the close of epoch 0 holds the
@@ -365,10 +292,10 @@ fn test_missed_record_round_adaptive() -> eyre::Result<()> {
 /// compared the stored record with its own closing block without halting) and logged no vote of
 /// its own for it. No node logs a line of [`fork_logs`]. At the end every node's
 /// [`CERTIFIED_THROUGH`] is its last closed epoch.
-fn held_member_two_closes(form: VoteForm) -> eyre::Result<()> {
+fn held_member_two_closes() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
-    let test = format!("held_member_two_closes_{}", form.name());
-    let release = form.overrides()?;
+    let test = String::from("held_member_two_closes");
+    let release = stack_overrides();
     let held = release.clone().env(
         [format!("validator-{}", HELD_MEMBER + 1)],
         EXECUTION_DELAY_ENV,
@@ -376,7 +303,7 @@ fn held_member_two_closes(form: VoteForm) -> eyre::Result<()> {
     );
     let mut fleet = CloseFleet::start(&test, HELD_EPOCH_SECS, &held)?;
     let mut load = None;
-    let checked = check_held_member(&mut fleet, form, &release, &mut load);
+    let checked = check_held_member(&mut fleet, &release, &mut load);
     let sent = load.map(Load::stop).transpose();
     fleet.guard.kill_all();
     let report = checked.wrap_err(format!("{test}: check logs in test_logs/{test}/"))?;
@@ -387,13 +314,12 @@ fn held_member_two_closes(form: VoteForm) -> eyre::Result<()> {
 /// The checks of [`held_member_two_closes`]; starts the load into `load`.
 fn check_held_member(
     fleet: &mut CloseFleet,
-    form: VoteForm,
     release: &FleetOverrides,
     load: &mut Option<Load>,
 ) -> eyre::Result<String> {
     let urls = fleet.urls.clone();
     let test = fleet.test.clone();
-    let expected = form.expected_switches()?;
+    let expected = expected_switches(&STACK_SWITCHES_ON)?;
     network_advancing(&urls)?;
     for node in 0..4 {
         assert_switches(&test, node, 0, &expected)?;
@@ -522,10 +448,10 @@ fn check_held_member(
 /// conflict ([`check_collector`]); the next epoch committed outputs beyond its closing one;
 /// no node logs a line of [`fork_logs`]; every node's [`CERTIFIED_THROUGH`] is its last closed
 /// epoch.
-fn missed_record_round(form: VoteForm) -> eyre::Result<()> {
+fn missed_record_round() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
-    let test = format!("missed_record_round_{}", form.name());
-    let release = form.overrides()?;
+    let test = String::from("missed_record_round");
+    let release = stack_overrides();
     let names = ROUND_HELD.map(|i| format!("validator-{}", i + 1));
     let held = release
         .clone()
@@ -533,7 +459,7 @@ fn missed_record_round(form: VoteForm) -> eyre::Result<()> {
         .env(names, EXIT_BEFORE_EPOCH_RECORD_ENV, MISSED_EPOCH.to_string());
     let mut fleet = CloseFleet::start(&test, ROUND_EPOCH_SECS, &held)?;
     let mut load = None;
-    let checked = check_missed_round(&mut fleet, form, &release, &mut load);
+    let checked = check_missed_round(&mut fleet, &release, &mut load);
     let sent = load.map(Load::stop).transpose();
     fleet.guard.kill_all();
     let report = checked.wrap_err(format!("{test}: check logs in test_logs/{test}/"))?;
@@ -544,13 +470,12 @@ fn missed_record_round(form: VoteForm) -> eyre::Result<()> {
 /// The checks of [`missed_record_round`]; starts the load into `load`.
 fn check_missed_round(
     fleet: &mut CloseFleet,
-    form: VoteForm,
     release: &FleetOverrides,
     load: &mut Option<Load>,
 ) -> eyre::Result<String> {
     let urls = fleet.urls.clone();
     let test = fleet.test.clone();
-    let expected = form.expected_switches()?;
+    let expected = expected_switches(&STACK_SWITCHES_ON)?;
     let (missed, next) = (MISSED_EPOCH, MISSED_EPOCH + 1);
     network_advancing(&urls)?;
     for node in 0..4 {

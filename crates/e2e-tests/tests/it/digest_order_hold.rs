@@ -12,10 +12,11 @@
 //! (`TN_TEST_OWN_CERT_DELAY_MS`, `_STAGE`, `_EVERY`, see `tn_types::test_hooks::own_cert_delay`)
 //! holds back the own certificate of [`HOOKED`], so its header at a held round is not a parent of
 //! its next header: what a far validator sees on a fleet. [`SLOWED`] executes every output with
-//! batches late (the engine's execution-delay hook), so the vote form of `quorum_exec_block`
-//! matters. Senders spread over all four validators submit consecutive nonces, up to [`WINDOW`]
-//! unexecuted each, and never send an accepted transaction again; the load runs across epoch
-//! boundaries. At the end every node's chain is walked block by block.
+//! batches late (the engine's execution-delay hook), so execution is uneven across the fleet and
+//! the execution block each header names follows a quorum, not the fastest node. Senders spread
+//! over all four validators submit consecutive nonces, up to [`WINDOW`] unexecuted each, and never
+//! send an accepted transaction again; the load runs across epoch boundaries. At the end every
+//! node's chain is walked block by block.
 
 use super::{
     common::{
@@ -153,26 +154,25 @@ const ORPHAN_RESULTS: [&str; 5] =
 const CAUSES: [&str; 2] = ["canceled", "committed"];
 
 /// With the hold on, every transaction a validator accepted lands exactly once while the own chain
-/// of one validator keeps breaking, with the adaptive vote form (`quorum_exec_block_starved_rounds:
-/// 4`), every stack switch on and the hook at `before_store` (see [`Form::hook`]). See
-/// [`check_form`] for the assertions.
+/// of one validator keeps breaking, with every stack switch on and the hook at `before_store` (see
+/// [`Form::hook`]). See [`check_form`] for the assertions.
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_hold_keeps_every_transaction_adaptive() -> eyre::Result<()> {
+fn test_hold_keeps_every_transaction_before_store() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
-    run_form(Form::Adaptive)
+    run_form(Form::BeforeStore)
 }
 
-/// [`test_hold_keeps_every_transaction_adaptive`] with the `always` vote form
-/// (`quorum_exec_block_starved_rounds: 0`) and the hook at `after_store` (see [`Form::hook`]).
+/// [`test_hold_keeps_every_transaction_before_store`] with the hook at `after_store` (see
+/// [`Form::hook`]).
 #[test]
 #[ignore = "should not run with a default cargo test: starts a four-validator network"]
-fn test_hold_keeps_every_transaction_always() -> eyre::Result<()> {
+fn test_hold_keeps_every_transaction_after_store() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
-    run_form(Form::Always)
+    run_form(Form::AfterStore)
 }
 
-/// The adaptive form (the stack's own switch list, [`STACK_SWITCHES_ON`]), with the hook at
+/// Every stack switch on ([`STACK_SWITCHES_ON`]), with the hook at
 /// `after_store` so a lane waits on a commit notice when the kill lands: the hooked validator is
 /// killed by SIGKILL under load once an epoch boundary has passed, and restarted on its datadir
 /// with the same overrides while the load to the other three continues. Its senders pause
@@ -187,7 +187,7 @@ fn test_hold_survives_a_kill_of_the_far_validator() -> eyre::Result<()> {
     run_form(Form::Kill)
 }
 
-/// The control: the fleet of [`test_hold_keeps_every_transaction_adaptive`] with only
+/// The control: the fleet of [`test_hold_keeps_every_transaction_before_store`] with only
 /// `digest_order_hold` off. The hooked validator re-queues digests out of order
 /// ([`OUT_OF_ORDER`] > 0); the transactions lost are reported, not asserted.
 #[test]
@@ -200,13 +200,13 @@ fn test_without_the_hold_the_far_validator_reorders() -> eyre::Result<()> {
 /// One test's fleet: the switches every node gets and what happens to the hooked node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
-    /// Every stack switch on (`quorum_exec_block_starved_rounds: 4`).
-    Adaptive,
-    /// Every stack switch on with `quorum_exec_block_starved_rounds: 0`.
-    Always,
-    /// [`Self::Adaptive`], with the hooked node killed and restarted under load.
+    /// Every stack switch on, the hook at `before_store`.
+    BeforeStore,
+    /// Every stack switch on, the hook at `after_store`.
+    AfterStore,
+    /// [`Self::AfterStore`], with the hooked node killed and restarted under load.
     Kill,
-    /// [`Self::Adaptive`] with `digest_order_hold: false`.
+    /// [`Self::BeforeStore`] with `digest_order_hold: false`.
     Control,
 }
 
@@ -214,8 +214,8 @@ impl Form {
     /// The test-log directory.
     fn test_name(self) -> &'static str {
         match self {
-            Self::Adaptive => "hold_adaptive",
-            Self::Always => "hold_always",
+            Self::BeforeStore => "hold_before_store",
+            Self::AfterStore => "hold_after_store",
             Self::Kill => "hold_kill",
             Self::Control => "hold_off_control",
         }
@@ -231,7 +231,6 @@ impl Form {
         STACK_SWITCHES_ON
             .iter()
             .map(|&(key, value)| match (self, key) {
-                (Self::Always, "quorum_exec_block_starved_rounds") => (key, "0"),
                 (Self::Control, "digest_order_hold") => (key, "false"),
                 _ => (key, value),
             })
@@ -245,15 +244,16 @@ impl Form {
     /// `after_store` keeps a certified header out of the next header's parents until a later own
     /// header commits without it (cause `committed`). Measured in the first runs: `before_store`
     /// re-queued 16 and 15 digests as `canceled` and none as `committed`, `after_store` 32 as
-    /// `committed` and none as `canceled`. The adaptive test and its control take `before_store`,
-    /// the `always` test and the kill take `after_store`, so the adaptive form runs both paths and
-    /// the kill lands while a lane waits on a commit notice. Holds last 5 s, past the next own
-    /// header at this cadence, on every third round: the round after a held one carries no own
-    /// parent, and the one after that does, so the lane is free again and drains.
+    /// `committed` and none as `canceled`. [`Self::BeforeStore`] and the control take
+    /// `before_store`, [`Self::AfterStore`] and the kill take `after_store`, so the hold runs on
+    /// both paths and the kill lands while a lane waits on a commit notice. Holds last 5 s, past
+    /// the next own header at this cadence, on every third round: the round after a held one
+    /// carries no own parent, and the one after that does, so the lane is free again and
+    /// drains.
     fn hook(self) -> (&'static str, u64, u64) {
         match self {
-            Self::Adaptive | Self::Control => ("before_store", 5_000, 3),
-            Self::Always | Self::Kill => ("after_store", 5_000, 3),
+            Self::BeforeStore | Self::Control => ("before_store", 5_000, 3),
+            Self::AfterStore | Self::Kill => ("after_store", 5_000, 3),
         }
     }
 
