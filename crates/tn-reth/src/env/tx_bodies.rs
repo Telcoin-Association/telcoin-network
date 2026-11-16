@@ -58,7 +58,9 @@ use crate::{
 };
 
 /// How long a read waits for a closed epoch's pack that is not sealed yet (the epoch an epoch
-/// handoff is sealing) or is being replaced (an install's rename window).
+/// handoff is sealing) or is being replaced (an install's rename window), and for a pack-read
+/// permit. It is one deadline for every wait of a resolve, counted from when its pack read began,
+/// so a read that tries again never waits this long per try.
 const PACK_WAIT: Duration = Duration::from_secs(1);
 
 /// How often such a read tries the pack again.
@@ -124,11 +126,20 @@ pub enum TxBodyErrorKind {
     /// epoch handoff that did not finish, or a past epoch left unsealed (`db validate`).
     #[error("the epoch's consensus pack stayed unsealed or mid-install for {0:?}")]
     HandoffTimeout(Duration),
+    /// The node's pack reads were all busy: no pack-read permit was given back before the read's
+    /// deadline ([`PACK_WAIT`] after its pack read began), or too many reads already waited for
+    /// one (`packs::MAX_PERMIT_WAITERS`). Nothing is wrong with the pack: the read can be
+    /// retried.
+    #[error(
+        "the node's consensus pack reads are all busy (none freed before the read's deadline, or \
+         too many reads already wait for one): the read can be retried"
+    )]
+    PermitTimeout,
 }
 
 impl TxBodyErrorKind {
     /// Every `reason` label of `tn_reth.tx_body_resolve_failures_total`.
-    pub(crate) const LABELS: [&'static str; 9] = [
+    pub(crate) const LABELS: [&'static str; 10] = [
         "no_batch_digest",
         "packs_not_attached",
         "pack_missing",
@@ -138,6 +149,7 @@ impl TxBodyErrorKind {
         "decode",
         "batch_too_large",
         "handoff_timeout",
+        "permit_timeout",
     ];
 
     /// This failure's `reason` label.
@@ -152,6 +164,7 @@ impl TxBodyErrorKind {
             Self::Decode { .. } => Self::LABELS[6],
             Self::BatchTooLarge => Self::LABELS[7],
             Self::HandoffTimeout(_) => Self::LABELS[8],
+            Self::PermitTimeout => Self::LABELS[9],
         }
     }
 }
@@ -403,19 +416,23 @@ impl TxBodySource {
 /// The live pack is asked again on each wait: the epoch can become the live one meanwhile (a
 /// same-epoch swap of an imported pack for a writable one, or the first `new_epoch` after a
 /// restart), and its log is then unsealed for good, so only the live pack answers.
+///
+/// Every wait of the read, for a pack-read permit or for the pack, ends at one deadline,
+/// [`PACK_WAIT`] after the read began: a permit not had by then fails the read
+/// ([`TxBodyErrorKind::PermitTimeout`]), as does finding too many reads already waiting for one.
 fn read_packs(
     packs: &PackSource,
     epoch: Epoch,
     digest: B256,
 ) -> Result<(Batch, BatchSource), TxBodyErrorKind> {
-    if let Some(live) = read_live(packs, epoch, digest) {
+    let deadline = Instant::now() + packs.wait();
+    if let Some(live) = read_live(packs, epoch, digest, deadline) {
         return live;
     }
-    let deadline = Instant::now() + PACK_WAIT;
     let mut reopened = false;
     loop {
         let read = {
-            let _permit = packs.permit();
+            let _permit = packs.permit(deadline).ok_or(TxBodyErrorKind::PermitTimeout)?;
             packs.reader(epoch).map(|(reader, fresh)| (reader.batch(digest), fresh))
         };
         match read {
@@ -429,11 +446,11 @@ fn read_packs(
             Err(PackOpenError::Missing) => return Err(TxBodyErrorKind::PackMissing),
             Err(PackOpenError::Failed(e)) => return Err(TxBodyErrorKind::Read(Box::new(e))),
             Err(PackOpenError::Unsealed | PackOpenError::Installing) => {
-                if let Some(live) = read_live(packs, epoch, digest) {
+                if let Some(live) = read_live(packs, epoch, digest, deadline) {
                     return live;
                 }
                 if Instant::now() >= deadline {
-                    return Err(TxBodyErrorKind::HandoffTimeout(PACK_WAIT));
+                    return Err(TxBodyErrorKind::HandoffTimeout(packs.wait()));
                 }
                 std::thread::sleep(PACK_RETRY);
             }
@@ -442,14 +459,18 @@ fn read_packs(
 }
 
 /// Batch `digest` from the live pack, if `epoch` is live and the pack was not sealed under the
-/// read (then the epoch is read as a closed one: `None`).
+/// read (then the epoch is read as a closed one: `None`). Asking takes a pack-read permit, live
+/// epoch or not: one not had by `deadline` fails the read.
 fn read_live(
     packs: &PackSource,
     epoch: Epoch,
     digest: B256,
+    deadline: Instant,
 ) -> Option<Result<(Batch, BatchSource), TxBodyErrorKind>> {
     let live = {
-        let _permit = packs.permit();
+        let Some(_permit) = packs.permit(deadline) else {
+            return Some(Err(TxBodyErrorKind::PermitTimeout));
+        };
         packs.live_batch(epoch, digest)
     };
     match live? {

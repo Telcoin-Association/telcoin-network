@@ -4,8 +4,9 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        mpsc, Arc,
     },
+    thread::Scope,
 };
 
 use parking_lot::Mutex;
@@ -13,7 +14,10 @@ use tempfile::TempDir;
 use tn_storage::consensus_pack::BatchReadError;
 use tn_types::{Batch, Epoch, ExecHeader, B256};
 
-use super::*;
+use super::{
+    packs::{Permit, DECODE_PERMITS, MAX_PERMIT_WAITERS},
+    *,
+};
 use crate::test_utils::batch_with_transactions;
 
 /// Bytes that do not decode as an EIP-2718 transaction.
@@ -502,6 +506,126 @@ fn a_missing_pack_is_mid_install_only_beside_an_install() -> eyre::Result<()> {
     assert!(ChainPacks::installing(dir.path(), 3), "the new copy renamed in");
     assert!(!ChainPacks::installing(dir.path(), 4), "another epoch");
     Ok(())
+}
+
+// --- the pack-read permits ------------------------------------------------------------------
+
+/// A deadline the reads of these tests reach only when their permits are never given back.
+const LONG_WAIT: Duration = Duration::from_secs(60);
+
+/// How soon a read refused at once must end: far longer than a refusal takes, far shorter than
+/// [`LONG_WAIT`].
+const AT_ONCE: Duration = Duration::from_secs(5);
+
+/// A source with no cache reading fake packs, its resolves waiting up to [`LONG_WAIT`] in all, and
+/// the batch those packs hold in closed epoch 2.
+fn long_waiting_source() -> (TxBodySource, Batch) {
+    let packs = Arc::new(FakePacks::default());
+    let b = batch(1, &[]);
+    packs.close(2, &b);
+    let source = TxBodySource::new(0);
+    source.attach_packs(PackSource::new(packs).with_wait(LONG_WAIT)).expect("first attach");
+    (source, b)
+}
+
+/// Every pack-read permit of `source`, held until dropped.
+fn hold_every_permit(source: &TxBodySource) -> Vec<Permit<'_>> {
+    let packs = source.packs().expect("attached");
+    let deadline = Instant::now() + LONG_WAIT;
+    (0..DECODE_PERMITS).map(|_| packs.permit(deadline).expect("a free permit")).collect()
+}
+
+/// Resolve position 0 of `batch` in epoch 2 on a thread of `scope`: its result and how long it
+/// took, if it ends within `within` (a read that never ends fails the test instead of hanging it).
+fn resolve_within<'scope, 'env>(
+    scope: &'scope Scope<'scope, 'env>,
+    source: &'env TxBodySource,
+    batch: &'env Batch,
+    within: Duration,
+) -> (Result<Vec<TransactionSigned>, TxBodyError>, Duration) {
+    let (sender, receiver) = mpsc::channel();
+    scope.spawn(move || {
+        let started = Instant::now();
+        let result = resolve(source, 2, batch, &[0]);
+        // the receiver is gone only when the test already failed
+        let _ = sender.send((result, started.elapsed()));
+    });
+    receiver.recv_timeout(within).expect("the read ends in time")
+}
+
+/// Wait until `waiting` threads wait for one of `source`'s pack-read permits.
+fn wait_for_waiters(source: &TxBodySource, waiting: usize) {
+    let packs = source.packs().expect("attached");
+    let until = Instant::now() + LONG_WAIT;
+    while packs.permit_counts().1 < waiting {
+        assert!(Instant::now() < until, "(free, waiting): {:?}", packs.permit_counts());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// With every pack-read permit held, a read waits for one until its deadline, `PACK_WAIT` after it
+/// began, and then fails as `PermitTimeout`, not before; the holders keep their permits.
+#[test]
+fn a_read_with_every_permit_held_fails_at_its_deadline() {
+    let (source, packs) = pack_source(0);
+    let b = batch(1, &[]);
+    packs.close(2, &b);
+    std::thread::scope(|scope| {
+        let held = hold_every_permit(&source);
+        let (result, took) = resolve_within(scope, &source, &b, PACK_WAIT * 10);
+        assert!(matches!(kind(result), TxBodyErrorKind::PermitTimeout));
+        assert!(took >= PACK_WAIT, "failed before its deadline: {took:?}");
+        let counts = source.packs().expect("attached").permit_counts();
+        assert_eq!(counts, (0, 0), "the holders keep theirs, and nobody waits");
+        drop(held);
+    });
+}
+
+/// With every pack-read permit held and `MAX_PERMIT_WAITERS` reads waiting for one, the next read
+/// fails at once, well inside its deadline, as `PermitTimeout`. The holders and the waiters are
+/// not disturbed: once the permits are given back, every waiter reads its batch.
+#[test]
+fn a_read_past_the_waiter_cap_fails_at_once() -> eyre::Result<()> {
+    let (source, b) = long_waiting_source();
+    let packs = source.packs().expect("attached");
+    std::thread::scope(|scope| -> eyre::Result<()> {
+        let held = hold_every_permit(&source);
+        let waiters: Vec<_> = (0..MAX_PERMIT_WAITERS)
+            .map(|_| scope.spawn(|| resolve(&source, 2, &b, &[0])))
+            .collect();
+        wait_for_waiters(&source, MAX_PERMIT_WAITERS);
+
+        let (result, took) = resolve_within(scope, &source, &b, AT_ONCE);
+        assert!(matches!(kind(result), TxBodyErrorKind::PermitTimeout));
+        assert!(took < AT_ONCE, "{took:?}");
+        assert_eq!(packs.permit_counts(), (0, MAX_PERMIT_WAITERS), "holders and waiters as before");
+
+        drop(held);
+        for waiter in waiters {
+            assert_eq!(waiter.join().expect("the waiter does not panic")?, expected(&b, &[0]));
+        }
+        Ok(())
+    })?;
+    assert_eq!(packs.permit_counts(), (DECODE_PERMITS, 0), "every permit given back");
+    Ok(())
+}
+
+/// A read that waits for a pack-read permit and gets one before its deadline reads its batch.
+#[test]
+fn a_read_that_gets_a_permit_before_its_deadline_succeeds() -> eyre::Result<()> {
+    let (source, b) = long_waiting_source();
+    let packs = source.packs().expect("attached");
+    std::thread::scope(|scope| -> eyre::Result<()> {
+        let mut held = hold_every_permit(&source);
+        let reader = scope.spawn(|| resolve(&source, 2, &b, &[0]));
+        wait_for_waiters(&source, 1);
+        // give one permit back
+        drop(held.pop());
+        assert_eq!(reader.join().expect("the read does not panic")?, expected(&b, &[0]));
+        assert_eq!(packs.permit_counts(), (1, 0), "the three other holders keep theirs");
+        drop(held);
+        Ok(())
+    })
 }
 
 // --- end to end: the engine's persist on a pointer datadir ------------------------------------

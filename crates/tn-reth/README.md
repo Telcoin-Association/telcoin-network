@@ -1006,7 +1006,11 @@ CHANGES.md TN-0200..0203.
      past pack that still fails its open with no handoff or install in progress is damaged: the
      read fails at once, and the chain's read-side heal rebuilds its indexes in the background.
 
-  At most 4 pack reads run at once. Each position is checked against the batch's length and its
+  At most 4 pack reads run at once, node-wide, and at most 124 more reads wait for one (`MAX_PERMIT_WAITERS`).
+  With the 4 readers that is 128 threads, half of the 256 that each RPC server's blocking pool keeps beyond its blocking-IO permits, which these reads do not take.
+  A read that finds 124 waiting fails at once, and one still waiting at its deadline fails then, both as `permit_timeout`.
+  The deadline is one second after the read began (`PACK_WAIT`), shared with the waits for a pack being sealed or replaced, so a read that tries again does not wait a second each time.
+  Each position is checked against the batch's length and its
   transaction decoded (EIP-2718). A read by hash checks the resolved transaction's hash too.
 
   `eth_getLogs`, on a block the RPC cache does not hold, reads the transaction of each matching
@@ -1020,7 +1024,8 @@ CHANGES.md TN-0200..0203.
   another transaction. Each failed block counts in `tn_reth_tx_body_resolve_failures_total` by
   `reason`: `no_batch_digest`, `packs_not_attached`, `pack_missing`, `batch_missing`, `read` (a
   pack read failed, its digest check included), `position_out_of_range`, `decode`,
-  `batch_too_large`, `handoff_timeout`. A read by hash that resolves another transaction fails as
+  `batch_too_large`, `handoff_timeout`, `permit_timeout` (the node's pack reads were all busy: the read can be retried).
+  A read by hash that resolves another transaction fails as
   well (TN-0202's `TxBodyMismatch`), outside that counter. The other series:
   `tn_reth_tx_body_resolves_total` by `source` (`recent`, `cold`, `live_pack`, `closed_pack`,
   `scoped` for a read answered from the read scope; `memory` in test builds),
