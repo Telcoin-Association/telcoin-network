@@ -258,21 +258,24 @@ fn source_inside(base_path: &Path, source: &Path) -> Option<String> {
 }
 
 /// The local records of `epoch` and `epoch - 1`, read from the records log at rest (no index,
-/// nothing written): the record of `epoch` must carry a certificate in the local certificates
-/// log, and chain to the record before it.
+/// nothing written) as the node's open recovers it, so a log an unclean stop left unsealed reads
+/// up to its torn tail ([`EpochRecordDb::read_records_at_rest`]): the record of `epoch` must
+/// carry a certificate in the local certificates log, and chain to the record before it.
 fn local_records(
     base_path: &Path,
     epoch: Epoch,
 ) -> Result<(EpochRecord, EpochRecord), EpochImportError> {
+    // What is left once an unsealed log reads up to its torn tail: a sealed log damaged at rest,
+    // a read the disk failed, or a log that does not open. A start refuses those too.
     let unreadable = |what: &str, path: PathBuf, e: &dyn Display| {
         EpochImportError::Records(format!(
-            "the local epoch {what} at {} do not read ({e}); with the node stopped, `db repair \
-             --force` heals them",
+            "the local epoch {what} at {} do not read ({e}); with the node stopped, \
+             `telcoin-network db repair` says what recovers them",
             path.display()
         ))
     };
     let records_path = base_path.join(RECORDS_NAME);
-    let records = EpochRecordDb::read_records_from_pack(&records_path)
+    let records = EpochRecordDb::read_records_at_rest(&records_path)
         .map_err(|e| unreadable("records", records_path, &e))?;
     let find = |epoch: Epoch| {
         records.iter().find(|record| record.epoch == epoch).cloned().ok_or_else(|| {
@@ -287,7 +290,7 @@ fn local_records(
         )));
     }
     let certs_path = base_path.join(CERTS_NAME);
-    let certs = EpochRecordDb::read_certs_from_pack(&certs_path)
+    let certs = EpochRecordDb::read_certs_at_rest(&certs_path)
         .map_err(|e| unreadable("certificates", certs_path, &e))?;
     if !certs.iter().any(|cert| cert.epoch_hash == record.digest()) {
         return Err(EpochImportError::Records(format!(
@@ -675,6 +678,47 @@ mod test {
         assert_eq!(super::local_records(tmp.path(), 1).unwrap(), (record1, record0));
         let err = super::local_records(tmp.path(), 2).unwrap_err();
         assert!(err.to_string().contains("does not chain"), "{err}");
+    }
+
+    /// Records and certificates logs left as a killed node leaves them (no clean-close sentinel,
+    /// zero padding past the data) are read as the node's open recovers them: up to the torn
+    /// tail. A sealed log that stops decoding is still refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_epoch_at_rest_reads_records_left_by_an_unclean_stop() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("epochs");
+        closed_epochs(&base).await;
+        let copy = tmp.path().join("copy");
+        std::fs::rename(base.join("epoch-1"), &copy).unwrap();
+        for name in [crate::epoch_records::RECORDS_NAME, crate::epoch_records::CERTS_NAME] {
+            let path = base.join(name);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.truncate(bytes.len() - crate::archive::data_file::SENTINEL_LEN as usize);
+            bytes.resize(bytes.len() + 4096, 0);
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let before = tree(&base);
+        let dry = ConsensusChain::import_epoch_at_rest(
+            &base,
+            1,
+            &copy,
+            false,
+            TIMEOUT,
+            IMPORT_MIN_FREE_BYTES,
+        )
+        .await
+        .expect("the records an unclean stop left verify the copy");
+        assert_eq!((dry.replaces, dry.installed), (EpochPackState::Missing, false));
+        assert_eq!(tree(&base), before, "the read left the logs as they were");
+
+        // sealed again, with a flipped byte: at-rest damage, refused
+        let records = base.join(crate::epoch_records::RECORDS_NAME);
+        let db = crate::epoch_records::EpochRecordDb::open(&base).unwrap();
+        db.close().await;
+        flip_middle_byte(&records);
+        let err = super::local_records(&base, 1).unwrap_err();
+        assert!(matches!(err, EpochImportError::Records(_)), "{err}");
+        assert!(err.to_string().contains("sealed"), "{err}");
     }
 
     /// A dry run verifies a copy and leaves the epochs directory byte-identical; the install puts

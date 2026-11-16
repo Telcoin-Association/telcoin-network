@@ -522,7 +522,8 @@ then checks the restored epoch with the others. `telcoin-network db import-epoch
 its last complete output (`wal_consistent_end`; a sealed log ends with its sentinel, which no peer
 serves) goes through the peer import's own staged path (`ConsensusChain::import_sealed`, the
 `import-N` directory, the checked seal and its read-back) against the local records of epochs N-1
-and N, read from their logs without opening the records DB (N certified, N chaining to N-1), and
+and N, read from their logs without opening the records DB (N certified, N chaining to N-1; a log
+an unclean stop left unsealed is read up to its torn tail, as the node's open recovers it), and
 only a verified copy is installed (`install_imported_epoch_dir`, rename-aside, which also puts back
 an interrupted install's aside first). It opens no `ConsensusChain`: an open writes (the live
 epoch's append open, `recover_incomplete_installs`, the sweep), and `stream_import`'s idempotency
