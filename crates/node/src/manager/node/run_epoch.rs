@@ -21,7 +21,7 @@ use crate::{
     worker::worker_task_manager_name,
 };
 use eyre::WrapErr as _;
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _};
 use std::{
     collections::{HashSet, VecDeque},
     future::{ready, Future},
@@ -601,11 +601,13 @@ where
     ///    forwards every output up to that number, read back from the pack (reads ignore a failed
     ///    sync), so without it an output whose persist failed could be executed.
     /// 2. On an exit without the boundary, drain leftover output to the engine; if the drain
-    ///    reaches the boundary, close the epoch and write its [`EpochRecord`] here too.
+    ///    reaches the boundary, close the epoch and write its [`EpochRecord`] here too. A gap in
+    ///    the drained numbers is returned and stops the node before the engine gets past it.
     /// 3. Clear the epoch-scoped DB tables when a boundary was crossed.
     /// 4. Check the consensus DB's stores still make writes durable (`ensure_stores_durable`).
     ///
-    /// Each failure is this node's own storage failing, so it is returned and stops the node.
+    /// Each failure (this node's own storage failing, or a gap in the drain) is returned and stops
+    /// the node.
     #[allow(clippy::too_many_arguments)]
     async fn finish_epoch(
         &mut self,
@@ -635,7 +637,7 @@ where
             while let Ok(_output) = consensus_output.try_recv() {}
             RunEpochMode::NewEpoch
         } else if let Some(target_hash) =
-            self.send_leftover_consensus_output_to_engine(consensus_output, to_engine).await
+            self.send_leftover_consensus_output_to_engine(consensus_output, to_engine).await?
         {
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
@@ -702,19 +704,52 @@ where
 
     /// Forward one consensus output to the engine and record progress.
     ///
-    /// If the leader's commit timestamp has reached `self.epoch_boundary`, the output is flagged as
-    /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
-    /// evicted from [`NodeBatchesCache`] and [`OurNodeBatchesCache`] (see
-    /// [`evict_committed_batches`]), then the output is stamped with the hand-off instant
-    /// (`ConsensusOutput::set_forwarded_at`, observability only) and sent.
-    /// `last_forwarded_consensus_number` is updated only after the send succeeds, so the
-    /// restart-replay and leftover-drain paths can rely on it marking what actually reached the
-    /// engine rather than what was merely dequeued.
+    /// Waits for room in `to_engine`, then hands the output over with [`Self::forward_output`].
+    /// Used by the restart replay and the leftover drain, which hold their output before they
+    /// call this and are cancelled only with the whole epoch loop, when the node exits (the
+    /// restart then replays the output from the consensus DB). The live path, which the epoch's
+    /// other exits can cancel, takes room first and the output second
+    /// ([`Self::wait_for_epoch_boundary`]).
     pub(super) async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        mut output: ConsensusOutput,
+        output: ConsensusOutput,
     ) -> eyre::Result<()> {
+        // taken before the wait so the engine's forward wait includes a full channel
+        let forwarded_at = Instant::now();
+        let permit = to_engine.reserve().await?;
+        self.forward_output(permit, output, forwarded_at);
+        Ok(())
+    }
+
+    /// Hand `output` to the engine through `permit` and record progress, without waiting.
+    ///
+    /// If the leader's commit timestamp has reached `self.epoch_boundary`, the output is flagged as
+    /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
+    /// evicted from [`NodeBatchesCache`] and [`OurNodeBatchesCache`] (see
+    /// [`evict_committed_batches`]), then the output is stamped with `forwarded_at`
+    /// (`ConsensusOutput::set_forwarded_at`, observability only: when the forwarder began to wait
+    /// for room for it, see [`Self::wait_for_epoch_boundary`] for the live path) and sent.
+    /// `last_forwarded_consensus_number` moves with the send: it marks what was accepted into the
+    /// engine channel rather than what was merely dequeued, and the restart-replay and
+    /// leftover-drain paths rely on that.
+    ///
+    /// A send through a permit cannot fail: it drops the output if the engine's receiver is gone.
+    /// So each caller checks the channel with no await between that check and this call
+    /// ([`Self::process_output`] through `reserve`, the live forward through
+    /// [`mpsc::Sender::is_closed`] once its output is in hand). As with an awaited `send` between
+    /// its check and its write, what remains is a receiver dropped in that instant; the engine is
+    /// a critical task, so its exit ends the node's outer select, and the restart replay forwards
+    /// again from the executed tip.
+    ///
+    /// Nothing here awaits: a caller that reserved `permit` before taking `output` off its source
+    /// holds the output across no await point, so a cancelled caller never drops one.
+    fn forward_output(
+        &mut self,
+        permit: mpsc::Permit<'_, ConsensusOutput>,
+        mut output: ConsensusOutput,
+        forwarded_at: Instant,
+    ) {
         let last_forwarded_consensus_number = output.number();
         if output.reaches_epoch_boundary(self.epoch_boundary) {
             // update output so engine closes epoch
@@ -723,30 +758,71 @@ where
         evict_committed_batches(&self.consensus_db, output.batch_digests());
         // free the quota of the committed batches and move the age-out horizon (issue #1794)
         self.reported_batches.forget(output.batch_digests(), output.leader_round());
-        // stamped before the send so the engine's forward wait includes a send blocked on a full
-        // channel; node-local, never serialized or hashed
-        output.set_forwarded_at(Instant::now());
+        // node-local, never serialized or hashed
+        output.set_forwarded_at(forwarded_at);
         // only forward the output to the engine
-        to_engine.send(output).await?;
-        // store number after successful send
+        permit.send(output);
         self.last_forwarded_consensus_number = last_forwarded_consensus_number;
-        Ok(())
     }
 
     /// Forward live consensus output until the epoch's final commit, then return its hash.
     ///
-    /// Each output is handed to `process_output` for execution. The first output whose commit
+    /// Each output is handed to `forward_output` for execution. The first output whose commit
     /// timestamp reaches `self.epoch_boundary` is the epoch's last: it is flagged as the close,
     /// stashed in `self.last_consensus_header`, forwarded, and its [`ConsensusHeaderDigest`]
     /// returned so the caller can drive `close_epoch` and track execution to that point. Errors
-    /// only if the output stream ends before any boundary output arrives.
+    /// if the output stream ends before any boundary output arrives, if the engine channel
+    /// closes, or on a gap in the output numbers.
+    ///
+    /// Cancel safe: `run_epoch` races this against the epoch's other exits (a mode change, a
+    /// certified record that closes the epoch, the node's shutdown), and one of them can win
+    /// while the engine is behind and its channel full. So the loop takes room in the channel
+    /// first and the output second. Its only awaits are the wait for room and the wait for an
+    /// output, both cancel safe, and an output taken off the queue is handed over before the next
+    /// await. Dropped at either await, the loop holds no output, and the leftover drain
+    /// (`send_leftover_consensus_output_to_engine`) forwards the next one in order.
+    ///
+    /// Taking the output after the room also moves the eviction of its batches from the batch
+    /// caches and the release of its batch-report quota ([`Self::forward_output`]) behind the wait
+    /// for room. Under backpressure one more output (the next to be taken) keeps its batches
+    /// cached and its quota counted until the engine frees a slot. That is harmless: the outputs
+    /// queued behind the full engine already keep their batches cached and their quota counted,
+    /// and this adds one; and an exit before the boundary leaves the output queued for the
+    /// leftover drain, whose forward evicts and releases it the same way.
     async fn wait_for_epoch_boundary(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
     ) -> eyre::Result<ConsensusHeaderDigest> {
-        // receive output from consensus and forward to engine
-        while let Some(mut output) = consensus_output.recv().await {
+        loop {
+            let waiting_since = Instant::now();
+            let permit = to_engine.reserve().await?;
+            // take a queued output with one poll of `recv`, not `try_recv`: `try_recv` parks the
+            // thread while a concurrent send has claimed a slot but not written it (the
+            // subscriber sends from another worker), where the poll returns not-ready and the
+            // await below takes the output once the send lands
+            //
+            // the forward-wait stamp: an output the poll takes is stamped `waiting_since`, exact
+            // for one queued before the wait for room began (the usual case under backpressure)
+            // and an upper bound for one that arrived during it; an output the await takes (it
+            // arrived after the room, its send was mid-write, or the runtime's task budget
+            // deferred the poll) is stamped on arrival
+            let queued = consensus_output.recv().now_or_never().flatten();
+            let (mut output, forwarded_at) = match queued {
+                Some(output) => (output, waiting_since),
+                None => match consensus_output.recv().await {
+                    Some(output) => (output, Instant::now()),
+                    None => break,
+                },
+            };
+            // the room was reserved before the wait for this output, and a send through it cannot
+            // fail: it drops the output if the engine's receiver went away meanwhile. Fail with
+            // the error `reserve` gives on a closed channel instead, so an output the engine never
+            // receives is neither counted as forwarded nor stashed as the boundary (it is in the
+            // consensus pack, and the restart replay forwards it).
+            if to_engine.is_closed() {
+                return Err(mpsc::error::SendError(()).into());
+            }
             // The engine executes exactly the sequence forwarded here, so enforce continuity
             // against the last number that actually reached it. A stale output (already
             // forwarded, e.g. replayed from the DB) would double-execute; a gap would silently
@@ -759,6 +835,8 @@ where
                         target: "epoch-manager",
                         number=output.number(),
                         last_forwarded=self.last_forwarded_consensus_number,
+                        digest=?output.consensus_header_hash(),
+                        path="live",
                         "skipping already-forwarded consensus output",
                     );
                     continue;
@@ -790,11 +868,11 @@ where
 
                 self.last_consensus_header = Some(output.clone().into());
                 // forward the output to the engine
-                self.process_output(to_engine, output).await?;
+                self.forward_output(permit, output, forwarded_at);
                 return Ok(target_hash);
             } else {
                 // only forward the output to the engine
-                self.process_output(to_engine, output).await?;
+                self.forward_output(permit, output, forwarded_at);
             }
         }
         Err(eyre::eyre!("invalid wait for epoch end"))
@@ -933,7 +1011,9 @@ async fn adjust_base_fees(
     };
 
     let block_height = epoch_info.blockHeight;
-    if tip.number + 1 != block_height {
+    let identity_holds = tip.number + 1 == block_height;
+    EpochMetrics::record_close_identity_check(identity_holds);
+    if !identity_holds {
         error!(
             target: "epoch-manager",
             tip_number = tip.number,
@@ -1078,7 +1158,7 @@ where
 
 /// How the next consensus output's number relates to the last one forwarded to the engine.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum OutputContinuity {
+pub(super) enum OutputContinuity {
     /// Already forwarded (`number <= last_forwarded`): skip as a duplicate.
     Stale,
     /// The expected next output (`last_forwarded + 1`): forward it.
@@ -1090,10 +1170,12 @@ enum OutputContinuity {
 
 /// Classify `number` against the last consensus number actually forwarded to the engine.
 ///
-/// Used only on the live-forwarding path ([`EpochManager::wait_for_epoch_boundary`]); the
-/// replay and leftover-drain paths legitimately re-forward numbers at or below
-/// `last_forwarded` and must not be checked.
-fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity {
+/// Used on the paths that take outputs off the consensus-output queue: the live forward
+/// ([`EpochManager::wait_for_epoch_boundary`]) and the queue phase of the leftover drain, which
+/// takes what the live forward would have taken next. The restart replay legitimately
+/// re-forwards numbers at or below `last_forwarded` (primed from the pack's latest) and must not
+/// be checked; the drain's pack phase loads from `last_forwarded + 1` on, in order.
+pub(super) fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity {
     if number <= last_forwarded {
         OutputContinuity::Stale
     } else if number == last_forwarded + 1 {
@@ -3034,5 +3116,495 @@ pub(super) mod tests {
                 "in_committee={in_committee} mode={mode:?}"
             );
         }
+    }
+
+    // ---- bench7 epoch-record-closing-block-check ----
+
+    /// The close-time identity check is counted: `mismatch` when the canonical tip is not a
+    /// closing block (genesis), `ok` once epoch 0's closing block executed. A chain-global failure
+    /// of the epoch-info read behind it compares nothing and counts nothing. What the check does
+    /// on a mismatch is unchanged: the close still errors.
+    ///
+    /// The recorder installs a thread-local, so the closes run on a current-thread runtime driven
+    /// from inside `metrics::with_local_recorder`.
+    #[test]
+    fn the_close_time_identity_check_is_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let closes = async {
+            let task_manager = TaskManager::new("close identity counter");
+            let chain: Arc<RethChainSpec> =
+                Arc::new(test_genesis_with_consensus_registry(4).into());
+            let tmp_dir = TempDir::with_prefix("close_identity_counter")?;
+            let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+            let acc = GasAccumulator::new(1);
+            let err = adjust_base_fees(&reth_env, &acc)
+                .await
+                .expect_err("genesis is not a closing block");
+            eyre::ensure!(
+                err.to_string().contains("close-time base-fee identity violated"),
+                "unexpected error: {err}"
+            );
+            let genesis = reth_env
+                .sealed_header_by_number(0)?
+                .ok_or_else(|| eyre::eyre!("the genesis header"))?;
+            execute_worker_block(
+                &reth_env,
+                &acc,
+                genesis,
+                &consensus_output_for_tests(1, 0, 1, true),
+                MIN_PROTOCOL_BASE_FEE,
+                0,
+                vec![],
+            )?;
+            adjust_base_fees(&reth_env, &acc).await?;
+
+            // both contracts stripped: the identity read fails chain-globally and is not counted
+            let mut genesis = test_genesis_with_consensus_registry(4);
+            genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+            genesis.alloc.remove(&CONSENSUS_REGISTRY_ADDRESS);
+            let stripped_dir = TempDir::with_prefix("close_identity_counter_stripped")?;
+            let stripped = RethEnv::new_for_temp_chain(
+                Arc::new(genesis.into()),
+                stripped_dir.path(),
+                &task_manager,
+                None,
+            )?;
+            adjust_base_fees(&stripped, &GasAccumulator::new(1)).await?;
+            Ok::<_, eyre::Report>(())
+        };
+        metrics::with_local_recorder(&recorder, || rt.block_on(closes)).expect("the closes");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = |result: &str| {
+            snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    key.key().name() == "tn_epoch.epoch_close_identity_check_total"
+                        && key.key().labels().any(|l| l.key() == "result" && l.value() == result)
+                })
+                .and_then(|(_, _, _, value)| match value {
+                    DebugValue::Counter(n) => Some(*n),
+                    _ => None,
+                })
+        };
+        assert_eq!(count("mismatch"), Some(1));
+        assert_eq!(count("ok"), Some(1));
+    }
+
+    /// The epoch entry accepts a record built the way the close builds it against the pin the
+    /// entry reads from the registry: epoch 0's closing block executed from a closing output with
+    /// the output digest as its beacon root (as the engine passes it), and record 0 committing
+    /// that block and that output. The pin (`blockHeight - 1`) is that block and carries every
+    /// marker the entry compares.
+    #[tokio::test]
+    async fn epoch_entry_accepts_a_genuine_record_against_the_registry_pin() -> eyre::Result<()> {
+        let temp = TempDir::with_prefix("entry_genuine_record")?;
+        let config = tn_config::Config::default_for_test_with_genesis(
+            test_genesis_with_consensus_registry(4),
+        );
+        let (mut manager, engine, reth_env, _tasks, _committee) =
+            manager_with_engine_on(&temp, None, config).await?;
+        let genesis = reth_env
+            .sealed_header_by_number(0)?
+            .ok_or_else(|| eyre::eyre!("the genesis header"))?;
+        let output = consensus_output_for_tests(1, 0, 1, true);
+        let gas_limit = genesis.gas_limit;
+        let payload = TNPayload::new(
+            genesis,
+            Address::random(),
+            0,
+            B256::random(),
+            &output,
+            output.consensus_header_hash().into(),
+            MIN_PROTOCOL_BASE_FEE,
+            gas_limit,
+            B256::random(),
+            0,
+        );
+        let closing = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?
+            .recovered_block
+            .clone_sealed_header();
+        eyre::ensure!(reth_env.epoch_state_from_canonical_tip()?.epoch == 1, "epoch 0 closed");
+
+        let record = EpochRecord {
+            epoch: 0,
+            final_state: closing.num_hash(),
+            final_consensus: output.num_hash(),
+            ..Default::default()
+        };
+        let cert = tn_types::EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: tn_types::BlsSignature::default(),
+            signed_authorities: Default::default(),
+        };
+        manager.consensus_chain.epochs().save(record, cert).await?;
+
+        let (committee, _epoch_info, _epoch_start, pin) =
+            manager.get_committee_with_epoch_start_info(&engine).await?;
+        assert_eq!(committee.epoch(), 1);
+        assert_eq!(pin.num_hash(), closing.num_hash(), "the pin is epoch 0's closing block");
+        manager.recover_previous_epoch_record(1, &pin, &engine).await?;
+        Ok(())
+    }
+
+    // ---- bench7 epoch-loop-output-drop ----
+
+    /// Output `number` led by a member of `committee` and carrying one batch of its own, so a
+    /// pack over `committee` saves it and reads it back.
+    pub(in crate::manager::node) fn member_output_at(
+        committee: &Committee,
+        number: u64,
+    ) -> ConsensusOutput {
+        let author = committee.authorities().first().expect("a committee member").id();
+        let batch = Batch { transactions: vec![vec![number as u8; 32]], ..Default::default() };
+        let mut leader = Certificate::default();
+        leader.update_header_for_test(
+            HeaderBuilder::from_header(leader.header())
+                .author(author)
+                .with_payload_batch(&batch, 0)
+                .build(),
+        );
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            number,
+            ReputationScores::default(),
+            None,
+            EpochSeedChainValue::genesis_placeholder(),
+        );
+        ConsensusOutput::new(
+            sub_dag,
+            ConsensusHeader::default().digest(),
+            number,
+            false,
+            [batch.digest()].into(),
+            vec![CertifiedBatch { address: Address::ZERO, batches: vec![batch] }],
+        )
+    }
+
+    /// Run the live forward the way `run_epoch`'s `select!` runs it, let `exit` win while the
+    /// forward waits for room in a full engine channel, then run the close's leftover drain, and
+    /// return the consensus numbers the engine received, in order, with the last forwarded
+    /// number the manager holds afterwards.
+    ///
+    /// Outputs 1 to 3 are saved to the pack first, as the subscriber saves each output before it
+    /// queues it. Output 1 is already in the engine channel, whose capacity is one, so the channel
+    /// is full; outputs 2 and 3 wait in the consensus-output queue. `biased` polls the forward
+    /// first, so `exit`, ready when first polled, wins exactly while the forward waits: the moment
+    /// a demotion, a rejoin, a certified record or the node's shutdown lands on a node whose
+    /// engine is behind.
+    async fn forward_then_exit_then_drain(
+        exit: impl Future<Output = ()>,
+    ) -> eyre::Result<(Vec<u64>, u64)> {
+        exit_while_the_forward_waits(exit, false).await
+    }
+
+    /// [`forward_then_exit_then_drain`], or with `for_output` the other wait of the forward: the
+    /// engine channel has room for one more output, the queue is empty, and `exit` wins while
+    /// the forward holds its reserved room and waits for an output; outputs 2 and 3 are queued
+    /// after the exit, before the drain.
+    async fn exit_while_the_forward_waits(
+        exit: impl Future<Output = ()>,
+        for_output: bool,
+    ) -> eyre::Result<(Vec<u64>, u64)> {
+        let temp = TempDir::with_prefix("forward_preempted")?;
+        let (mut manager, _engine, _reth_env, _tasks, committee) =
+            manager_with_engine(&temp).await?;
+        // a boundary no test output reaches
+        manager.epoch_boundary = u64::MAX;
+        let outputs: Vec<_> = (1..=3).map(|number| member_output_at(&committee, number)).collect();
+        for output in &outputs {
+            manager.consensus_chain.save_consensus_output(output.clone()).await?;
+        }
+        let (to_engine, mut engine_rx) = mpsc::channel(if for_output { 2 } else { 1 });
+        manager.process_output(&to_engine, outputs[0].clone()).await?;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        if !for_output {
+            for output in &outputs[1..] {
+                queue_tx.send(output.clone()).await?;
+            }
+        }
+
+        tokio::select! {
+            biased;
+            res = manager.wait_for_epoch_boundary(&to_engine, &mut queue) => {
+                eyre::bail!("the forward ended before the exit: {res:?}");
+            }
+            _ = exit => {}
+        }
+        if for_output {
+            for output in &outputs[1..] {
+                queue_tx.send(output.clone()).await?;
+            }
+        }
+
+        // the engine pulls everything forwarded until the drain is over
+        let engine = async move {
+            let mut received = Vec::new();
+            while let Some(output) = engine_rx.recv().await {
+                received.push(output.number());
+            }
+            received
+        };
+        let drain = async {
+            let boundary =
+                manager.send_leftover_consensus_output_to_engine(&mut queue, &to_engine).await;
+            drop(to_engine);
+            boundary
+        };
+        let (boundary, received) = tokio::join!(drain, engine);
+        // the drain's continuity check does not fire: the forward lost nothing
+        assert!(boundary?.is_none(), "no test output reaches the boundary");
+        Ok((received, manager.last_forwarded_consensus_number))
+    }
+
+    /// A demotion (or a rejoin) notifies the epoch's shutdown, and the epoch's task manager then
+    /// ends the epoch Ok. When that lands while the forward waits on a full engine channel, the
+    /// output the forward took off the queue still reaches the engine, before the next one.
+    #[tokio::test]
+    async fn a_mode_change_while_the_engine_is_full_loses_no_output() -> eyre::Result<()> {
+        let consensus_shutdown = ShutdownNotifier::new();
+        consensus_shutdown.notify();
+        let mut epoch_tasks = TaskManager::new(EPOCH_TASK_MANAGER);
+        let exit = async move {
+            let ended = epoch_tasks.until_task_ends(consensus_shutdown.clone()).await;
+            epoch_tasks_ended(ended, &ShutdownNotifier::new()).expect("a mode change, not a stop");
+        };
+        let (received, last_forwarded) = forward_then_exit_then_drain(exit).await?;
+        assert_eq!(received, [1, 2, 3], "the engine executes every output, in order");
+        assert_eq!(last_forwarded, 3);
+        Ok(())
+    }
+
+    /// The node's shutdown landing while the forward waits on a full engine channel: the output
+    /// the forward was about to take still reaches the engine, before the next one.
+    #[tokio::test]
+    async fn the_node_ending_while_the_engine_is_full_loses_no_output() -> eyre::Result<()> {
+        let node_shutdown = ShutdownNotifier::new();
+        node_shutdown.notify();
+        let (received, last_forwarded) =
+            forward_then_exit_then_drain(node_shutdown.subscribe()).await?;
+        assert_eq!(received, [1, 2, 3], "the engine executes every output, in order");
+        assert_eq!(last_forwarded, 3);
+        Ok(())
+    }
+
+    /// A mode change landing while the forward holds room in the engine channel and waits for
+    /// the next output: the room is released, and the outputs queued after it reach the engine
+    /// through the drain, in order.
+    #[tokio::test]
+    async fn a_mode_change_while_the_forward_waits_for_output_loses_no_output() -> eyre::Result<()>
+    {
+        let consensus_shutdown = ShutdownNotifier::new();
+        consensus_shutdown.notify();
+        let mut epoch_tasks = TaskManager::new(EPOCH_TASK_MANAGER);
+        let exit = async move {
+            let ended = epoch_tasks.until_task_ends(consensus_shutdown.clone()).await;
+            epoch_tasks_ended(ended, &ShutdownNotifier::new()).expect("a mode change, not a stop");
+        };
+        let (received, last_forwarded) = exit_while_the_forward_waits(exit, true).await?;
+        assert_eq!(received, [1, 2, 3], "the engine executes every output, in order");
+        assert_eq!(last_forwarded, 3);
+        Ok(())
+    }
+
+    /// A certified record of a later epoch, which ends an active validator's epoch, landing while
+    /// the forward waits on a full engine channel: the output the forward was about to take still
+    /// reaches the engine, before the next one.
+    #[tokio::test]
+    async fn a_closing_record_while_the_engine_is_full_loses_no_output() -> eyre::Result<()> {
+        let committee = tn_test_utils_committee::CommitteeFixture::builder(
+            tn_storage::mem_db::MemDatabase::default,
+        )
+        .build()
+        .committee();
+        let temp = TempDir::with_prefix("closing_record_exit")?;
+        let chain = ConsensusChain::new_for_test(temp.path().to_owned(), committee.clone()).await?;
+        let keys: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+        // records 0 to 3, certified: record 3 shows that running epoch 2 already closed
+        let mut parent_hash = EpochDigest::default();
+        for epoch in 0..4 {
+            let mut record = EpochRecord {
+                epoch,
+                committee: keys.clone(),
+                next_committee: keys.clone(),
+                parent_hash,
+                ..Default::default()
+            };
+            record.final_consensus.number = u64::from(epoch + 1) * 10;
+            parent_hash = record.digest();
+            let certificate = tn_types::EpochCertificate {
+                epoch_hash: record.digest(),
+                signature: tn_types::BlsSignature::default(),
+                signed_authorities: Default::default(),
+            };
+            chain.epochs().save(record, certificate).await?;
+        }
+        let bus = ConsensusBusApp::new();
+        bus.node_mode().send_replace(NodeMode::CvvActive);
+        let exit = async move {
+            let record = certified_record_closed_epoch(bus, chain, 2).await;
+            assert_eq!(record.epoch, 3, "the record that closes the running epoch");
+        };
+        let (received, last_forwarded) = forward_then_exit_then_drain(exit).await?;
+        assert_eq!(received, [1, 2, 3], "the engine executes every output, in order");
+        assert_eq!(last_forwarded, 3);
+        Ok(())
+    }
+
+    // ---- bench7 epoch-loop-output-drop: review follow-ups ----
+
+    /// The live forward's intake fixture: a manager that already forwarded output 1 into an
+    /// engine channel of a chosen capacity, and a boundary every output reaches, so the forward
+    /// returns once it hands one output over.
+    struct ForwardFixture {
+        /// The manager under test.
+        manager: EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        /// The committee whose member leads every test output.
+        committee: Committee,
+        /// The engine channel's sender, as `run_epoch` passes it.
+        to_engine: mpsc::Sender<ConsensusOutput>,
+        /// The engine channel's receiver, holding output 1.
+        engine_rx: mpsc::Receiver<ConsensusOutput>,
+        /// The engine, reth environment, their tasks and the datadir, kept alive for the test.
+        _keep: (ExecutionNode, RethEnv, TaskManager, TempDir),
+    }
+
+    impl ForwardFixture {
+        /// Forward output 1 into an engine channel of `capacity`.
+        async fn new(capacity: usize) -> eyre::Result<Self> {
+            let temp = TempDir::with_prefix("forward_intake")?;
+            let (mut manager, engine, reth_env, tasks, committee) =
+                manager_with_engine(&temp).await?;
+            manager.epoch_boundary = 0;
+            let (to_engine, engine_rx) = mpsc::channel(capacity);
+            manager.process_output(&to_engine, member_output_at(&committee, 1)).await?;
+            Ok(Self {
+                manager,
+                committee,
+                to_engine,
+                engine_rx,
+                _keep: (engine, reth_env, tasks, temp),
+            })
+        }
+    }
+
+    /// An output queued while the forward waits for room is taken by the forward's one poll of
+    /// the queue once the room appears, and stamped with the start of the wait for room.
+    #[tokio::test]
+    async fn the_forward_takes_an_output_queued_during_its_wait_for_room() -> eyre::Result<()> {
+        use futures::FutureExt as _;
+
+        // a full engine channel, output 2 queued before the forward starts
+        let mut fx = ForwardFixture::new(1).await?;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        queue_tx.send(member_output_at(&fx.committee, 2)).await?;
+        let room_at;
+        let res = {
+            let forward = fx.manager.wait_for_epoch_boundary(&fx.to_engine, &mut queue);
+            tokio::pin!(forward);
+            assert!((&mut forward).now_or_never().is_none(), "the forward waits for room");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            room_at = Instant::now();
+            assert_eq!(fx.engine_rx.recv().await.map(|output| output.number()), Some(1));
+            forward.await
+        };
+        let forwarded = fx.engine_rx.try_recv()?;
+        assert_eq!(res?, forwarded.consensus_header_hash(), "the boundary is output 2");
+        assert_eq!(forwarded.number(), 2);
+        let stamp = forwarded.forwarded_at().expect("a forwarded output is stamped");
+        assert!(stamp < room_at, "stamped when the wait for room began, not when it ended");
+        assert_eq!(fx.manager.last_forwarded_consensus_number, 2);
+        Ok(())
+    }
+
+    /// An output that arrives while the forward holds room and waits for output is taken by the
+    /// forward's await, and stamped on arrival.
+    #[tokio::test]
+    async fn the_forward_stamps_a_late_output_on_arrival() -> eyre::Result<()> {
+        use futures::FutureExt as _;
+
+        // room for one more output, an empty queue
+        let mut fx = ForwardFixture::new(2).await?;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        let sent_at;
+        let res = {
+            let forward = fx.manager.wait_for_epoch_boundary(&fx.to_engine, &mut queue);
+            tokio::pin!(forward);
+            assert!((&mut forward).now_or_never().is_none(), "the forward waits for output");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sent_at = Instant::now();
+            queue_tx.send(member_output_at(&fx.committee, 2)).await?;
+            forward.await
+        };
+        assert_eq!(fx.engine_rx.try_recv()?.number(), 1);
+        let forwarded = fx.engine_rx.try_recv()?;
+        assert_eq!(res?, forwarded.consensus_header_hash(), "the boundary is output 2");
+        let stamp = forwarded.forwarded_at().expect("a forwarded output is stamped");
+        assert!(stamp >= sent_at, "stamped on arrival");
+        assert_eq!(fx.manager.last_forwarded_consensus_number, 2);
+        Ok(())
+    }
+
+    /// A closed queue still yields what it holds: the forward hands over the queued output, then
+    /// finds the queue closed and empty and ends with its error, without a boundary.
+    #[tokio::test]
+    async fn the_forward_drains_a_closed_queue_then_ends() -> eyre::Result<()> {
+        let mut fx = ForwardFixture::new(4).await?;
+        // a boundary no test output reaches
+        fx.manager.epoch_boundary = u64::MAX;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        queue_tx.send(member_output_at(&fx.committee, 2)).await?;
+        drop(queue_tx);
+        let err = fx
+            .manager
+            .wait_for_epoch_boundary(&fx.to_engine, &mut queue)
+            .await
+            .expect_err("the queue closed before a boundary");
+        assert!(format!("{err:#}").contains("invalid wait for epoch end"), "{err:#}");
+        let mut received = Vec::new();
+        while let Ok(output) = fx.engine_rx.try_recv() {
+            received.push(output.number());
+        }
+        assert_eq!(received, [1, 2], "the queued output reaches the engine");
+        assert_eq!(fx.manager.last_forwarded_consensus_number, 2);
+        Ok(())
+    }
+
+    /// The engine's receiver gone while the forward holds room and waits for output: the output
+    /// that then arrives (here the boundary) fails the forward with the closed-channel error, is
+    /// not counted as forwarded and is not stashed as the boundary.
+    #[tokio::test]
+    async fn the_forward_fails_on_an_engine_gone_while_it_waits() -> eyre::Result<()> {
+        use futures::FutureExt as _;
+
+        // room for one more output, an empty queue
+        let mut fx = ForwardFixture::new(2).await?;
+        let boundary = member_output_at(&fx.committee, 2);
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        let res = {
+            let forward = fx.manager.wait_for_epoch_boundary(&fx.to_engine, &mut queue);
+            tokio::pin!(forward);
+            assert!((&mut forward).now_or_never().is_none(), "the forward waits for output");
+            drop(fx.engine_rx);
+            queue_tx.send(boundary.clone()).await?;
+            forward.await
+        };
+        let err = res.expect_err("the engine is gone");
+        assert!(err.downcast_ref::<mpsc::error::SendError<()>>().is_some(), "{err:#}");
+        assert_eq!(fx.manager.last_forwarded_consensus_number, 1, "nothing more was forwarded");
+        assert_ne!(
+            fx.manager.last_consensus_header.as_ref().map(|header| header.digest()),
+            Some(boundary.consensus_header_hash()),
+            "the boundary the engine never got is not stashed",
+        );
+        Ok(())
     }
 }

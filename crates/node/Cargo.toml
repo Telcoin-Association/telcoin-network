@@ -44,8 +44,10 @@ serde_json = { workspace = true }
 
 [features]
 # Propagate the adiri-testnet feature to every downstream crate that has adiri-gated fork logic, so
-# a `--features adiri` node build actually compiles it in. tn-node's own adiri code is test-only:
-# the pre-fork entry-fee pin in `manager::node::run_epoch::tests`.
+# a `--features adiri` node build actually compiles it in. tn-node's own adiri code: the
+# epoch-record closing-block check skips the `extra_data` marker for adiri's early epochs
+# (`closing_marker_checked` in `manager::node::close_epoch`, matching tn-engine's adiri tolerance),
+# and the pre-fork entry-fee pin in `manager::node::run_epoch::tests`.
 adiri = [
     "tn-config/adiri",
     "tn-engine/adiri",

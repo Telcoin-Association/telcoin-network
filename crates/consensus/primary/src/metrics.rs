@@ -231,15 +231,22 @@ impl PrimaryMetrics {
     }
 }
 
-/// A stage of the voter's vote path, in the order `RequestHandler::vote_inner` runs them.
+/// A stage of the voter's vote path, in the order the vote path runs them: the pre-lock wait
+/// before the per-author lock, then the stages of `RequestHandler::vote_inner`.
 ///
 /// [`Self::as_str`] is the `stage` label of `tn_primary_vote_stage_seconds` and
 /// `tn_primary_vote_timeouts_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoteStage {
+    /// The bounded wait for local execution to reach the header's latest execution block, taken
+    /// before the per-author lock when `vote_queue_fix` is on.
+    ///
+    /// It runs before the vote timeout starts, so no vote timeout fires in it.
+    PreLockWait,
     /// Header checks, the drift tier decision and the seed signature verify.
     Validate,
-    /// The wait for local execution to reach the header's latest execution block.
+    /// The wait for local execution to reach the header's latest execution block, or with
+    /// `vote_queue_fix` on the check of it without a wait.
     ExecWait,
     /// The missing-parent check, parent acceptance, the wait for the parents and their checks.
     Parents,
@@ -255,10 +262,11 @@ pub(crate) enum VoteStage {
 
 impl VoteStage {
     /// The number of stages.
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
 
     /// Every stage, in vote path order. A stage's position here is its [`Self::index`].
     pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::PreLockWait,
         Self::Validate,
         Self::ExecWait,
         Self::Parents,
@@ -271,6 +279,7 @@ impl VoteStage {
     /// The static metric label for this stage.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::PreLockWait => "prelock_wait",
             Self::Validate => "validate",
             Self::ExecWait => "exec_wait",
             Self::Parents => "parents",
@@ -286,13 +295,14 @@ impl VoteStage {
     /// The match is exhaustive, so a new stage does not build until it gets a position here.
     pub(crate) const fn index(self) -> usize {
         match self {
-            Self::Validate => 0,
-            Self::ExecWait => 1,
-            Self::Parents => 2,
-            Self::LeadSleep => 3,
-            Self::SyncBatches => 4,
-            Self::VoteStore => 5,
-            Self::Persist => 6,
+            Self::PreLockWait => 0,
+            Self::Validate => 1,
+            Self::ExecWait => 2,
+            Self::Parents => 3,
+            Self::LeadSleep => 4,
+            Self::SyncBatches => 5,
+            Self::VoteStore => 6,
+            Self::Persist => 7,
         }
     }
 }
@@ -334,6 +344,10 @@ pub(crate) struct VoteStageHandles {
     /// Vote timeouts by the stage in progress when the timeout fired, indexed by
     /// [`VoteStage::index`] (`tn_primary_vote_timeouts_total{stage}`).
     timeouts: [Counter; VoteStage::COUNT],
+    /// Finished vote requests by outcome, indexed by
+    /// [`VoteOutcome::index`](crate::network::handler::VoteOutcome::index)
+    /// (`tn_primary_vote_outcomes_total{outcome}`).
+    outcomes: [Counter; crate::network::handler::VoteOutcome::COUNT],
 }
 
 impl VoteStageHandles {
@@ -350,6 +364,9 @@ impl VoteStageHandles {
             }),
             timeouts: VoteStage::ALL.map(|stage| {
                 metrics::counter!("tn_primary.vote_timeouts_total", "stage" => stage.as_str())
+            }),
+            outcomes: crate::network::handler::VoteOutcome::ALL.map(|outcome| {
+                metrics::counter!("tn_primary.vote_outcomes_total", "outcome" => outcome.as_str())
             }),
         }
     }
@@ -387,6 +404,11 @@ impl VoteStageHandles {
     /// Count a vote timeout that fired while `stage` was in progress.
     pub(crate) fn record_timeout(&self, stage: VoteStage) {
         self.timeouts[stage.index()].increment(1);
+    }
+
+    /// Count a finished vote request under its outcome.
+    pub(crate) fn record_outcome(&self, outcome: crate::network::handler::VoteOutcome) {
+        self.outcomes[outcome.index()].increment(1);
     }
 }
 
@@ -524,6 +546,127 @@ impl DigestsRequeuedHandles {
     /// The counter of batch digests re-queued for `cause`.
     pub(crate) fn counter(&self, cause: RequeueCause) -> &Counter {
         &self.by_cause[cause.index()]
+    }
+}
+
+// bench7 digest-order-hold
+/// The `tn_primary_requeued_out_of_order_total{cause}` counters, resolved once when a proposer is
+/// built so no `metrics` macro runs per re-queue. The handles are `Arc`-backed.
+///
+/// A re-queued batch digest counts here when it returns to its worker's queue while a newer digest
+/// of the same worker, by the proposer's per-worker sequence, is out of the queue, so it may
+/// execute after that digest: the out-of-order carriage of issue #1807. The count describes the
+/// lane at the re-queue, not a confirmed execution inversion. The proposer's `LaneSequences::judge`
+/// holds the exact rule.
+#[derive(Clone, Debug)]
+pub(crate) struct RequeuedOutOfOrderHandles {
+    /// One counter per [`RequeueCause`], indexed by its position in [`RequeueCause::ALL`].
+    by_cause: [Counter; RequeueCause::ALL.len()],
+}
+
+impl RequeuedOutOfOrderHandles {
+    /// Resolve the counter of every cause against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            by_cause: RequeueCause::ALL.map(|cause| {
+                metrics::counter!(
+                    "tn_primary.requeued_out_of_order_total",
+                    "cause" => cause.as_str()
+                )
+            }),
+        }
+    }
+
+    /// The counter of digests re-queued out of order for `cause`.
+    pub(crate) fn counter(&self, cause: RequeueCause) -> &Counter {
+        &self.by_cause[cause.index()]
+    }
+}
+
+/// Why the proposer could not judge the order of a re-queued batch digest: the `reason` label of
+/// `tn_primary_requeued_order_unknown_total`. Such a digest never counts as out of order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequeueOrderUnknown {
+    /// The proposer holds no sequence for the digest: it rode a stored header re-sent after a
+    /// restart, which this proposer never drained, or its worker reported it twice and the other
+    /// copy took the sequence.
+    UnknownSeq,
+    /// The digest's header was tracked again by a re-send after a commit notice at or above its
+    /// round had settled it: it committed and the max-delay tick re-sent it before the round moved
+    /// on, or a restart re-sent it from the store. Either way its digests have no place in the
+    /// queue's order, and a committed header's digests are re-queued a second time.
+    StaleResend,
+}
+
+impl RequeueOrderUnknown {
+    /// Every reason, in [`Self::index`] order.
+    pub(crate) const ALL: [Self; 2] = [Self::UnknownSeq, Self::StaleResend];
+
+    /// The static metric label for this reason.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownSeq => "unknown_seq",
+            Self::StaleResend => "stale_resend",
+        }
+    }
+
+    /// This reason's position in [`Self::ALL`] and in [`RequeuedOrderUnknownHandles`].
+    const fn index(self) -> usize {
+        match self {
+            Self::UnknownSeq => 0,
+            Self::StaleResend => 1,
+        }
+    }
+}
+
+/// The `tn_primary_requeued_order_unknown_total{reason}` counters, resolved once when a proposer is
+/// built so no `metrics` macro runs per re-queue. The handles are `Arc`-backed.
+#[derive(Clone, Debug)]
+pub(crate) struct RequeuedOrderUnknownHandles {
+    /// One counter per [`RequeueOrderUnknown`], indexed by its position in
+    /// [`RequeueOrderUnknown::ALL`].
+    by_reason: [Counter; RequeueOrderUnknown::ALL.len()],
+}
+
+impl RequeuedOrderUnknownHandles {
+    /// Resolve the counter of every reason against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            by_reason: RequeueOrderUnknown::ALL.map(|reason| {
+                metrics::counter!(
+                    "tn_primary.requeued_order_unknown_total",
+                    "reason" => reason.as_str()
+                )
+            }),
+        }
+    }
+
+    /// The counter of re-queued digests whose order is unknown for `reason`.
+    pub(crate) fn counter(&self, reason: RequeueOrderUnknown) -> &Counter {
+        &self.by_reason[reason.index()]
+    }
+}
+
+/// The order hold's metrics (issue #1807, the `digest_order_hold` switch), resolved once when a
+/// proposer is built. The handles are `Arc`-backed. With the switch off neither moves from 0.
+#[derive(Clone, Debug)]
+pub(crate) struct OrderHoldHandles {
+    /// `tn_primary.headers_held_total`: new own headers that left at least one batch digest
+    /// queued because the hold kept its worker's lane back.
+    pub(crate) headers_held: Counter,
+    /// `tn_primary.digests_held`: the batch digests the newest own header left queued in held
+    /// lanes. Set at each new header, so it reads 0 from the first header built after the last
+    /// blocker left, and set to 0 when the proposer stops.
+    pub(crate) digests_held: Gauge,
+}
+
+impl OrderHoldHandles {
+    /// Resolve both handles against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            headers_held: metrics::counter!("tn_primary.headers_held_total"),
+            digests_held: metrics::gauge!("tn_primary.digests_held"),
+        }
     }
 }
 
@@ -891,6 +1034,7 @@ mod tests {
         assert_eq!(find("tn_primary.votes_recast_total", None), &DebugValue::Counter(1));
         assert_eq!(find("tn_primary.vote_requests_too_new_total", None), &DebugValue::Counter(1));
         let labels = [
+            "prelock_wait",
             "validate",
             "exec_wait",
             "parents",
@@ -918,6 +1062,59 @@ mod tests {
             panic!("lock stage series is not a histogram");
         };
         assert_eq!(lock.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0.004]);
+    }
+
+    // ---- bench7 voter-lock ----
+
+    /// The vote path handles register one outcome counter per vote outcome, labelled with the
+    /// outcome's `vote path timing` value, and count each finished request under its outcome.
+    #[test]
+    fn test_vote_outcome_handles_register_every_outcome() {
+        use crate::network::handler::VoteOutcome;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let handles = VoteStageHandles::new();
+            handles.record_outcome(VoteOutcome::Superseded);
+            handles.record_outcome(VoteOutcome::Superseded);
+            handles.record_outcome(VoteOutcome::Created);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let labels = [
+            "created",
+            "recast",
+            "missing_parents",
+            "deferred",
+            "too_new",
+            "behind",
+            "superseded",
+            "rejected",
+            "timeout",
+            "error",
+        ];
+        assert_eq!(VoteOutcome::ALL.map(VoteOutcome::as_str), labels);
+        for (index, outcome) in VoteOutcome::ALL.into_iter().enumerate() {
+            assert_eq!(outcome.index(), index);
+            let value = snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    let key = key.key();
+                    key.name() == "tn_primary.vote_outcomes_total"
+                        && key
+                            .labels()
+                            .any(|l| l.key() == "outcome" && l.value() == outcome.as_str())
+                })
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("outcome {} not registered", outcome.as_str()));
+            let counted = match outcome {
+                VoteOutcome::Superseded => 2,
+                VoteOutcome::Created => 1,
+                _ => 0,
+            };
+            assert_eq!(value, &DebugValue::Counter(counted), "{}", outcome.as_str());
+        }
     }
 
     /// Every mode change counts once under its `to` and `reason` labels, and a change to the mode

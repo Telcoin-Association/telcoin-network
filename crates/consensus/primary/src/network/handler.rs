@@ -7,7 +7,7 @@ use crate::{
     metrics::{record_mode_transition, ModeTransitionReason, VoteStage, VoteStageHandles},
     network::message::{PrimaryGossip, PrimaryRPCError},
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBusApp, ExecutionCheckError, NodeMode,
+    ConsensusBusApp, ExecutionCheck, ExecutionCheckError, NodeMode,
 };
 use futures::AsyncWriteExt as _;
 use lru::LruCache;
@@ -208,6 +208,16 @@ pub(crate) struct RequestHandler<DB> {
     /// in the same branch, so this keeps the warning to once per author per round. Only headers
     /// whose author passed committee validation get that far, so every key is a committee member.
     deferred_vote_warned: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
+    /// The newest `(epoch, round)` of a vote request received from each author. Read and written
+    /// only with `vote_queue_fix` on.
+    ///
+    /// A request of the same epoch and a lower round is refused as superseded before the
+    /// per-author lock, or once it takes it. An entry moves only for a request whose peer is its
+    /// author, so no peer can raise another author's mark, and only for a header of this epoch
+    /// at most `gc_depth` rounds past the committed round, so a far-future header cannot hold
+    /// back the author's real ones. Only committee members get that far, so the map holds one
+    /// entry per member at most. The lock is never held across an await.
+    newest_vote_requests: Arc<Mutex<HashMap<AuthorityIdentifier, (Epoch, Round)>>>,
     /// Digests of certificates this node verified recently, bounded by
     /// [`RECENTLY_VERIFIED_CERTIFICATES`].
     ///
@@ -257,6 +267,7 @@ where
             consensus_certs: Default::default(),
             epoch_votes_seen: Default::default(),
             deferred_vote_warned: Default::default(),
+            newest_vote_requests: Default::default(),
             recent_verified_certs: Arc::new(Mutex::new(LruCache::new(
                 RECENTLY_VERIFIED_CERTIFICATES,
             ))),
@@ -956,6 +967,7 @@ where
     ) {
         let total = timing.finish_at(Instant::now());
         let outcome = VoteOutcome::of(res, &timing);
+        self.vote_metrics.record_outcome(outcome);
         match outcome {
             VoteOutcome::Created => self.vote_metrics.record_created(),
             VoteOutcome::Recast => self.vote_metrics.record_recast(),
@@ -975,6 +987,7 @@ where
             round,
             epoch,
             outcome = outcome.as_str(),
+            prelock_wait_ms = timing.stage_ms(VoteStage::PreLockWait),
             lock_ms = timing.lock.map_or(0, millis),
             validate_ms = timing.stage_ms(VoteStage::Validate),
             exec_wait_ms = timing.stage_ms(VoteStage::ExecWait),
@@ -1029,6 +1042,41 @@ where
         if !self.consensus_bus.is_active_cvv() && !voted_for_header() {
             self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
             return Err(HeaderError::NotActiveCvv.into());
+        }
+        if self.consensus_config.parameters().vote_queue_fix {
+            // a request queued behind the author lock waits out the execution wait under it, one
+            // request after another. wait here instead, side by side with the author's other
+            // requests, and refuse the ones a newer request supersedes. a header outside the
+            // window on arrival neither moves the mark nor waits: `vote_inner` refuses it before
+            // its execution check, unless the committed round moved it inside the window while
+            // it queued on the lock, when it is checked without a wait (a recoverable
+            // `ExecutionBehind` if its block is not executed yet). a header that fails the
+            // stateless checks of `Header::validate` skips the wait too: `vote_inner` refuses it
+            // before its execution check whatever its block, so it goes straight to the author
+            // lock, where it is refused with the same error and penalty and leaves the same entry
+            // as after the wait (only a newer request of its author arriving during the wait it no
+            // longer makes would have turned that into `SupersededRequest`). the window already
+            // keeps a round-0 header and one of another epoch from waiting. every other check of
+            // `vote_inner` (the attached parents, the drift tier, the seed signature) stays under
+            // the lock, so a header that fails only one of those still waits
+            let in_window = self.in_vote_window(&header);
+            self.refuse_superseded_request(&header, in_window)?;
+            if in_window && header.validate(self.consensus_config.committee()).is_ok() {
+                timing.enter(VoteStage::PreLockWait);
+                let waited = timeout(
+                    VOTE_EXECUTION_WAIT,
+                    self.consensus_bus.wait_for_execution(header.latest_execution_block()),
+                )
+                .await;
+                timing.close_at(Instant::now());
+                // every other outcome is decided again by `vote_inner`, which checks execution
+                // under the lock without a wait and so without a watch to find closed
+                if matches!(waited, Ok(Err(ExecutionCheckError::Closed))) {
+                    return Err(HeaderError::ClosedWatchChannel.into());
+                }
+                // a newer request from the author may have arrived during the wait
+                self.refuse_superseded_request(&header, false)?;
+            }
         }
         // We have already verified committee membership with the peer check but this will double
         // check. Each committee member has it's own lock so different authorities can be
@@ -1086,6 +1134,13 @@ where
                         Some((epoch, round, digest, Some(PrimaryResponse::Vote(vote.clone()))));
                 }
                 return Ok(PrimaryResponse::Vote(vote));
+            }
+            if self.consensus_config.parameters().vote_queue_fix {
+                // a newer request from the author may have arrived while this one queued on the
+                // lock: refuse it before any decision below, leaving the entry untouched. it comes
+                // after the two answers above, which hand back a vote already cast for this header
+                // and sign nothing new for an older one
+                self.refuse_superseded_request(&header, false)?;
             }
             // put back below when this request ends without a decision on the header
             let previous_vote = auth_last_vote.clone();
@@ -1154,9 +1209,12 @@ where
                 }
             }
             // put the entry back while the request is evaluated: the network layer drops this
-            // future when the requester cancels the request, and a dropped request must leave the
-            // guard as it found it. an empty entry would let another header from this author at
-            // the same round past the check above and into `check_for_missing_parents`
+            // future on an inbound failure (the transport's request timeout, a closed connection)
+            // or at shutdown, and a dropped request must leave the guard as it found it. a
+            // requester's cancel does not reach this node: the request runs on until it is
+            // answered or the transport times it out. an empty entry would let another header
+            // from this author at the same round past the check above and into
+            // `check_for_missing_parents`
             *auth_last_vote = previous_vote.clone();
             let epoch = header.epoch();
             let round = header.round();
@@ -1285,6 +1343,62 @@ where
             warned.insert(header.author().clone(), round);
         }
         first
+    }
+
+    /// Whether `header`'s epoch and round are ones this node votes on now: this committee's epoch
+    /// and a round from 1 up to the committed round plus `gc_depth`, the bound `vote_inner` refuses
+    /// as too new above.
+    fn in_vote_window(&self, header: &Header) -> bool {
+        let max_round = self
+            .consensus_bus
+            .committed_round()
+            .saturating_add(self.consensus_config.parameters().gc_depth);
+        header.epoch() == self.consensus_config.committee().epoch()
+            && header.round() != 0
+            && header.round() <= max_round
+    }
+
+    /// Refuse a vote request for `header` when its author has sent a newer one, and with `record`
+    /// make this request the author's newest.
+    ///
+    /// Only a request of the newest one's epoch and a strictly lower round is refused, so a retry
+    /// of the same header and the resend that carries missing parents pass, and a header of
+    /// another epoch is never refused here and gets the answer it gets with the switch off. The
+    /// mark refuses any lower round of its author without checking the header, so a malformed
+    /// header below the mark (a round-0 one, say) is answered `SupersededRequest` without the
+    /// penalty its own check would bring; only the author's own requests get that far. The caller
+    /// has checked that the peer is the header's author, and records only a header inside
+    /// [`Self::in_vote_window`]: one past it is never voted on, and a mark it set would refuse the
+    /// author's real headers until its rounds caught up. It is asked on arrival, after the wait
+    /// before the author lock and once the lock is taken. The refusal is `SupersededRequest`:
+    /// recoverable, without a penalty, and never written to the author's vote state.
+    ///
+    /// On arrival it comes before the author lock, so ahead of the cached-vote answer and the
+    /// stored-vote recast that run under it: a repeat of an older header this node voted for,
+    /// arriving after a newer request of the same author, is refused instead of getting its vote
+    /// back. Nothing is signed and the cached vote stays; the author abandoned that header when it
+    /// proposed the newer one.
+    fn refuse_superseded_request(&self, header: &Header, record: bool) -> PrimaryNetworkResult<()> {
+        let mut newest = self.newest_vote_requests.lock();
+        match newest.get(header.author()).copied() {
+            Some((newest_epoch, newest_round))
+                if header.epoch() == newest_epoch && header.round() < newest_round =>
+            {
+                Err(PrimaryNetworkError::SupersededRequest {
+                    epoch: header.epoch(),
+                    round: header.round(),
+                    newest_epoch,
+                    newest_round,
+                })
+            }
+            _ => {
+                // every recorded header is of this committee's epoch, so this only raises the mark
+                if record {
+                    newest.insert(header.author().clone(), (header.epoch(), header.round()));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Decide a vote request's drift tier from how far `header`'s `created_at` leads the local
@@ -1424,7 +1538,8 @@ where
         // the header and the local clock. a tier-2 answer is uncached and carries no penalty, so
         // an author can make this node repeat it at will, with the same header or with a new one
         // for the same round; decided here, each repeat costs no signature verify, no execution
-        // wait and no parent reads. a lead within the tolerance is waited out after the parent
+        // wait (with `vote_queue_fix` on, it has already paid the bounded wait before the author
+        // lock) and no parent reads. a lead within the tolerance is waited out after the parent
         // checks instead, because the time they take uses up part of it
         if let HeaderLead::Deferred(reason) = self.check_header_lead(&header, subsecond_active)? {
             return Ok(PrimaryResponse::RecoverableError(reason));
@@ -1468,14 +1583,30 @@ where
         // request, so the requester asks again soon and votes once execution has caught up
         timing.enter(VoteStage::ExecWait);
         let header_block = header.latest_execution_block();
-        match tokio::time::timeout(
-            VOTE_EXECUTION_WAIT,
-            self.consensus_bus.wait_for_execution(header_block),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(ExecutionCheckError::Fork)) => {
+        // `None` is a voter behind on execution
+        let execution = if self.consensus_config.parameters().vote_queue_fix {
+            // `vote_request` already waited before the author lock: check without waiting again,
+            // so requests queued on the lock are not held a second time each. a block not readable
+            // from the canonical database at or below the tip is behind, never a fork
+            match self.consensus_bus.check_execution_block(header_block) {
+                ExecutionCheck::Match => Some(Ok(())),
+                ExecutionCheck::Fork => Some(Err(ExecutionCheckError::Fork)),
+                ExecutionCheck::BelowFloor { floor } => {
+                    Some(Err(ExecutionCheckError::BelowFloor { floor }))
+                }
+                ExecutionCheck::NotYet | ExecutionCheck::Unconfirmed => None,
+            }
+        } else {
+            tokio::time::timeout(
+                VOTE_EXECUTION_WAIT,
+                self.consensus_bus.wait_for_execution(header_block),
+            )
+            .await
+            .ok()
+        };
+        match execution {
+            Some(Ok(())) => {}
+            Some(Err(ExecutionCheckError::Fork)) => {
                 error!(
                     target: "primary",
                     peer_hash = ?header_block,
@@ -1484,7 +1615,7 @@ where
                 );
                 return Err(HeaderError::UnknownExecutionResult(header_block).into());
             }
-            Ok(Err(ExecutionCheckError::BelowFloor { floor })) => {
+            Some(Err(ExecutionCheckError::BelowFloor { floor })) => {
                 // a snapshot-restored voter holds no block below its floor, so it can neither
                 // confirm nor refute the header's and never will: a final refusal without a
                 // penalty, not a fork
@@ -1500,10 +1631,10 @@ where
                 }
                 .into());
             }
-            Ok(Err(ExecutionCheckError::Closed)) => {
+            Some(Err(ExecutionCheckError::Closed)) => {
                 return Err(HeaderError::ClosedWatchChannel.into());
             }
-            Err(_) => {
+            None => {
                 self.consensus_bus.metrics().votes_refused_execution_behind_total.increment(1);
                 return Err(HeaderError::ExecutionBehind {
                     header_block: header_block.number,
@@ -2311,9 +2442,10 @@ impl VoteTiming {
     }
 }
 
-/// How a vote request ended: the `outcome` field of the `vote path timing` line.
+/// How a vote request ended: the `outcome` field of the `vote path timing` line and the
+/// `outcome` label of `tn_primary_vote_outcomes_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VoteOutcome {
+pub(crate) enum VoteOutcome {
     /// A new vote was signed, made durable and returned.
     Created,
     /// A vote signed earlier for this header was returned again.
@@ -2329,6 +2461,9 @@ enum VoteOutcome {
     /// validator, or its execution did not reach the header's block within the voter's execution
     /// wait.
     Behind,
+    /// A recoverable refusal because a newer request from the same author had arrived
+    /// (`vote_queue_fix` on).
+    Superseded,
     /// The request or its header failed a check, or a cached refusal was returned.
     Rejected,
     /// The vote timeout fired before a decision.
@@ -2338,6 +2473,41 @@ enum VoteOutcome {
 }
 
 impl VoteOutcome {
+    /// The number of outcomes.
+    pub(crate) const COUNT: usize = 10;
+
+    /// Every outcome. An outcome's position here is its [`Self::index`].
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Created,
+        Self::Recast,
+        Self::MissingParents,
+        Self::Deferred,
+        Self::TooNew,
+        Self::Behind,
+        Self::Superseded,
+        Self::Rejected,
+        Self::Timeout,
+        Self::Error,
+    ];
+
+    /// The position of this outcome in [`Self::ALL`], for per-outcome arrays.
+    ///
+    /// The match is exhaustive, so a new outcome does not build until it gets a position here.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Created => 0,
+            Self::Recast => 1,
+            Self::MissingParents => 2,
+            Self::Deferred => 3,
+            Self::TooNew => 4,
+            Self::Behind => 5,
+            Self::Superseded => 6,
+            Self::Rejected => 7,
+            Self::Timeout => 8,
+            Self::Error => 9,
+        }
+    }
+
     /// Classify a finished vote request from its result and stage stamps.
     fn of(res: &PrimaryNetworkResult<PrimaryResponse>, timing: &VoteTiming) -> Self {
         if timing.timed_out.is_some() {
@@ -2354,6 +2524,7 @@ impl VoteOutcome {
             Err(PrimaryNetworkError::InvalidHeader(
                 HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. },
             )) => Self::Behind,
+            Err(PrimaryNetworkError::SupersededRequest { .. }) => Self::Superseded,
             Err(PrimaryNetworkError::Timeout(_)) => Self::Timeout,
             Err(PrimaryNetworkError::InvalidHeader(
                 HeaderError::Storage(_)
@@ -2375,8 +2546,8 @@ impl VoteOutcome {
         }
     }
 
-    /// The static `outcome` field value.
-    const fn as_str(self) -> &'static str {
+    /// The static `outcome` field value and metric label.
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
             Self::Recast => "recast",
@@ -2384,12 +2555,26 @@ impl VoteOutcome {
             Self::Deferred => "deferred",
             Self::TooNew => "too_new",
             Self::Behind => "behind",
+            Self::Superseded => "superseded",
             Self::Rejected => "rejected",
             Self::Timeout => "timeout",
             Self::Error => "error",
         }
     }
 }
+
+// compile-time check that `ALL` holds each outcome at its `index`, as for `VoteStage::ALL`, with
+// the same limits: an outcome given a position at or past `COUNT` passes it and still needs `COUNT`
+// raised and `ALL` extended by hand (until then `record_outcome` indexes past its counters and
+// panics the first time the outcome is recorded, as `record_stage` would), and an outcome given a
+// position another outcome already holds passes it too, and would count under that outcome's label
+const _: () = {
+    let mut position = 0;
+    while position < VoteOutcome::COUNT {
+        assert!(VoteOutcome::ALL[position].index() == position, "VoteOutcome::ALL out of order");
+        position += 1;
+    }
+};
 
 /// Rate limit for the `behind the gc window inside the rejoin grace; holding demotion` line: one
 /// line per [`REJOIN_GRACE_LOG_INTERVAL`] at most, carrying the holds counted since the previous
@@ -2505,6 +2690,13 @@ mod tests {
         assert_eq!(outcome(Err(HeaderError::NotActiveCvv.into()), &timing), "behind");
         let behind = HeaderError::ExecutionBehind { header_block: 12, local_block: 9 };
         assert_eq!(outcome(Err(behind.into()), &timing), "behind");
+        let superseded = PrimaryNetworkError::SupersededRequest {
+            epoch: 0,
+            round: 4,
+            newest_epoch: 0,
+            newest_round: 6,
+        };
+        assert_eq!(outcome(Err(superseded), &timing), "superseded");
         let storage = HeaderError::Storage(eyre::eyre!("disk"));
         assert_eq!(outcome(Err(storage.into()), &timing), "error");
         assert_eq!(
