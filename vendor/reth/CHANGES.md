@@ -3452,7 +3452,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   scan returns all 300 logs and resolves nothing); `kept_counts_the_values_this_threads_scopes_keep`
   (each keep in a scope counts, a replaced value and an inner scope's too; a keep outside a scope
   and another thread's keeps do not); `range_scan_reads_are_bounded` and the other filter tests
-  unchanged. *Upstream*: no (TN's format).
+  unchanged. Mutation-checked, each failing a test: no weight added (the position-row scan
+  returns every log), the weight added for every block (the inline scan and
+  `range_scan_reads_are_bounded` are refused), and `keep` not counting (both tests).
+  *Upstream*: no (TN's format).
 
 - **TN-0210** — `debug_getRawBlock` and `debug_getRawTransactions` read the provider on the RPC
   blocking pool. *Kind*: fix.
