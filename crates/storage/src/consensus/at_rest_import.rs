@@ -25,7 +25,7 @@ use super::{ConsensusChain, ConsensusChainError};
 use crate::{
     consensus_pack::{
         legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, ConsensusPack,
-        DATA_NAME, SENTINEL_MIN_VERSION,
+        PackError, DATA_NAME, SENTINEL_MIN_VERSION,
     },
     epoch_records::{EpochRecordDb, CERTS_NAME, RECORDS_NAME},
     pack_validate::{classify_physical_corruption, validate_pack_file, Verdict},
@@ -110,7 +110,9 @@ pub enum EpochImportError {
         /// The directory holding the pack that validates.
         dir: PathBuf,
     },
-    /// The copy does not read as a data log of the epoch's pack (why).
+    /// The copy cannot be imported (why): it is inside the epochs directory, does not read as a
+    /// data log of the epoch's pack (a legacy v0 one, damaged, or not one), or ends before the
+    /// epoch's certified final output. Nothing was installed.
     Source(String),
     /// The copy failed the import's verification, or the import failed; nothing was installed.
     Import(ConsensusChainError),
@@ -229,7 +231,19 @@ impl ConsensusChain {
         let Some((import_path, path)) =
             Self::import_sealed(base_path, file.take(len), &record, &previous, timeout, min_free)
                 .await
-                .map_err(EpochImportError::Import)?
+                .map_err(|e| match e {
+                    // the stream's clean end before the certified final
+                    ConsensusChainError::PackError(PackError::NotConsensus) => {
+                        EpochImportError::Source(format!(
+                            "the copy ends before the epoch's certified final output {}, so \
+                             nothing was installed: use a copy taken after the epoch closed (a \
+                             backup taken while it was the node's live epoch holds only its \
+                             first outputs)",
+                            record.final_consensus.number
+                        ))
+                    }
+                    e => EpochImportError::Import(e),
+                })?
         else {
             return Err(EpochImportError::Import(ConsensusChainError::IO(std::io::Error::other(
                 format!("this process is already importing epoch {epoch}"),
@@ -264,8 +278,24 @@ fn copy_end(data: &Path, epoch: Epoch) -> Result<u64, String> {
             data.display()
         ));
     }
-    wal_consistent_end(data, epoch).map_err(|e| {
-        format!("{} does not read as a data log of epoch {epoch}'s pack: {e}", data.display())
+    // The texts speak of the copy: the replay's own (`corrupt_pack`, `read_failed`) name the
+    // remedies for the datadir's pack.
+    wal_consistent_end(data, epoch).map_err(|e| match e {
+        PackError::CorruptPack(_) => {
+            let at = match classify_physical_corruption(data, epoch) {
+                Ok(Some(corruption)) => {
+                    format!(" ({:?} at byte {})", corruption.kind, corruption.offset)
+                }
+                _ => String::new(),
+            };
+            format!("the copy's data log {} is damaged{at}: use another copy", data.display())
+        }
+        PackError::ReadError(_) => format!(
+            "reading the copy's data log {} failed (a disk read error, not damage found in the \
+             copy): check the device it is on, then rerun",
+            data.display()
+        ),
+        e => format!("{} does not read as a data log of epoch {epoch}'s pack: {e}", data.display()),
     })
 }
 
@@ -696,12 +726,13 @@ mod test {
     /// The import refuses, before writing anything, what it cannot verify or need not import:
     /// epoch 0, the live epoch and later, local records missing the epoch or its certificate, a
     /// pack in place that validates (as `epoch-N` or an interrupted install's aside), and a copy
-    /// of another epoch, one with a flipped byte, or one that is not a pack.
+    /// of another epoch, one with a flipped byte, one cut before the epoch's final output, or one
+    /// that is not a pack. A bad copy's refusal speaks of the copy, not of the datadir's pack.
     #[tokio::test(flavor = "multi_thread")]
     async fn import_epoch_at_rest_refuses_what_it_cannot_verify_or_need_not_import() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("epochs");
-        closed_epochs(&base).await;
+        let epoch1 = closed_epochs(&base).await;
         let copy = tmp.path().join("copy");
         copy_dir(&base.join("epoch-1"), &copy);
         let import = |epoch, source: PathBuf| {
@@ -747,10 +778,19 @@ mod test {
         copy_dir(&copy, &flipped);
         flip_middle_byte(&flipped.join(DATA_NAME));
         let err = import(1, flipped).await.unwrap_err();
-        assert!(
-            matches!(err, EpochImportError::Import(_) | EpochImportError::Source(_)),
-            "a flipped byte: {err}"
-        );
+        let text = err.to_string();
+        assert!(matches!(err, EpochImportError::Source(_)), "a flipped byte: {text}");
+        assert!(text.contains("use another copy"), "{text}");
+        for remedy in ["db repair", "start the node over"] {
+            assert!(!text.contains(remedy), "{remedy}: {text}");
+        }
+        // a sealed prefix: a backup of the epoch taken before it closed
+        let short = tmp.path().join("short");
+        rebuild_epoch1(&short, &epoch1, 2, 2).await;
+        let err = import(1, short.join("epoch-1")).await.unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, EpochImportError::Source(_)), "a prefix: {text}");
+        assert!(text.contains("ends before the epoch's certified final output 6"), "{text}");
         let err = import(1, tmp.path().join("no-such-copy")).await.unwrap_err();
         assert!(matches!(err, EpochImportError::Source(_)), "{err}");
         assert_eq!(tree(&base), before, "a refused copy left nothing behind");
