@@ -1363,13 +1363,14 @@ pub struct DbLoadStateArgs {
     /// against the last epoch record), and the restore's import of the consensus pack
     /// (`consensus_data`) against the last epoch records, then exit 0 if all pass. The
     /// consensus pack is imported into a directory under the temp directory (`$TMPDIR` when
-    /// set, else the system's: `/tmp` on Linux), which needs the pack's size plus the node's
-    /// import floor (one default growth step of the execution database plus a margin) free
-    /// there, since a running node may share that filesystem: it refuses to start without that
-    /// room, the import stops before free space drops below the floor, and the directory is
-    /// removed afterwards. On many Linux hosts `/tmp` is a RAM-backed tmpfs or a small root
-    /// partition: set `TMPDIR` to a directory on a disk with room. The state data's own
-    /// records are read only by the restore itself.
+    /// set, else the system's: `/tmp` on Linux; an empty `TMPDIR` or one inside the datadir is
+    /// refused), which needs the pack's size plus the node's import floor (one default growth
+    /// step of the execution database plus a margin) free there, since a running node may
+    /// share that filesystem: it refuses to start without that room, the import stops before
+    /// free space drops below the floor, and the directory is removed afterwards. On many
+    /// Linux hosts `/tmp` is a RAM-backed tmpfs or a small root partition: set `TMPDIR` to a
+    /// directory on a disk with room. The state data's own records are read only by the
+    /// restore itself.
     ///
     /// With `--chain` the chain's bundled committee is held in memory (one already in the datadir
     /// is used, as a restore would), never written. It takes no datadir lock, so it can vet a
@@ -1489,7 +1490,8 @@ impl DbLoadStateArgs {
         if self.verify_only {
             // The restore imports the consensus pack only after the state, which can take hours:
             // check it now, as the restore will, outside the datadir.
-            verify_bundle_consensus(&std::env::temp_dir(), &bundle_consensus, &records)?;
+            let staging = staging_root(&datadir, &std::env::temp_dir())?;
+            verify_bundle_consensus(&staging, &bundle_consensus, &records)?;
             println!(
                 "verified: the bundle at {} restores epoch {} (block {}): its certificate chain \
                  verifies against the genesis committee, its state matches the epoch record, and \
@@ -2203,6 +2205,36 @@ fn verify_bundle_consensus(
             staging_root.display()
         ))
     })
+}
+
+/// The staging root `--verify-only` imports the bundle's consensus pack under: `temp` (the temp
+/// directory, `$TMPDIR` when set) made absolute. Refused when empty (it would stage in the current
+/// directory) or inside `datadir`, which the check must not write to (a relative `TMPDIR` resolves
+/// against the current directory, which may be there).
+fn staging_root(datadir: &Path, temp: &Path) -> eyre::Result<PathBuf> {
+    if temp.as_os_str().is_empty() {
+        bail!("TMPDIR is empty: set it to a directory outside the datadir");
+    }
+    let root = std::path::absolute(temp)
+        .map_err(|e| eyre!("cannot resolve the staging root {}: {e}", temp.display()))?;
+    let resolved = root.canonicalize().map_err(|e| {
+        eyre!(
+            "cannot resolve the staging root {} (set TMPDIR to a directory outside the datadir): \
+             {e}",
+            root.display()
+        )
+    })?;
+    let datadir_resolved = datadir
+        .canonicalize()
+        .map_err(|e| eyre!("cannot resolve the datadir {}: {e}", datadir.display()))?;
+    if resolved.starts_with(&datadir_resolved) {
+        bail!(
+            "the staging root {} is inside the datadir {}: set TMPDIR to a directory outside it",
+            root.display(),
+            datadir.display()
+        );
+    }
+    Ok(root)
 }
 
 /// The free-space floor `--verify-only` keeps under its staging root: the node's own for a peer's
@@ -4517,6 +4549,30 @@ mod tests {
         super::staging_has_room(root, pack + floor, pack, floor).expect("exactly enough");
         let saturated = super::staging_has_room(root, u64::MAX, u64::MAX, floor);
         assert!(saturated.is_ok(), "no overflow: {saturated:?}");
+    }
+
+    /// `--verify-only`'s staging root is the temp directory made absolute, never empty and never
+    /// inside the datadir (where a relative `TMPDIR` can land it), through a link as well.
+    #[cfg(unix)]
+    #[test]
+    fn verify_only_staging_root_is_outside_the_datadir() {
+        let datadir = tempfile::tempdir().expect("datadir");
+        let inside = datadir.path().join("tmp");
+        fs::create_dir(&inside).expect("create tmp");
+        let err = super::staging_root(datadir.path(), &inside).expect_err("inside the datadir");
+        assert!(format!("{err:#}").contains("is inside the datadir"), "{err:#}");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let link = elsewhere.path().join("link");
+        std::os::unix::fs::symlink(&inside, &link).expect("link into the datadir");
+        let err = super::staging_root(datadir.path(), &link).expect_err("a link into it");
+        assert!(format!("{err:#}").contains("is inside the datadir"), "{err:#}");
+        let err = super::staging_root(datadir.path(), Path::new("")).expect_err("empty");
+        assert!(format!("{err:#}").contains("TMPDIR is empty"), "{err:#}");
+        assert_eq!(
+            super::staging_root(datadir.path(), elsewhere.path()).expect("outside"),
+            elsewhere.path(),
+            "an absolute root outside the datadir is used as given"
+        );
     }
 
     /// A datadir for `db load-state` whose genesis committee is `signers`, with node info, no chain
