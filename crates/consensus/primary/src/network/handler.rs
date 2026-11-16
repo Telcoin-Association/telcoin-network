@@ -985,6 +985,8 @@ where
                 ring.outputs_to_reach(exec.tip, exec.named),
             )
         };
+        // open: the named block is above the arrival tip and still not held at the answer, for any
+        // outcome, a request refused on arrival without a wait included
         let exec_deficit_open = !reached;
         // only a superseded answer names the newer request; every other outcome logs 0 and 0
         let (superseded_by_round, superseded_after_ms) = match timing.superseded {

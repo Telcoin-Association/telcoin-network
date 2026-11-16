@@ -397,4 +397,39 @@ mod tests {
         assert_eq!(recent.newest_before_epoch(0), None, "nothing before epoch 0");
         assert_eq!(RecentBlocks::new(8).newest_before_epoch(5), None, "empty ring");
     }
+
+    /// `outputs_to_reach` with every entry in the ring: a block at or below the tip is held with
+    /// nothing to execute; above the tip the count runs up to the first entry at or above it, and
+    /// entries executed after that one add nothing.
+    #[test]
+    fn outputs_to_reach_counts_up_to_the_output_that_reaches_the_block() {
+        let (recent, _) = ring_of(8, &[10, 11, 12, 13, 14]);
+        assert_eq!(recent.outputs_to_reach(12, 11), (0, true), "below the tip");
+        assert_eq!(recent.outputs_to_reach(12, 12), (0, true), "the tip itself");
+        assert_eq!(recent.outputs_to_reach(10, 11), (1, true), "the next output");
+        assert_eq!(recent.outputs_to_reach(10, 12), (2, true), "13 and 14 add nothing");
+        assert_eq!(recent.outputs_to_reach(10, 14), (4, true), "the newest output");
+        // an output can produce several blocks: the ring holds each output's final block
+        let (recent, _) = ring_of(8, &[10, 13, 16]);
+        assert_eq!(recent.outputs_to_reach(10, 12), (1, true), "inside the output ending at 13");
+        assert_eq!(recent.outputs_to_reach(11, 15), (2, true), "a tip between two entries");
+    }
+
+    /// A ring shorter than the gap counts only the entries it still holds, a lower bound.
+    #[test]
+    fn outputs_to_reach_is_a_lower_bound_past_the_ring() {
+        // a ring of four keeps 5..=8: from tip 2, block 7 took five outputs (3..=7), three held
+        let (recent, _) = ring_of(4, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(recent.outputs_to_reach(2, 7), (3, true));
+        assert_eq!(recent.outputs_to_reach(2, 20), (4, false), "never reached: every held entry");
+    }
+
+    /// A block no entry reaches is open, counting every entry above the tip.
+    #[test]
+    fn outputs_to_reach_is_open_when_no_entry_reaches_the_block() {
+        let (recent, _) = ring_of(8, &[9, 10, 11, 12, 13]);
+        assert_eq!(recent.outputs_to_reach(10, 20), (3, false), "11, 12 and 13");
+        assert_eq!(recent.outputs_to_reach(13, 20), (0, false), "nothing executed past the tip");
+        assert_eq!(RecentBlocks::new(4).outputs_to_reach(0, 1), (0, false), "empty ring");
+    }
 }

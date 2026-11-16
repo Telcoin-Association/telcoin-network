@@ -350,8 +350,10 @@ pub(crate) struct VoteStageHandles {
     outcomes: [Counter; crate::network::handler::VoteOutcome::COUNT],
     /// The block-bearing outputs a voter still had to execute to hold a request's execution
     /// block, indexed by `open` (`tn_primary_vote_exec_deficit_outputs{open}`): index 0
-    /// `open="false"`, the exact count for a block held at the answer; index 1 `open="true"`, the
-    /// outputs executed during a wait that ended without the block, a lower bound.
+    /// `open="false"`, the exact count for a block held at the answer; index 1 `open="true"`, a
+    /// block above the voter's tip at arrival and still not held at the answer, whatever the
+    /// outcome, including a request refused on arrival without a wait. Its count is the outputs
+    /// executed between arrival and answer, often 0, and a lower bound of the deficit.
     exec_deficit: [Histogram; 2],
 }
 
@@ -420,7 +422,9 @@ impl VoteStageHandles {
     }
 
     /// Record a request's execution deficit in outputs. `open` is a request whose named block was
-    /// not held at the answer: `outputs` then counts only the outputs executed during the wait.
+    /// above the tip at arrival and not held at the answer, for any outcome, including a request
+    /// refused on arrival without a wait: `outputs` then counts only the outputs executed between
+    /// arrival and answer, often 0.
     pub(crate) fn record_exec_deficit(&self, outputs: u64, open: bool) {
         self.exec_deficit[usize::from(open)].record(outputs as f64);
     }

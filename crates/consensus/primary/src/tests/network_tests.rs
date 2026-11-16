@@ -7739,7 +7739,9 @@ async fn vote_path_timing_line_carries_exec_deficit() -> eyre::Result<()> {
         ),
         "{open}"
     );
-    assert!(open.find(" total_ms=") < open.find(" exec_named="), "new fields come last: {open}");
+    let total_at = open.find(" total_ms=").expect("the total field");
+    let named_at = open.find(" exec_named=").expect("the named field");
+    assert!(total_at < named_at, "new fields come last: {open}");
 
     // block 4 is named and reached inside the wait, three outputs after the tip on arrival
     let executor = execute_outputs(&consensus_bus, chain[2..=4].to_vec(), step);
@@ -7863,6 +7865,78 @@ async fn vote_path_timing_line_carries_superseding_request() -> eyre::Result<()>
     let stale = timing_line(1);
     assert!(stale.contains(" outcome=\"superseded\" "), "{stale}");
     assert!(stale.contains(" superseded_by_round=3 superseded_after_ms=0"), "{stale}");
+
+    Ok(())
+}
+
+// ---- bench8 vote-superseded-by: review follow-ups ----
+
+/// A repeat of the author's newest round keeps that round's first arrival: round 2 waits, round 3
+/// arrives `gap` later and again `repeat_gap` after its answer, and round 2's refusal measures
+/// `superseded_after_ms` to the first round-3 request, not to the repeat.
+///
+/// The stage stamps read the wall clock, so this test runs on it: about one second.
+#[tokio::test]
+async fn vote_path_superseded_after_keeps_the_first_arrival() -> eyre::Result<()> {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(LinesAt {
+        target: "primary::network",
+        level: tracing::Level::DEBUG,
+        lines: lines.clone(),
+    });
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_vote_queue_fix(temp_dir.path(), true).await;
+    let executed = BlockNumHash::new(parent.number(), parent.hash());
+    let unexecuted = BlockNumHash::new(parent.number() + 1, BlockHash::random());
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let gap = Duration::from_millis(50);
+    let repeat_gap = Duration::from_millis(150);
+    assert!(
+        VOTE_EXECUTION_WAIT > (gap + repeat_gap) * 4,
+        "both round-3 requests arrive in the wait"
+    );
+    let newest = header_at(&committee, author, 3, executed);
+
+    // round 2 names a block that never executes and waits; round 3 names an executed block and is
+    // answered, then the same request arrives again while round 2 still waits
+    let (older, (first, repeat)) = tokio::join!(
+        handler.vote(peer, header_at(&committee, author, 2, unexecuted), Vec::new()),
+        async {
+            tokio::time::sleep(gap).await;
+            let first = handler.vote(peer, newest.clone(), Vec::new()).await;
+            tokio::time::sleep(repeat_gap).await;
+            let repeat = handler.vote(peer, newest, Vec::new()).await;
+            (first, repeat)
+        },
+    );
+    assert_matches!(
+        older,
+        Err(PrimaryNetworkError::SupersededRequest { round: 2, newest_round: 3, .. }),
+        "round 2 is superseded by round 3 during its wait"
+    );
+    for answer in [&first, &repeat] {
+        assert!(
+            !matches!(answer, Err(PrimaryNetworkError::SupersededRequest { .. })),
+            "{answer:?}"
+        );
+    }
+    let superseded = lines
+        .lock()
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("vote path timing") && line.contains(" round=2 "))
+        .cloned()
+        .expect("a vote path timing line for round 2");
+    assert!(superseded.contains(" outcome=\"superseded\" "), "{superseded}");
+    assert_eq!(line_field(&superseded, "superseded_by_round"), 3, "{superseded}");
+    // the first round-3 request arrived `gap` after round 2, the repeat at least `gap +
+    // repeat_gap` after it: a mark moved to the repeat would read at least the second
+    let after = line_field(&superseded, "superseded_after_ms");
+    let gap_ms = u64::try_from(gap.as_millis()).expect("a short gap");
+    let repeat_ms = u64::try_from((gap + repeat_gap).as_millis()).expect("a short gap");
+    assert!(after >= gap_ms && after < repeat_ms, "measured to the first arrival: {superseded}");
 
     Ok(())
 }
