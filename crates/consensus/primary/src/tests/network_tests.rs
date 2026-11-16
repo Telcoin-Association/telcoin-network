@@ -7047,8 +7047,8 @@ async fn old_block_voter(
     OldBlockVoter { types, outputs, executed }
 }
 
-/// Case 1: a header naming the block a proposer with
-/// `quorum_exec_block` names, [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] ring entries (outputs that built
+/// Case 1: a header naming the block the quorum
+/// rule names, [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] ring entries (outputs that built
 /// a block) below the tip of a voter in step with it, is voted for at once. The voter's database
 /// answers for no block here, so the vote rests on the ring alone.
 ///
@@ -7204,8 +7204,8 @@ async fn old_number_with_another_hash_is_refused_as_a_fork() -> eyre::Result<()>
 
 /// Case 4 in the ring, as the voter answers today: a voter
 /// [`OLD_BLOCK_EARLY_OUTPUTS`] outputs into its epoch votes at once for a header naming the
-/// previous epoch's closing block (the block the epoch opened on: the lowest block a proposer with
-/// `quorum_exec_block` names, as it skips parents that name a block below it) and, alike, for one
+/// previous epoch's closing block (the block the epoch opened on: the lowest block the quorum
+/// rule names, as it skips parents that name a block below it) and, alike, for one
 /// naming the block [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] ring entries below its tip, which lies
 /// before that block, in the previous epoch (the block the rule would name without that bound).
 /// The voter's database answers for no block here, so the ring alone decides both: it compares the

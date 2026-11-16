@@ -83,7 +83,7 @@ async fn test_multi_worker_proposed_header_payload() -> eyre::Result<()> {
         proposer.last_parents,
         selected,
         untracked_trigger(),
-        exec_off(&committee, &primary.id()),
+        exec_no_parents(&committee, &primary.id()),
     )
     .await?;
 
@@ -565,7 +565,7 @@ async fn propose_round_two(
         parents,
         VecDeque::new(),
         untracked_trigger(),
-        exec_off(committee, &primary.id()),
+        exec_no_parents(committee, &primary.id()),
     )
     .await
     .expect("header proposed");
@@ -1945,10 +1945,10 @@ async fn test_header_without_requeued_digest_reports_zero_requeue_wait() {
 
 // ---- bench6 quorum-exec-block ----
 
-/// [`ExecBlockInputs`] with the `quorum_exec_block` switch off, for tests that drive
-/// [`Proposer::propose_header`] directly: the header names the own tip exactly as before.
-fn exec_off(committee: &Committee, author: &AuthorityIdentifier) -> ExecBlockInputs {
-    ExecBlockInputs::new(ExecPolicy::Off, committee, author, &[])
+/// [`ExecBlockInputs`] with no parents, for tests that drive [`Proposer::propose_header`]
+/// directly: with only its own tip to rank, the header names the own tip.
+fn exec_no_parents(committee: &Committee, author: &AuthorityIdentifier) -> ExecBlockInputs {
+    ExecBlockInputs::new(committee, author, &[])
 }
 
 /// The epoch of the quorum-exec-block models: their parents and their ring's blocks carry it.
@@ -1998,9 +1998,8 @@ fn exec_ring(outputs: u64) -> RecentBlocks {
 
 /// The quorum-rule inputs of authority 0 in a ten-member, equal-power committee of epoch 3
 /// (quorum 7), on `parents`.
-fn table_inputs(policy: ExecPolicy, parents: Vec<ParentExecBlock>) -> ExecBlockInputs {
+fn table_inputs(parents: Vec<ParentExecBlock>) -> ExecBlockInputs {
     ExecBlockInputs {
-        policy,
         author: AuthorityIdentifier::dummy_for_test(0),
         own_power: 1,
         epoch: EXEC_MODEL_EPOCH,
@@ -2031,7 +2030,7 @@ fn table_parents(first: u8, count: u8, number: BlockNumber) -> Vec<ParentExecBlo
 /// Catches: a rank by count instead of power, a missing cap or floor, a floor counted in block
 /// numbers, other-epoch, genesis, own or repeated parents counted, a hostile number moving the
 /// choice past the cap or the floor, and an empty or short ring mishandled. (The parents carry no
-/// hash here; `test_quorum_exec_block_switch_off_keeps_header_bytes` checks the header's hash is
+/// hash here; `test_quorum_exec_block_header_names_the_own_ring_block` checks the header's hash is
 /// the own ring's.)
 #[test]
 fn test_quorum_exec_block_choice_table() {
@@ -2043,68 +2042,34 @@ fn test_quorum_exec_block_choice_table() {
     let genesis = |id: u8| ParentExecBlock { round: 0, number: 0, ..table_parent(id, 0) };
     let weighted = |id: u8, power, number| ParentExecBlock { power, ..table_parent(id, number) };
 
-    let cases: Vec<(&str, ExecPolicy, Vec<ParentExecBlock>, BlockNumber, ExecBasis)> = vec![
-        ("in step", ExecPolicy::Always, table_parents(1, 9, 157), 157, ExecBasis::Tip),
-        (
-            "ahead by one output",
-            ExecPolicy::Always,
-            table_parents(1, 9, 154),
-            154,
-            ExecBasis::Quorum,
-        ),
-        (
-            "ahead by six outputs",
-            ExecPolicy::Always,
-            table_parents(1, 9, 139),
-            139,
-            ExecBasis::Quorum,
-        ),
+    let cases: Vec<(&str, Vec<ParentExecBlock>, BlockNumber, ExecBasis)> = vec![
+        ("in step", table_parents(1, 9, 157), 157, ExecBasis::Tip),
+        ("ahead by one output", table_parents(1, 9, 154), 154, ExecBasis::Quorum),
+        ("ahead by six outputs", table_parents(1, 9, 139), 139, ExecBasis::Quorum),
         (
             "three parents at the tip are not a quorum with the own tip",
-            ExecPolicy::Always,
             [table_parents(1, 3, 157), table_parents(4, 6, 139)].concat(),
             139,
             ExecBasis::Quorum,
         ),
         (
             "six parents at the tip are a quorum with the own tip",
-            ExecPolicy::Always,
             [table_parents(1, 6, 157), table_parents(7, 3, 139)].concat(),
             157,
             ExecBasis::Tip,
         ),
-        (
-            "own node behind: the cap",
-            ExecPolicy::Always,
-            table_parents(1, 9, 170),
-            157,
-            ExecBasis::Tip,
-        ),
+        ("own node behind: the cap", table_parents(1, 9, 170), 157, ExecBasis::Tip),
         (
             "a quorum value between entries resolves to the own entry below it",
-            ExecPolicy::Always,
             table_parents(1, 9, 150),
             148,
             ExecBasis::Quorum,
         ),
-        (
-            "older than the floor",
-            ExecPolicy::Always,
-            table_parents(1, 9, 120),
-            133,
-            ExecBasis::Floor,
-        ),
-        ("exactly the floor", ExecPolicy::Always, table_parents(1, 9, 133), 133, ExecBasis::Quorum),
-        (
-            "fewer than a quorum of usable parents",
-            ExecPolicy::Always,
-            table_parents(1, 5, 139),
-            157,
-            ExecBasis::Tip,
-        ),
+        ("older than the floor", table_parents(1, 9, 120), 133, ExecBasis::Floor),
+        ("exactly the floor", table_parents(1, 9, 133), 133, ExecBasis::Quorum),
+        ("fewer than a quorum of usable parents", table_parents(1, 5, 139), 157, ExecBasis::Tip),
         (
             "other-epoch and genesis parents are not usable",
-            ExecPolicy::Always,
             [
                 table_parents(1, 4, 139),
                 vec![other_epoch(5, 139), other_epoch(6, 139), genesis(7), genesis(8), genesis(9)],
@@ -2115,70 +2080,43 @@ fn test_quorum_exec_block_choice_table() {
         ),
         (
             "the own certificate among the parents is skipped",
-            ExecPolicy::Always,
             [vec![table_parent(0, 139)], table_parents(1, 5, 139)].concat(),
             157,
             ExecBasis::Tip,
         ),
         (
             "an author counts once",
-            ExecPolicy::Always,
             [table_parents(1, 4, 139), vec![table_parent(1, 139), table_parent(2, 139)]].concat(),
             157,
             ExecBasis::Tip,
         ),
         (
             "ranked by voting power, not by count",
-            ExecPolicy::Always,
             vec![weighted(1, 4, 139), weighted(2, 1, 139), weighted(3, 1, 139)],
             139,
             ExecBasis::Quorum,
         ),
         (
             "f hostile parents naming a huge number do not move the choice",
-            ExecPolicy::Always,
             [table_parents(1, 3, u64::MAX), table_parents(4, 6, 151)].concat(),
             151,
             ExecBasis::Quorum,
         ),
         (
             "f low parents beside six honest ones at the tip do not move the choice",
-            ExecPolicy::Always,
             [table_parents(1, 3, 0), table_parents(4, 6, 157)].concat(),
             157,
             ExecBasis::Tip,
         ),
         (
             "f low parents in a minimal parent set drag the choice to the floor and no lower",
-            ExecPolicy::Always,
             [table_parents(1, 3, 0), table_parents(4, 3, 157)].concat(),
             133,
             ExecBasis::Floor,
         ),
-        (
-            "the starved window applies the rule",
-            ExecPolicy::Starved,
-            table_parents(1, 9, 139),
-            139,
-            ExecBasis::Quorum,
-        ),
-        (
-            "the tip policy ignores the parents",
-            ExecPolicy::Tip,
-            table_parents(1, 9, 139),
-            157,
-            ExecBasis::Tip,
-        ),
-        (
-            "the switch off ignores the parents",
-            ExecPolicy::Off,
-            table_parents(1, 9, 139),
-            157,
-            ExecBasis::Tip,
-        ),
     ];
-    for (name, policy, parents, number, basis) in cases {
-        let choice = choose_exec_block(&ring, &table_inputs(policy, parents));
+    for (name, parents, number, basis) in cases {
+        let choice = choose_exec_block(&ring, &table_inputs(parents));
         assert_eq!(choice.block, entry(number), "{name}: the own ring's number and hash");
         assert_eq!(choice.tip, tip, "{name}");
         assert_eq!(choice.basis, basis, "{name}");
@@ -2186,36 +2124,28 @@ fn test_quorum_exec_block_choice_table() {
 
     // a short ring floors at its oldest entry
     let short = exec_ring(4);
-    let choice =
-        choose_exec_block(&short, &table_inputs(ExecPolicy::Always, table_parents(1, 9, 50)));
+    let choice = choose_exec_block(&short, &table_inputs(table_parents(1, 9, 50)));
     assert_eq!(choice.block, short.nth_newest(3).expect("oldest"), "the oldest of four entries");
     assert_eq!((choice.block.number, choice.basis), (100, ExecBasis::Floor));
 
-    // an empty ring keeps the default block the tip read returned before the switch
+    // an empty ring names the default block
     let empty = RecentBlocks::new(50);
-    let choice =
-        choose_exec_block(&empty, &table_inputs(ExecPolicy::Always, table_parents(1, 9, 139)));
+    let choice = choose_exec_block(&empty, &table_inputs(table_parents(1, 9, 139)));
     assert_eq!(choice.block, empty.latest_execution_block_num_hash());
     assert_eq!(choice.block.number, 0, "the default header's block");
     assert_eq!(choice.basis, ExecBasis::Tip);
 }
 
 /// What one in-step fleet run of the self-feeding model records per round and node: how many
-/// outputs the named block trails the tip, the policy and the basis.
-type FleetRound = Vec<(usize, ExecPolicy, ExecBasis)>;
+/// outputs the named block trails the tip, and the basis.
+type FleetRound = Vec<(usize, ExecBasis)>;
 
 /// Ten in-step proposers (one ring stands for all ten: they executed the same outputs), one new
 /// output executed before every round, each round's headers the next round's parents. Round 1
-/// builds on genesis parents. After round `r`'s proposals, each `(r, node)` in `cancels` reports
-/// that node's round-`r - 1` header cancelled; every other node's round-`r` header certifies.
-fn self_feeding_fleet(
-    starved_rounds: u32,
-    rounds: Round,
-    cancels: &[(Round, usize)],
-) -> Vec<FleetRound> {
+/// builds on genesis parents.
+fn self_feeding_fleet(rounds: Round) -> Vec<FleetRound> {
     const FLEET: u8 = 10;
     let ids: Vec<_> = (0..FLEET).map(AuthorityIdentifier::dummy_for_test).collect();
-    let mut policies = vec![ExecBlockPolicy::new(true, starved_rounds); ids.len()];
     // the fleet has been running: twelve outputs before round 1
     let mut ring = exec_ring(12);
     let mut history: Vec<BlockNumHash> = (0..12).map(|o| exec_output_block(o).num_hash()).collect();
@@ -2238,9 +2168,8 @@ fn self_feeding_fleet(
             .collect();
         let mut this_round = Vec::new();
         let mut next_named = Vec::new();
-        for (author, policy) in ids.iter().zip(&mut policies) {
+        for author in &ids {
             let inputs = ExecBlockInputs {
-                policy: policy.for_round(round),
                 author: author.clone(),
                 own_power: 1,
                 epoch: EXEC_MODEL_EPOCH,
@@ -2249,17 +2178,10 @@ fn self_feeding_fleet(
             };
             let choice = choose_exec_block(&ring, &inputs);
             let at = history.iter().position(|b| *b == choice.block).expect("an executed output");
-            this_round.push((history.len() - 1 - at, inputs.policy, choice.basis));
+            this_round.push((history.len() - 1 - at, choice.basis));
             next_named.push(choice.block);
         }
         named = next_named;
-        for (node, policy) in policies.iter_mut().enumerate() {
-            if cancels.contains(&(round, node)) {
-                policy.on_cancelled(round - 1, round);
-            } else {
-                policy.on_certified(round);
-            }
-        }
         out.push(this_round);
     }
     out
@@ -2267,25 +2189,18 @@ fn self_feeding_fleet(
 
 /// I-4 item 1: the choice function fed its own outputs as the next round's parents. An in-step
 /// ten-node fleet over 20 rounds settles exactly [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] outputs
-/// below its tip under `always` (the quorum value can only rise through the floor), and names its
-/// tip under the adaptive policy. Three nodes whose header was cancelled rank the other seven's
-/// fresh tips for their four-round window: they trail by the one output executed since the
-/// parents were proposed, without ratcheting, and return to the tip when the rounds are spent.
-/// With the whole fleet in a window at once the lag climbs as under `always` and drops back to 0
-/// when the window ends.
+/// below its tip (the quorum value can only rise through the floor).
 ///
-/// Catches: a rule that ranks the parents' tips it does not have (the model would show lag 0
-/// under `always`), a floor that does not hold the ratchet at N, a window that never closes or
-/// returns by value, and a starved node beside tip nodes whose lag grows round by round.
+/// Catches: a rule that ranks the parents' tips it does not have (the model would show lag 0),
+/// and a floor that does not hold the ratchet at N.
 #[test]
 fn test_quorum_exec_block_self_feeding_fleet() {
     let n = QUORUM_EXEC_BLOCK_FLOOR_ENTRIES;
-    let always = self_feeding_fleet(0, 20, &[]);
+    let always = self_feeding_fleet(20);
     for (round, nodes) in (1..).zip(&always) {
         // round r trails by r - 1 outputs until the floor holds it at N
         let expected = usize::min(round - 1, n);
-        for (node, (lag, policy, basis)) in nodes.iter().enumerate() {
-            assert_eq!(*policy, ExecPolicy::Always);
+        for (node, (lag, basis)) in nodes.iter().enumerate() {
             assert_eq!(*lag, expected, "always: round {round}, node {node}");
             if round > n + 1 {
                 assert_eq!(*basis, ExecBasis::Floor, "always: round {round} sits on the floor");
@@ -2293,167 +2208,6 @@ fn test_quorum_exec_block_self_feeding_fleet() {
         }
     }
     assert!(always[n..].iter().flatten().all(|(lag, ..)| *lag == n), "lag exactly N from round 9");
-
-    let adaptive = self_feeding_fleet(4, 20, &[]);
-    assert!(
-        adaptive.iter().flatten().all(|entry| *entry == (0, ExecPolicy::Tip, ExecBasis::Tip)),
-        "adaptive, in step and certified: every header names its tip"
-    );
-
-    // nodes 0-2 learn after round 5 that their round-4 header was cancelled: rounds 6-9 use the
-    // rule
-    let cancels = [(5, 0), (5, 1), (5, 2)];
-    let windowed = self_feeding_fleet(4, 20, &cancels);
-    for (round, nodes) in (1..).zip(&windowed) {
-        for (node, (lag, policy, basis)) in nodes.iter().enumerate() {
-            let starved = node < 3 && (6..=9).contains(&round);
-            if starved {
-                assert_eq!(
-                    (*lag, *policy, *basis),
-                    (1, ExecPolicy::Starved, ExecBasis::Quorum),
-                    "round {round}, node {node}"
-                );
-            } else {
-                assert_eq!(
-                    (*lag, *policy, *basis),
-                    (0, ExecPolicy::Tip, ExecBasis::Tip),
-                    "round {round}, node {node}"
-                );
-            }
-        }
-    }
-
-    // every node learns after round 5 that its round-4 header was cancelled: for the window the
-    // parents are earlier picks of the rule, so the lag climbs one output a round as under
-    // `always`, and every node is back on its tip when the rounds are spent
-    let whole_fleet: Vec<(Round, usize)> = (0..10).map(|node| (5, node)).collect();
-    let fleet_window = self_feeding_fleet(4, 20, &whole_fleet);
-    for (round, nodes) in (1..).zip(&fleet_window) {
-        let expected = if (6..=9).contains(&round) {
-            (round - 5, ExecPolicy::Starved, ExecBasis::Quorum)
-        } else {
-            (0, ExecPolicy::Tip, ExecBasis::Tip)
-        };
-        for (node, entry) in nodes.iter().enumerate() {
-            assert_eq!(*entry, expected, "whole fleet in a window: round {round}, node {node}");
-        }
-    }
-}
-
-/// The adaptive policy's state machine, one header a round: a cancel opens a window of the next K
-/// headers and the policy returns to the tip once they are built; the doubling waits for the
-/// window's first header; the lagging cancel of the header built before the window is not counted
-/// again; repeated cancels double K up to [`QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS`]; a streak of
-/// [`QUORUM_EXEC_BLOCK_RESET_STREAK`] certified tip headers resets K, a header certified inside a
-/// window does not count, including the window's last header when a cancel reported before the
-/// proposer moved past it extends the run. The switch off and the `always` policy keep no window.
-#[test]
-fn test_quorum_exec_block_adaptive_policy_state_machine() {
-    let mut policy = ExecBlockPolicy::new(true, 4);
-    assert!(exec_build_headers(&mut policy, 1..=4).is_empty());
-
-    // round 3 is cancelled once round 4 is built: rounds 5-8 use the rule
-    policy.on_cancelled(3, 4);
-    assert_eq!(exec_window_from(&policy, 5), (5..=8).collect::<Vec<_>>());
-    assert_eq!(policy.next_window, 4, "the doubling waits for the window's first header");
-    assert_eq!(exec_build_headers(&mut policy, [5]), vec![5]);
-    assert_eq!(policy.next_window, 8);
-    // round 4 named its tip before the window opened: its cancel is the same episode
-    policy.on_cancelled(4, 5);
-    assert_eq!(exec_window_from(&policy, 6), (6..=8).collect::<Vec<_>>());
-    assert_eq!(policy.next_window, 8);
-    // a header certified inside the window does not count toward the reset
-    assert_eq!(exec_build_headers(&mut policy, [6]), vec![6]);
-    policy.on_certified(6);
-    assert_eq!((policy.certified_streak, policy.next_window), (0, 8));
-
-    // the window's headers are built: the round-9 tip probe is cancelled once round 10 is built,
-    // so the doubled window covers rounds 11-18
-    assert_eq!(exec_build_headers(&mut policy, 7..=10), vec![7, 8]);
-    policy.on_cancelled(9, 10);
-    assert_eq!(exec_window_from(&policy, 11), (11..=18).collect::<Vec<_>>());
-    assert_eq!(exec_build_headers(&mut policy, 11..=13), vec![11, 12, 13]);
-    assert_eq!(policy.next_window, 16);
-
-    // a header inside the window cancelled: the window extends to the next sixteen headers, so
-    // rounds 11-29 use the rule
-    policy.on_cancelled(12, 13);
-    assert_eq!(exec_window_from(&policy, 14), (14..=29).collect::<Vec<_>>());
-    assert_eq!(exec_build_headers(&mut policy, [14]), vec![14]);
-    assert_eq!(policy.next_window, 32);
-
-    // more cancels double K up to the bound and no further: each tip probe after a window is
-    // cancelled once the next header is built, and the policy returns to the tip when the
-    // window's headers are built
-    assert_eq!(exec_build_headers(&mut policy, 15..=31), (15..=29).collect::<Vec<_>>());
-    let mut round = 30;
-    let mut last = 0;
-    for (len, expected) in [(32, 64), (64, 128), (128, 128), (128, 128)] {
-        policy.on_cancelled(round, round + 1);
-        let first = round + 2;
-        last = first + len - 1;
-        assert_eq!(
-            exec_build_headers(&mut policy, first..=last + 2),
-            (first..=last).collect::<Vec<_>>(),
-            "returns once the window's headers are built"
-        );
-        assert_eq!(policy.next_window, expected);
-        round = last + 1;
-    }
-    assert_eq!(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS, 128);
-
-    // one certified header that named its tip does not reset K; a streak of them does
-    policy.on_certified(last + 1);
-    assert_eq!(policy.next_window, 128, "one certified tip header");
-    let streak_end = last + QUORUM_EXEC_BLOCK_RESET_STREAK;
-    assert!(exec_build_headers(&mut policy, last + 3..=streak_end + 2).is_empty());
-    for round in last + 2..streak_end {
-        policy.on_certified(round);
-    }
-    assert_eq!(policy.next_window, 128, "one short of the streak");
-    policy.on_certified(streak_end);
-    assert_eq!(policy.next_window, 4);
-    policy.on_cancelled(streak_end + 1, streak_end + 2);
-    assert_eq!(
-        exec_window_from(&policy, streak_end + 3),
-        (streak_end + 3..=streak_end + 6).collect::<Vec<_>>(),
-        "a fresh window of K = 4"
-    );
-
-    // round 7, inside the window 5-8, is cancelled once round 8, the window's last header, is
-    // built: the run extends, so round 8 stays a rule header and its certificate keeps the doubled
-    // K
-    let mut edge = ExecBlockPolicy::new(true, 4);
-    assert!(exec_build_headers(&mut edge, 1..=4).is_empty());
-    edge.on_cancelled(3, 4);
-    assert_eq!(exec_build_headers(&mut edge, 5..=8), (5..=8).collect::<Vec<_>>());
-    edge.on_cancelled(7, 8);
-    assert_eq!(exec_window_from(&edge, 9), (9..=16).collect::<Vec<_>>());
-    edge.on_certified(8);
-    assert_eq!(edge.certified_streak, 0, "a rule header's certificate does not count");
-    assert_eq!(exec_build_headers(&mut edge, [9]), vec![9]);
-    assert_eq!(edge.next_window, 16);
-
-    // a configured window above the bound is lowered to it
-    let mut wide = ExecBlockPolicy::new(true, 200);
-    assert_eq!((wide.base_window, wide.next_window), (128, 128));
-    wide.on_cancelled(1, 2);
-    assert_eq!(exec_build_headers(&mut wide, 3..=251), (3..=130).collect::<Vec<_>>());
-    wide.on_cancelled(250, 251);
-    assert_eq!(exec_build_headers(&mut wide, [252]), vec![252]);
-    assert_eq!(wide.next_window, 128);
-
-    // the switch off and the `always` policy ignore the reports
-    for (mut p, expected) in [
-        (ExecBlockPolicy::new(false, 4), ExecPolicy::Off),
-        (ExecBlockPolicy::new(true, 0), ExecPolicy::Always),
-    ] {
-        let before = p.clone();
-        p.on_cancelled(3, 4);
-        p.on_certified(5);
-        assert_eq!(p, before);
-        assert!((1..=50).all(|round| p.for_round(round) == expected));
-    }
 }
 
 /// A fixture of four authorities (quorum 3) whose consensus config carries `params`.
@@ -2527,56 +2281,17 @@ async fn exec_propose(
     (header, line)
 }
 
-/// I-4 item 9, switch off: with the default parameters a header names
-/// `latest_execution_block_num_hash()` exactly as before, whatever its parents name, and its bytes
-/// equal the header `Header::new` builds from today's call; the `header proposed` line reports
-/// `exec_policy=off`, `exec_basis=tip`. The same ring and parents with `quorum_exec_block: true`
-/// name the quorum block, resolved from the own ring (never the parents' hash), so the switch is
-/// what decides.
+/// I-4 item 9: a header names the quorum block, resolved from the own ring (never the parents'
+/// hash), and its `header proposed` line reports `exec_block`, `exec_tip` and `exec_basis`.
 ///
-/// Catches: the switch-off path reading anything but the previous call, a default that turns the
-/// rule on, a parent's hash in a header, and the four new fields missing or misnamed.
+/// Catches: a parent's hash in a header, and the fields missing or misnamed.
 #[tokio::test]
-async fn test_quorum_exec_block_switch_off_keeps_header_bytes() {
+async fn test_quorum_exec_block_header_names_the_own_ring_block() {
     use crate::log_capture::LogCapture;
-
     let capture = LogCapture::new("consensus::metrics");
     let _capture_guard = tracing::subscriber::set_default(capture.clone());
     let task_manager = TaskManager::default();
-
-    // switch off (the default parameters)
     let fixture = exec_fixture(tn_config::Parameters::default());
-    let cb = exec_bus();
-    let _rx_headers = cb.subscribe_headers();
-    let mut proposer = exec_proposer(&fixture, &cb, &task_manager, exec_parents(&fixture, 1, 112));
-    assert_eq!(proposer.exec_block_policy, ExecBlockPolicy::new(false, 0));
-    let (header, line) = exec_propose(&mut proposer, &capture).await;
-
-    let today = cb.app().latest_execution_block_num_hash();
-    assert_eq!(today.number, 133);
-    assert_eq!(header.latest_execution_block(), today);
-    let rebuilt = Header::new(
-        header.author().clone(),
-        header.round(),
-        header.epoch(),
-        header.payload().clone(),
-        header.parents().clone(),
-        today,
-        header.seed_signature().cloned().unwrap_or_default(),
-        header.created_at_ms(),
-    );
-    assert_eq!(tn_types::encode(&header), tn_types::encode(&rebuilt), "header bytes unchanged");
-    assert_eq!(header.digest(), rebuilt.digest());
-    assert_eq!(line.u64_field("exec_block"), Some(133));
-    assert_eq!(line.u64_field("exec_tip"), Some(133));
-    assert_eq!(line.field("exec_basis"), Some("tip"));
-    assert_eq!(line.field("exec_policy"), Some("off"));
-
-    // switch on, rule on every header: the same ring and parents name the quorum block
-    let fixture = exec_fixture(tn_config::Parameters {
-        quorum_exec_block: true,
-        ..tn_config::Parameters::default()
-    });
     let cb = exec_bus();
     let _rx_headers = cb.subscribe_headers();
     let mut proposer = exec_proposer(&fixture, &cb, &task_manager, exec_parents(&fixture, 1, 112));
@@ -2588,461 +2303,9 @@ async fn test_quorum_exec_block_switch_off_keeps_header_bytes() {
     assert_eq!(line.u64_field("exec_block"), Some(112));
     assert_eq!(line.u64_field("exec_tip"), Some(133));
     assert_eq!(line.field("exec_basis"), Some("quorum"));
-    assert_eq!(line.field("exec_policy"), Some("always"));
-}
-
-/// The adaptive policy through the proposer: the certifier's cancel report, handled by
-/// `process_uncertified_header`, moves the next headers onto the quorum rule
-/// (`exec_policy=starved`) for K headers, a round jump does not end the window, and an own
-/// certificate among a new header's parents counts toward the streak that resets K.
-///
-/// Catches: a cancel report that never reaches the policy, a window counted in rounds or spent by
-/// anything but the proposer's own headers, and an own certificate that is not seen as a certified
-/// header.
-#[tokio::test]
-async fn test_quorum_exec_block_cancel_report_reaches_the_policy() {
-    use crate::log_capture::LogCapture;
-
-    let capture = LogCapture::new("consensus::metrics");
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
-    let task_manager = TaskManager::default();
-    let fixture = exec_fixture(tn_config::Parameters {
-        quorum_exec_block: true,
-        quorum_exec_block_starved_rounds: 4,
-        ..tn_config::Parameters::default()
-    });
-    let cb = exec_bus();
-    let _rx_headers = cb.subscribe_headers();
-    let mut proposer = exec_proposer(&fixture, &cb, &task_manager, exec_parents(&fixture, 1, 112));
-
-    // round 2 names the tip
-    let (round_two, line) = exec_propose(&mut proposer, &capture).await;
-    assert_eq!(round_two.round(), 2);
-    assert_eq!(line.field("exec_policy"), Some("tip"));
-    assert_eq!(line.u64_field("exec_block"), Some(133));
-
-    // the certifier reports a round-1 header cancelled: rounds 3-6 use the rule
-    proposer.process_uncertified_header(1, HeaderDigest::default());
-    proposer.last_parents = exec_parents(&fixture, 2, 112);
-    let (round_three, line) = exec_propose(&mut proposer, &capture).await;
-    assert_eq!(round_three.round(), 3);
-    assert_eq!(line.field("exec_policy"), Some("starved"));
-    assert_eq!(line.field("exec_basis"), Some("quorum"));
-    assert_eq!(line.u64_field("exec_block"), Some(112));
-    assert_eq!(exec_window_from(&proposer.exec_block_policy, 4), (4..=6).collect::<Vec<_>>());
-
-    // two more counted cancels, with no certified tip header between them, double K twice, each
-    // when the next header under the rule is built; a cancel of round 3 arrives once the proposer
-    // has moved on to round 4
-    assert_eq!(proposer.exec_block_policy.next_window, 8);
-    proposer.round = 4;
-    proposer.process_uncertified_header(3, round_three.digest());
-    assert_eq!(proposer.exec_block_policy.next_window, 8);
-    proposer.last_parents = exec_parents(&fixture, 4, 112);
-    let (round_five, line) = exec_propose(&mut proposer, &capture).await;
-    assert_eq!(round_five.round(), 5);
-    assert_eq!(line.field("exec_policy"), Some("starved"));
-    assert_eq!(proposer.exec_block_policy.next_window, 16);
-    // the round jumps to 20 with no report: the window counts headers, so the next one still uses
-    // the rule (a window of rounds would have ended at round 12)
-    proposer.round = 20;
-    proposer.last_parents = exec_parents(&fixture, 20, 112);
-    let (round_21, line) = exec_propose(&mut proposer, &capture).await;
-    assert_eq!(round_21.round(), 21);
-    assert_eq!(line.field("exec_policy"), Some("starved"));
-    assert_eq!(proposer.exec_block_policy.next_window, 16);
-    // the round-21 header is cancelled once the proposer has moved on to round 22: the window
-    // extends, and K doubles again when round 23 is built
-    proposer.round = 22;
-    proposer.process_uncertified_header(21, round_21.digest());
-    proposer.last_parents = exec_parents(&fixture, 22, 112);
-    let (round_23, line) = exec_propose(&mut proposer, &capture).await;
-    assert_eq!(round_23.round(), 23);
-    assert_eq!(line.field("exec_policy"), Some("starved"));
-    assert_eq!(proposer.exec_block_policy.next_window, 32);
-    // the window's last fifteen headers, built through the policy as the proposer builds them
-    assert_eq!(
-        exec_build_headers(&mut proposer.exec_block_policy, 24..=39),
-        (24..=38).collect::<Vec<_>>()
-    );
-
-    // the own round-40 certificate, a tip header, among the parents of round 41 starts the streak;
-    // one certified tip header does not reset K
-    let own = Certificate::new_unsigned_for_test(
-        &fixture.committee(),
-        HeaderBuilder::default()
-            .author(fixture.first_authority().id())
-            .round(40)
-            .epoch(fixture.committee().epoch())
-            .parents(BTreeSet::new())
-            .build(),
-        Vec::new(),
-    )
-    .expect("own certificate");
-    proposer.round = 40;
-    proposer.last_parents = [vec![own], exec_parents(&fixture, 40, 112)].concat();
-    let (round_41, line) = exec_propose(&mut proposer, &capture).await;
-    assert_eq!(round_41.round(), 41);
-    assert_eq!(line.field("exec_policy"), Some("tip"));
-    assert_eq!(proposer.exec_block_policy.certified_streak, 1);
-    assert_eq!(proposer.exec_block_policy.next_window, 32);
-}
-
-/// The reset streak in the adaptive policy's state machine: after a doubled window one certified
-/// tip header does not reset K and [`QUORUM_EXEC_BLOCK_RESET_STREAK`] consecutive ones do; any
-/// cancel report restarts the streak, even one the window logic ignores; a header certified inside
-/// a window neither counts nor breaks the streak (D29).
-///
-/// Catches: a reset on a single certified tip header (the e2e test certified 0.81 that way), a
-/// streak that survives a cancel, and a header built under the quorum rule counted as a tip header.
-#[test]
-fn test_quorum_exec_block_reset_needs_a_streak_of_certified_tip_headers() {
-    let streak = QUORUM_EXEC_BLOCK_RESET_STREAK;
-    let mut policy = ExecBlockPolicy::new(true, 4);
-    // round 3 cancelled once round 4 is built opens 5-8; the round-9 probe cancelled once round 10
-    // is built opens 11-18
-    assert!(exec_build_headers(&mut policy, 1..=4).is_empty());
-    policy.on_cancelled(3, 4);
-    assert_eq!(exec_build_headers(&mut policy, 5..=10), vec![5, 6, 7, 8]);
-    policy.on_cancelled(9, 10);
-    assert_eq!(exec_build_headers(&mut policy, 11..=12), vec![11, 12]);
-    assert_eq!(policy.next_window, 16);
-
-    // a header certified inside the window does not count
-    policy.on_certified(12);
-    assert_eq!(policy.certified_streak, 0);
-
-    // back on the tip at round 19: one certified tip header leaves the doubled window
-    assert_eq!(exec_build_headers(&mut policy, 13..=19), (13..=18).collect::<Vec<_>>());
-    policy.on_certified(19);
-    assert_eq!((policy.certified_streak, policy.next_window), (1, 16));
-
-    // a cancel inside the streak restarts it: round 30 cancelled once round 31 is built opens
-    // 32-47, and K doubles when round 32 is built
-    assert!(exec_build_headers(&mut policy, 20..=31).is_empty());
-    for round in 20..30 {
-        policy.on_certified(round);
-    }
-    assert_eq!(policy.certified_streak, 11);
-    policy.on_cancelled(30, 31);
-    assert_eq!((policy.certified_streak, policy.next_window), (0, 16));
-    assert_eq!(exec_window_from(&policy, 32), (32..=47).collect::<Vec<_>>());
-
-    // a late report for a header built before that window opened leaves the window alone but
-    // still restarts the streak
-    policy.on_certified(31);
-    assert_eq!(policy.certified_streak, 1);
-    assert_eq!(exec_build_headers(&mut policy, [32]), vec![32]);
-    policy.on_cancelled(25, 32);
-    assert_eq!((policy.certified_streak, policy.next_window), (0, 32));
-    assert_eq!(exec_window_from(&policy, 33), (33..=47).collect::<Vec<_>>());
-
-    // the window is spent at round 48: one short of the streak keeps K doubled, a certified window
-    // header in between neither counts nor breaks it, and the streak's last header resets K
-    let last = 48 + streak - 1;
-    assert_eq!(exec_build_headers(&mut policy, 33..=last + 2), (33..=47).collect::<Vec<_>>());
-    for round in 48..last {
-        policy.on_certified(round);
-    }
-    assert_eq!((policy.certified_streak, policy.next_window), (streak - 1, 32));
-    policy.on_certified(47);
-    assert_eq!(policy.certified_streak, streak - 1, "a window header does not count");
-    policy.on_certified(last);
-    assert_eq!((policy.certified_streak, policy.next_window), (streak, 4));
-
-    // the next isolated cancel opens a window of the configured K
-    policy.on_cancelled(last + 1, last + 2);
-    assert_eq!(policy.certified_streak, 0);
-    assert_eq!(exec_window_from(&policy, last + 3), (last + 3..=last + 6).collect::<Vec<_>>());
-}
-
-/// SplitMix64, the model's seeded draw: no wall clock, no generator state.
-fn splitmix64(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-/// Whether a header naming the own tip at `round` certifies in sample `seed` of a regime where it
-/// certifies with probability `permille` / 1000. A function of the round alone, so a sample's
-/// failing rounds do not depend on the path the policy takes through it.
-fn tip_draw(seed: u64, permille: u64, round: Round) -> bool {
-    splitmix64((seed << 32) | u64::from(round)) % 1000 < permille
-}
-
-/// One round of [`exec_policy_model`].
-#[derive(Clone, Copy, Debug)]
-struct ModelRound {
-    /// The rule the header was built under.
-    rule: ExecPolicy,
-    /// Whether the header certified.
-    certified: bool,
-    /// The window the next counted cancel opens, after this round's reports.
-    next_window: Round,
-}
-
-/// The adaptive policy (configured window 4) driven by tip outcomes alone, in the proposer's
-/// order: the build of header `r` reports header `r - 1` certified (its certificate is a parent)
-/// before it picks the rule, and the certifier's cancel of header `r - 1` arrives once header `r`
-/// is proposed. A header under the quorum rule certifies (the e2e test: all of them did); a header
-/// naming the tip certifies when `tip_certifies(r)`, which is asked for tip headers only.
-fn exec_policy_model(
-    rounds: Round,
-    mut tip_certifies: impl FnMut(Round) -> bool,
-) -> Vec<ModelRound> {
-    let mut policy = ExecBlockPolicy::new(true, 4);
-    let mut out: Vec<ModelRound> = Vec::new();
-    for round in 1..=rounds {
-        let previous = out.last().map(|r| r.certified);
-        if previous == Some(true) {
-            policy.on_certified(round - 1);
-        }
-        let rule = policy.for_round(round);
-        if previous == Some(false) {
-            policy.on_cancelled(round - 1, round);
-        }
-        let certified = rule == ExecPolicy::Starved || tip_certifies(round);
-        out.push(ModelRound { rule, certified, next_window: policy.next_window });
-    }
-    out
-}
-
-/// The model the reset streak was chosen with (bench 6, #1804): with p the chance that a header
-/// naming the own tip certifies, the policy loses at most 2 % of its headers in every sample for
-/// every p up to 0.9, over 4000 rounds and eight samples per p. The numbers pinned, with their
-/// measured values: p = 0 1.75 %, 0.3 1.48 %, 0.5 alternating by round (the e2e regime) or by tip
-/// header 0.88 %, 0.6 1.27 %, 0.9 0.90 %, 0.97 1.11 %, 0.99 0.94 % with 87 % of rounds on the tip,
-/// 1 nothing lost and every round on the tip. The rule as built (one certified tip header reset K)
-/// lost 16.7 % at 0.5 alternating, 7.4 % at 0.9. A fresh policy loses five headers in the first
-/// 100 rounds of the alternation, one per doubling.
-///
-/// The model's headers under the quorum rule always certify (in the e2e test all of them did), so
-/// it loses only tip headers, never more than the switch off: that follows from the assumption and
-/// is not checked here. A voter that refuses an older block (`BelowRestoreFloor` after a restore)
-/// can fail a rule header the tip would have passed.
-///
-/// Catches: a reset rule that one success in two satisfies, a window that stops doubling while
-/// the tip keeps failing, and a rule that never resets (the share on the tip at p = 0.99).
-#[test]
-fn test_quorum_exec_block_policy_model_holds_the_target() {
-    const ROUNDS: Round = 4000;
-    const SEEDS: u64 = 8;
-    let total = usize::try_from(u64::from(ROUNDS) * SEEDS).expect("small model");
-    let lost = |rounds: &[ModelRound]| rounds.iter().filter(|r| !r.certified).count();
-    let on_tip =
-        |rounds: &[ModelRound]| rounds.iter().filter(|r| r.rule == ExecPolicy::Tip).count();
-
-    // (certify permille, most headers lost in basis points over all samples)
-    for (permille, max_lost_bp) in
-        [(0, 180), (300, 170), (600, 150), (900, 120), (970, 150), (990, 110), (1000, 0)]
-    {
-        let (mut all_lost, mut all_tip) = (0, 0);
-        for seed in 0..SEEDS {
-            let rounds = exec_policy_model(ROUNDS, |round| tip_draw(seed, permille, round));
-            let seed_lost = lost(&rounds);
-            if permille <= 900 {
-                assert!(
-                    seed_lost * 10_000 <= 200 * rounds.len(),
-                    "p {permille}/1000, seed {seed}: {seed_lost} of {ROUNDS} lost, over 2 %"
-                );
-            }
-            all_lost += seed_lost;
-            all_tip += on_tip(&rounds);
-        }
-        assert!(
-            all_lost * 10_000 <= max_lost_bp * total,
-            "p {permille}/1000: {all_lost} of {total} lost, over {max_lost_bp} bp"
-        );
-        if permille == 990 {
-            assert!(all_tip * 100 >= 85 * total, "p 0.99: {all_tip} of {total} rounds on the tip");
-        }
-        if permille == 1000 {
-            assert_eq!(all_tip, total, "every tip header certifies: no window, lag 0");
-        }
-    }
-
-    // p = 0.5 alternating, by round (the e2e regime: outputs commit every second round) and by
-    // tip header
-    let by_round = exec_policy_model(ROUNDS, |round| round % 2 == 0);
-    let mut nth = 0u32;
-    let by_tip = exec_policy_model(ROUNDS, |_| {
-        nth += 1;
-        nth % 2 == 1
-    });
-    for (name, rounds) in [("by round", &by_round), ("by tip header", &by_tip)] {
-        let (l, t) = (lost(rounds), on_tip(rounds));
-        assert!(
-            l * 10_000 <= 100 * rounds.len(),
-            "alternating {name}: {l} of {ROUNDS} lost, over 1 %"
-        );
-        assert!(
-            t * 10_000 <= 200 * rounds.len(),
-            "alternating {name}: {t} of {ROUNDS} rounds on the tip"
-        );
-    }
-    assert!(
-        lost(&by_round[..100]) <= 5,
-        "the climb from K = 4 to the bound costs one header a step"
-    );
-}
-
-/// The policy after a regime ends: the tip certifies every other round for 500 to 627 rounds (every
-/// phase of the 130-round cycle at the bound), then every tip header certifies but one isolated
-/// cancel. The policy is back on its tip within one maximum window plus the two headers of the
-/// failed probe, and stays there; K is back to 4 within [`QUORUM_EXEC_BLOCK_RESET_STREAK`] rounds
-/// of the return. An isolated cancel after that opens a window of 4 rounds; one soon after the
-/// return opens a window of the bound. Either costs only the cancelled header.
-///
-/// Catches: a policy that does not return to the tip after the regime ends, a streak that never
-/// completes, and a window opened by a cancel that is not counted.
-#[test]
-fn test_quorum_exec_block_policy_model_after_the_regime_ends() {
-    let max = QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS;
-    let idx = |round: Round| usize::try_from(round - 1).expect("small model");
-    for end in 500..500 + max {
-        let model = |at: Round| {
-            exec_policy_model(end + 600, |round| {
-                if round <= end {
-                    round % 2 == 0
-                } else {
-                    round != end + at
-                }
-            })
-        };
-        let rounds = model(300);
-        let back = (end + 1..end + 300)
-            .find(|&r| rounds[idx(r)..idx(end + 300)].iter().all(|x| x.rule == ExecPolicy::Tip))
-            .expect("back on the tip before the isolated cancel");
-        assert!(
-            back - end <= max + 2,
-            "regime of {end} rounds: back on the tip {} rounds after",
-            back - end
-        );
-        let reset = (end + 1..end + 300)
-            .find(|&r| rounds[idx(r)].next_window == 4)
-            .expect("K back to the configured value");
-        assert!(
-            reset <= back + QUORUM_EXEC_BLOCK_RESET_STREAK,
-            "regime of {end}: reset at {reset}, back at {back}"
-        );
-
-        // headers lost after the regime, and rounds under the rule after the isolated cancel
-        let cost = |rounds: &[ModelRound], cancel: Round| -> (usize, usize) {
-            (
-                rounds[idx(end + 1)..].iter().filter(|r| !r.certified).count(),
-                rounds[idx(cancel)..].iter().filter(|r| r.rule == ExecPolicy::Starved).count(),
-            )
-        };
-        assert_eq!(cost(&rounds, end + 300), (1, 4), "regime of {end}: a cancel after the reset");
-        let early = model(back - end + 10);
-        let bound = usize::try_from(max).expect("small model");
-        assert_eq!(
-            cost(&early, back + 10),
-            (1, bound),
-            "regime of {end}: a cancel before the reset"
-        );
-    }
 }
 
 // ---- bench7 quorum-exec-block ----
-
-/// Build one own header at each of `rounds`, in order, under `policy` as the proposer does (one
-/// [`ExecBlockPolicy::for_round`] call per header), and return the rounds whose header was built
-/// under the quorum rule.
-fn exec_build_headers(
-    policy: &mut ExecBlockPolicy,
-    rounds: impl IntoIterator<Item = Round>,
-) -> Vec<Round> {
-    rounds.into_iter().filter(|round| policy.for_round(*round) == ExecPolicy::Starved).collect()
-}
-
-/// The rounds of the headers a copy of `policy` builds under the quorum rule when the proposer
-/// builds one header a round from `from` on, up to the first header that names the tip again.
-/// `policy` itself is left as it is.
-fn exec_window_from(policy: &ExecBlockPolicy, from: Round) -> Vec<Round> {
-    let mut policy = policy.clone();
-    (from..).take_while(|round| policy.for_round(*round) == ExecPolicy::Starved).collect()
-}
-
-/// Review finding V1: the adaptive window counts headers built under the rule, not rounds. A
-/// proposer that jumps rounds right after a cancel (its next round is its parents' round plus one)
-/// still builds K headers under the rule, whatever their rounds; the review's sequence (K = 4, a
-/// cancel at round 4, parents of round 10 next) now puts the round-11 header under the rule, where
-/// a window of rounds 5-8 had passed without one header and still doubled. A cancel of a header
-/// built under the rule after the jump extends the run, and the header's certificate does not
-/// count toward the reset streak.
-///
-/// Catches: a window that ends by round number, a window opened at the cancel's round rather than
-/// spent by the next headers, and a rule header after a jump classified as a tip header.
-#[test]
-fn test_quorum_exec_block_window_counts_headers_across_a_round_jump() {
-    // the cancel arrives once round 4 is built, then the proposer's next header is at round 11
-    let mut policy = ExecBlockPolicy::new(true, 4);
-    assert!(exec_build_headers(&mut policy, 1..=4).is_empty());
-    policy.on_cancelled(3, 4);
-    assert_eq!(exec_build_headers(&mut policy, [11, 12, 13, 14, 15]), vec![11, 12, 13, 14]);
-    assert_eq!(policy.next_window, 8);
-
-    // jumps inside the window: every header built is under the rule until four were built
-    let mut jumpy = ExecBlockPolicy::new(true, 4);
-    jumpy.on_cancelled(3, 4);
-    assert_eq!(exec_build_headers(&mut jumpy, [11, 20, 35, 36, 50]), vec![11, 20, 35, 36]);
-
-    // parents of a later round moved the proposer's round to 10 before the cancel arrived, with no
-    // header at 10: the window still starts with the next header built
-    let mut moved = ExecBlockPolicy::new(true, 4);
-    assert!(exec_build_headers(&mut moved, 1..=4).is_empty());
-    moved.on_cancelled(4, 10);
-    assert_eq!(exec_build_headers(&mut moved, 11..=15), vec![11, 12, 13, 14]);
-
-    // the review's sequence: the round-11 header, built under the rule, is cancelled once round 12
-    // is built; the run extends to eight more headers and K doubles once per window that got a
-    // header (at rounds 11 and 13)
-    let mut review = ExecBlockPolicy::new(true, 4);
-    assert!(exec_build_headers(&mut review, 1..=4).is_empty());
-    review.on_cancelled(3, 4);
-    assert_eq!(exec_build_headers(&mut review, [11, 12]), vec![11, 12]);
-    review.on_cancelled(11, 12);
-    assert_eq!(exec_build_headers(&mut review, 13..=21), (13..=20).collect::<Vec<_>>());
-    assert_eq!(review.next_window, 16);
-    // the round-12 header was built under the rule after the jump: its certificate does not count
-    review.on_certified(12);
-    assert_eq!(review.certified_streak, 0, "a rule header's certificate does not count");
-    // the round-21 header named the tip: its certificate does
-    review.on_certified(21);
-    assert_eq!(review.certified_streak, 1);
-}
-
-/// Review finding V1, the doubling: a counted cancel asks for the next window to double, and the
-/// doubling is applied when the next header under the rule is built. A window that has had no
-/// header built under it yet has not doubled, reports that are not counted leave it as it is, and
-/// several counted cancels with no rule header built between them double once: no header built
-/// under the rule means no new evidence that the rule's blocks fail.
-///
-/// Catches: a doubling applied at the cancel, before any header was built under the window, and
-/// one doubling per report rather than per window that got a header.
-#[test]
-fn test_quorum_exec_block_window_without_a_header_does_not_double() {
-    let mut policy = ExecBlockPolicy::new(true, 4);
-    assert!(exec_build_headers(&mut policy, 1..=4).is_empty());
-    policy.on_cancelled(3, 4);
-    assert_eq!((policy.remaining, policy.next_window), (4, 4), "open, not yet doubled");
-    // the lagging cancel of the round-4 header is the same episode: no change
-    policy.on_cancelled(4, 4);
-    assert_eq!((policy.remaining, policy.next_window), (4, 4));
-    // the window's first header applies the doubling, once
-    assert_eq!(exec_build_headers(&mut policy, 5..=7), vec![5, 6, 7]);
-    assert_eq!((policy.remaining, policy.next_window), (1, 8));
-
-    // two counted cancels arrive before the next header: the window extends to eight headers and
-    // K doubles once, when round 8 is built
-    policy.on_cancelled(5, 7);
-    policy.on_cancelled(6, 7);
-    assert_eq!((policy.remaining, policy.next_window), (8, 8));
-    assert_eq!(exec_build_headers(&mut policy, 8..=16), (8..=15).collect::<Vec<_>>());
-    assert_eq!(policy.next_window, 16);
-}
 
 /// Review item I1: the final bound of [`choose_exec_block`] holds on a ring whose numbers do not
 /// rise. The ring holds twenty outputs of the epoch before (blocks 100 to 157; 157 opened the
@@ -3074,23 +2337,21 @@ fn test_quorum_exec_block_bound_holds_on_a_ring_whose_numbers_drop() {
     assert_eq!(ring.newest_before_epoch(EXEC_MODEL_EPOCH), Some(opening));
     let bounded = ExecBlockChoice { block: opening, tip, basis: ExecBasis::Floor };
 
-    for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
-        let inputs = table_inputs(policy, table_parents(1, 6, 160));
-        let raw = quorum_rule_choice(&ring, &inputs, Some(opening));
-        assert_eq!(
-            raw,
-            ExecBlockChoice { block: dropped, tip, basis: ExecBasis::Quorum },
-            "{policy:?}: the rule alone names the entry below the opening block"
-        );
-        assert_eq!(bound_to_opening(raw, Some(opening)), bounded, "{policy:?}: the bound");
-        // end to end: a debug build stops at the assertion, a release build names the opening
-        // block
-        let result = catch_unwind(AssertUnwindSafe(|| choose_exec_block(&ring, &inputs)));
-        if cfg!(debug_assertions) {
-            assert!(result.is_err(), "{policy:?}: the debug assertion fires");
-        } else {
-            assert_eq!(result.ok(), Some(bounded), "{policy:?}: the bound in a release build");
-        }
+    let inputs = table_inputs(table_parents(1, 6, 160));
+    let raw = quorum_rule_choice(&ring, &inputs, Some(opening));
+    assert_eq!(
+        raw,
+        ExecBlockChoice { block: dropped, tip, basis: ExecBasis::Quorum },
+        "the rule alone names the entry below the opening block"
+    );
+    assert_eq!(bound_to_opening(raw, Some(opening)), bounded, "the bound");
+    // end to end: a debug build stops at the assertion, a release build names the opening
+    // block
+    let result = catch_unwind(AssertUnwindSafe(|| choose_exec_block(&ring, &inputs)));
+    if cfg!(debug_assertions) {
+        assert!(result.is_err(), "the debug assertion fires");
+    } else {
+        assert_eq!(result.ok(), Some(bounded), "the bound in a release build");
     }
 
     // the bound leaves a choice at or above the opening block alone, and does nothing without an
@@ -3107,10 +2368,9 @@ fn test_quorum_exec_block_bound_holds_on_a_ring_whose_numbers_drop() {
 /// The rule ranks the faulty value first, so the quorum value is 151 where the honest parents
 /// alone give 136: the member at 136 cannot vote for 151, the faulty member withholds, and the
 /// header gets two of the three votes it needs. Naming 136 it would have certified; naming the
-/// tip, as with the switch off and under the adaptive form outside a window, it fails too. Over a
-/// sweep of honest tips and faulty values, neither form that applies the rule names a block that
-/// fewer honest members hold than hold the tip, so its header certifies whenever the tip header
-/// would have.
+/// tip it fails too. Over a sweep of honest tips and faulty values, the rule never names a block
+/// that fewer honest members hold than hold the tip, so its header certifies whenever the tip
+/// header would have.
 ///
 /// Catches: a faulty value that moves the choice past the own tip, a choice that is not an own
 /// ring entry, and a header under the rule that loses an honest vote the tip header would have
@@ -3121,14 +2381,13 @@ fn test_quorum_exec_block_faulty_high_parents_cost_the_gain_only() {
     let tip = ring.latest_execution_block_num_hash();
     assert_eq!(tip.number, 157);
     // authority 0 proposes, 1 is faulty, 2 and 3 are honest; quorum 3 of 4
-    let inputs = |policy: ExecPolicy, faulty: Option<BlockNumber>, honest: [BlockNumber; 2]| {
+    let inputs = |faulty: Option<BlockNumber>, honest: [BlockNumber; 2]| {
         let parents = faulty
             .map(|number| table_parent(1, number))
             .into_iter()
             .chain([table_parent(2, honest[0]), table_parent(3, honest[1])])
             .collect();
         ExecBlockInputs {
-            policy,
             author: AuthorityIdentifier::dummy_for_test(0),
             own_power: 1,
             epoch: EXEC_MODEL_EPOCH,
@@ -3144,47 +2403,39 @@ fn test_quorum_exec_block_faulty_high_parents_cost_the_gain_only() {
     };
 
     let honest = [151, 136];
-    let choose = |policy, faulty| choose_exec_block(&ring, &inputs(policy, faulty, honest));
-    let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
-    for policy in [ExecPolicy::Off, ExecPolicy::Tip] {
-        assert_eq!(choose(policy, Some(10_000)), own_tip, "{policy:?}: the tip, as on main");
-    }
+    let choose = |faulty| choose_exec_block(&ring, &inputs(faulty, honest));
     assert_eq!(votes(tip, honest), 1, "the tip header is cancelled");
     let lifted = ring.newest_at_or_below(151).expect("ring entry");
-    for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
-        assert_eq!(
-            choose(policy, Some(10_000)),
-            ExecBlockChoice { block: lifted, tip, basis: ExecBasis::Quorum },
-            "{policy:?}: the faulty value lifts the quorum value to 151"
-        );
-    }
+    assert_eq!(
+        choose(Some(10_000)),
+        ExecBlockChoice { block: lifted, tip, basis: ExecBasis::Quorum },
+        "the faulty value lifts the quorum value to 151"
+    );
     assert_eq!(votes(lifted, honest), 2, "the header under the rule is cancelled too");
-    let honest_only = choose(ExecPolicy::Always, None);
+    let honest_only = choose(None);
     assert_eq!(honest_only.block.number, 136);
     assert_eq!(votes(honest_only.block, honest), 3, "without the faulty value it certifies");
 
     // the sweep: honest tips below, at and above the own tip, faulty values above it
     let tips: Vec<BlockNumber> = (100..=169).step_by(3).collect();
-    for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
-        for faulty in [158, 1_000, 10_000, BlockNumber::MAX] {
-            for &first in &tips {
-                for &second in &tips {
-                    let honest = [first, second];
-                    let choice = choose_exec_block(&ring, &inputs(policy, Some(faulty), honest));
-                    let case = format!("{policy:?}: faulty {faulty}, honest {honest:?}");
-                    assert!(choice.block.number <= tip.number, "{case}: capped at the own tip");
-                    assert_eq!(
-                        ring.newest_at_or_below(choice.block.number),
-                        Some(choice.block),
-                        "{case}: an own ring entry"
-                    );
-                    assert!(votes(choice.block, honest) >= votes(tip, honest), "{case}");
-                    let without = choose_exec_block(&ring, &inputs(policy, None, honest));
-                    assert!(
-                        choice.block.number >= without.block.number,
-                        "{case}: the faulty value only lifts the choice"
-                    );
-                }
+    for faulty in [158, 1_000, 10_000, BlockNumber::MAX] {
+        for &first in &tips {
+            for &second in &tips {
+                let honest = [first, second];
+                let choice = choose_exec_block(&ring, &inputs(Some(faulty), honest));
+                let case = format!("faulty {faulty}, honest {honest:?}");
+                assert!(choice.block.number <= tip.number, "{case}: capped at the own tip");
+                assert_eq!(
+                    ring.newest_at_or_below(choice.block.number),
+                    Some(choice.block),
+                    "{case}: an own ring entry"
+                );
+                assert!(votes(choice.block, honest) >= votes(tip, honest), "{case}");
+                let without = choose_exec_block(&ring, &inputs(None, honest));
+                assert!(
+                    choice.block.number >= without.block.number,
+                    "{case}: the faulty value only lifts the choice"
+                );
             }
         }
     }
@@ -3217,45 +2468,38 @@ fn test_quorum_exec_block_never_names_a_block_before_the_epoch_opened() {
     let entry = |number: BlockNumber| ring.newest_at_or_below(number).expect("ring entry");
     let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
 
-    for policy in [ExecPolicy::Always, ExecPolicy::Starved] {
-        let choose = |parents: Vec<ParentExecBlock>| {
-            choose_exec_block(&ring, &table_inputs(policy, parents))
-        };
-        // honest parents still on the opening block name it
-        assert_eq!(
-            choose(table_parents(1, 6, 157)),
-            ExecBlockChoice { block: opening, tip, basis: ExecBasis::Quorum },
-            "{policy:?}: a quorum on the opening block"
-        );
-        // one low parent in a minimal set no longer drags the choice below the opening block:
-        // without it the set falls short of a quorum and the own tip is named
-        for low in [120, 148] {
-            let mut parents = table_parents(1, 5, 160);
-            parents.push(table_parent(6, low));
-            assert_eq!(choose(parents), own_tip, "{policy:?}: one parent at {low}");
-        }
-        // f low parents beside a quorum: the quorum value is set by the counted values only
-        let mut parents = table_parents(1, 6, 160);
-        parents.extend(table_parents(7, 3, 103));
-        assert_eq!(
-            choose(parents),
-            ExecBlockChoice { block: entry(160), tip, basis: ExecBasis::Quorum },
-            "{policy:?}: three low parents beside six at 160"
-        );
-        // whatever the low parent names, the choice is never below the opening block
-        for low in 0..=tip.number {
-            let mut parents = table_parents(1, 5, 160);
-            parents.push(table_parent(6, low));
-            let choice = choose(parents);
-            assert!(
-                choice.block.number >= opening.number,
-                "{policy:?}: a parent at {low} named {choice:?}"
-            );
-            if low >= opening.number {
-                // a usable value still counts and sets the quorum value, as before
-                let expected = if low >= 160 { entry(160) } else { entry(low) };
-                assert_eq!(choice.block, expected, "{policy:?}: a usable parent at {low}");
-            }
+    let choose = |parents: Vec<ParentExecBlock>| choose_exec_block(&ring, &table_inputs(parents));
+    // honest parents still on the opening block name it
+    assert_eq!(
+        choose(table_parents(1, 6, 157)),
+        ExecBlockChoice { block: opening, tip, basis: ExecBasis::Quorum },
+        "a quorum on the opening block"
+    );
+    // one low parent in a minimal set no longer drags the choice below the opening block:
+    // without it the set falls short of a quorum and the own tip is named
+    for low in [120, 148] {
+        let mut parents = table_parents(1, 5, 160);
+        parents.push(table_parent(6, low));
+        assert_eq!(choose(parents), own_tip, "one parent at {low}");
+    }
+    // f low parents beside a quorum: the quorum value is set by the counted values only
+    let mut parents = table_parents(1, 6, 160);
+    parents.extend(table_parents(7, 3, 103));
+    assert_eq!(
+        choose(parents),
+        ExecBlockChoice { block: entry(160), tip, basis: ExecBasis::Quorum },
+        "three low parents beside six at 160"
+    );
+    // whatever the low parent names, the choice is never below the opening block
+    for low in 0..=tip.number {
+        let mut parents = table_parents(1, 5, 160);
+        parents.push(table_parent(6, low));
+        let choice = choose(parents);
+        assert!(choice.block.number >= opening.number, "a parent at {low} named {choice:?}");
+        if low >= opening.number {
+            // a usable value still counts and sets the quorum value, as before
+            let expected = if low >= 160 { entry(160) } else { entry(low) };
+            assert_eq!(choice.block, expected, "a usable parent at {low}");
         }
     }
 
@@ -3266,81 +2510,8 @@ fn test_quorum_exec_block_never_names_a_block_before_the_epoch_opened() {
         push_epoch_output(&mut first, EXEC_MODEL_EPOCH - 1, output);
     }
     for low in [0, 100, 142, 156, 157] {
-        let choice =
-            choose_exec_block(&first, &table_inputs(ExecPolicy::Always, table_parents(1, 9, low)));
+        let choice = choose_exec_block(&first, &table_inputs(table_parents(1, 9, low)));
         assert_eq!(choice, ExecBlockChoice { block: opening, tip: opening, basis: ExecBasis::Tip });
-    }
-}
-
-/// `quorum_exec_block_starved_rounds` values the proposer cannot use as written: a window with the
-/// switch off has no effect and a window above the bound is lowered to it. Neither stops the node;
-/// the proposer logs one warning at its start, naming both switch values and the bound, and runs
-/// the policy `ExecBlockPolicy::new` builds (off, or adaptive at the bound). Values it uses as
-/// written log nothing.
-///
-/// Catches: a silently ignored window, a window above the bound used as is, and a warning for a
-/// valid configuration.
-#[tokio::test]
-async fn test_quorum_exec_block_starved_rounds_warning() {
-    use crate::log_capture::LogCapture;
-
-    let off = "quorum_exec_block_starved_rounds has no effect while quorum_exec_block is off";
-    let above = "quorum_exec_block_starved_rounds is above its bound; the bound is used";
-    for (enabled, starved_rounds, expected) in [
-        (false, 0, None),
-        (false, 4, Some(off)),
-        (false, 500, Some(off)),
-        (true, 0, None),
-        (true, 4, None),
-        (true, QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS, None),
-        (true, QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS + 1, Some(above)),
-        (true, u32::MAX, Some(above)),
-    ] {
-        assert_eq!(
-            ExecBlockPolicy::starved_rounds_warning(enabled, starved_rounds),
-            expected,
-            "quorum_exec_block={enabled} quorum_exec_block_starved_rounds={starved_rounds}"
-        );
-    }
-
-    let task_manager = TaskManager::default();
-    for (enabled, starved_rounds, expected, window) in [
-        (false, 4, Some(off), 4),
-        (true, 200, Some(above), QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS),
-        (true, 4, None, 4),
-    ] {
-        let capture = LogCapture::new("primary::proposer");
-        let _capture_guard = tracing::subscriber::set_default(capture.clone());
-        let fixture = exec_fixture(tn_config::Parameters {
-            quorum_exec_block: enabled,
-            quorum_exec_block_starved_rounds: starved_rounds,
-            ..tn_config::Parameters::default()
-        });
-        let mut proposer = exec_proposer(&fixture, &exec_bus(), &task_manager, Vec::new());
-        assert_eq!(proposer.exec_block_policy, ExecBlockPolicy::new(enabled, starved_rounds));
-        assert_eq!(proposer.exec_block_policy.base_window, window);
-        let rule = if enabled { ExecPolicy::Tip } else { ExecPolicy::Off };
-        assert_eq!(proposer.exec_block_policy.for_round(1), rule, "the policy runs as built");
-        let warnings: Vec<_> = [off, above].iter().flat_map(|text| capture.events(text)).collect();
-        match expected {
-            None => assert!(warnings.is_empty(), "no warning: {warnings:?}"),
-            Some(text) => {
-                assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
-                assert_eq!(warnings[0].message, text);
-                assert_eq!(
-                    warnings[0].field("quorum_exec_block"),
-                    Some(enabled.to_string().as_str())
-                );
-                assert_eq!(
-                    warnings[0].u64_field("quorum_exec_block_starved_rounds"),
-                    Some(u64::from(starved_rounds))
-                );
-                assert_eq!(
-                    warnings[0].u64_field("bound"),
-                    Some(u64::from(QUORUM_EXEC_BLOCK_MAX_STARVED_ROUNDS))
-                );
-            }
-        }
     }
 }
 
@@ -3388,7 +2559,7 @@ fn test_quorum_exec_block_inputs_carry_the_committee_epoch() {
                     .expect("unsigned parent certificate")
             })
             .collect();
-        let inputs = ExecBlockInputs::new(ExecPolicy::Always, &committee, &author, &parents);
+        let inputs = ExecBlockInputs::new(&committee, &author, &parents);
         assert_eq!(inputs.epoch, 4);
         choose_exec_block(&ring, &inputs)
     };
@@ -3811,10 +2982,10 @@ async fn test_header_proposed_reports_own_parent_and_hold_fields() {
             assert_eq!(line.u64_field(field), Some(0), "{field} at round {}", header.round());
         }
         let names: Vec<_> = line.fields.iter().map(|(name, _)| *name).collect();
-        let tail = names.len() - 5;
+        let tail = names.len() - 4;
         assert_eq!(
             names[tail..],
-            ["exec_policy", "own_parent", "held", "held_lanes", "blockers"],
+            ["own_parent", "held", "held_lanes", "blockers"],
             "the new fields close the line"
         );
     }
