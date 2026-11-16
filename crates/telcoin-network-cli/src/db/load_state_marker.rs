@@ -11,8 +11,8 @@
 //! - [`remove`] takes it away once every step has committed.
 //! - A node refuses to start while it is there ([`refuse_interrupted_load_state`]).
 //! - A rerun of `db load-state` removes what the stopped run created, then restores again
-//!   ([`clear_interrupted_load_state`]). It refuses, with what to remove by hand, when the stopped
-//!   run wrote into chain data that was there before it.
+//!   ([`clear_interrupted_load_state`]). It refuses, with what to move aside, when the stopped run
+//!   wrote into chain data that was there before it.
 
 use eyre::{bail, eyre, WrapErr as _};
 use std::{
@@ -102,20 +102,17 @@ pub(crate) fn refuse_interrupted_load_state(datadir: &Path) -> eyre::Result<()> 
     Ok(())
 }
 
-/// Before a restore into `datadir`: if an earlier `db load-state` there did not finish, remove the
-/// chain data it created (the `chain_data_dirs` its marker lists, the restored-state floor marker
-/// it wrote) and then the marker, so this run starts on the datadir that one started on. Refuses,
-/// removing nothing, when one of `chain_data_dirs` is there but not on the marker's list: the
-/// stopped run wrote into data that was there before it, and only the operator can say what it is.
-/// Returns whether there was an unfinished restore.
-pub(crate) fn clear_interrupted_load_state(
+/// The entries of `chain_data_dirs` that the marker of an unfinished `db load-state` in `datadir`
+/// lists: the ones that run created, which a rerun removes before it restores. `None` when there is
+/// no marker. Refuses a marker naming anything else, as a rerun does.
+pub(crate) fn listed<'dirs>(
     datadir: &Path,
-    chain_data_dirs: &[PathBuf],
-) -> eyre::Result<bool> {
+    chain_data_dirs: &'dirs [PathBuf],
+) -> eyre::Result<Option<Vec<&'dirs PathBuf>>> {
     let path = marker_path(datadir);
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(eyre!("failed to read {}: {e}", path.display())),
     };
     let mut created = Vec::new();
@@ -133,20 +130,45 @@ pub(crate) fn clear_interrupted_load_state(
             })?;
         created.push(dir);
     }
+    Ok(Some(created))
+}
+
+/// Before a restore into `datadir`: if an earlier `db load-state` there did not finish, remove the
+/// chain data it created (the `chain_data_dirs` its marker lists, the restored-state floor marker
+/// it wrote) and then the marker, so this run starts on the datadir that one started on. Refuses,
+/// removing nothing, when one of `chain_data_dirs` is there but not on the marker's list: the
+/// stopped run wrote into data that was there before it, and only the operator can say what it is.
+/// Returns whether there was an unfinished restore.
+pub(crate) fn clear_interrupted_load_state(
+    datadir: &Path,
+    chain_data_dirs: &[PathBuf],
+) -> eyre::Result<bool> {
+    let Some(created) = listed(datadir, chain_data_dirs)? else {
+        return Ok(false);
+    };
     let mut not_created = Vec::new();
     for dir in chain_data_dirs {
         if !created.contains(&dir) && exists(dir)? {
-            not_created.push(dir.display().to_string());
+            not_created.push(dir);
         }
     }
     if !not_created.is_empty() {
+        // a validator's votes and proposals are in `consensus-db`: one restored without them
+        // must not sign again in an epoch it already signed in
+        let stay_stopped = if not_created.iter().any(|dir| dir.ends_with("consensus-db")) {
+            "; a validator restored that way stays stopped until the network has closed the last \
+             epoch it took part in"
+        } else {
+            ""
+        };
+        let names: Vec<_> = not_created.iter().map(|dir| dir.display().to_string()).collect();
         bail!(
             "a `db load-state` into {} did not finish, and it wrote into {}, which were there \
-             before it started: remove them by hand (node keys and config stay), and {}, then run \
-             `db load-state` again",
+             before it started: move them aside (node keys and config stay{stay_stopped}), then \
+             run `db load-state` again, which removes what the unfinished run created and \
+             restores again",
             datadir.display(),
-            not_created.join(", "),
-            path.display(),
+            names.join(", "),
         );
     }
     for dir in created {
@@ -217,17 +239,27 @@ mod tests {
     }
 
     /// A chain-data directory that was there before the stopped run (not on its list) is refused
-    /// by the rerun, and nothing is removed.
+    /// by the rerun, which says to move it aside and keep the marker for the next rerun (a
+    /// validator whose `consensus-db` goes aside stays stopped), and nothing is removed.
     #[test]
     fn a_rerun_refuses_chain_data_the_stopped_run_did_not_create() {
         let dir = interrupted();
         let root = dir.path();
         let [db, static_files, consensus] = chain_data_dirs(root);
+        write(root, &[db.clone(), static_files.clone()]).unwrap();
+        let err = clear_interrupted_load_state(root, &chain_data_dirs(root)).unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains(&consensus.display().to_string()), "{err}");
+        assert!(err.contains("move them aside"), "{err}");
+        assert!(err.contains("stays stopped until the network has closed"), "{err}");
+        assert!(!err.contains(&marker_path(root).display().to_string()), "the marker stays: {err}");
+
         write(root, &[static_files, consensus]).unwrap();
         let err = clear_interrupted_load_state(root, &chain_data_dirs(root)).unwrap_err();
         let err = err.to_string();
         assert!(err.contains(&db.display().to_string()), "{err}");
-        assert!(err.contains("by hand"), "{err}");
+        assert!(err.contains("move them aside"), "{err}");
+        assert!(!err.contains("stays stopped"), "no consensus-db moved aside: {err}");
         assert_eq!(
             names(root),
             [

@@ -479,8 +479,12 @@ there, before it writes any, and removes it when the restore is complete. A run 
 consensus databases are incomplete. Run `db load-state` again with the same
 bundle: it removes the chain data the stopped run created (`db/`, `static_files/`, `consensus-db/`
 and `restored-state-floor`) and restores again. Keys and config stay. If the stopped run wrote into
-a chain-data directory that was there before it, the rerun names it and stops: remove it, and the
-marker, by hand. A failed run (a bad bundle, say) removes what it created itself.
+a chain-data directory that was there before it, the rerun names it and stops: move it aside and run
+`db load-state` again (a validator whose `consensus-db/` goes aside stays stopped until the network
+has closed the last epoch it took part in). A failed run (a bad bundle, say) removes what it created
+itself. `db load-state` refuses, before it writes anything, a datadir whose `consensus-db/epochs`
+holds the bundle epoch's pack (`epoch-N`, or an interrupted install of it, `epoch-N.replaced`): the
+restore rebuilds that pack and does not replace one.
 
 `telcoin-network db migrate-execution` runs the MDBX to tn-lmdb migration of the execution
 database with the node stopped, instead of at the node's next start: it refuses while a node

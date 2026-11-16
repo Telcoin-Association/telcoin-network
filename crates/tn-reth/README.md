@@ -535,8 +535,9 @@ it so the beneficiary and base-fee accounts are never spuriously touched.
 transaction into a CRC32+zstd state pack; it records the caller-supplied state root **without
 recomputing it**. The restore side is the real integrity check (`SnapshotRestorer`):
 
-- refuses any datadir that already holds chain data; genesis (the trust root) always comes from
-  the local chain spec, never the snapshot;
+- refuses a datadir whose execution database holds blocks past genesis (and `db load-state` one
+  whose `consensus-db/epochs` already holds the bundle epoch's pack); genesis (the trust root)
+  always comes from the local chain spec, never the snapshot;
 - scaffolds a header-only chain (real hashes inside the shipped window, zero-hash dummies below);
 - **recomputes the state root from scratch** out of the imported accounts (`StateRoot::from_tx`)
   and hard-fails unless it equals both the pack's declared root and `header(B).state_root` from
@@ -951,8 +952,9 @@ as its index in the consensus batch its block executed ("Transactions stored by 
   **Operator response:** the file is damaged on this node only (disk or memory fault,
   or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
   wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start
-  the node, which re-executes the chain from genesis (or restore a snapshot). Check the disk:
-  one damaged file usually means more. A v2 datadir written before these checksums does not open
+  the node, which re-executes the chain from genesis (or restore a snapshot into a fresh datadir:
+  move `consensus-db/` aside as well, and a validator then stays stopped until the network has
+  closed the last epoch it took part in). Check the disk: one damaged file usually means more. A v2 datadir written before these checksums does not open
   (`static file <path> has no checksums`): v2 datadirs must hold only checksummed files, since
   two flipped bits could otherwise pass a checksummed file off as an unchecked one. Recreate it,
   or `db reset-execution` and re-execute.

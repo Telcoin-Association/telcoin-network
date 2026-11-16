@@ -312,8 +312,10 @@ the epoch ran meanwhile and the file is the handle's (same device and inode); ot
 `consensus_slot{1,2}` files — a non-authoritative hint; the pack files are ground truth.
 
 **Pack retention (invariant).** Packs are never pruned: no code deletes an `epoch-{N}` pack that
-holds outputs. The only removal of a data log, `remove_header_only_legacy`, removes a legacy pack
-holding nothing but its header. An install replaces an epoch's files only with the epoch's whole
+holds outputs, but for one its own failed import just created (`db load-state` refuses a datadir
+that holds the bundle epoch's pack, and removes only the `epoch-N` its failed import made). The only
+other removal of a data log, `remove_header_only_legacy`, removes a legacy pack holding nothing but
+its header. An install replaces an epoch's files only with the epoch's whole
 certified chain (`stream_import`, over a pack lacking that chain's final output) or with the same
 log re-indexed or migrated (a read-side heal). The checked batch reads above serve readers that
 record where a batch is (its leader epoch and digest) and treat a missing pack as damage, so

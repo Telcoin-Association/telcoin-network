@@ -150,7 +150,8 @@ the export root can be deleted by retention while a copy or import is in progres
 
 ### 2. Initializing a new node from a bundle
 
-Into a **fresh** datadir (the importer refuses one that already holds reth chain data), load the bundle:
+Into a **fresh** datadir (the importer refuses one whose execution database holds blocks past genesis,
+or whose `consensus-db/epochs` already holds the bundle epoch's pack), load the bundle:
 
 ```
 telcoin-network db load-state /path/to/epoch-N --chain adiri --datadir NEW_DATADIR
@@ -198,12 +199,15 @@ chains above — instead of replaying from genesis.
   pack (reconstructing it needs a pre-epoch-0 genesis descriptor the bundle does not carry), so no
   resume hint is written. Bootstrap from a later epoch.
 - The target datadir must be fresh, all four bundle files must be present, and `--chain` must match the source network.
+  A datadir that kept `consensus-db/` from a node that reached the bundle's epoch holds that epoch's
+  pack, and is refused before anything is written: move `consensus-db/` aside first (a validator
+  restored that way stays stopped until the network has closed the last epoch it took part in).
 - If an import fails it removes only the chain-data directories it created (`db`, `static_files`, `consensus-db`) and leaves your keys and config intact. Never delete the whole datadir (it holds your node keys) — just fix the bundle and re-run.
-- If an import is *killed* rather than failed (SIGKILL, OOM, power loss), that cleanup never runs, so
-  partially written `db`, `static_files`, and `consensus-db` directories are left behind and the next
-  attempt refuses the datadir as non-empty. The remedy is the same surgical one the failure path
-  performs: remove those three directories under the datadir — never the datadir itself, which holds
-  your keys — and re-run. A bundle rejected during the pre-import certificate check creates none of
-  those three directories, so this only applies to a run that was killed after the import started.
+- If an import is *killed* rather than failed (SIGKILL, OOM, power loss), that cleanup never runs: the
+  run leaves the chain data it wrote and its marker `load-state-in-progress`, and the node refuses to
+  start while the marker is there. Re-run `db load-state` with the same bundle: it removes what the
+  stopped run created (never the datadir itself, which holds your keys) and restores again. A bundle
+  rejected during the pre-import certificate check creates no chain data, so this only applies to a
+  run that was killed after the import started.
   (`--chain` still materializes `genesis/committee.yaml` if it is absent, since that file is the
   trust root the check reads; it is config, not chain data, and re-running is unaffected by it.)
