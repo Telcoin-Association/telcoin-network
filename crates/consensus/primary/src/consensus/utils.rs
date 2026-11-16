@@ -1,11 +1,15 @@
 //! Consensus utils
 
 use crate::consensus::ConsensusState;
-use std::collections::HashSet;
-use tn_types::{
-    forks, Certificate, DefaultHashFunction, Hash as _, HeaderDigest, Round, B256, DIGEST_LENGTH,
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt,
 };
-use tracing::debug;
+use tn_types::{
+    forks, AuthorityIdentifier, Certificate, DefaultHashFunction, Hash as _, HeaderDigest, Round,
+    B256, DIGEST_LENGTH,
+};
+use tracing::{debug, info};
 
 /// Domain separator for the post-fork intra-round tie-break key (#1260).
 ///
@@ -39,6 +43,7 @@ pub(crate) fn order_dag_inner(
 
     let mut ordered = Vec::new();
     let mut already_ordered = HashSet::new();
+    let mut skipped = SkippedParents::default();
 
     let mut buffer = vec![leader];
     while let Some(x) = buffer.pop() {
@@ -63,6 +68,9 @@ pub(crate) fn order_dag_inner(
                         .last_committed
                         .get(certificate.origin())
                         .map_or_else(|| false, |r| &certificate.round() <= r);
+                    if skip {
+                        skipped.note(certificate, &state.last_committed);
+                    }
                     if !skip {
                         buffer.push(certificate);
                         already_ordered.insert(digest);
@@ -72,6 +80,7 @@ pub(crate) fn order_dag_inner(
             }
         }
     }
+    skipped.log(leader);
 
     // Ordering the output by round is necessary to make sure batches from early rounds go in before
     // later rounds and to put the leader at the end plus it makes the commit sequence prettier.
@@ -139,6 +148,77 @@ pub fn gc_round(commit_round: Round, gc_depth: Round) -> Round {
     commit_round.saturating_sub(gc_depth)
 }
 
+/// The most `(origin, round)` entries the `skips` field of `subdag parent skipped` lists.
+const MAX_LOGGED_SKIPS: usize = 10;
+
+/// The parents [`order_dag_inner`] skips because their origin already committed a later round:
+/// the fields of the `subdag parent skipped` line.
+///
+/// A parent at exactly its origin's last committed round is that origin's committed certificate
+/// (the DAG holds one certificate per origin and round), so only a parent below it is noted: that
+/// certificate was committed by an earlier sub-dag or is never committed. One sub-dag notes at most
+/// one entry per certificate of its GC window and one edge per parent edge it walks.
+#[derive(Debug, Default)]
+struct SkippedParents {
+    /// The last committed round of each skipped certificate's origin, keyed by the certificate's
+    /// round and origin.
+    certificates: BTreeMap<(Round, AuthorityIdentifier), Round>,
+    /// The parent edges that hit such a skip: a certificate named by three children counts three.
+    edges: usize,
+}
+
+impl SkippedParents {
+    /// Note `certificate`, a parent the ordering skipped, if its round is below its origin's last
+    /// committed round in `last_committed`.
+    fn note(
+        &mut self,
+        certificate: &Certificate,
+        last_committed: &HashMap<AuthorityIdentifier, Round>,
+    ) {
+        let Some(&last) = last_committed.get(certificate.origin()) else {
+            return;
+        };
+        if certificate.round() < last {
+            self.edges += 1;
+            self.certificates.insert((certificate.round(), certificate.origin().clone()), last);
+        }
+    }
+
+    /// Write one `subdag parent skipped` line for the sub-dag of `leader`, if it skipped a parent
+    /// below its origin's last committed round.
+    fn log(&self, leader: &Certificate) {
+        if self.certificates.is_empty() {
+            return;
+        }
+        info!(
+            target: "consensus::metrics",
+            epoch = leader.epoch(),
+            leader_round = leader.round(),
+            skipped = self.certificates.len(),
+            edges = self.edges,
+            skips = %LoggedSkips(&self.certificates),
+            "subdag parent skipped"
+        );
+    }
+}
+
+/// The `skips` field: the lowest [`MAX_LOGGED_SKIPS`] skipped certificates by round, then origin,
+/// as `[origin:round:last_committed,…]` with the full origin id and no spaces.
+struct LoggedSkips<'a>(&'a BTreeMap<(Round, AuthorityIdentifier), Round>);
+
+impl fmt::Display for LoggedSkips<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (index, ((round, origin), last)) in self.0.iter().take(MAX_LOGGED_SKIPS).enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{origin}:{round}:{last}")?;
+        }
+        f.write_str("]")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +246,63 @@ mod tests {
              certificate_digest); a mismatch means the preimage layout changed, which changes \
              every post-fork commit order",
         );
+    }
+
+    /// `subdag parent skipped` on a four-authority DAG of rounds 1 to 3, every certificate citing
+    /// the whole round below, ordered from a round 3 leader. Nothing committed: no line. Then
+    /// authority `a` has committed round 2 and `b` round 3: `a`'s round 2 certificate is skipped
+    /// at its last commit without an entry, `b`'s round 2 certificate is one entry over one edge,
+    /// and the round 1 certificates of both are named by each of the two round 2 certificates
+    /// still ordered: two entries over four edges.
+    ///
+    /// Catches: a line per edge, an entry for a skip at the last committed round, a line for a
+    /// sub-dag without such a skip, and a list in discovery order.
+    #[test]
+    fn subdag_parent_skipped_reports_parents_below_the_last_commit() {
+        use crate::{log_capture::LogCapture, test_utils::make_optimal_certificates};
+        use std::collections::BTreeSet;
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils_committee::CommitteeFixture;
+
+        let capture = LogCapture::new("consensus::metrics");
+        let _capture_guard = tracing::subscriber::set_default(capture.clone());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let ids: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+        let genesis: BTreeSet<_> =
+            Certificate::genesis(&committee).iter().map(|cert| cert.digest()).collect();
+        let (certificates, _) = make_optimal_certificates(&committee, 1..=3, &genesis, &ids);
+        let mut state = ConsensusState::new(50);
+        for certificate in &certificates {
+            state.try_insert(certificate).expect("certificate inserts");
+        }
+        let leader = certificates.iter().find(|cert| cert.round() == 3).expect("a round 3 leader");
+
+        order_dag_inner(leader, &state, false);
+        assert!(capture.events("subdag parent skipped").is_empty(), "nothing committed");
+
+        let others: Vec<AuthorityIdentifier> =
+            ids.iter().filter(|id| *id != leader.origin()).cloned().collect();
+        let (a, b) = (others[0].clone(), others[1].clone());
+        state.last_committed.insert(a.clone(), 2);
+        state.last_committed.insert(b.clone(), 3);
+        let ordered = order_dag_inner(leader, &state, false);
+        assert!(ordered.iter().all(|cert| cert.origin() != &a && cert.origin() != &b));
+
+        let lines = capture.events("subdag parent skipped");
+        assert_eq!(lines.len(), 1, "one line per sub-dag");
+        let line = &lines[0];
+        let names: Vec<&str> = line.fields.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["epoch", "leader_round", "skipped", "edges", "skips"]);
+        assert_eq!(line.u64_field("epoch"), Some(u64::from(leader.epoch())));
+        assert_eq!(line.u64_field("leader_round"), Some(3));
+        assert_eq!(line.u64_field("skipped"), Some(3));
+        assert_eq!(line.u64_field("edges"), Some(5));
+        let expected = BTreeMap::from([((1, a.clone()), 2), ((1, b.clone()), 3), ((2, b), 3)]);
+        let entries: Vec<String> = expected
+            .iter()
+            .map(|((round, origin), last)| format!("{origin}:{round}:{last}"))
+            .collect();
+        assert_eq!(line.field("skips"), Some(format!("[{}]", entries.join(",")).as_str()));
     }
 }
