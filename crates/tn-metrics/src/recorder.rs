@@ -91,6 +91,12 @@ const GAS_BUCKETS: &[f64] = &[
 const BATCH_TRANSACTIONS_BUCKETS: &[f64] =
     &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 750.0, 1_000.0, 1_250.0, 1_500.0];
 
+/// Buckets for `tn_primary_vote_exec_deficit_outputs`, the block-bearing outputs a voter still had
+/// to execute to hold the execution block a vote request names. Fine at the low end, where most
+/// requests sit, up to 64.
+const VOTE_EXEC_DEFICIT_OUTPUTS_BUCKETS: &[f64] =
+    &[0.0, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 64.0];
+
 /// Buckets for `tn_executor_output_batches`, the batch count of one consensus output.
 ///
 /// One output is one committed Bullshark sub-DAG, and a steady-state sub-DAG holds about two
@@ -230,6 +236,10 @@ fn build_prometheus_recorder() -> eyre::Result<PrometheusRecorder> {
         .set_buckets_for_metric(
             Matcher::Full("tn_executor_output_batches".to_string()),
             OUTPUT_BATCHES_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_primary_vote_exec_deficit_outputs".to_string()),
+            VOTE_EXEC_DEFICIT_OUTPUTS_BUCKETS,
         )?;
     let builder = EXECUTION_STAGE_HISTOGRAMS.iter().try_fold(builder, |builder, name| {
         builder.set_buckets_for_metric(Matcher::Full(name.to_string()), SUB_MS_SECONDS_BUCKETS)
@@ -638,5 +648,30 @@ mod tests {
             let first = format!("{name}_bucket{{le=\"0.0001\"}}");
             assert!(!rendered.contains(&first), "{name} took the sub-ms layout: {rendered}");
         });
+    }
+
+    // ---- bench8 bench8-obs ----
+
+    /// The vote execution deficit histogram takes its own buckets through its `Full` matcher, so
+    /// a deficit of 3 outputs lands in `le="4"` and not in `le="2"`.
+    #[test]
+    fn test_vote_exec_deficit_outputs_buckets() {
+        let inner = build_prometheus_recorder().expect("recorder builds");
+        let handle = inner.handle();
+        let recorder = TnPrefixRecorder { inner };
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!("tn_primary.vote_exec_deficit_outputs", "open" => "false")
+                .record(3.0);
+        });
+
+        let rendered = handle.render();
+        [
+            "tn_primary_vote_exec_deficit_outputs_bucket{open=\"false\",le=\"2\"} 0\n",
+            "tn_primary_vote_exec_deficit_outputs_bucket{open=\"false\",le=\"4\"} 1\n",
+            "tn_primary_vote_exec_deficit_outputs_bucket{open=\"false\",le=\"64\"} 1\n",
+        ]
+        .into_iter()
+        .for_each(|line| assert!(rendered.contains(line), "missing {line:?} in {rendered}"));
     }
 }

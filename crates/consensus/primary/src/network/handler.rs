@@ -949,10 +949,15 @@ where
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let author = header.author().clone();
         let (epoch, round) = (header.epoch(), header.round());
+        // read before any wait: the block the header names and this voter's tip on arrival
+        let exec = ExecArrival {
+            named: header.latest_execution_block().number,
+            tip: self.consensus_bus.latest_execution_block_num_hash().number,
+        };
         let mut timing = VoteTiming::new();
         self.vote_metrics.record_request();
         let res = self.vote_request(peer, header, parents, &mut timing).await;
-        self.observe_vote(&author, epoch, round, &res, timing);
+        self.observe_vote(&author, epoch, round, &res, timing, exec);
         res
     }
 
@@ -964,10 +969,22 @@ where
         round: Round,
         res: &PrimaryNetworkResult<PrimaryResponse>,
         mut timing: VoteTiming,
+        exec: ExecArrival,
     ) {
         let total = timing.finish_at(Instant::now());
         let outcome = VoteOutcome::of(res, &timing);
         self.vote_metrics.record_outcome(outcome);
+        // one short read of the ring at the answer, released before anything else: the tip and the
+        // outputs executed since arrival, newest first, so it walks only those entries
+        let (exec_tip_answer, (exec_deficit_outputs, reached)) = {
+            let ring = self.consensus_bus.recent_blocks().borrow();
+            (
+                ring.latest_execution_block_num_hash().number,
+                ring.outputs_to_reach(exec.tip, exec.named),
+            )
+        };
+        let exec_deficit_open = !reached;
+        self.vote_metrics.record_exec_deficit(exec_deficit_outputs, exec_deficit_open);
         match outcome {
             VoteOutcome::Created => self.vote_metrics.record_created(),
             VoteOutcome::Recast => self.vote_metrics.record_recast(),
@@ -997,6 +1014,11 @@ where
             store_ms = timing.stage_ms(VoteStage::VoteStore),
             persist_ms = timing.stage_ms(VoteStage::Persist),
             total_ms = millis(total),
+            exec_named = exec.named,
+            exec_tip_arrival = exec.tip,
+            exec_tip_answer,
+            exec_deficit_outputs,
+            exec_deficit_open,
             "vote path timing"
         );
     }
@@ -2440,6 +2462,16 @@ impl VoteTiming {
     fn stage_ms(&self, stage: VoteStage) -> u64 {
         self.stage(stage).map_or(0, millis)
     }
+}
+
+/// The execution side of a vote request on its arrival, logged on the `vote path timing` line.
+#[derive(Clone, Copy, Debug)]
+struct ExecArrival {
+    /// The number of the execution block the header names (`exec_named`).
+    named: u64,
+    /// This voter's latest executed block number when the request arrived, before any wait
+    /// (`exec_tip_arrival`).
+    tip: u64,
 }
 
 /// How a vote request ended: the `outcome` field of the `vote path timing` line and the

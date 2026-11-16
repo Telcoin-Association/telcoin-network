@@ -348,6 +348,11 @@ pub(crate) struct VoteStageHandles {
     /// [`VoteOutcome::index`](crate::network::handler::VoteOutcome::index)
     /// (`tn_primary_vote_outcomes_total{outcome}`).
     outcomes: [Counter; crate::network::handler::VoteOutcome::COUNT],
+    /// The block-bearing outputs a voter still had to execute to hold a request's execution
+    /// block, indexed by `open` (`tn_primary_vote_exec_deficit_outputs{open}`): index 0
+    /// `open="false"`, the exact count for a block held at the answer; index 1 `open="true"`, the
+    /// outputs executed during a wait that ended without the block, a lower bound.
+    exec_deficit: [Histogram; 2],
 }
 
 impl VoteStageHandles {
@@ -367,6 +372,9 @@ impl VoteStageHandles {
             }),
             outcomes: crate::network::handler::VoteOutcome::ALL.map(|outcome| {
                 metrics::counter!("tn_primary.vote_outcomes_total", "outcome" => outcome.as_str())
+            }),
+            exec_deficit: ["false", "true"].map(|open| {
+                metrics::histogram!("tn_primary.vote_exec_deficit_outputs", "open" => open)
             }),
         }
     }
@@ -409,6 +417,12 @@ impl VoteStageHandles {
     /// Count a finished vote request under its outcome.
     pub(crate) fn record_outcome(&self, outcome: crate::network::handler::VoteOutcome) {
         self.outcomes[outcome.index()].increment(1);
+    }
+
+    /// Record a request's execution deficit in outputs. `open` is a request whose named block was
+    /// not held at the answer: `outputs` then counts only the outputs executed during the wait.
+    pub(crate) fn record_exec_deficit(&self, outputs: u64, open: bool) {
+        self.exec_deficit[usize::from(open)].record(outputs as f64);
     }
 }
 

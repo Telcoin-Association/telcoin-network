@@ -126,6 +126,39 @@ impl RecentBlocks {
         self.executed_blocks.iter().any(|executed| executed.num_hash() == block)
     }
 
+    /// Count the outputs executed above block `tip` that reach block `named`.
+    ///
+    /// The ring holds one entry per executed output that produced a block, so the entries above
+    /// `tip` up to and including the first one at or above `named` are the outputs a node whose tip
+    /// was `tip` had to execute to hold `named`. Returns that count and `true` when an entry
+    /// reaches `named`, otherwise the count of every entry above `tip` and `false`. A `named` at or
+    /// below `tip` is `(0, true)`. Only entries still in the ring count: when more outputs than the
+    /// ring holds executed after `tip`, the count is a lower bound.
+    pub fn outputs_to_reach(&self, tip: BlockNumber, named: BlockNumber) -> (u64, bool) {
+        if named <= tip {
+            return (0, true);
+        }
+        let mut below_named = 0u64;
+        let mut reached = false;
+        // newest first, stopping at the first entry at or below `tip`, so the walk is bounded by
+        // the outputs executed since `tip`. of the entries at or above `named` only the oldest
+        // counts: it is the output that reached `named`
+        for number in self
+            .executed_blocks
+            .iter()
+            .rev()
+            .map(|block| block.num_hash().number)
+            .take_while(|number| *number > tip)
+        {
+            if number < named {
+                below_named = below_named.saturating_add(1);
+            } else {
+                reached = true;
+            }
+        }
+        (below_named.saturating_add(u64::from(reached)), reached)
+    }
+
     /// The ring's part of the execution check (see [`ExecutionCheck`]).
     ///
     /// `Some(NotYet)` while nothing is executed or the executed tip is below `block`'s number,

@@ -7648,3 +7648,142 @@ async fn quorum_exec_block_voter_votes_author_stepping_back_switch_off() -> eyre
 async fn quorum_exec_block_voter_votes_author_stepping_back_switch_on() -> eyre::Result<()> {
     author_stepping_back_is_voted_at_once(true).await
 }
+
+// ---- bench8 vote-exec-tip ----
+
+/// Execute `blocks` on `consensus_bus`'s ring, one output each, `step` apart.
+fn execute_outputs(
+    consensus_bus: &ConsensusBusApp,
+    blocks: Vec<SealedHeader>,
+    step: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let consensus_bus = consensus_bus.clone();
+    tokio::spawn(async move {
+        for block in blocks {
+            tokio::time::sleep(step).await;
+            let number = block.num_hash().number;
+            consensus_bus.recent_blocks().send_modify(|ring| {
+                ring.push_latest(
+                    u32::try_from(number).expect("a small round"),
+                    ConsensusNumHash::new(number, ConsensusHeaderDigest::default()),
+                    Some(block),
+                )
+            });
+        }
+    })
+}
+
+/// The `vote path timing` line ends with the voter's execution side of the request: the block the
+/// header names, the voter's tip on arrival and at the answer, and the block-bearing outputs it
+/// still had to execute to hold the named block. A wait that ends without the block logs the
+/// outputs executed during it with `exec_deficit_open=true`; a block reached inside the wait counts
+/// the outputs that reached it; a block already held is 0. The deficit histogram records each
+/// under its `open` label.
+#[tokio::test(start_paused = true)]
+async fn vote_path_timing_line_carries_exec_deficit() -> eyre::Result<()> {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(LinesAt {
+        target: "primary::network",
+        level: tracing::Level::DEBUG,
+        lines: lines.clone(),
+    });
+    let last_timing_line = || {
+        let lines = lines.lock();
+        lines
+            .iter()
+            .rev()
+            .find(|line| line.starts_with("vote path timing"))
+            .cloned()
+            .expect("a vote path timing line")
+    };
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } = {
+        // the handler resolves its vote metric handles with the recorder active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    // a ring wide enough to keep every output of the test (the fixture's keeps one)
+    let mut ring = RecentBlocks::new(16);
+    ring.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    consensus_bus.recent_blocks().send_replace(ring);
+    let mut chain = vec![parent];
+    for number in 1..=4 {
+        let parent_hash = chain[chain.len() - 1].hash();
+        chain.push(SealedHeader::seal_slow(ExecHeader {
+            number,
+            parent_hash,
+            ..Default::default()
+        }));
+    }
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let step = Duration::from_millis(100);
+    assert!(VOTE_EXECUTION_WAIT > step * 4, "the wait outlasts the outputs the test executes");
+
+    // block 3 is named, block 1 executes during the wait and the wait ends without block 3
+    let executor = execute_outputs(&consensus_bus, vec![chain[1].clone()], step);
+    let _ = handler.vote(peer, header_at(&committee, author, 1, chain[3].num_hash()), vec![]).await;
+    executor.await?;
+    let open = last_timing_line();
+    assert!(open.contains(" outcome=\"behind\" "), "{open}");
+    assert!(
+        open.contains(
+            " exec_named=3 exec_tip_arrival=0 exec_tip_answer=1 exec_deficit_outputs=1 \
+             exec_deficit_open=true"
+        ),
+        "{open}"
+    );
+    assert!(open.find(" total_ms=") < open.find(" exec_named="), "new fields come last: {open}");
+
+    // block 4 is named and reached inside the wait, three outputs after the tip on arrival
+    let executor = execute_outputs(&consensus_bus, chain[2..=4].to_vec(), step);
+    let _ = handler.vote(peer, header_at(&committee, author, 1, chain[4].num_hash()), vec![]).await;
+    executor.await?;
+    let reached = last_timing_line();
+    assert!(
+        reached.contains(
+            " exec_named=4 exec_tip_arrival=1 exec_tip_answer=4 exec_deficit_outputs=3 \
+             exec_deficit_open=false"
+        ),
+        "{reached}"
+    );
+
+    // block 2 is already held on arrival
+    let _ = handler.vote(peer, header_at(&committee, author, 2, chain[2].num_hash()), vec![]).await;
+    let held = last_timing_line();
+    assert!(
+        held.contains(
+            " exec_named=2 exec_tip_arrival=4 exec_tip_answer=4 exec_deficit_outputs=0 \
+             exec_deficit_open=false"
+        ),
+        "{held}"
+    );
+
+    // one snapshot for both series: a snapshot may drain histogram samples
+    let snapshot = snapshotter.snapshot().into_vec();
+    let samples = |open: &str| {
+        snapshot.iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == "tn_primary.vote_exec_deficit_outputs"
+                && key.key().labels().any(|l| l.key() == "open" && l.value() == open))
+            .then_some(value)
+        })
+    };
+    let Some(DebugValue::Histogram(closed)) = samples("false") else {
+        panic!("the open=false deficit series is not registered");
+    };
+    let closed: Vec<f64> = closed.iter().map(|sample| sample.0).collect();
+    assert_eq!(closed, vec![3.0, 0.0], "the held deficits, in request order");
+    let Some(DebugValue::Histogram(open)) = samples("true") else {
+        panic!("the open=true deficit series is not registered");
+    };
+    let open: Vec<f64> = open.iter().map(|sample| sample.0).collect();
+    assert_eq!(open, vec![1.0], "the outputs executed during the wait that missed the block");
+
+    Ok(())
+}
