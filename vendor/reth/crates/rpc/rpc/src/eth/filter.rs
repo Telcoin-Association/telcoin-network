@@ -532,37 +532,32 @@ where
                     return Err(ProviderError::HeaderNotFound(block_hash.into()).into())
                 };
 
-                // Get header - from cached block if available, otherwise from provider
-                let header = if let Some(block) = &maybe_block {
-                    block.header().clone()
-                } else {
-                    self.provider()
-                        .header_by_hash_or_number(block_hash.into())?
-                        .ok_or_else(|| ProviderError::HeaderNotFound(block_hash.into()))?
-                };
-
-                // Check if the block has been pruned (EIP-4444)
-                let earliest_block = self.provider().earliest_block_number()?;
-                if header.number() < earliest_block {
-                    return Err(EthApiError::PrunedHistoryUnavailable.into());
+                if maybe_block.is_some() {
+                    return self.logs_at_block_hash(&filter, block_hash, &receipts, maybe_block)
                 }
 
-                let block_num_hash = BlockNumHash::new(header.number(), block_hash);
+                // TN(TN-0208): without the cached block the header and each matching transaction
+                // are provider reads, which can block (a datadir that stores transactions by batch
+                // position reads them from a consensus pack), so they run on the blocking pool
+                // under a blocking IO permit, as the range scan does.
+                let permit = self
+                    .eth_api
+                    .acquire_owned_blocking_io()
+                    .await
+                    .map_err(|_| EthFilterError::InternalError)?;
 
-                let mut all_logs = Vec::new();
-                append_matching_block_logs(
-                    &mut all_logs,
-                    maybe_block
-                        .map(ProviderOrBlock::Block)
-                        .unwrap_or_else(|| ProviderOrBlock::Provider(self.provider())),
-                    &filter,
-                    block_num_hash,
-                    &receipts,
-                    false,
-                    header.timestamp(),
-                )?;
+                let (tx, rx) = oneshot::channel();
+                let this = self.clone();
+                self.task_spawner.spawn_blocking_task(Box::pin(async move {
+                    let _permit = permit;
+                    // a request dropped before its task started needs no reads
+                    if !tx.is_closed() {
+                        let _ =
+                            tx.send(this.logs_at_block_hash(&filter, block_hash, &receipts, None));
+                    }
+                }));
 
-                Ok(all_logs)
+                rx.await.map_err(|_| EthFilterError::InternalError)?
             }
             FilterBlockOption::Range { from_block, to_block } => {
                 // Handle special case where from block is pending
@@ -639,6 +634,53 @@ where
                     .await
             }
         }
+    }
+
+    /// TN(TN-0208): returns the logs of the block with `block_hash` that match `filter`, from its
+    /// `receipts` and, when the RPC cache holds it, the block.
+    ///
+    /// Without the block, the header and the transaction of each matching receipt are read from
+    /// the provider, which blocks: call it on a blocking thread then.
+    fn logs_at_block_hash(
+        &self,
+        filter: &Filter,
+        block_hash: alloy_primitives::BlockHash,
+        receipts: &[ProviderReceipt<Eth::Provider>],
+        maybe_block: Option<
+            Arc<reth_primitives_traits::RecoveredBlock<ProviderBlock<Eth::Provider>>>,
+        >,
+    ) -> Result<Vec<Log>, EthFilterError> {
+        // Get header - from cached block if available, otherwise from provider
+        let header = if let Some(block) = &maybe_block {
+            block.header().clone()
+        } else {
+            self.provider()
+                .header_by_hash_or_number(block_hash.into())?
+                .ok_or_else(|| ProviderError::HeaderNotFound(block_hash.into()))?
+        };
+
+        // Check if the block has been pruned (EIP-4444)
+        let earliest_block = self.provider().earliest_block_number()?;
+        if header.number() < earliest_block {
+            return Err(EthApiError::PrunedHistoryUnavailable.into());
+        }
+
+        let block_num_hash = BlockNumHash::new(header.number(), block_hash);
+
+        let mut all_logs = Vec::new();
+        append_matching_block_logs(
+            &mut all_logs,
+            maybe_block
+                .map(ProviderOrBlock::Block)
+                .unwrap_or_else(|| ProviderOrBlock::Provider(self.provider())),
+            filter,
+            block_num_hash,
+            receipts,
+            false,
+            header.timestamp(),
+        )?;
+
+        Ok(all_logs)
     }
 
     /// Installs a new filter and returns the new identifier.
@@ -2213,6 +2255,145 @@ mod tests {
 
         drop(permits);
         assert!(scan.await.unwrap().is_empty());
+    }
+
+    /// TN(TN-0208): logs by block hash, for a block the RPC cache does not hold, read the
+    /// provider on the blocking pool under a blocking IO permit, not on the runtime's threads.
+    /// The test runtime has one thread, and another thread holds the provider's header,
+    /// body-index and block stores until the request holds its permit: a request that read them
+    /// inline would block the runtime's thread until the holder gave up. The logs, a provider
+    /// error and the cached path (no permit) are answered as before.
+    #[tokio::test]
+    async fn logs_by_hash_read_the_provider_off_the_runtime() {
+        use alloy_consensus::TxLegacy;
+        use alloy_eips::eip2718::Encodable2718;
+        use reth_db_api::models::StoredBlockBodyIndices;
+        use reth_ethereum_primitives::TransactionSigned;
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+        use std::sync::mpsc;
+
+        let tx = TransactionSigned::new_unhashed(
+            TxLegacy {
+                chain_id: Some(1),
+                nonce: 0,
+                gas_price: 21_000,
+                gas_limit: 21_000,
+                to: alloy_primitives::TxKind::Call(alloy_primitives::Address::ZERO),
+                value: alloy_primitives::U256::ZERO,
+                input: alloy_primitives::Bytes::new(),
+            }
+            .into(),
+            alloy_primitives::Signature::test_signature(),
+        );
+        let header = alloy_consensus::Header { number: 100, ..Default::default() };
+        let hash = header.hash_slow();
+        let provider = MockEthProvider::default();
+        provider.add_block(
+            hash,
+            reth_ethereum_primitives::Block {
+                header,
+                body: reth_ethereum_primitives::BlockBody {
+                    transactions: vec![tx.clone()],
+                    ..Default::default()
+                },
+            },
+        );
+        provider.add_receipts(
+            100,
+            vec![reth_ethereum_primitives::Receipt {
+                tx_type: TxType::Legacy,
+                cumulative_gas_used: 21_000,
+                logs: vec![alloy_primitives::Log {
+                    address: alloy_primitives::Address::ZERO,
+                    data: alloy_primitives::LogData::new_unchecked(
+                        vec![],
+                        alloy_primitives::Bytes::new(),
+                    ),
+                }],
+                success: true,
+            }],
+        );
+        provider
+            .add_block_body_indices(100, StoredBlockBodyIndices { first_tx_num: 0, tx_count: 1 });
+        let indices = provider.block_body_indices.clone();
+        let stores = (
+            provider.headers.clone(),
+            provider.block_body_indices.clone(),
+            provider.blocks.clone(),
+        );
+
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Box::new(TokioTaskExecutor::default()),
+        );
+        let inner = eth_filter.inner.clone();
+        let guard = inner.eth_api.blocking_io_task_guard().clone();
+        let permits = guard.available_permits();
+        let by_hash = || {
+            inner.clone().logs_for_filter(Filter::new().at_block_hash(hash), QueryLimits::default())
+        };
+
+        // the receipts are cached and the block is not, so the request reads the stores only
+        // after the cache
+        inner.eth_cache().get_receipts(hash).await.unwrap().expect("receipts");
+
+        // another thread holds the stores until released, or for 10 s
+        let (locked_tx, locked) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let (headers, indices, blocks) = &stores;
+            let _held = (headers.lock(), indices.lock(), blocks.lock());
+            locked_tx.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(10)).is_ok()
+        });
+        locked.recv().unwrap();
+
+        let request = tokio::spawn(by_hash());
+        let start = Instant::now();
+        while guard.available_permits() == permits &&
+            !request.is_finished() &&
+            start.elapsed() < Duration::from_secs(5)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let taken = permits - guard.available_permits();
+        let _ = release.send(());
+        assert!(holder.join().unwrap(), "the request read the provider on the runtime's thread");
+        assert_eq!(taken, 1, "the request reads under one blocking IO permit");
+
+        let logs = request.await.unwrap().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_hash, Some(hash));
+        assert_eq!(logs[0].block_number, Some(100));
+        assert_eq!(logs[0].transaction_hash, Some(tx.trie_hash()));
+        // the blocking task frees its permit just after it answers
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while guard.available_permits() != permits {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the permit comes back");
+
+        // a provider error on the blocking pool is answered as itself, not as an internal error
+        indices.lock().clear();
+        let err = by_hash().await.unwrap_err();
+        assert!(matches!(err, EthFilterError::EthAPIError(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            EthFilterError::from(ProviderError::BlockBodyIndicesNotFound(100)).to_string()
+        );
+
+        // with the block cached the request reads its transactions from it and takes no permit
+        inner.eth_cache().get_recovered_block(hash).await.unwrap().expect("block");
+        let all = guard.clone().acquire_many_owned(permits as u32).await.unwrap();
+        let cached = tokio::time::timeout(Duration::from_secs(10), by_hash())
+            .await
+            .expect("the cached path waits for no permit")
+            .unwrap();
+        assert_eq!(cached, logs);
+        drop(all);
     }
 
     /// A range mode over `count` consecutive blocks starting at 100, each with one receipt.

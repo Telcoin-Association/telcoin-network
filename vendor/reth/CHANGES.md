@@ -3384,3 +3384,32 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   for the same reads outside a scope. Mutation-checked: without the scope in
   `append_matching_block_logs`, or with the resolver keeping nothing in it, the block's batch is
   read once per transaction and the test fails. *Upstream*: no (TN's format).
+
+- **TN-0208** — Logs by block hash read the provider on the RPC blocking pool when the RPC cache
+  does not hold the block. *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (the `AtBlockHash` arm of
+  `EthFilterInner::logs_for_filter`, `logs_at_block_hash`; test
+  `logs_by_hash_read_the_provider_off_the_runtime`).
+  *Why*: for a block the cache does not hold, the arm read the header, the earliest block and the
+  transaction of each matching receipt (`append_matching_block_logs` with the provider) inside the
+  async handler, on the runtime that drives the RPC server, which in TN also runs the node's other
+  async tasks. Upstream those are static-file row reads; on a datadir that stores transactions by
+  batch position (TN-0201, TN-0202) the transaction reads go through TN's resolver, which can block
+  on a consensus-pack read and decode (once per block since TN-0204). The cache miss now runs the
+  way the range scan has since TN-0019: it takes a blocking-IO permit, runs the reads on the
+  server's blocking pool (`spawn_blocking_task`, which TN routes to its own pool) and awaits the
+  answer; a request dropped before its task starts skips the reads. The reads are the same calls in
+  the same order, moved unchanged into `logs_at_block_hash`, so every answer and error is the
+  same; a closed permit semaphore or a lost task answers `InternalError`, as in the range scan. A
+  block the cache holds is matched on the async side as before, without a permit.
+  `logs_at_block_hash` is synchronous, so the read scope `append_matching_block_logs` enters
+  (TN-0204) opens and closes on the one blocking thread. `eth_getLogs`, `eth_getFilterLogs` and
+  `EngineEthFilter::logs` reach the arm; `eth_getFilterChanges` serves a by-hash filter as a range
+  scan, and `logs` subscriptions match in-memory notifications.
+  *Can reach execution or storage*: no. RPC only: the same reads, on another thread.
+  *Tests*: `logs_by_hash_read_the_provider_off_the_runtime` (on a one-thread runtime, while another
+  thread holds the mock provider's header, body-index and block stores until the request holds a
+  permit; before the change the request blocked the runtime's thread until the holder gave up, and
+  took no permit; also the logs, a missing body index answered as the provider's error, and a
+  cached block answered with every permit taken).
+  *Upstream*: no; upstream has the same shape, where those reads are short.
