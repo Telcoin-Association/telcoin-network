@@ -4738,9 +4738,6 @@ async fn test_header_proposed_reports_bench8_fields() {
             assert_eq!(line.u64_field("num_parents"), Some(listed.len() as u64));
             let expected = format!("[{}]", listed.join(","));
             assert_eq!(line.field("parents"), Some(expected.as_str()), "round {round}");
-            if on && round == 2 {
-                println!("B8-1b sample line: {line:?}");
-            }
         }
     }
 }
