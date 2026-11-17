@@ -3432,7 +3432,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   kept a batch in the thread's read scope now adds `SCAN_READS_PER_RESOLVED_BLOCK` (1,000) to the
   scan's read count before the bound check, so under the default bound of 1,000,000 a scan
   resolves at most 1,000 blocks, then ends with `QueryExceedsMaxReads` and TN-0193's retry range
-  (a single-block range is never refused). The scan reads `TxReadScope::kept`, this thread's count
+  (a single-block range is never refused). That error's text no longer says the query read
+  "receipts and logs", which the weight is neither: it is `query exceeds max reads N, retry with
+  the range A-B`, in the shape of the response limit's `query exceeds max results N, ...`. The scan reads `TxReadScope::kept`, this thread's count
   of the values its scopes keep, before and after `append_matching_block_logs`; TN's resolver
   keeps each batch it resolves in the scope (TN-0204), and only position rows reach it. The
   matching runs on the scan's thread, with no await in it, in every mode: the cached mode passes a

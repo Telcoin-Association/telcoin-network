@@ -798,7 +798,8 @@ where
     ) -> Result<Vec<Log>, EthFilterError> {
         let mut all_logs = Vec::new();
 
-        // TN(TN-0193): the receipts and logs this scan may read, and has read.
+        // TN(TN-0193, TN-0209): the reads this scan may count, and has counted: its receipts and
+        // logs, and the weight of each block whose transactions it resolved.
         let max_reads =
             limits.max_logs_per_response.map(|max| max.saturating_mul(SCAN_READS_PER_RESPONSE_LOG));
         let mut reads = 0usize;
@@ -927,7 +928,7 @@ where
                         max_reads,
                         from_block,
                         to_block = retry_to_block,
-                        "Query exceeded max receipts and logs read"
+                        "Query exceeded max reads"
                     );
                     return Err(EthFilterError::QueryExceedsMaxReads {
                         max_reads,
@@ -1141,12 +1142,12 @@ pub enum EthFilterError {
     /// position.
     #[error("too many addresses or topics in one filter position, the limit is {0}")]
     TooManyFilterValues(usize),
-    /// TN(TN-0193): a range scan read more receipts and logs than it may.
-    #[error(
-        "query reads more than {max_reads} receipts and logs, retry with the range {from_block}-{to_block}"
-    )]
+    /// TN(TN-0193, TN-0209): a range scan counted more reads than it may: its receipts and logs,
+    /// and `SCAN_READS_PER_RESOLVED_BLOCK` for each block whose transactions it resolved. The
+    /// text has the shape of the response limit's, which a client may already retry on.
+    #[error("query exceeds max reads {max_reads}, retry with the range {from_block}-{to_block}")]
     QueryExceedsMaxReads {
-        /// Most receipts and logs one range scan may read
+        /// Most reads one range scan may count
         max_reads: usize,
         /// Start block of the suggested retry range
         from_block: u64,
@@ -2842,6 +2843,8 @@ mod tests {
             ),
             "{err:?}"
         );
+        // the text names the reads, which here are mostly the blocks' weight, not receipts and logs
+        assert_eq!(err.to_string(), "query exceeds max reads 15000, retry with the range 1-14");
         assert_eq!(resolver.calls.load(Ordering::Relaxed), 15, "one batch per block scanned");
         // the retry range fits
         assert_eq!(scan(provider, 14).await.unwrap().len(), 14);
