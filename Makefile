@@ -157,7 +157,8 @@ help:
 	@echo "    :::> Run actionlint and shellcheck (pinned Docker images) on the release workflow and scripts." ;
 	@echo ;
 	@echo "make yubikey-setup" ;
-	@echo "    :::> One-time maintainer setup: provision the release signing key on a YubiKey (etc/yubikey-setup.sh run)." ;
+	@echo "    :::> One-time maintainer setup: provision the release signing key on a YubiKey (yubikey-setup.sh run in the release submodule)." ;
+	@echo "    :::> A new key is a pull request to tn-release-signing, then a release submodule pointer move here. Runbook: docs/src/maintainers/yubikey-setup.md." ;
 	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
@@ -634,10 +635,16 @@ release-prep release-tag release-build release-sign release-verify release-publi
 	./etc/release.sh $(patsubst release-%,%,$@) "$(TAG)"
 
 # one-time maintainer setup for the release signing key; runbook: docs/src/maintainers/yubikey-setup.md
+# The script belongs to tn-release-signing, which this repository carries as the release
+# submodule. It works only from the root of a checkout of that repository, so it runs from
+# release/. The allowlist file it stages goes to tn-release-signing as a pull request, and the
+# key signs releases here once that merges and the release submodule pointer moves past it.
 yubikey-setup:
-	./etc/yubikey-setup.sh run
+	@test -f release/yubikey-setup.sh || { echo "run git submodule update --init -- release first"; exit 2; }
+	cd release && ./yubikey-setup.sh run
 
-# lint the release workflows and scripts with pinned actionlint and shellcheck images
+# lint the release workflows and scripts with pinned actionlint and shellcheck images; the
+# scripts in the release submodule are linted in their own repository
 release-lint:
 	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color .github/workflows/release.yaml .github/workflows/docs.yaml
-	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE) shellcheck -x -S style etc/release.sh etc/yubikey-setup.sh .github/scripts/verify_commit_hash.sh
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE) shellcheck -x -S style etc/release.sh .github/scripts/verify_commit_hash.sh
