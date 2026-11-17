@@ -581,6 +581,8 @@ async fn a_lost_pack_imported_from_a_sealed_copy_passes_the_start() -> eyre::Res
             install,
             std::time::Duration::from_secs(30),
             tn_storage::consensus_pack::IMPORT_MIN_FREE_BYTES,
+            // only epoch 0 is checked against the genesis committee
+            None,
         )
     };
     // a node start: the chain opens, then the execution database attaches its packs

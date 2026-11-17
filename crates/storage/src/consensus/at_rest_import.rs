@@ -548,7 +548,18 @@ fn pack_damage(data: &Path, record: &EpochRecord, previous: &EpochRecord) -> Opt
     }
     let report = match validate_pack_file(data, epoch, Some(previous)) {
         Ok(report) if report.verdict == Verdict::Invalid => {
-            return Some(format!("`db validate --epoch {epoch}` finds it INVALID"))
+            let against = match epoch.checked_sub(1) {
+                Some(before) => format!("this node's record of epoch {before}"),
+                None => "the genesis committee's start of epoch 0".to_owned(),
+            };
+            let first = report
+                .issues
+                .first()
+                .map_or_else(|| "none listed".to_owned(), |issue| format!("{issue:?}"));
+            return Some(format!(
+                "it does not validate against {against} ({} issue(s), the first: {first})",
+                report.issues.len(),
+            ));
         }
         Ok(report) => report,
         Err(e) => return Some(format!("its validation failed: {e}")),
@@ -1251,6 +1262,18 @@ mod test {
         rebuild_epoch1(&base, &epoch1, 2, 2).await;
         incomplete(check(1, None), "ends at output 5");
         rebuild_epoch1(&base, &epoch1, 2, 3).await;
+        assert_eq!(check(1, None), PastPackCheck::Complete);
+        // another chain's pack of epoch 1 does not chain to this node's record of epoch 0
+        let other = tmp.path().join("other-chain");
+        closed_epochs(&other).await;
+        let whole = tmp.path().join("whole-epoch-1");
+        std::fs::rename(base.join("epoch-1"), &whole).unwrap();
+        copy_dir(&other.join("epoch-1"), &base.join("epoch-1"));
+        let PastPackCheck::Incomplete(why) = check(1, None) else { panic!("another chain's pack") };
+        assert!(why.contains("does not validate against this node's record of epoch 0"), "{why}");
+        assert!(!why.contains("db validate"), "the check names what failed, not a command: {why}");
+        std::fs::remove_dir_all(base.join("epoch-1")).unwrap();
+        std::fs::rename(&whole, base.join("epoch-1")).unwrap();
         assert_eq!(check(1, None), PastPackCheck::Complete);
     }
 
