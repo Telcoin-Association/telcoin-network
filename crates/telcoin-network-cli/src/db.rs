@@ -139,7 +139,9 @@ enum DbSubcommand {
     /// Migrate legacy consensus packs to v2 (dry run unless --force).
     ///
     /// Rewrites each legacy (pre-v2) epoch pack into a v2 data log (header-first), rebuilds its
-    /// indexes, and seals it; the node also migrates an epoch's pack when it opens or reads it.
+    /// indexes, and seals it. The node migrates a pack itself only when it resumes its epoch or
+    /// reads the epoch's consensus data (for a peer, or a consensus lookup); reads of its
+    /// transactions by position fail on a legacy pack until it is migrated.
     /// The node MUST be stopped: it refuses while a node holds the datadir, and holds the datadir
     /// while it runs. Without `--force` it reports what it would migrate and changes nothing. A
     /// pack whose committed data is damaged is reported with its recovery, never truncated. Exits
@@ -581,8 +583,10 @@ fn validate_pack(
                 writeln!(
                     out,
                     "legacy v0 pack: a dry run of its migration to v2 copies {outputs} \
-                     output(s) cleanly; `db migrate --force`, or the node when it opens or \
-                     reads this epoch, converts it."
+                     output(s) cleanly; `telcoin-network db migrate --force` converts it. Until \
+                     then reads of its transactions by position fail: the node converts it only \
+                     when it resumes this epoch or reads its consensus data (for a peer, or a \
+                     consensus lookup), never for a transaction read."
                 )?;
                 Ok(())
             }
@@ -693,8 +697,9 @@ fn validate_pack(
 
 /// A truncatable tail heals only where the node opens the epoch for append: the epoch it resumes
 /// (or one it has yet to reach). The node only reads a past epoch and never truncates it, so there
-/// the tail needs `db repair`: report that and fail. A legacy (pre-v2) pack is exempt, since the
-/// node migrates it to v2 when it reads the epoch, which drops the tail.
+/// the tail needs `db repair`: report that and fail. A legacy (pre-v2) pack is exempt: its
+/// migration to v2 drops the tail (`db migrate --force`, or the node when it resumes the epoch or
+/// reads its consensus data), as [`print_legacy_tail_note`] says.
 fn require_current_epoch_for_tail(
     data_file: &Path,
     epoch: Epoch,
@@ -751,8 +756,9 @@ fn newest_epoch_beside(data_file: &Path) -> Option<Epoch> {
 }
 
 /// For a legacy (pre-v2) pack whose unacked tail is truncatable, say how it goes away: the
-/// migration to v2 drops it, whether run by `db migrate` or by the node when it opens or reads the
-/// epoch. (A v2 pack's tail is covered by the printed corruption's recommended action.)
+/// migration to v2 drops it, run by `db migrate --force`, or by the node only when it resumes the
+/// epoch or reads its consensus data (a read of its transactions by position fails instead). (A
+/// v2 pack's tail is covered by the printed corruption's recommended action.)
 fn print_legacy_tail_note(
     data_file: &Path,
     epoch: Epoch,
@@ -762,8 +768,10 @@ fn print_legacy_tail_note(
         if version < SENTINEL_MIN_VERSION {
             writeln!(
                 out,
-                "note: legacy (v{version}) pack — migrating it to v2 (`db migrate --force`, or the \
-                 node when it opens or reads this epoch) drops this unacked tail."
+                "note: legacy (v{version}) pack — its migration to v2 drops this unacked tail: \
+                 `telcoin-network db migrate --force` converts it. Until then reads of its \
+                 transactions by position fail: the node converts it only when it resumes this \
+                 epoch or reads its consensus data (for a peer, or a consensus lookup)."
             )?;
         }
     }
@@ -3681,8 +3689,11 @@ mod tests {
             pack.commit().unwrap();
         };
         let validate = || {
-            super::DbValidateArgs { path: Some(epoch_dir.clone()), epoch: None, all: false }
-                .execute(&dir.path().to_path_buf())
+            let mut out = Vec::new();
+            let result =
+                super::DbValidateArgs { path: Some(epoch_dir.clone()), epoch: None, all: false }
+                    .run(&dir.path().to_path_buf(), &mut out);
+            (result, String::from_utf8(out).unwrap())
         };
 
         // The meta's committee must decode (a real committee of more than one authority).
@@ -3694,12 +3705,17 @@ mod tests {
             PackRecord::EpochMeta(EpochMeta { committee: committee.build(), ..Default::default() });
         write_v0(std::slice::from_ref(&meta));
         assert_eq!(super::legacy_migration_dry_run(&data_file, 0), Ok(0));
-        assert!(validate().is_ok(), "a v0 pack that migrates cleanly validates");
+        let (result, report) = validate();
+        assert!(result.is_ok(), "a v0 pack that migrates cleanly validates: {report}");
+        // only `db migrate` converts it: the node's transaction reads of it fail until then
+        assert!(report.contains("`telcoin-network db migrate --force` converts it"), "{report}");
+        assert!(report.contains("reads of its transactions by position fail"), "{report}");
+        assert!(!report.contains("when it opens or reads"), "{report}");
 
         // A batch with no consensus header after it belongs to no output: the migration refuses.
         write_v0(&[meta, PackRecord::Batch(tn_types::Batch::default())]);
         assert!(super::legacy_migration_dry_run(&data_file, 0).is_err());
-        assert!(validate().is_err(), "a v0 pack the migration refuses fails validation");
+        assert!(validate().0.is_err(), "a v0 pack the migration refuses fails validation");
     }
 
     #[test]
