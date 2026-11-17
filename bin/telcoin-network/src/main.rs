@@ -1,6 +1,10 @@
 //! Main binary for TN CLI
 
-use telcoin_network_cli::{cli::Cli, passphrase::get_bls_passphrase_from_env, NoArgs};
+use telcoin_network_cli::{
+    cli::{exit_status, Cli},
+    passphrase::get_bls_passphrase_from_env,
+    NoArgs,
+};
 use tn_node::launch_node;
 
 fn main() {
@@ -20,6 +24,7 @@ fn main() {
         launch_node(builder, tn_datadir, key_config, version)
     }) {
         eprintln!("Error: {err:?}");
-        std::process::exit(1);
+        // a fork stop exits with its own status, so a supervisor can leave it stopped
+        std::process::exit(exit_status(&err));
     }
 }

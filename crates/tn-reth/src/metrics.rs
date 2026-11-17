@@ -1314,7 +1314,9 @@ const TX_BODY_RESOLVES: &str = "tn_reth.tx_body_resolves_total";
 
 /// Counter of the blocks whose transactions, stored by batch position, could not be resolved,
 /// labeled by why (`reason`). Alert on any nonzero value: the read returned an error, and every
-/// later read of those transactions will until the packs are restored.
+/// later read of those transactions will until the packs are restored. `permit_timeout` is the
+/// exception: the node's pack reads were all busy (a burst of RPC history reads), and the same
+/// read answers once they are not.
 const TX_BODY_RESOLVE_FAILURES: &str = "tn_reth.tx_body_resolve_failures_total";
 
 /// Counter of the closed epochs' consensus packs the transaction resolver opened. Each open reads

@@ -598,7 +598,8 @@ and the default build reads an MDBX database to migrate it). Every backend diffe
   checks stat each name with `symlink_metadata` (a symbolic link counts as present, dangling or
   not), so a stat error fails the open. The MDBX build's error names the
   directory and both engines; the operator runs the default build or starts from a fresh datadir
-  (or `db load-state`). The MDBX build also refuses a migrated `db/` whose `tn-lmdb.dat` is
+  (or `db load-state`; a validator then stays stopped until the network has closed the last epoch
+  it took part in). The MDBX build also refuses a migrated `db/` whose `tn-lmdb.dat` is
   missing (the marker `db/mdbx-migrated` alone), saying to restore the file and run a build
   without `mdbx`, rather than create a new database in its place. It warns of a stopped migration's temp
   directory (`db/tn-lmdb-migrating/`, a partial copy beside an unchanged MDBX database), naming it
@@ -794,12 +795,13 @@ one of reth's: its rows are not copied (reth does not read them either).
   | `mdbx.dat` beside `tn-lmdb.dat` and the emptied `db/tn-lmdb-migrating/`, differing in length or MDBX transaction id from the record `db/tn-lmdb-migrating/mdbx-source` | an MDBX build (an older binary) wrote MDBX between the migration's commit point and its version file; removing `mdbx.dat` would roll those writes back | both files are kept. When the error says MDBX is at a later transaction than the migration copied, the MDBX build advanced it with the static files: remove `db/tn-lmdb.dat` and `db/tn-lmdb-migrating/`, then start this build again, which migrates `mdbx.dat` from the start. Otherwise (`mdbx.dat` may be one an MDBX build created anew, pruning the static files down to it) rebuild as above. Do not start an older release on the datadir |
   | an unfinished migration (the emptied `db/tn-lmdb-migrating/` beside `tn-lmdb.dat`) whose `tn-lmdb.dat` this build cannot open, say in another tn-lmdb format version | a stopped migration of an older build | nothing is changed. With `mdbx.dat` still there: remove `db/tn-lmdb.dat` and `db/tn-lmdb-migrating/`, then start again, which migrates MDBX from the start. Without it: rebuild as above |
   | an unfinished migration whose `mdbx.dat` another process has open (`MDBX_BUSY`, "another process has the MDBX database open") | two datadirs name one `db/`, and an MDBX build runs on the other | both files are kept: stop that process, then start again |
-  | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`) |
+  | `db/mdbx-migrated` without `tn-lmdb.dat` | the migrated database is missing | restore `tn-lmdb.dat`, or start from a fresh datadir (or `db load-state`; a validator then stays stopped until the network has closed the last epoch it took part in) |
   | an MDBX database whose `storage_settings` row or TN layout marker says v2, does not parse, or names an unknown format version (`refuse_non_v1_source`) | the migration changes the engine, never the layout, and no TN build writes v2 on MDBX | MDBX is unchanged: resolve by hand |
 
 - **No rollback:** once `mdbx.dat` is removed there is no way back to MDBX. The MDBX build of this
   tree refuses a `db/` holding `tn-lmdb.dat`, or the marker without it (saying to restore the file
-  and run a tn-lmdb build), so going back means a fresh datadir (or `db load-state`). A release
+  and run a tn-lmdb build), so going back means a fresh datadir (or `db load-state`; a validator
+  then stays stopped until the network has closed the last epoch it took part in). A release
   from before the backend guard has no such refusal; what stops it is the version file: it
   refuses `db/database.version` (1002, the tn-lmdb version) before it opens anything, so `db/` and
   `static_files/` are left as they were and the tn-lmdb build still runs on them. Do not edit or
@@ -948,7 +950,9 @@ as its index in the consensus batch its block executed ("Transactions stored by 
   configuration`). Not caught: a data, offsets or `.csoff` file of another file of the segment with
   the same length (every change-set file starts at row 0), or another file's longer data and
   offsets under a segment's latest file, which startup cuts to the `.conf`; they read as this
-  file's values with no error. Copy or restore whole datadirs, never single static files.
+  file's values with no error. Copy or restore whole datadirs, never single static files (a
+  validator restored that way stays stopped until the network has closed the epoch it was last
+  in).
   **Operator response:** the file is damaged on this node only (disk or memory fault,
   or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
   wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start
@@ -1004,7 +1008,11 @@ CHANGES.md TN-0200..0203.
      past pack that still fails its open with no handoff or install in progress is damaged: the
      read fails at once, and the chain's read-side heal rebuilds its indexes in the background.
 
-  At most 4 pack reads run at once. Each position is checked against the batch's length and its
+  At most 4 pack reads run at once, node-wide, and at most 124 more reads wait for one (`MAX_PERMIT_WAITERS`).
+  With the 4 readers that is 128 threads, half of the 256 that each RPC server's blocking pool keeps beyond its blocking-IO permits, which these reads do not take.
+  A read that finds 124 waiting fails at once, and one still waiting at its deadline fails then, both as `permit_timeout`.
+  The deadline is one second after the read began (`PACK_WAIT`), shared with the waits for a pack being sealed or replaced, so a read that tries again does not wait a second each time.
+  Each position is checked against the batch's length and its
   transaction decoded (EIP-2718). A read by hash checks the resolved transaction's hash too.
 
   `eth_getLogs`, on a block the RPC cache does not hold, reads the transaction of each matching
@@ -1018,7 +1026,8 @@ CHANGES.md TN-0200..0203.
   another transaction. Each failed block counts in `tn_reth_tx_body_resolve_failures_total` by
   `reason`: `no_batch_digest`, `packs_not_attached`, `pack_missing`, `batch_missing`, `read` (a
   pack read failed, its digest check included), `position_out_of_range`, `decode`,
-  `batch_too_large`, `handoff_timeout`. A read by hash that resolves another transaction fails as
+  `batch_too_large`, `handoff_timeout`, `permit_timeout` (the node's pack reads were all busy: the read can be retried).
+  A read by hash that resolves another transaction fails as
   well (TN-0202's `TxBodyMismatch`), outside that counter. The other series:
   `tn_reth_tx_body_resolves_total` by `source` (`recent`, `cold`, `live_pack`, `closed_pack`,
   `scoped` for a read answered from the read scope; `memory` in test builds),
@@ -1078,7 +1087,8 @@ CHANGES.md TN-0200..0203.
     validate --epoch N` reports the pack's damage and `db repair` fixes what it can
     (crates/storage/README.md); otherwise `db import-epoch` replaces that epoch's pack with a
     verified copy, from a backup taken after it closed or another node's, or start over as above.
-  - `handoff_timeout`: a closed epoch's pack stayed unsealed or mid-install for a second. During
+  - `handoff_timeout`: a closed epoch's pack was still unsealed or mid-install when the read's
+    one-second deadline passed (the second also covers any wait for a pack-read permit). During
     an epoch handoff it passes; if it stays, a past epoch's pack was left unsealed: `db
     validate`.
 - **Moving between formats.** An inline datadir becomes a version-2 one only by a rebuild: `db
@@ -1294,7 +1304,21 @@ because the copied execution database replaces the rebuild.
   first epoch that differs, not the block. On a mismatch the node logs `stored epoch record
   final_state does not match this node's closing block` with the epoch and both blocks, counts
   `tn_epoch_final_state_mismatches_total`, and stops; a restart stops again when it enters the next
-  epoch. Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
+  epoch.
+  The closing block must also be the block where the epoch-closing calls ran for the record's
+  `final_consensus`: its `parent_beacon_block_root` is that consensus header's digest, its nonce
+  carries the epoch, and its `extra_data` is the 32-byte closing seed (compared with the seed of the
+  boundary header the node closed on when it holds one; an adiri build skips the `extra_data`
+  compare for epochs up to 160). A record the node builds at a close gets the same check before it
+  is saved, voted on or published. A block that fails logs `epoch record final_state is not the
+  block where the epoch-closing calls ran, stopping the node` with the failed comparison as
+  `check`, where it was checked as `path` (`built`, `rederived`, `stored` or `entry`) and what the
+  stop prevents as `reason`, and stops the node. Every check counts in
+  `tn_epoch_epoch_record_closing_block_check_total{result}` (`ok`, `no_block`, `beacon_root`,
+  `nonce_epoch`, `extra_data_length` or `extra_data_seed`), and every record the node publishes as
+  its own logs `epoch record published` with its `final_state`, `final_consensus`, `digest` and
+  `branch`.
+  Only the epoch-0 placeholder is not compared: the epoch-0 close replaces it. A
   `restored-state-floor` beside a full consensus database (one copied in with a restored
   observer's execution database by the swap below) moves aside with the execution database, so the
   rebuild executes and compares every epoch, including those below the old floor (the below-floor

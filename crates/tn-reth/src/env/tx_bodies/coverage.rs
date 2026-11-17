@@ -37,7 +37,8 @@ use crate::RethEnv;
      node's certified epoch records and with `--force` installs it; without one, start over as \
      a new node, \
      moving both the execution database (`telcoin-network db reset-execution`) and `consensus-db` \
-     aside, or swap in the execution database of an observer bootstrapped with \
+     aside (a validator then stays stopped until the network has closed the last epoch it took \
+     part in), or swap in the execution database of an observer bootstrapped with \
      `telcoin-network db load-state` from epoch {} or a later one (`db reset-execution --for-swap`)",
     blocks.start(),
     blocks.end(),

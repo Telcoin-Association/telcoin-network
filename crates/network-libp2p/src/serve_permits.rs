@@ -25,9 +25,11 @@
 //! the pool has free permits, so one peer cannot hold a whole class. The per-peer counts keep only
 //! peers that hold a permit. An unbounded class keeps no per-peer counts.
 //!
-//! A permit is held for the whole task. For `vote` that includes a wait on the author's vote lock
-//! in the primary's request handler, behind an earlier vote request of the same peer. The per-peer
-//! share bounds that wait to one task per peer.
+//! A permit is held for the whole task. For `vote` that is all of the primary's request handler:
+//! the wait for the author's vote lock, behind an earlier vote request of the same peer, every wait
+//! under that lock, and the bounded wait for execution that runs before the lock. The per-peer
+//! share bounds how many of one peer's vote tasks wait at once: all of them can wait for
+//! execution at the same time.
 //!
 //! Every series carries the `network` and `class` labels only, so the cardinality is the six
 //! classes per swarm. The pools register all six classes at construction, so `gossip` and

@@ -307,7 +307,9 @@ pub struct Parameters {
     /// Must be at least `max_header_delay + max_header_time_drift_tolerance` (the tolerance lives
     /// in the network config's `sync_config`; while the sub-second gate is dormant for the epoch
     /// it is rounded up to whole seconds, matching the voter), above the voter's 1 s execution
-    /// wait (`VOTE_EXECUTION_WAIT`) and below the 10 s libp2p request timeout.
+    /// wait (`VOTE_EXECUTION_WAIT`) and below 9 s: the 10 s libp2p request timeout less the
+    /// execution wait, which the voter does before it takes the author lock and starts this
+    /// timeout.
     /// `ConsensusConfig::validate_epoch_timing` rejects other values, and the node runs
     /// it on entering any epoch it can still vote in, so it refuses to start such an epoch with
     /// one. An epoch its committee has already closed is replayed without the check. Defaults to
@@ -1226,5 +1228,50 @@ mod test {
             listed
         );
         Ok(())
+    }
+
+    /// Parses a parameters file that holds the one required key plus the `extra` lines.
+    fn parse_with(extra: &str) -> Parameters {
+        let yaml = format!("basefee_address: \"{GOVERNANCE_SAFE_ADDRESS}\"\n{extra}");
+        serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("{extra:?} must parse: {e}"))
+    }
+
+    /// Re-serializing a parameters file keeps every key it held at the same value, and the result
+    /// parses back to the same parameters.
+    ///
+    /// Strings compare without case: an address is written back in lowercase hex whatever its
+    /// checksum case in the file, which is the same address.
+    #[test]
+    fn reserializing_keeps_the_existing_keys() {
+        let lowercase = |value: &serde_yaml::Value| match value {
+            serde_yaml::Value::String(text) => serde_yaml::Value::String(text.to_lowercase()),
+            other => other.clone(),
+        };
+        let bench5 = format!(
+            "basefee_address: \"{GOVERNANCE_SAFE_ADDRESS}\"\nmax_header_delay: 300ms\n\
+             min_header_delay: 250ms\nvote_timeout: 5s\ngc_depth: 50\n\
+             header_num_of_batches_threshold: 1\nmax_header_num_of_batches: 10\n\
+             max_batch_delay: 200ms\nsync_retry_delay: 5s\n"
+        );
+        for text in [bench5.as_str(), MAINNET_PARAMETERS, TESTNET_PARAMETERS] {
+            let input: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml parses");
+            let params: Parameters = serde_yaml::from_str(text).expect("parameters parse");
+            let output = serde_yaml::to_value(&params).expect("parameters serialize");
+            for (key, value) in input.as_mapping().expect("a parameters file is a mapping") {
+                assert_eq!(
+                    output.get(key).map(lowercase),
+                    Some(lowercase(value)),
+                    "key {key:?} changed on re-serialization"
+                );
+            }
+            let reparsed: Parameters = serde_yaml::from_value(output).expect("output parses");
+            assert_eq!(reparsed, params);
+        }
+    }
+
+    /// An unknown key is ignored, so a mistyped key leaves the node at its defaults.
+    #[test]
+    fn unknown_keys_are_ignored() {
+        assert_eq!(parse_with("no_such_switch: true\nanother_unknown: 3ms"), parse_with(""));
     }
 }

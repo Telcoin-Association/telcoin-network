@@ -18,13 +18,17 @@
 use crate::{
     consensus::LeaderSchedule,
     error::{ProposerError, ProposerResult},
-    metrics::{DigestsRequeuedHandles, HeadersProposedHandles, ProposeReason, RequeueCause},
-    ConsensusBus,
+    metrics::{
+        DigestsRequeuedHandles, HeadersProposedHandles, OrderHoldHandles, ProposeReason,
+        RequeueCause, RequeueOrderUnknown, RequeuedOrderUnknownHandles, RequeuedOutOfOrderHandles,
+    },
+    order_hold::{HoldPlan, OwnChainOrder},
+    ConsensusBus, RecentBlocks,
 };
 use reth_metrics::metrics::Counter;
 use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, VecDeque},
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     time::Instant,
 };
@@ -32,9 +36,9 @@ use tn_config::{ConsensusConfig, KeyConfig};
 use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
     forks::{seed_signature_active, subsecond_timestamp_active},
-    now_ms, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
-    EpochSeedMessage, Hash as _, Header, HeaderDigest, Noticer, Round, TaskManager, TaskSpawner,
-    TnReceiver, TnSender, VotingPower, WorkerId,
+    now_ms, AuthorityIdentifier, BlockHash, BlockNumHash, BlockNumber, Certificate, Committee,
+    Database, Epoch, EpochDigest, EpochSeedMessage, Hash as _, Header, HeaderDigest, Noticer,
+    Round, TaskManager, TaskSpawner, TnReceiver, TnSender, VotingPower, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -62,8 +66,15 @@ impl OurDigestMessage {
     /// Splits the message into components required for processing the batch.
     fn process(self) -> (oneshot::Sender<()>, ProposerDigest) {
         let OurDigestMessage { digest, worker_id, ack_channel } = self;
-        let digest =
-            ProposerDigest { digest, worker_id, received: Instant::now(), requeued: false };
+        let now = Instant::now();
+        let digest = ProposerDigest {
+            digest,
+            worker_id,
+            received: now,
+            first_received: now,
+            requeued: false,
+            seq: None,
+        };
         (ack_channel, digest)
     }
 }
@@ -78,14 +89,28 @@ struct ProposerDigest {
     /// The worker that produced this block.
     pub worker_id: WorkerId,
     /// When the proposer queued this digest: its arrival from the worker, or its re-queue after
-    /// the header that carried it was not committed. The `header proposed` line and
-    /// `tn_primary_digest_wait_seconds` measure the oldest digest's wait from here.
+    /// the header that carried it was not committed. The `header proposed` line's
+    /// `oldest_digest_wait_ms` measures the oldest digest's wait from here.
     pub received: Instant,
+    /// When the proposer first received this digest from its worker, kept across re-queues.
+    /// `tn_primary_digest_wait_seconds` and the `header proposed` line's `oldest_requeue_wait_ms`
+    /// measure from here, so a digest that rode an uncommitted header still reports its whole
+    /// wait. Equal to `received` until a re-queue; a re-queued digest this proposer never received
+    /// (it rode a stored header re-sent after a restart) starts here at its re-queue.
+    pub first_received: Instant,
     /// Whether this digest was re-queued at least once, so `received` marks its latest re-queue
     /// rather than its arrival from the worker. The `header proposed` line counts these as
     /// `requeued`, which splits headers whose digest wait may be cut short by a re-queue from the
     /// rest.
     pub requeued: bool,
+    /// This digest's place in its worker's lane: the order the worker reported it in, counted per
+    /// worker from zero over the proposer's life (one epoch), and kept across re-queues. `None`
+    /// when this proposer does not know it: the digest rode a stored header re-sent after a
+    /// restart or a header re-sent after an own commit had settled its round, or its worker
+    /// reported it twice and the other copy kept the sequence. Read only to count
+    /// re-queues out of order (issue #1807, see [`LaneSequences`]), never when a header's contents
+    /// are chosen.
+    pub seq: Option<u64>,
 }
 
 #[cfg(test)]
@@ -146,6 +171,14 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
     proposed_headers: BTreeMap<Round, Header>,
+    /// The first receipt of each batch digest drained into an own header this proposer still
+    /// holds: the header being built, or one tracked in [`Self::proposed_headers`]. A header's
+    /// payload keeps no time, so a re-queue takes the digest's stamp back from here and its wait
+    /// keeps counting from its first receipt. A stamp leaves when its digest is re-queued or its
+    /// header commits, so this holds at most the payloads of the tracked headers and the one in
+    /// flight. A digest in two tracked headers (its worker reported it twice) has one stamp, which
+    /// the first header to leave takes, so the other copy's wait restarts at its re-queue.
+    proposed_first_received: BTreeMap<BlockHash, Instant>,
     /// The consensus leader schedule to be used in order to resolve the leader needed for the
     /// protocol advancement.
     leader_schedule: LeaderSchedule,
@@ -165,6 +198,29 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     headers_proposed: HeadersProposedHandles,
     /// The `tn_primary_digests_requeued_total{cause}` counters, resolved once per epoch.
     digests_requeued: DigestsRequeuedHandles,
+    /// Each worker lane's sequence of reported digests and where the drained ones are, for the
+    /// out-of-order re-queue counter (issue #1807). Observability only.
+    lane_seqs: LaneSequences,
+    /// The highest own round a commit notice named in this proposer's life. Handling that notice
+    /// takes every tracked header at or below it out of [`Self::proposed_headers`], and that is
+    /// the only place it rises; a proposal result at or below it is not tracked again (the
+    /// guard in `Self::handle_proposal_result`). Every tracked header therefore lies above it,
+    /// a re-queue never meets a header tracked again after its own commit, and the
+    /// `stale_resend` reason of `tn_primary_requeued_order_unknown_total` stays 0. It starts
+    /// at 0 after a restart, so a committed header the restarted proposer re-sends from the
+    /// store is tracked, and its digests count as `unknown_seq` when they are re-queued.
+    committed_own_round: Round,
+    /// The `tn_primary_requeued_out_of_order_total{cause}` counters, resolved once per epoch.
+    requeued_out_of_order: RequeuedOutOfOrderHandles,
+    /// The `tn_primary_requeued_order_unknown_total{reason}` counters, resolved once per epoch.
+    requeued_order_unknown: RequeuedOrderUnknownHandles,
+    /// The own-chain order hold of issue #1807, consulted for every new header. A field of the
+    /// epoch's proposer because its record names a header by round alone, and rounds restart
+    /// every epoch.
+    order_hold: OwnChainOrder,
+    /// The `tn_primary_headers_held_total` and `tn_primary_digests_held` handles, resolved once
+    /// per epoch.
+    order_hold_metrics: OrderHoldHandles,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -200,6 +256,26 @@ struct ProposalTrigger {
     pending_before: usize,
     /// `tn_primary_headers_proposed_total{reason}` for [`Self::reason`].
     proposed: Counter,
+    /// The new header's place in the own chain and what the order hold of issue #1807 kept back.
+    hold: HoldReport,
+}
+
+/// The order-hold fields of a new header's `header proposed` line (issue #1807).
+///
+/// Observability only. The three counts are zero when the hold keeps nothing back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HoldReport {
+    /// The header's parents carry this node's certificate of the own header tracked at the
+    /// previous round (see [`HoldPlan::own_parent`]).
+    own_parent: bool,
+    /// Digests the hold left in the queue: those still queued in a held lane once the header took
+    /// its share.
+    held: usize,
+    /// Workers whose lanes the hold kept back: [`HoldPlan::held_workers`].
+    held_lanes: usize,
+    /// Tracked older own headers with digests that the parents do not prove to be ancestors of
+    /// the header: [`HoldPlan::blockers`].
+    blockers: usize,
 }
 
 impl<DB: Database> Proposer<DB> {
@@ -294,6 +370,7 @@ impl<DB: Database> Proposer<DB> {
             digests: BTreeMap::new(),
             next_lane: 0,
             proposed_headers: BTreeMap::new(),
+            proposed_first_received: BTreeMap::new(),
             leader_schedule,
             advance_round: true,
             task_spawner,
@@ -301,6 +378,12 @@ impl<DB: Database> Proposer<DB> {
             key_config: config.key_config().clone(),
             headers_proposed: HeadersProposedHandles::new(),
             digests_requeued: DigestsRequeuedHandles::new(),
+            lane_seqs: LaneSequences::default(),
+            committed_own_round: 0,
+            requeued_out_of_order: RequeuedOutOfOrderHandles::new(),
+            requeued_order_unknown: RequeuedOrderUnknownHandles::new(),
+            order_hold: OwnChainOrder::default(),
+            order_hold_metrics: OrderHoldHandles::new(),
         }
     }
 
@@ -310,6 +393,8 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// - current_header: caller checks to see if there is already a header built for this round. If
     ///   current_header.is_some() the proposer uses this header instead of building a new one.
+    /// - exec_inputs: what [`ExecBlockInputs::choose`] needs to pick the header's execution block;
+    ///   the ring is read once, right before [`Header::new`], where the tip was read before.
     #[instrument(level = "debug", skip_all, fields(round = identity.round, epoch = identity.epoch, num_digests = digests.len()))]
     async fn propose_header(
         identity: HeaderIdentity,
@@ -318,6 +403,7 @@ impl<DB: Database> Proposer<DB> {
         parents: Vec<Certificate>,
         digests: VecDeque<ProposerDigest>,
         trigger: ProposalTrigger,
+        exec_inputs: ExecBlockInputs,
     ) -> ProposerResult<Header> {
         let HeaderIdentity {
             round: current_round,
@@ -376,23 +462,40 @@ impl<DB: Database> Proposer<DB> {
         // while `now_ms` reads the wall clock, and the two can disagree (e.g. after a clock step)
         let created_at = now_ms().max(min_created_at.unwrap_or_default());
 
+        // synchronous: the ring's read guard is released before the next await
+        let exec = exec_inputs.choose(consensus_bus);
+
         let header = Header::new(
             author,
             current_round,
             current_epoch,
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
             parents.iter().map(|x| x.header().digest()).collect(),
-            consensus_bus.app().latest_execution_block_num_hash(),
+            exec.block,
             seed_signature,
             created_at,
         );
 
-        // the oldest digest's wait ends here, once the header carrying it exists; a header
-        // without digests has no wait to report and records no sample
-        let oldest_digest_wait = digests.iter().map(|d| d.received).min().map(|r| r.elapsed());
-        if let Some(wait) = oldest_digest_wait {
+        // a digest's wait ends here, once the header carrying it exists, and one clock read keeps
+        // the waits below comparable; a header without digests has no wait to report and records
+        // no sample
+        let now = Instant::now();
+        let wait_since = move |stamp: Instant| now.saturating_duration_since(stamp);
+        // since the oldest digest was last queued, restarted by a re-queue
+        let oldest_digest_wait = digests.iter().map(|d| d.received).min().map(wait_since);
+        // since the oldest digest first arrived, across re-queues: the histogram's sample, which
+        // equals the larger of the two waits the line reports
+        let oldest_first_wait = digests.iter().map(|d| d.first_received).min().map(wait_since);
+        if let Some(wait) = oldest_first_wait {
             consensus_bus.app().metrics().digest_wait_seconds.record(wait.as_secs_f64());
         }
+        // the same over only the re-queued digests, zero when the header carries none
+        let oldest_requeue_wait = digests
+            .iter()
+            .filter(|d| d.requeued)
+            .map(|d| d.first_received)
+            .min()
+            .map_or(Duration::ZERO, wait_since);
 
         // Metric: header_proposed - tracks header proposals
         info!(
@@ -406,7 +509,15 @@ impl<DB: Database> Proposer<DB> {
             digests = %HeaderDigests(&digests),
             oldest_digest_wait_ms = oldest_digest_wait.map_or(0, duration_ms),
             requeued = digests.iter().filter(|d| d.requeued).count(),
+            oldest_requeue_wait_ms = duration_ms(oldest_requeue_wait),
             pending_before = trigger.pending_before,
+            exec_block = exec.block.number,
+            exec_tip = exec.tip.number,
+            exec_basis = exec.basis.as_str(),
+            own_parent = trigger.hold.own_parent,
+            held = trigger.hold.held,
+            held_lanes = trigger.hold.held_lanes,
+            blockers = trigger.hold.blockers,
             "header proposed"
         );
         trigger.proposed.increment(1);
@@ -826,9 +937,19 @@ impl<DB: Database> Proposer<DB> {
         for round in committed_headers {
             max_committed_round = max_committed_round.max(round);
             // try to remove round - log warning if round is missing
-            if self.proposed_headers.remove(&round).is_none() {
-                warn!("own committed header not found at round {round}, probably because of restarts.");
-            };
+            match self.proposed_headers.remove(&round) {
+                // a committed digest is done waiting, so its first receipt is no longer needed
+                Some(header) => {
+                    header.payload().keys().for_each(|digest| {
+                        self.proposed_first_received.remove(digest);
+                        self.lane_seqs.committed(digest);
+                    });
+                    self.forget_held(round);
+                }
+                None => warn!(
+                    "own committed header not found at round {round}, probably because of restarts."
+                ),
+            }
         }
 
         // re-insert batches for any proposed header from a round below the current commit
@@ -839,19 +960,44 @@ impl<DB: Database> Proposer<DB> {
         let mut digests_to_resend: BTreeMap<WorkerId, VecDeque<ProposerDigest>> = BTreeMap::new();
         // Oldest to newest rounds.
         let mut retransmit_rounds = Vec::new();
-        // a re-queued digest's wait restarts here: the proposer keeps no arrival time for digests
-        // already in a header
+        // a re-queued digest's wait since it was last queued restarts here; its first receipt
+        // comes back from `proposed_first_received`
         let requeued_at = Instant::now();
+        // a header tracked at or below an own round an earlier notice settled would be a re-send
+        // tracked again after it left, its digests without a sequence and counted apart as
+        // `stale_resend`. Every tracked header lies above `committed_own_round` (see its doc), so
+        // `resent` is false here and `stale_resend` stays 0
+        let settled_round = self.committed_own_round;
+        let mut stale_resend = 0;
 
         // walk proposed headers in order by round, up to the committed round
         self.proposed_headers
             .iter()
             .take_while(|(header_round, _)| **header_round <= max_committed_round)
             .for_each(|(header_round, header)| {
+                let resent = *header_round <= settled_round;
+                if resent {
+                    stale_resend += header.payload().len();
+                }
                 // add payloads from oldest to newest into each worker's lane
-                push_payload(&mut digests_to_resend, header, requeued_at);
+                push_payload(
+                    &mut digests_to_resend,
+                    header,
+                    requeued_at,
+                    &mut self.proposed_first_received,
+                    |batch| {
+                        // the entry leaves either way, as the first receipt does
+                        let seq = self.lane_seqs.returned(batch);
+                        if resent {
+                            None
+                        } else {
+                            seq
+                        }
+                    },
+                );
                 retransmit_rounds.push(*header_round);
             });
+        self.committed_own_round = self.committed_own_round.max(max_committed_round);
 
         // process rounds that need to be retransmitted
         if !retransmit_rounds.is_empty() {
@@ -859,12 +1005,14 @@ impl<DB: Database> Proposer<DB> {
                 digests_to_resend,
                 retransmit_rounds.first().copied().unwrap_or_default(),
                 RequeueCause::Committed,
+                stale_resend,
             );
 
             // remove the old headers that failed
             // the proposed blocks are included in the next header
             retransmit_rounds.iter().for_each(|round| {
                 self.proposed_headers.remove(round);
+                self.forget_held(*round);
             });
 
             warn!(
@@ -898,12 +1046,37 @@ impl<DB: Database> Proposer<DB> {
     /// The commit path re-queues every expired header in one call and keeps them oldest first
     /// across rounds. With `max_header_num_of_batches` capping a header, the older batches here
     /// can wait one header longer. This is rare, and #1807 covers what out-of-order carriage
-    /// does to transaction nonces.
+    /// does to transaction nonces; `tn_primary_requeued_out_of_order_total` counts it. Under the
+    /// order hold, two tracked headers that carry one worker are own-chain linked, so the older
+    /// is certified and never canceled, and the reverse order cannot reorder a lane.
     fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
         let mut requeued = BTreeMap::new();
-        match self.proposed_headers.get(&round) {
+        // see `process_committed_headers`: a header tracked again after an own commit settled its
+        // round would keep no sequence; a tracked header lies above `committed_own_round`, so
+        // `resent` is false here
+        let resent = round <= self.committed_own_round;
+        let stale_resend = match self.proposed_headers.get(&round) {
             Some(header) if round < self.round && header.digest() == digest => {
-                push_payload(&mut requeued, header, Instant::now());
+                push_payload(
+                    &mut requeued,
+                    header,
+                    Instant::now(),
+                    &mut self.proposed_first_received,
+                    |batch| {
+                        // the entry leaves either way, as the first receipt does
+                        let seq = self.lane_seqs.returned(batch);
+                        if resent {
+                            None
+                        } else {
+                            seq
+                        }
+                    },
+                );
+                if resent {
+                    header.payload().len()
+                } else {
+                    0
+                }
             }
             _ => {
                 debug!(
@@ -915,9 +1088,23 @@ impl<DB: Database> Proposer<DB> {
                 );
                 return;
             }
-        }
+        };
         self.proposed_headers.remove(&round);
-        self.prepend_requeued(requeued, round, RequeueCause::Canceled);
+        self.forget_held(round);
+        self.prepend_requeued(requeued, round, RequeueCause::Canceled, stale_resend);
+    }
+
+    /// Tell the order hold that the own header at `round` left [`Self::proposed_headers`].
+    /// Called beside every removal from it.
+    fn forget_held(&mut self, round: Round) {
+        self.order_hold.forget(round);
+    }
+
+    /// Tell the order hold that the own header at `round` is sent again without a new plan: the
+    /// restart re-propose and the max-delay re-send. A header that has a record keeps it; one
+    /// without (the restart) proves no older header.
+    fn record_held_resent(&mut self, round: Round) {
+        self.order_hold.record_resent(round);
     }
 
     /// Prepend `requeued`, the batch digests of own headers that will not be committed (oldest
@@ -926,26 +1113,65 @@ impl<DB: Database> Proposer<DB> {
     /// A non-empty re-queue logs one `digests resent` line and counts the digests in
     /// `tn_primary_digests_requeued_total{cause}`. `from_round` is the round of the oldest header
     /// the digests came from.
+    ///
+    /// The digests are also judged for order (issue #1807, the rule is [`LaneSequences::judge`]):
+    /// those that return behind a newer digest of their worker count in
+    /// `tn_primary_requeued_out_of_order_total{cause}` and in the line's `out_of_order`, those
+    /// without a known sequence in `tn_primary_requeued_order_unknown_total{reason}`.
+    /// `stale_resend` digests would come from headers tracked again by a re-send after an own
+    /// commit settled their round, which the callers give no sequence. No such header is tracked
+    /// (see `Self::committed_own_round`), so the callers pass 0 and the `stale_resend` reason stays
+    /// 0; the digests of a committed header that a restarted proposer re-sent from the store have
+    /// no sequence either and count as `unknown_seq`.
     fn prepend_requeued(
         &mut self,
         mut requeued: BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
         from_round: Round,
         cause: RequeueCause,
+        stale_resend: usize,
     ) -> usize {
         let count: usize = requeued.values().map(VecDeque::len).sum();
         // a header without digests leaves nothing to re-send
         if count == 0 {
             return 0;
         }
+        // every digest of this re-queue has left `lane_seqs` by now, so none is judged against
+        // another digest that returns with it
+        let order = self.lane_seqs.judge(&requeued);
         info!(
             target: "consensus::metrics",
             count,
             from_round,
             round = self.round,
             cause = cause.as_str(),
+            out_of_order = order.out_of_order,
             "digests resent"
         );
-        self.digests_requeued.counter(cause).increment(u64::try_from(count).unwrap_or(u64::MAX));
+        // invariant I2 of the order hold: a digest re-queued behind a newer digest of its lane
+        // means the hold did not cover that lane, through the garbage-collection cut its module
+        // doc describes or a fault; one line per re-queue, not per digest
+        if order.out_of_order > 0 {
+            warn!(
+                target: "primary::proposer",
+                count,
+                from_round,
+                round = self.round,
+                cause = cause.as_str(),
+                out_of_order = order.out_of_order,
+                "digests re-queued out of order under the order hold"
+            );
+        }
+        let total = |digests: usize| u64::try_from(digests).unwrap_or(u64::MAX);
+        self.digests_requeued.counter(cause).increment(total(count));
+        self.requeued_out_of_order.counter(cause).increment(total(order.out_of_order));
+        // every tracked header lies above `committed_own_round`, so `stale_resend` is 0 and every
+        // digest without a sequence counts as `unknown_seq`
+        self.requeued_order_unknown
+            .counter(RequeueOrderUnknown::UnknownSeq)
+            .increment(total(order.unknown.saturating_sub(stale_resend)));
+        self.requeued_order_unknown
+            .counter(RequeueOrderUnknown::StaleResend)
+            .increment(total(stale_resend));
 
         // prepend the re-queued digests to each worker's pending queue and update `self`
         std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
@@ -953,6 +1179,13 @@ impl<DB: Database> Proposer<DB> {
         });
         self.digests = requeued;
         count
+    }
+
+    /// Queue a digest its worker just reported at the back of the worker's lane, numbered next in
+    /// that lane's sequence.
+    fn queue_reported(&mut self, mut digest: ProposerDigest) {
+        digest.seq = Some(self.lane_seqs.assign(digest.worker_id));
+        self.digests.entry(digest.worker_id).or_default().push_back(digest);
     }
 
     /// Total number of digests pending across all workers.
@@ -971,15 +1204,20 @@ impl<DB: Database> Proposer<DB> {
     /// and the cursor advances past the last lane served, so slots rotate across headers
     /// and no lane is excluded permanently when more workers have digests than a header
     /// holds. With one worker this is exactly the old single-queue FIFO drain.
-    fn drain_digests_for_header(&mut self) -> VecDeque<ProposerDigest> {
+    ///
+    /// Every lane of a `held` worker is left out: its digests stay queued in order (the order
+    /// hold of issue #1807) and take no slot, and the cursor advances past the last lane served.
+    fn drain_digests_except(&mut self, held: &BTreeSet<WorkerId>) -> VecDeque<ProposerDigest> {
         let queues = &self.digests;
-        let max_depth = queues.values().map(VecDeque::len).max().unwrap_or(0);
-        // Ascending worker ids, rotated to start at the cursor.
+        // Ascending worker ids, rotated to start at the cursor, without the held lanes.
         let lanes: Vec<WorkerId> = queues
             .range(self.next_lane..)
             .chain(queues.range(..self.next_lane))
             .map(|(id, _)| *id)
+            .filter(|id| !held.contains(id))
             .collect();
+        let max_depth =
+            lanes.iter().filter_map(|id| queues.get(id)).map(VecDeque::len).max().unwrap_or(0);
         // One entry per (round, worker) pair with a digest at that queue depth, in slot
         // order; each worker id appears exactly its queue length before the cap applies.
         let order: Vec<WorkerId> = (0..max_depth)
@@ -992,10 +1230,47 @@ impl<DB: Database> Proposer<DB> {
             .take(self.max_header_num_of_batches)
             .collect();
         self.next_lane = order.last().map_or(self.next_lane, |last| last.wrapping_add(1));
-        order
+        let drained: VecDeque<ProposerDigest> = order
             .into_iter()
             .filter_map(|worker_id| self.digests.get_mut(&worker_id).and_then(VecDeque::pop_front))
-            .collect()
+            .collect();
+        // the header's payload keeps no time, so each digest's first receipt waits here until the
+        // digest commits or comes back in a re-queue; its sequence waits beside it
+        drained.iter().for_each(|drained| {
+            self.proposed_first_received
+                .entry(drained.digest)
+                .and_modify(|first| *first = (*first).min(drained.first_received))
+                .or_insert(drained.first_received);
+            self.lane_seqs.drained(drained);
+        });
+        drained
+    }
+
+    /// Drain the next header's digests under the order hold's `plan` and report what the hold
+    /// kept back: every lane of [`HoldPlan::held_workers`] stays queued, in order.
+    ///
+    /// A header that leaves digests queued in a held lane counts in
+    /// `tn_primary_headers_held_total`, and `tn_primary_digests_held` is set to how many it left
+    /// (0 when nothing is held).
+    fn drain_held(&mut self, plan: &HoldPlan) -> (VecDeque<ProposerDigest>, HoldReport) {
+        let digests = self.drain_digests_except(&plan.held_workers);
+        let held: usize = plan
+            .held_workers
+            .iter()
+            .filter_map(|worker_id| self.digests.get(worker_id))
+            .map(VecDeque::len)
+            .sum();
+        if held > 0 {
+            self.order_hold_metrics.headers_held.increment(1);
+        }
+        self.order_hold_metrics.digests_held.set(held as f64);
+        let hold = HoldReport {
+            own_parent: plan.own_parent,
+            held,
+            held_lanes: plan.held_workers.len(),
+            blockers: plan.blockers.len(),
+        };
+        (digests, hold)
     }
 
     /// Conditions are met to propose the next header.
@@ -1058,6 +1333,9 @@ impl<DB: Database> Proposer<DB> {
                 );
                 // clear parents if reproposing after restart
                 self.last_parents.clear();
+                // a restarted proposer has no record of the stored header, so it proves no older
+                // header (a record already held for its round is kept)
+                self.record_held_resent(header.round());
 
                 let consensus_bus = self.consensus_bus.clone();
                 self.task_spawner.spawn_task("re-propose header", async move {
@@ -1070,17 +1348,28 @@ impl<DB: Database> Proposer<DB> {
             }
             // create new header
             None => {
+                // the parents the header carries, taken before the drain so that the order hold
+                // plans on exactly this set (issue #1807)
+                let parents = std::mem::take(&mut self.last_parents);
+                let pending_before = self.pending_digests_len();
+                // plan and record at the drain: a record is read only through a tracked own
+                // parent, so the record of a header whose proposal fails is inert
+                let order = &mut self.order_hold;
+                let plan =
+                    order.plan(current_round, &parents, &self.proposed_headers, &self.authority_id);
+                order.record(&plan);
+                let (digests, hold) = self.drain_held(&plan);
                 // collect values from &mut self for this header
                 let trigger = ProposalTrigger {
                     reason,
-                    pending_before: self.pending_digests_len(),
+                    pending_before,
                     proposed: self.headers_proposed.counter(reason),
+                    hold,
                 };
-                let digests = self.drain_digests_for_header();
-                let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id.clone();
                 let prior_epoch_record = self.prior_epoch_record;
                 let key_config = self.key_config.clone();
+                let exec_inputs = ExecBlockInputs::new(&self.committee, &authority_id, &parents);
 
                 let consensus_bus = self.consensus_bus.clone();
                 // spawn tokio task to create, store, and send new header to certifier
@@ -1099,6 +1388,7 @@ impl<DB: Database> Proposer<DB> {
                         parents,
                         digests,
                         trigger,
+                        exec_inputs,
                     )
                     .await;
 
@@ -1128,6 +1418,27 @@ impl<DB: Database> Proposer<DB> {
         // reschedule intervals
         self.min_delay_interval.reset_after(self.calc_min_delay());
         self.max_delay_interval.reset_after(self.calc_max_delay());
+        // a header at or below an own round a commit notice already settled is not tracked again.
+        // That notice took every tracked header at or below it out of `proposed_headers`, and the
+        // newest own header is the only one sent again, so this is a committed header: a re-send
+        // (the max-delay tick or the restart re-propose) that raced its notice, or a new header
+        // whose notice came before this result. Its digests leave the order bookkeeping as a
+        // committed header's do. Tracked again, it would hold its lanes behind every later header
+        // without an own parent until the next own commit at or above its round, and that commit
+        // would re-queue its committed digests a second time. The insert below is the only one into
+        // `proposed_headers`, so every tracked header lies above `committed_own_round` and the
+        // `stale_resend` reason of `tn_primary_requeued_order_unknown_total` stays 0.
+        // `committed_own_round` starts at 0 after a restart, so this guard does not catch the
+        // max-delay re-send of a last own header that committed before the restart (see the order
+        // hold's module doc); its digests count as `unknown_seq` when that commit re-queues them.
+        if header.round() <= self.committed_own_round {
+            header.payload().keys().for_each(|digest| {
+                self.proposed_first_received.remove(digest);
+                self.lane_seqs.committed(digest);
+            });
+            self.forget_held(header.round());
+            return Ok(());
+        }
         // track header so proposer can repropose the digests and system messages
         // if this header fails to be committed for some reason
         self.proposed_headers.insert(header.round(), header);
@@ -1184,6 +1495,35 @@ impl<DB: Database> Proposer<DB> {
             .filter(|header| header.epoch() == current_epoch && header.round() >= self.round)
     }
 
+    /// Log `proposer stopped` when the proposer shuts down, which ends its epoch: what it leaves to
+    /// the orphan re-pool of the next epoch start (issue #1807).
+    ///
+    /// `queued_digests` are still in the queues; `proposed_uncommitted` are the own headers
+    /// proposed and neither committed nor canceled (the tracked ones) and `uncommitted_digests`
+    /// their distinct digests; `in_flight_digests` were drained into a header whose proposal had
+    /// not come back. The three digest counts do not overlap.
+    ///
+    /// Only the shutdown arm of [`Self::run`] logs it, which is how an epoch closes: an error exit
+    /// from `run`, or the task dropped without its shutdown notice, ends without the line.
+    fn log_stopped(&self) {
+        let tracked: BTreeSet<&BlockHash> =
+            self.proposed_headers.values().flat_map(|header| header.payload().keys()).collect();
+        let in_flight_digests =
+            self.lane_seqs.out_of_queue().filter(|d| !tracked.contains(d)).count();
+        info!(
+            target: "consensus::metrics",
+            epoch = self.committee.epoch(),
+            round = self.round,
+            queued_digests = self.pending_digests_len(),
+            proposed_uncommitted = self.proposed_headers.len(),
+            uncommitted_digests = tracked.len(),
+            in_flight_digests,
+            "proposer stopped"
+        );
+        // the held digests leave with the proposer, for the orphan re-pool
+        self.order_hold_metrics.digests_held.set(0.0);
+    }
+
     /// Wrapper async function to either query the pending header or never resolve.
     async fn pending_header(
         pending_header: &mut Option<PendingHeaderTask>,
@@ -1210,6 +1550,7 @@ impl<DB: Database> Proposer<DB> {
         loop {
             tokio::select! {
                 _ = &self.rx_shutdown => {
+                    self.log_stopped();
                     return Ok(())
                 }
                 // check for new digests from workers and send ack back to worker
@@ -1227,7 +1568,7 @@ impl<DB: Database> Proposer<DB> {
                     // parse message into parts
                     let (ack, digest) = msg.process();
                     let _ = ack.send(());
-                    self.digests.entry(digest.worker_id).or_default().push_back(digest);
+                    self.queue_reported(digest);
                 }
                 // check for new parent certificates
                 // synchronizer sends collection of certificates when there is quorum (2f+1)
@@ -1285,6 +1626,13 @@ impl<DB: Database> Proposer<DB> {
             //      - this is happy path
             //      - vote for leader or leader already has enough votes to trigger commit
             let enough_parents = self.has_parents_for_round();
+            // digests held back in a lane count here as every queued digest does: a held backlog
+            // of at least the threshold builds the next header without waiting for the min delay,
+            // and that header can carry none of it. Under load this changes nothing (the queue is
+            // above the threshold either way); at light load a held backlog fires earlier.
+            // Leaving held digests out of the count while the only blocker is the previous round's
+            // own header, so that the min delay waits for its certificate, is not built (see the
+            // order hold's module doc)
             let enough_digests = self.pending_digests_len() >= self.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
@@ -1335,6 +1683,8 @@ impl<DB: Database> Proposer<DB> {
             } else if should_repropose_header {
                 if let Some(last_proposed) = self.resendable_last_proposed() {
                     warn!(target: "primary::proposer", interval=?self.calc_max_delay(), "re-proposing last header after max delay interval expired for round {}", self.round);
+                    // the same header again: it keeps the record its plan left
+                    self.record_held_resent(last_proposed.round());
                     let (tx, rx) = oneshot::channel();
                     let consensus_bus = self.consensus_bus.clone();
                     let proposer_store = self.proposer_store.clone();
@@ -1378,22 +1728,135 @@ impl fmt::Display for HeaderDigests<'_> {
     }
 }
 
+/// The order bookkeeping behind `tn_primary_requeued_out_of_order_total` (issue #1807): each worker
+/// lane's sequence of reported digests, and which drained digests are out of the queue.
+///
+/// A lane is one (author, worker) pair: this proposer's digests of one worker. The worker reports
+/// them in the order their transactions' nonces need, the queue and the drain keep that order, and
+/// a header carries them in it, so a re-queue is the only way an older digest can end up executed
+/// after a newer one.
+///
+/// Observability only: the proposer never reads this when it chooses a header's contents. It grows
+/// with the tracked headers: one entry per digest of the header in flight or of a tracked header,
+/// the same bound as `Proposer::proposed_first_received`, plus two values per worker.
+#[derive(Debug, Default)]
+struct LaneSequences {
+    /// The sequence the next digest each worker reports receives.
+    next: BTreeMap<WorkerId, u64>,
+    /// Every digest drained into an own header that has since neither returned to the queue nor
+    /// committed: the digests of the header in flight and of the tracked headers, each with its
+    /// worker and its sequence (`None` when unknown).
+    out: BTreeMap<BlockHash, (WorkerId, Option<u64>)>,
+    /// Per worker, the highest sequence a committed own header carried.
+    committed: BTreeMap<WorkerId, u64>,
+}
+
+impl LaneSequences {
+    /// The sequence of the next digest `worker_id` reports.
+    fn assign(&mut self, worker_id: WorkerId) -> u64 {
+        let next = self.next.entry(worker_id).or_default();
+        let seq = *next;
+        *next = seq.saturating_add(1);
+        seq
+    }
+
+    /// Record `digest` as drained into the header being built. A digest its worker reported twice
+    /// keeps the place of the copy drained first.
+    fn drained(&mut self, digest: &ProposerDigest) {
+        self.out.entry(digest.digest).or_insert((digest.worker_id, digest.seq));
+    }
+
+    /// Take back the sequence of `digest`, which returns to the queue.
+    fn returned(&mut self, digest: &BlockHash) -> Option<u64> {
+        self.out.remove(digest).and_then(|(_, seq)| seq)
+    }
+
+    /// Record `digest` as committed in an own header: it leaves for good, and its sequence raises
+    /// its lane's committed mark.
+    fn committed(&mut self, digest: &BlockHash) {
+        if let Some((worker_id, Some(seq))) = self.out.remove(digest) {
+            self.committed
+                .entry(worker_id)
+                .and_modify(|mark| *mark = (*mark).max(seq))
+                .or_insert(seq);
+        }
+    }
+
+    /// The digests drained into an own header that is in flight or tracked.
+    fn out_of_queue(&self) -> impl Iterator<Item = &BlockHash> + '_ {
+        self.out.keys()
+    }
+
+    /// Judge the order of the digests in `requeued`, which return to the front of their lanes.
+    ///
+    /// A re-queued digest is **out of order** when its lane has a newer digest (a higher sequence)
+    /// that has already left the queue and does not return with it: one drained into an own header
+    /// that is still in flight or tracked and is not part of this re-queue, or one carried by an
+    /// own header that committed. Such a newer digest is executed first if its header commits, so
+    /// the older one may execute after it: the count says what the lane looks like at the
+    /// re-queue, not that an execution inversion happened. A newer digest that came back to the
+    /// queue earlier does
+    /// not count: the re-queued digest lands ahead of it. Every digest of this re-queue must have
+    /// left `out` before the call, so digests that return together are not judged against each
+    /// other.
+    ///
+    /// The count is per re-queue: a digest returned again while a newer one is still out counts
+    /// again, while an inversion that one later re-queue returns together (the newer digest's
+    /// header and the older's die in the same commit notice) is not counted a second time. A
+    /// digest without a known sequence is counted as unknown, never as out of order.
+    fn judge(&self, requeued: &BTreeMap<WorkerId, VecDeque<ProposerDigest>>) -> RequeueOrder {
+        // the newest sequence of each lane that is out of the queue for now or for good
+        let mut newest_out = self.committed.clone();
+        for (worker_id, seq) in self.out.values() {
+            if let Some(seq) = seq {
+                newest_out.entry(*worker_id).and_modify(|n| *n = (*n).max(*seq)).or_insert(*seq);
+            }
+        }
+        let mut order = RequeueOrder::default();
+        for digest in requeued.values().flatten() {
+            match digest.seq {
+                None => order.unknown += 1,
+                Some(seq) if newest_out.get(&digest.worker_id).is_some_and(|n| *n > seq) => {
+                    order.out_of_order += 1
+                }
+                Some(_) => {}
+            }
+        }
+        order
+    }
+}
+
+/// The order of one re-queue's digests, from [`LaneSequences::judge`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RequeueOrder {
+    /// Digests that return behind a newer digest of their lane.
+    out_of_order: usize,
+    /// Digests without a known sequence.
+    unknown: usize,
+}
+
 /// Append the batch digests of `header`, in payload order, to their workers' lanes in `lanes`,
 /// each stamped as queued at `requeued_at` and marked as re-queued.
 ///
-/// The proposer keeps no arrival time for a digest already in a header, so a re-queued digest's
-/// wait restarts at `requeued_at`.
+/// Each digest takes its first receipt back out of `first_received`, so its wait from the worker's
+/// report keeps counting across the re-queue. A digest without one (it rode a stored header
+/// re-sent after a restart, so this proposer never received it) starts at `requeued_at`. Its lane
+/// sequence comes from `seq`, `None` when the proposer does not know it.
 fn push_payload(
     lanes: &mut BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
     header: &Header,
     requeued_at: Instant,
+    first_received: &mut BTreeMap<BlockHash, Instant>,
+    mut seq: impl FnMut(&BlockHash) -> Option<u64>,
 ) {
     header.payload().iter().for_each(|(digest, worker_id)| {
         lanes.entry(*worker_id).or_default().push_back(ProposerDigest {
             digest: *digest,
             worker_id: *worker_id,
             received: requeued_at,
+            first_received: first_received.remove(digest).unwrap_or(requeued_at),
             requeued: true,
+            seq: seq(digest),
         });
     });
 }
@@ -1402,6 +1865,246 @@ fn push_payload(
 /// proposer's log lines.
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How far below its own tip the quorum rule may name a block, in entries of the recent-blocks
+/// ring (executed outputs that produced a block, not block numbers).
+///
+/// The ring's capacity is `gc_depth`, so the floor is its own constant. Every proposer of an
+/// in-step fleet settles exactly here: the blocks its parents name are earlier picks of the same
+/// rule, not tips, so the quorum value can only rise through the floor.
+///
+/// An output without transactions produces no block and adds no ring entry, so the floor has no
+/// bound in rounds or in time: with light traffic the named block can be arbitrarily old. What that
+/// delays is an honest node noticing its own execution fork. If its execution diverges at block N
+/// and the next outputs are empty, it keeps naming a block below N, and neither a voter's check of
+/// the header's block (`Fork`) nor the subscriber's or state sync's check of a leader's block sees
+/// the divergence until up to eight more outputs have produced blocks. A header naming the own tip
+/// would name the forked tip, and voters would refuse it at once. A faulty author gains nothing
+/// from this: a voter already accepts any canonical block above its restore floor.
+pub(crate) const QUORUM_EXEC_BLOCK_FLOOR_ENTRIES: usize = 8;
+
+/// Why a header names the execution block it names. Reported as `exec_basis` on `header proposed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecBasis {
+    /// The own tip: the ring is empty, fewer than a quorum of voting power named usable blocks,
+    /// or the quorum value is at or above the own tip (the cap).
+    Tip,
+    /// The quorum value is below the own tip and no older than the floor; the block is the newest
+    /// own ring entry at or below it.
+    Quorum,
+    /// The quorum value is older than the floor: the ring entry
+    /// [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip, or the oldest entry of a shorter
+    /// ring. Also the epoch's opening block when a choice fell below it, which the final bound of
+    /// [`choose_exec_block`] prevents and an honest node never reaches.
+    Floor,
+}
+
+impl ExecBasis {
+    /// The value of the `exec_basis` field on `header proposed`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Tip => "tip",
+            Self::Quorum => "quorum",
+            Self::Floor => "floor",
+        }
+    }
+}
+
+/// One parent certificate's named execution block, as the quorum rule reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParentExecBlock {
+    /// The certificate's author.
+    pub(crate) author: AuthorityIdentifier,
+    /// The author's voting power in the proposer's committee.
+    pub(crate) power: VotingPower,
+    /// The certificate's epoch.
+    pub(crate) epoch: Epoch,
+    /// The certificate's round; 0 for a genesis certificate.
+    pub(crate) round: Round,
+    /// The number of the execution block the certificate's header names.
+    pub(crate) number: BlockNumber,
+}
+
+impl ParentExecBlock {
+    /// The named block of `parent`, weighted by its author's power in `committee`.
+    fn new(parent: &Certificate, committee: &Committee) -> Self {
+        Self {
+            author: parent.origin().clone(),
+            power: committee.voting_power_by_id(parent.origin()),
+            epoch: parent.epoch(),
+            round: parent.round(),
+            number: parent.header().latest_execution_block().number,
+        }
+    }
+}
+
+/// Everything the execution-block choice needs except the ring, fixed when the proposal is
+/// spawned.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecBlockInputs {
+    /// This proposer's authority: its tip stands for it, and its own certificate is skipped.
+    pub(crate) author: AuthorityIdentifier,
+    /// This proposer's voting power.
+    pub(crate) own_power: VotingPower,
+    /// The header's epoch: parents from another epoch are skipped.
+    pub(crate) epoch: Epoch,
+    /// The committee's quorum threshold (2f+1) in voting power.
+    pub(crate) quorum_threshold: VotingPower,
+    /// The header's parents' named blocks.
+    pub(crate) parents: Vec<ParentExecBlock>,
+}
+
+impl ExecBlockInputs {
+    /// The inputs for a header by `author` on `parents`.
+    fn new(committee: &Committee, author: &AuthorityIdentifier, parents: &[Certificate]) -> Self {
+        let parents =
+            parents.iter().map(|parent| ParentExecBlock::new(parent, committee)).collect();
+        Self {
+            author: author.clone(),
+            own_power: committee.voting_power_by_id(author),
+            epoch: committee.epoch(),
+            quorum_threshold: committee.quorum_threshold(),
+            parents,
+        }
+    }
+
+    /// Choose the header's execution block from the bus's recent-blocks ring.
+    ///
+    /// Synchronous on purpose: the ring is read once per proposal and the watch's read guard is
+    /// dropped on return, before the caller reaches an await.
+    fn choose(&self, consensus_bus: &ConsensusBus) -> ExecBlockChoice {
+        let ring = consensus_bus.app().recent_blocks().borrow();
+        choose_exec_block(&ring, self)
+    }
+}
+
+/// The execution block a header names, the own tip it was chosen against and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExecBlockChoice {
+    /// The block the header names.
+    pub(crate) block: BlockNumHash,
+    /// The proposer's own executed tip when the block was chosen.
+    pub(crate) tip: BlockNumHash,
+    /// Why this block.
+    pub(crate) basis: ExecBasis,
+}
+
+/// Choose the execution block for a header from this node's recent-blocks `ring` (its newest
+/// entry is the own tip) and the header's parents (issue #1804, design D).
+///
+/// How the quorum rule chooses:
+/// - the own tip counts once, for the own authority; each parent from another author counts when it
+///   is of the header's epoch and not genesis (round 0). An own certificate among the parents is
+///   skipped, and an author is counted at most once (its first usable certificate);
+/// - the values are ranked by number and weighted by voting power: the quorum value is the highest
+///   number that holders of at least `quorum_threshold` power have reached. With less usable power
+///   than that the own tip is named;
+/// - the quorum value is capped at the own tip: a higher block is one this node cannot vouch for,
+///   and letting f Byzantine parents pick it would bring the starvation back. Below the cap, f
+///   faulty parents that name high blocks still lift the value past what the honest parents
+///   reached, and if they then withhold their votes, a header under the rule can miss the votes of
+///   honest members that have not executed the lifted block and be cancelled. That costs the rule's
+///   gain, not more: every voter that holds the own tip holds the choice, so a header under the
+///   rule certifies whenever the same header naming the tip would have;
+/// - it is floored at the ring entry [`QUORUM_EXEC_BLOCK_FLOOR_ENTRIES`] back from the tip (the
+///   oldest entry of a shorter ring). Entries count outputs that produced a block, so the floor has
+///   no bound in time (the constant's doc says what that delays);
+/// - the block is the newest own ring entry at or below the value, so the number and the hash are
+///   always this node's own execution, never a parent's hash;
+/// - nothing is named below the block the header's epoch opened on, the previous epoch's closing
+///   block (see [`RecentBlocks::newest_before_epoch`]): while the ring still holds that block, a
+///   parent naming an older one is not counted, and once the ring holds only the epoch's own blocks
+///   every entry is newer. Every member executed that block before it entered the epoch, so only a
+///   faulty parent names less, and a voter restored from that epoch's export holds nothing older:
+///   one low parent in a minimal parent set would otherwise drag the choice to a floor entry that
+///   such a voter refuses for good. The bound matches a restored voter's floor only because every
+///   state export is taken at an epoch's closing block; an export taken inside an epoch would need
+///   a bound in blocks below the own tip as well;
+/// - a final bound names the opening block itself (`exec_basis=floor`) if the choice still fell
+///   below it, so the guarantee no longer rests on the ring's numbers rising in push order. On an
+///   honest node it never fires, and a debug assertion says so. It cannot cover a proposer that
+///   starts the epoch before executing the previous epoch's closing block: that block is not in its
+///   ring yet, its own tip stands in for it, and the rule names that tip.
+///
+/// Peer numbers are only compared, never used in arithmetic or as an index; power sums saturate.
+/// An empty ring names the default block.
+pub(crate) fn choose_exec_block(ring: &RecentBlocks, inputs: &ExecBlockInputs) -> ExecBlockChoice {
+    let tip = ring.latest_execution_block_num_hash();
+    if ring.is_empty() {
+        return ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+    }
+    // the epoch's opening block, while the ring still holds it; once the ring holds only this
+    // epoch's blocks, every entry is above it
+    let opening = ring.newest_before_epoch(inputs.epoch);
+    let choice = quorum_rule_choice(ring, inputs, opening);
+    let bounded = bound_to_opening(choice, opening);
+    debug_assert_eq!(bounded, choice, "the quorum rule chose a block before the epoch opened");
+    bounded
+}
+
+/// The quorum rule's choice for a header, before the final bound of [`choose_exec_block`]:
+/// `opening` is the epoch's opening block if the ring still holds it.
+fn quorum_rule_choice(
+    ring: &RecentBlocks,
+    inputs: &ExecBlockInputs,
+    opening: Option<BlockNumHash>,
+) -> ExecBlockChoice {
+    let tip = ring.latest_execution_block_num_hash();
+    let own_tip = ExecBlockChoice { block: tip, tip, basis: ExecBasis::Tip };
+    // the own tip and every counted parent value are at or above the opening block, so the
+    // quorum value is too; the block named for that value is the newest entry at or below it (the
+    // opening entry is a candidate) or the floor entry above it, so on a ring whose numbers rise
+    // nothing below the opening block is named
+    let lowest_usable = opening.map_or(0, |opening| opening.number);
+    let mut counted = BTreeSet::from([&inputs.author]);
+    let mut values = vec![(tip.number, inputs.own_power)];
+    for parent in &inputs.parents {
+        if parent.epoch == inputs.epoch
+            && parent.round > 0
+            && parent.number >= lowest_usable
+            && counted.insert(&parent.author)
+        {
+            values.push((parent.number, parent.power));
+        }
+    }
+    // highest first; the order among equal numbers cannot change the number the walk returns
+    values.sort_unstable_by_key(|(number, _)| Reverse(*number));
+    let mut holders: VotingPower = 0;
+    let quorum_value = values.iter().find_map(|(number, power)| {
+        holders = holders.saturating_add(*power);
+        (holders >= inputs.quorum_threshold).then_some(*number)
+    });
+    let Some(quorum_value) = quorum_value.filter(|value| *value < tip.number) else {
+        // too little usable power, or the cap: the own tip
+        return own_tip;
+    };
+
+    let Some(floor) = ring.nth_newest(QUORUM_EXEC_BLOCK_FLOOR_ENTRIES) else {
+        return own_tip;
+    };
+    if quorum_value < floor.number {
+        return ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor };
+    }
+    // the floor entry is at or below the value, so the lookup always finds an entry
+    match ring.newest_at_or_below(quorum_value) {
+        Some(block) => ExecBlockChoice { block, tip, basis: ExecBasis::Quorum },
+        None => ExecBlockChoice { block: floor, tip, basis: ExecBasis::Floor },
+    }
+}
+
+/// `choice`, or the epoch's `opening` block when `choice` names a block before it.
+///
+/// The opening block is an entry of the own ring, so the header still names a block this node
+/// executed, by its own hash. A raised choice reports [`ExecBasis::Floor`]: the opening block is
+/// the lowest block the rule may name.
+fn bound_to_opening(choice: ExecBlockChoice, opening: Option<BlockNumHash>) -> ExecBlockChoice {
+    match opening {
+        Some(opening) if choice.block.number < opening.number => {
+            ExecBlockChoice { block: opening, tip: choice.tip, basis: ExecBasis::Floor }
+        }
+        _ => choice,
+    }
 }
 
 #[cfg(test)]

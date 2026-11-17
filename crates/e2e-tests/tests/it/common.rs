@@ -9,7 +9,9 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use clap::Parser as _;
-use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints, TestBinary};
+use e2e_tests::{
+    create_validator_info, setup_log_dir, FleetOverrides, NodeEndpoints, NodeOverrides, TestBinary,
+};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::{Report, WrapErr as _};
 use jsonrpsee::{
@@ -534,7 +536,41 @@ pub(crate) fn start_validator_with_env(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Child {
-    let data_dir = base_dir.join(format!("validator-{}", instance + 1));
+    let node = extra_env
+        .iter()
+        .fold(NodeOverrides::default(), |node, (name, value)| node.env(*name, *value));
+    let fleet = FleetOverrides::default().set_node(format!("validator-{}", instance + 1), node);
+    start_validator_with_overrides(instance, bin, base_dir, rpc_port, test, run, extra_args, &fleet)
+        .expect("failed to execute")
+}
+
+/// Start a validator node process with additional CLI arguments and the overrides `fleet` sets
+/// for it, looked up by its datadir name `validator-<instance + 1>`.
+///
+/// Its `parameters.yaml` entries are merged into `base_dir/validator-<instance + 1>` before it
+/// starts, after the fleet-wide entries of `TN_E2E_PARAMETERS` (see
+/// [`NodeOverrides::apply_with_e2e_parameters`]): every start writes the harness's file plus
+/// that start's entries, so a restart with the same fleet leaves the file as it was, and a restart
+/// through any other start helper puts the harness's file back (with the fleet-wide entries) and
+/// sets none of the fleet's variables. Its environment variables are set on the spawned command
+/// after the variables [`TestBinary::command`] forwards ([`start_validator_with_env`] delegates
+/// here with a one-node fleet). A node the fleet sets nothing for starts exactly as
+/// [`start_validator_with_args`] starts it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_validator_with_overrides(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+    fleet: &FleetOverrides,
+) -> eyre::Result<Child> {
+    let name = format!("validator-{}", instance + 1);
+    let overrides = fleet.node(&name);
+    let data_dir = base_dir.join(&name);
+    overrides.apply_with_e2e_parameters(&data_dir)?;
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
     let ipc_path = base_dir.join(format!("validator-{}.ipc", instance + 1));
@@ -557,11 +593,11 @@ pub(crate) fn start_validator_with_env(
         .arg(format!("{test}-node{instance}"));
 
     command.args(extra_args);
-    command.envs(extra_env.iter().copied());
+    command.envs(overrides.env.iter().map(|(name, value)| (name, value)));
 
     setup_log_dir(&mut command, instance, test, run);
 
-    command.spawn().expect("failed to execute")
+    Ok(command.spawn()?)
 }
 
 /// The log file [`setup_log_dir`] gives run `run` of node `instance` under `test_logs/<test>/`:
@@ -597,6 +633,71 @@ pub(crate) fn strip_ansi(text: &str) -> String {
         }
     }
     plain
+}
+
+/// Node `instance`'s stdout log of run `run` of `test`, as lines without ANSI escapes.
+///
+/// Read lossily: the node may be mid-write, and a torn multi-byte character must not fail the read.
+pub(crate) fn node_log_lines(test: &str, instance: usize, run: u32) -> eyre::Result<Vec<String>> {
+    plain_log_lines(&node_log_path(test, instance, run, false))
+}
+
+/// The lines of the node log at `path` without ANSI escapes, read lossily (see
+/// [`node_log_lines`]).
+pub(crate) fn plain_log_lines(path: &Path) -> eyre::Result<Vec<String>> {
+    let bytes = std::fs::read(path).wrap_err_with(|| format!("reading {}", path.display()))?;
+    Ok(strip_ansi(&String::from_utf8_lossy(&bytes)).lines().map(str::to_owned).collect())
+}
+
+/// Whether the node log `line` contains `text` and carries every `name=value` in `fields` as a
+/// whole token, so `epoch=6` does not match `epoch=60`.
+pub(crate) fn log_line_matches(line: &str, text: &str, fields: &[String]) -> bool {
+    line.contains(text)
+        && fields.iter().all(|field| line.split_whitespace().any(|token| token == field.as_str()))
+}
+
+/// Poll node `instance`'s run-`run` log of `test` until a line matches `text` and `fields` (see
+/// [`log_line_matches`]), for up to `timeout`.
+pub(crate) async fn wait_for_node_log_line(
+    test: &str,
+    instance: usize,
+    run: u32,
+    text: &str,
+    fields: &[String],
+    timeout: Duration,
+) -> eyre::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if node_log_lines(test, instance, run)?
+            .iter()
+            .any(|line| log_line_matches(line, text, fields))
+        {
+            return Ok(());
+        }
+        eyre::ensure!(
+            Instant::now() < deadline,
+            "test_logs/{test}/node{instance}-run{run}.log has no `{text}` line with {fields:?} \
+             after {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The number in the `name=value` field of a plain node log line.
+pub(crate) fn log_field(line: &str, name: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+}
+
+/// A field is read only as a whole `name=` token, so `round` does not read `header_round`.
+#[test]
+fn test_log_field_reads_whole_fields() {
+    let line = "WARN primary::proposer: reproposing header current_round=752 header_round=5 \
+                newest_round=750 header=Header { round: 5 }";
+    assert_eq!(log_field(line, "header_round"), Some(5));
+    assert_eq!(log_field(line, "newest_round"), Some(750));
+    assert_eq!(log_field(line, "round"), None);
+    assert_eq!(log_field(line, "committed_round"), None);
 }
 
 /// Advertise a validator's JSON-RPC endpoint on its worker record.
@@ -653,6 +754,9 @@ pub(crate) fn start_observer_with_args(
 
 /// Start a process running the observer node whose datadir is `base_dir/<name>`, as set up by
 /// [`e2e_tests::config_observer`], with additional CLI arguments.
+///
+/// The entries of `TN_E2E_PARAMETERS` are merged into its `parameters.yaml` first (see
+/// [`NodeOverrides::apply_with_e2e_parameters`]); a value the node cannot read panics here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_named_observer(
     instance: usize,
@@ -665,6 +769,9 @@ pub(crate) fn start_named_observer(
     extra_args: &[&str],
 ) -> Child {
     let data_dir = base_dir.join(name);
+    NodeOverrides::default()
+        .apply_with_e2e_parameters(&data_dir)
+        .expect("TN_E2E_PARAMETERS applies to the observer's parameters.yaml");
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
     let ipc_path = base_dir.join(format!("{name}.ipc"));
@@ -1125,12 +1232,37 @@ pub(crate) fn start_nodes(
     test: &str,
     run: u32,
 ) -> eyre::Result<(Vec<Child>, Vec<NodeEndpoints>)> {
+    start_nodes_with_overrides(temp_path, validators, test, run, &FleetOverrides::default())
+}
+
+/// Like [`start_nodes`], with the overrides `fleet` sets for each node, looked up by its name in
+/// `validators` (its datadir under `temp_path`), so a restart of a subset finds the same nodes'
+/// overrides.
+///
+/// Every node's `parameters.yaml` entries are merged into `temp_path/<name>` before any node
+/// starts, after the fleet-wide entries of `TN_E2E_PARAMETERS` (see
+/// [`FleetOverrides::apply_with_e2e_parameters`]; a start without entries puts the harness's file
+/// back), so an override one node cannot take fails the start with nothing spawned. Each node's
+/// environment variables are set on its process only. A restart through [`start_nodes`] drops both,
+/// so a node whose overrides matter to the chain is restarted here with the same fleet. A node the
+/// fleet sets nothing for starts exactly as [`start_nodes`] starts it.
+pub(crate) fn start_nodes_with_overrides(
+    temp_path: &Path,
+    validators: &[(&str, Address)],
+    test: &str,
+    run: u32,
+    fleet: &FleetOverrides,
+) -> eyre::Result<(Vec<Child>, Vec<NodeEndpoints>)> {
+    // every node's overrides before any spawn: the caller guards the children only after an `Ok`,
+    // so a node that cannot take its overrides must fail the start while none is running
+    fleet.apply_with_e2e_parameters(temp_path, validators.iter().map(|(v, _)| *v))?;
     let bin = e2e_tests::get_telcoin_network_binary();
 
     let mut children = Vec::new();
     let mut endpoints = Vec::new();
     for (v, _) in validators.iter() {
         let dir = temp_path.join(v);
+        let node_overrides = fleet.node(v);
 
         if *v == NEW_VALIDATOR {
             info!(target: "epoch-test", ?v, "starting new validator");
@@ -1161,6 +1293,7 @@ pub(crate) fn start_nodes(
             .arg(ws_port.to_string())
             .arg("--ipcpath")
             .arg(ipc_path.to_string_lossy().as_ref());
+        command.envs(node_overrides.env.iter().map(|(name, value)| (name, value)));
 
         setup_log_dir(&mut command, v, test, run);
 

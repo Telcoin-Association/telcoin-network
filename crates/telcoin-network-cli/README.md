@@ -96,6 +96,8 @@ LoadCredentialEncrypted=bls-passphrase:/etc/telcoin/bls-passphrase.cred
 ExecStart=/usr/local/bin/telcoin-network --bls-passphrase-source credential node --datadir /var/lib/telcoin --http
 ```
 
+A unit that restarts the node on failure (`Restart=on-failure`) also needs `RestartPreventExitStatus=10`: the node exits with status 10 when it has forked, and a restart meets the same fork (see [Exit status](../../docs/src/getting-started/validator-operations.md#exit-status)).
+
 systemd decrypts the credential when the unit starts and places it in the unit's credential directory, which it names in `CREDENTIALS_DIRECTORY`. The node reads the passphrase from there, so it never appears on the command line, in the unit's `Environment=`, or in the process environment. `LoadCredential=bls-passphrase:<path>` works the same way for an unencrypted file. To use another credential name, pass `--bls-passphrase-credential <NAME>` or set `TN_BLS_PASSPHRASE_CREDENTIAL`; an empty value keeps the default, `bls-passphrase`. The name is checked only when the `credential` source reads it.
 
 An existing unit that passes the passphrase through `Environment=TN_BLS_PASSPHRASE=...` or an `EnvironmentFile=` moves to the credential in five steps:
@@ -663,7 +665,7 @@ The `parameters.yaml` file controls consensus timing and behavior. The node read
 | `max_header_num_of_batches`             | `10`     | Maximum batch digests per header                    |
 | `max_header_delay`                      | `2500ms` | Maximum wait time between header proposals          |
 | `min_header_delay`                      | `1000ms` | Minimum wait time; allows early header proposal     |
-| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + [`max_header_time_drift_tolerance`](#max_header_time_drift_tolerance-network-config) (rounded up to whole seconds pre-fork) and below the 10 s libp2p request timeout |
+| `vote_timeout`                          | `5s`     | Voter-side limit per vote request; at least `max_header_delay` + [`max_header_time_drift_tolerance`](#max_header_time_drift_tolerance-network-config) (rounded up to whole seconds pre-fork) and below 9 s: the 10 s libp2p request timeout less the voter's 1 s execution wait |
 | `gc_depth`                              | `50`     | Consensus rounds retained before garbage collection |
 | `sync_retry_delay`                      | `5s`     | Delay before retrying sync requests                 |
 | `sync_retry_nodes`                      | `3`      | Number of random committee nodes to query on retry  |
@@ -713,7 +715,7 @@ parallel_fetch_request_delay_interval:
 ### Checks that stop the node
 
 Beyond parsing `parameters.yaml`, the node checks the values below each time it sets up consensus for an epoch: as it starts, at every epoch boundary, and when it re-enters the current epoch after its role changes.
-The two `vote_timeout` checks are the exception: they bound the node's own votes, so they run only for an epoch the node can still vote in.
+The `vote_timeout` checks are the exception: they bound the node's own votes, so they run only for an epoch the node can still vote in.
 An epoch that its committee has already closed, shown by a stored epoch record carrying that committee's certificate, is replayed without them; a node catching up from genesis or from an old snapshot passes through such epochs.
 Validators and observers run the same checks.
 When one fails, the node logs `epoch returned error` and then `Error running node:` with a message that names the field, and exits.
@@ -731,7 +733,7 @@ The only input to these checks that changes between epochs is whether the sub-se
 | `header_num_of_batches_threshold` from 1 to `max_header_num_of_batches`  | At 0 the proposer seals empty headers; above the maximum the two limits contradict each other                                                                                                        |
 | `min_header_delay` at most `max_header_delay`                            | The minimum is an early-proposal point inside the maximum's window; inverted, the maximum always expires first and the minimum never takes effect                                                   |
 | `vote_timeout` at least `max_header_delay` plus the voter's longest drift wait | A vote request must stay open for a full header cadence plus the time the voter may spend waiting out a future-dated header. The drift wait is `max_header_time_drift_tolerance` once the sub-second timestamp fork is active for the epoch, and the tolerance rounded up to whole seconds before it (1 s for the 250 ms default) |
-| `vote_timeout` below 10 s                                                | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires                                                        |
+| `vote_timeout` below 9 s                                                 | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires. The voter waits up to 1 s for execution before it takes the author lock and starts `vote_timeout`, so that wait plus `vote_timeout` must stay below 10 s |
 
 With `--chain adiri` or `--chain mainnet`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
 Neither preset sets `vote_timeout`, so it is 5 s.

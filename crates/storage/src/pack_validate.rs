@@ -242,7 +242,8 @@ pub fn lost_pack_remedy(epoch_dir: impl Display) -> String {
          and a validator restored that way stays stopped until the network has closed the epoch \
          it was last in. Without a backup, start the node over as the recovery steps for a \
          missing pack in crates/tn-reth/README.md (\"Transactions stored by position\") \
-         describe. Do NOT delete `{epoch_dir}` or the chain-data directories (`db`, \
+         describe (a validator then stays stopped until the network has closed the last epoch \
+         it took part in). Do NOT delete `{epoch_dir}` or the chain-data directories (`db`, \
          `static_files`, `consensus-db`): a datadir that stores transactions by position refuses \
          every start without that pack."
     )
@@ -1965,10 +1966,11 @@ mod test {
     }
 
     /// Every data-loss kind's recommended action names what works: nothing fetches a past epoch's
-    /// pack again, so it points at a backup or starting the node over, and warns off deleting the
-    /// `epoch-N` directory (a datadir storing transactions by position refuses every start without
-    /// it). A torn meta with nothing behind it says which case removing the directory is for: the
-    /// newest epoch, which holds no output, never a past one.
+    /// pack again, so it points at a backup or starting the node over (after which a validator
+    /// stays stopped until the network has closed the last epoch it took part in), and warns off
+    /// deleting the `epoch-N` directory (a datadir storing transactions by position refuses every
+    /// start without it). A torn meta with nothing behind it says which case removing the
+    /// directory is for: the newest epoch, which holds no output, never a past one.
     #[test]
     fn test_data_loss_remediation_names_a_backup_never_a_resync() {
         for kind in [
@@ -1995,6 +1997,13 @@ mod test {
             assert!(
                 text.contains("crates/tn-reth/README.md"),
                 "{kind:?}: must point at the recovery steps: {text}"
+            );
+            assert!(
+                text.contains(
+                    "describe (a validator then stays stopped until the network has closed the \
+                     last epoch it took part in)"
+                ),
+                "{kind:?}: a validator that starts over must stay stopped: {text}"
             );
             assert!(
                 text.contains("Do NOT delete `epoch-N`"),

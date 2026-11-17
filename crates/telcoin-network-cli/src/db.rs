@@ -245,7 +245,8 @@ enum DbSubcommand {
     /// one missing refuses, naming the epochs, and a rebuild does not get past that (it
     /// re-executes from the same packs): put back each missing past `epoch-N` from a backup taken
     /// after that epoch closed or another node's sealed copy (`db import-epoch`), or start over as
-    /// a new node with `consensus-db` moved aside as well, or swap in an observer's execution
+    /// a new node with `consensus-db` moved aside as well (a validator then stays stopped until
+    /// the network has closed the last epoch it took part in), or swap in an observer's execution
     /// database (`--for-swap`).
     ResetExecution(DbResetExecutionArgs),
 }
@@ -4826,6 +4827,27 @@ mod tests {
             assert_eq!(reset.force, force, "{args:?}");
             assert_eq!(reset.for_swap, for_swap, "{args:?}");
         }
+    }
+
+    /// `db reset-execution`'s help, which sends a node that lost a past pack to start over with
+    /// `consensus-db` moved aside, says a validator then stays stopped.
+    #[test]
+    fn db_reset_execution_help_keeps_a_validator_that_starts_over_stopped() {
+        use clap::CommandFactory as _;
+        let cli = Cli::<NoArgs>::command();
+        let help = cli
+            .find_subcommand("db")
+            .and_then(|db| db.find_subcommand("reset-execution"))
+            .and_then(|command| command.get_long_about())
+            .expect("reset-execution's details")
+            .to_string();
+        assert!(
+            help.contains(
+                "start over as a new node with `consensus-db` moved aside as well (a validator \
+                 then stays stopped until the network has closed the last epoch it took part in)"
+            ),
+            "{help}"
+        );
     }
 
     #[test]
