@@ -39,8 +39,10 @@ GitHub marks every Adiri release and every release candidate as a pre-release, s
 One signature over `SHA256SUMS` therefore covers the binary, the image and the chain configuration.
 The blocks below extract the chain-config files from the tag, so Path A checks all five lines and Path B checks every line but the tarball's.
 `SHA256SUMS.asc` is made with a maintainer's OpenPGP signing key, held on a YubiKey, which it never leaves.
-The same key signs the git tag.
-The keys allowed to sign are in [`.github/maintainer-gpg-keys/`](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/maintainer-gpg-keys/README.md) on `main`, and their fingerprints are in the maintainer release keys table in [`SECURITY.md`](https://github.com/Telcoin-Association/telcoin-network/blob/main/SECURITY.md#maintainer-release-keys).
+The git tag carries a signature by a key on the same allowlist.
+The keys allowed to sign are in `keys/` of [`tn-release-signing`](https://github.com/Telcoin-Association/tn-release-signing), the repository that holds the maintainer keys every signed Telcoin project shares.
+This repository carries it as the `release` submodule, and the keys that count are the ones at the commit `main` records for `release`.
+Their fingerprints are in the key table of `KEYS.md` in that same commit.
 
 A good signature proves that a maintainer on that list approved these exact files.
 It does not prove that the binary was built from the tagged source.
@@ -62,13 +64,14 @@ Start each path in a new, empty directory and run its commands in one shell.
 The first command of each block stops on a directory that is not empty, so a file left from an earlier download is never checked in place of this release's.
 Set `TAG` on the first line to the release you are installing.
 
-Both paths take the maintainer keys from `main`, never from the release's tag.
-A tag therefore cannot bring its own key, and a key that is revoked or removed on `main` stops verifying at once.
+Both paths take the maintainer keys from `main`, never from the release's tag: they clone `main`, check out its `release` submodule at the commit `main` records, and read the keys there.
+A tag therefore cannot bring its own key, and moving the `release` pointer on `main` needs a review from a maintainer who holds a release key.
+A key removed from the allowlist stops verifying as soon as `main` records a `release` commit without it.
 The tag is fetched into the same checkout by its full name, `refs/tags/<TAG>`, because `git clone --branch <TAG>` prefers a branch of the same name, if one exists, and says nothing.
 
 ## Path A: tarball
 
-In a new, empty directory, these commands clone `main` for the maintainer keys, fetch the tag, extract the chain-config files from it, download the four release files, stopping at the first download that fails, check the signature over `SHA256SUMS`, and check every hash in it:
+In a new, empty directory, these commands clone `main` and its `release` submodule for the maintainer keys, fetch the tag, extract the chain-config files from it, download the four release files, stopping at the first download that fails, check the signature over `SHA256SUMS`, and check every hash in it:
 
 ```sh
 TAG=v0.17.0-adiri
@@ -76,10 +79,11 @@ REPO=Telcoin-Association/telcoin-network
 BASE="https://github.com/$REPO/releases/download/$TAG"
 if [ -n "$(ls -A)" ]; then echo "Run these commands in a new, empty directory" >&2; false; fi &&
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
+git -C tn-main submodule update --init --depth 1 -- release &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
 git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
-for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
-gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
+for k in tn-main/release/keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
+gpg --show-keys --with-fingerprint tn-main/release/keys/*.asc &&
 curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" "$BASE/telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
 gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
 awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
@@ -117,13 +121,14 @@ It must print `OK` for all three files.
 The keys come from `main`, so the tag cannot change them.
 Check that they are the maintainers' keys: every primary key fingerprint that `gpg --show-keys` printed, including the one after `signed by primary key`, must appear in both of these places:
 
-- the maintainer release keys table in `tn-main/SECURITY.md`, from the same `main` checkout (also [on GitHub](https://github.com/Telcoin-Association/telcoin-network/blob/main/SECURITY.md#maintainer-release-keys)), with a Status that is not `revoked`;
+- the key table in `tn-main/release/KEYS.md`, from the same `main` checkout, with a Status that is not `revoked`;
 - the maintainer's GitHub account at `https://github.com/<handle>.gpg`, where `<handle>` is the key file's name without `.asc`.
 
+`git -C tn-main submodule status -- release` prints the commit of `tn-release-signing` that the keys and the table came from.
 This loop prints the keys GitHub has for each handle:
 
 ```sh
-for k in tn-main/.github/maintainer-gpg-keys/*.asc; do
+for k in tn-main/release/keys/*.asc; do
   h=$(basename "$k" .asc)
   echo "== $h"
   curl -fsSL "https://github.com/$h.gpg" | gpg --show-keys --with-fingerprint
@@ -172,10 +177,11 @@ REPO=Telcoin-Association/telcoin-network
 BASE="https://github.com/$REPO/releases/download/$TAG"
 if [ -n "$(ls -A)" ]; then echo "Run these commands in a new, empty directory" >&2; false; fi &&
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
+git -C tn-main submodule update --init --depth 1 -- release &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
 git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
-for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
-gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
+for k in tn-main/release/keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
+gpg --show-keys --with-fingerprint tn-main/release/keys/*.asc &&
 curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
 gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
 awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
@@ -219,13 +225,13 @@ cat IMAGE_DIGEST
 
 ## Optional: check the tag signature
 
-The tag carries its own signature from the same key.
+The tag carries its own signature, by one key on the allowlist.
 To check it in a throwaway keyring, from the directory you started in:
 
 ```sh
 GNUPGHOME=$(mktemp -d)
 export GNUPGHOME
-gpg --quiet --import tn-main/.github/maintainer-gpg-keys/*.asc
+gpg --quiet --import tn-main/release/keys/*.asc
 git -C tn-main verify-tag "$TAG"
 unset GNUPGHOME
 ```
@@ -245,12 +251,12 @@ Never extract, install or run anything from a release that failed one of these c
 | `BADSIG` (gpgv prints `BAD signature`) | `SHA256SUMS` changed after it was signed | Stop and report it. |
 | `ERRSIG` (gpgv prints `Can't check signature: No public key`) | The signing key is not in the allowlist on `main`: `TAG` is wrong, the files belong to another release, or the key was removed after this release was signed | Check `TAG`; if it is right, stop and report it. |
 | `REVKEYSIG` (gpgv still prints `Good signature`) | The signing key was revoked, for example after a YubiKey was lost | Stop and report it. A release signed before the revocation can no longer be verified against `main`, which is intended. |
-| `EXPKEYSIG` (gpgv still prints `Good signature`) | The signing key has expired | Stop and report it. An older release signed before the expiry cannot be verified against `main` until a maintainer extends the key there. |
+| `EXPKEYSIG` (gpgv still prints `Good signature`) | The signing key has expired | Stop and report it. An older release signed before the expiry cannot be verified against `main` until a maintainer extends the key and `main` records a `release` commit that carries the extended key. |
 | `EXPSIG` | The signature itself has expired | Stop and report it. |
 | One of the rows above next to a `GOODSIG` | Another signature in `SHA256SUMS.asc` is bad, unverifiable, expired or revoked, and the block refuses the file as a whole | Stop and report it. |
 | `sha256sum` prints `FAILED` | A file differs from its signed hash | Check `TAG` and run the block again in a new, empty directory; if it fails again, stop and report it. |
 | `sha256sum` prints `FAILED open or read` for a `chain-configs/` file | `git archive` did not extract it from the tag | Check that the tag was fetched; if it was, stop and report it. |
-| A fingerprint is missing from, or differs from, `SECURITY.md` or GitHub, or its `SECURITY.md` Status is `revoked` | The keys on `main` are not the current maintainer keys | Stop and report it. |
+| A fingerprint is missing from, or differs from, `tn-main/release/KEYS.md` or GitHub, or its `KEYS.md` Status is `revoked` | The keys on `main` are not the current maintainer keys | Stop and report it. |
 | `IMAGE_DIGEST does not name an image in ghcr.io/telcoin-association/<package> by digest` | The signed `IMAGE_DIGEST` points outside the tag's package, for example at the other network's package | Stop and report it. |
 | `Commit SHA` differs from the tag's commit, `Build Features` is not empty on a mainnet tag, or on an `-adiri` tag lacks `adiri` or lists anything but `adiri` and `faucet` | The binary does not match the release | Stop and report it. |
 | `exec format error`, or Docker warns that the image platform does not match the host | The release is built for Linux x86_64 only | Use an x86_64 host, or build from source. |

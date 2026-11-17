@@ -140,7 +140,9 @@ In order of importance:
    configuration the lanes read (`.cargo/`, `.config/`, the toolchain pins, and every
    `rustfmt.toml` and `clippy.toml`) to the four accounts in `MAINTAINERS` (the `ci-scope`
    job in `pr.yaml`), so a PR that touches any of them needs one of those four to approve
-   it. GitHub reads CODEOWNERS from the PR's base branch, so a PR cannot change who has to
+   it. `/release` and `/.gitmodules`, which decide which maintainer keys may sign a release,
+   are assigned to the two release key holders instead, so a PR that moves the submodule
+   pointer needs one of them. GitHub reads CODEOWNERS from the PR's base branch, so a PR cannot change who has to
    review it. Other paths need the one approval, but not a code owner's. Recommended, and
    still off: *Require approval of the most recent reviewable push*, so the author of that
    push cannot approve it themselves.
@@ -413,7 +415,7 @@ The release signatures and the on-chain attestation answer different questions: 
 | `draft-release` | a pushed `v*` tag, once `validate-tag` has passed | `etc/release.sh draft` | `contents: write` | 5 min |
 | `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `Install Foundry`, `etc/release.sh verify` | `contents: read` | 20 min |
 
-`validate-tag` checks that the tag is an annotated tag signed by a key in the allowlist (`.github/maintainer-gpg-keys/` on `main`), that it points at a commit on `main` whose Cargo version and `CHANGELOG.md` section match it, and that the commit was attested on-chain, which is what `cast` is installed for.
+`validate-tag` checks that the tag is an annotated tag signed by a key in the allowlist (`release/keys/` at the commit `main` records for the `release` submodule), that it points at a commit on `main` whose Cargo version and `CHANGELOG.md` section match it, and that the commit was attested on-chain, which is what `cast` is installed for.
 A tag is validated against every release tag that exists when it is pushed: on the push, the first run of `validate-tag` compares it with every `v*` tag in its checkout, and a re-run with the tags created before GitHub created the run, which `actions: read` lets it look up; the date in the tag plays no part there.
 The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly there instead of being ignored, and `etc/release.sh` decides what a release tag is.
 `draft-release` creates the draft with the same notes, or refreshes the notes of a draft it created before; the draft carries no assets until the maintainer's `make release-build` uploads them.
@@ -428,12 +430,14 @@ No job in `release.yaml` may be named `CI Success`: item 1 of "Repository settin
 
 ### Scripts and keys come from `main`
 
-Every job checks out `refs/heads/main`, never the tagged tree, with `fetch-depth: 0` (every tag, and the `refs/remotes/origin/main` that the ancestry and version checks read) and `persist-credentials: false`.
+Every job checks out `refs/heads/main`, never the tagged tree, with `fetch-depth: 0` (every tag, and the `refs/remotes/origin/main` that the ancestry and version checks read), `submodules: true` and `persist-credentials: false`.
 The checkout step still receives the job's token and fetches with it; `persist-credentials: false` only keeps the token out of `.git/config` for the steps after it.
 `etc/release.sh`, `.github/scripts/verify_commit_hash.sh` and the allowlist all come from that checkout.
+The allowlist is `keys/` of `tn-release-signing`, the repository of maintainer keys that every signed Telcoin project shares, which `main` carries as the `release` submodule; `etc/release.sh` reads the keys and the signature threshold in `KEYS.md` from the submodule's object store at the commit `main` records, never from its checked-out files, which is why every checkout takes the submodule.
 The reason is the one the `attest` job in `pr.yaml` gives for its `trusted/` checkout: a tag on a commit that edits a script or adds a key would otherwise be judged by its own edit.
-The local `make release-*` targets read the allowlist from `origin/main` as well, and `make release-build` and `make release-publish` refuse to run when `etc/release.sh` or `verify_commit_hash.sh` differs from it.
-The operator check in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) also builds its keyring from a checkout of `main`, and fetches the tag into it by its full name, `refs/tags/<TAG>`, because `git clone --branch <TAG>` prefers a branch of the same name.
+A key reaches the allowlist only through a pull request that moves the `release` pointer on `main`, and `.github/CODEOWNERS` assigns `/release` and `/.gitmodules` to the maintainers who hold release keys, so that move needs one of them to approve it.
+The local `make release-*` targets read the allowlist at the commit `origin/main` records for `release` as well, and `make release-build` and `make release-publish` refuse to run when `etc/release.sh` or `verify_commit_hash.sh` differs from it.
+The operator check in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) also builds its keyring from a checkout of `main` and its `release` submodule, and fetches the tag into it by its full name, `refs/tags/<TAG>`, because `git clone --branch <TAG>` prefers a branch of the same name.
 
 The job definitions are the exception.
 GitHub reads `release.yaml` itself from the tagged commit (for a dispatch, from the branch it runs on), so a tag on a commit that edits the workflow runs the edited workflow under that tag's name.
@@ -449,7 +453,7 @@ A `GITHUB_TOKEN` must also never be able to publish an artifact.
 A CI build would compile every dependency, build scripts and procedural macros included, in a job holding a token that can upload release assets or push the image.
 In `release.yaml` no job has `packages: write`, and the one job with any write, `draft-release`, runs only the pinned `actions/checkout`, which fetches `main` with the token and does not leave it in the checkout, and `etc/release.sh draft`, which calls `gh`.
 Its `contents: write` lets the token create, edit, publish and delete releases and their assets, and push any branch or tag that no ruleset protects, but it holds no artifact and cannot sign one.
-Anyone with write access can get the same permission from a workflow on their own branch, so what protects an operator is the check in Installing a release: the signature over `SHA256SUMS` against the allowlist on `main`, and the fingerprint comparison with `SECURITY.md` on `main`.
+Anyone with write access can get the same permission from a workflow on their own branch, so what protects an operator is the check in Installing a release: the signature over `SHA256SUMS` against the allowlist on `main`, and the fingerprint comparison with `KEYS.md` in `main`'s `release` submodule.
 The release text is not protected: anyone with write access can edit a draft's notes, so the install page, built from `main`, is the reference.
 
 ### The post-publish check is detective only

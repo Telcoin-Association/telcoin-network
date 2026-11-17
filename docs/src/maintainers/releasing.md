@@ -57,14 +57,34 @@ So an older release still verifies after newer ones exist, while a lower version
 
 ## Machines and prerequisites
 
+### The `release` submodule
+
+The maintainer keys that may sign a release and the signature threshold live in [`tn-release-signing`](https://github.com/Telcoin-Association/tn-release-signing), the repository that every signed Telcoin project shares.
+This repository carries it as the git submodule `release/`: each key is `release/keys/<handle>.asc`, and [`KEYS.md`](https://github.com/Telcoin-Association/tn-release-signing/blob/main/KEYS.md) holds the key table and the line `Signatures required: N`.
+Every step that needs a key reads the keys and that line at the commit `origin/main` records for `release`, from the submodule's object store, never from its checked-out files, from the tag or from this repository's own tree.
+When the submodule lacks that commit, the step fetches it from the submodule's `origin`.
+A tag therefore cannot introduce a key, and the keys change only when a PR moves the `release` pointer on `main`, which needs the review of a maintainer who holds a release key (see [Moving the submodule pointer](#moving-the-submodule-pointer)).
+Every key in the shared allowlist can sign a release of this repository.
+
+Every checkout that runs a step, on the laptop and on the build server, needs the submodule checked out.
+Run this after each pull of `main`:
+
+```sh
+git submodule update --init -- release
+```
+
+Without it, every step that reads the keys stops with exit 2, and `release-prep` stops when the submodule is at another commit than `main` records, because it requires a clean tracked tree.
+On a checkout whose `HEAD` predates the submodule, the command fails with a pathspec error; pull `main` first.
+The release workflow checks the repository out with its submodules, so CI needs nothing more.
+
 ### Laptop (macOS)
 
-- [YubiKey signing setup](yubikey-setup.md) is done, and your key is on the allowlist on `main`.
+- [YubiKey signing setup](yubikey-setup.md) is done, and your key is in the allowlist at the `release` commit that `main` records.
 - `gpg --card-status` shows the YubiKey.
 - `git config --get user.signingkey` prints your signing key fingerprint followed by `!`; `RELEASE_GPG_KEY` overrides it for one command.
 - `gh auth status` shows a login with the `repo` scope, which `release-sign` needs to read the draft and upload to it.
 - Docker runs `linux/amd64` images, as Docker Desktop does on any Mac: `release-sign` pulls the release image by digest, compares its binary with the tarball's and runs its `--version`.
-- The repository is cloned and on an up-to-date `main`.
+- The repository is cloned and on an up-to-date `main`, with the [`release` submodule](#the-release-submodule) checked out.
 - Foundry's `cast` is optional: with it, `release-tag` and `release-sign` also check the on-chain attestation, and without it they print a notice and leave that check to CI.
 
 ### Build server (Ubuntu or Debian, Linux x86_64)
@@ -75,8 +95,8 @@ Any Ubuntu or Debian server on Linux x86_64 can be the build server; `release-bu
 - `gh auth status` shows a login with the `repo` scope, to upload to the draft and edit it.
 - Docker is logged in to `ghcr.io` through `make docker-login`; [Registry access on the build server](yubikey-setup.md#registry-access-on-the-build-server) covers the first login.
 - `cast --version` works, and `.env` holds `GITHUB_ATTESTATION_PRIVATE_KEY` for an address with the MAINTAINER role (see the [CI environment notes](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#environment)).
-- `make init-submodules` has been run.
-- The checkout is on an up-to-date `main` with a clean tracked tree.
+- `make init-submodules` has been run; it checks out `tn-contracts` and `release`.
+- The checkout is on an up-to-date `main` with a clean tracked tree, and the [`release` submodule](#the-release-submodule) is at the commit `main` records.
   `release-prep` requires `HEAD` to be `origin/main`.
   `release-build` and `release-publish` refuse to run when `etc/release.sh` or `.github/scripts/verify_commit_hash.sh` differ from `origin/main`.
 
@@ -84,7 +104,8 @@ The YubiKey never goes to the build server, and the registry token never goes on
 
 ### One-time setup
 
-- The allowlist on `main` must hold a provisioned key; every check fails on a placeholder file and names it.
+- `main` must record the `release` submodule, and the allowlist at that commit must hold a provisioned key; every check fails without the submodule, and on a placeholder file, which it names.
+  `MIN_SIGNATURES` in `etc/release.sh` must be at least the `Signatures required` line of `KEYS.md` at that commit.
 - A repository admin sets up the tag ruleset on `v*`, as [Settings the release workflow requires](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#settings-the-release-workflow-requires) describes: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one.
   The scripts cannot see the ruleset, and the signatures do not depend on it: every step that reads a tag requires exactly one signature on it, made by a key in the allowlist on `main`, and publishing requires at least `MIN_SIGNATURES` maintainer signatures over `SHA256SUMS`.
   The ruleset covers what signatures cannot: GitHub runs `release.yaml` from the tagged commit, so the ruleset decides who can start the workflow for a release tag, and it keeps a tag from being moved or deleted after it was validated.
@@ -107,7 +128,7 @@ The YubiKey never goes to the build server, and the registry token never goes on
 ### 1. Prepare and merge the release PR (build server)
 
 ```sh
-git switch main && git pull --ff-only
+git switch main && git pull --ff-only && git submodule update --init -- release
 make release-prep TAG=v0.17.0-adiri
 ```
 
@@ -133,7 +154,7 @@ If the release commit landed in a batch with another PR, repeat this step on the
 When the PR has merged, attest the release commit, which is the commit you will tag:
 
 ```sh
-git switch main && git pull --ff-only
+git switch main && git pull --ff-only && git submodule update --init -- release
 RELEASE_SHA="$(git log -1 --format=%H --grep='^release: v0\.17\.0-adiri (#' origin/main)"
 git switch --detach "$RELEASE_SHA" && ALLOW_STALE_BASE=1 make attest
 git switch main
@@ -151,7 +172,7 @@ The new section shows up on the docs site's [Release notes](../getting-started/r
 ### 2. Sign and push the tag (laptop)
 
 ```sh
-git switch main && git pull --ff-only
+git switch main && git pull --ff-only && git submodule update --init -- release
 make release-tag TAG=v0.17.0-adiri
 ```
 
@@ -197,7 +218,7 @@ gh release view v0.17.0-adiri
 ### 4. Build (build server)
 
 ```sh
-git switch main && git pull --ff-only
+git switch main && git pull --ff-only && git submodule update --init -- release
 make release-build TAG=v0.17.0-adiri
 ```
 
@@ -294,26 +315,47 @@ Publishing a candidate never moves an image alias.
 
 ## What the deployment scripts check
 
-The node deployment scripts in [tn-node-deployment](https://github.com/Telcoin-Association/tn-node-deployment) install and update nodes from these releases with no person reading the output, so they check every release the same way:
+The node deployment scripts in [tn-node-deployment](https://github.com/Telcoin-Association/tn-node-deployment) install and update nodes from these releases with no person reading the output.
+They take a release only under a tag in the form of the host's network: `vX.Y.Z` on mainnet, and `vX.Y.Z-adiri` or, when the operator names it, `vX.Y.Z-adiri-rcN` on Adiri.
+They refuse a mainnet release candidate, `vX.Y.Z-rcN`, before they download anything.
+They check every release they take the same way:
 
-1. They download `SHA256SUMS` and `SHA256SUMS.asc` from the release, and the tarball or `IMAGE_DIGEST`, whichever they install.
-2. They build a keyring from the maintainer public keys shipped in their own signed script release, not from this repository, and run `gpgv --status-fd 1 --keyring <keyring> SHA256SUMS.asc SHA256SUMS`.
-3. They require a `VALIDSIG` line whose primary key fingerprint, the line's last field, is one of those keys, and refuse the release on any `BADSIG`, `EXPKEYSIG`, `REVKEYSIG`, `NO_PUBKEY` or `ERRSIG` line.
-4. Before anything is installed, they check each file they use against its line in `SHA256SUMS`, the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` included.
+1. They download `SHA256SUMS`, `SHA256SUMS.asc` and `IMAGE_DIGEST` from the release, and the host's tarball when they install the binary.
+2. They build a keyring from the `*.asc` files in `lib/release-keys/` of the signed script release the host runs, not from this repository, and run `gpgv --status-fd 1 --keyring <keyring> SHA256SUMS.asc SHA256SUMS`.
+3. They judge its status lines, and take the release when at least one signature is good and no line refuses it.
+   A signature is good when a `GOODSIG` line is followed by a `VALIDSIG` line whose last field, the 40-character fingerprint of the primary key, is one of their keys; one is enough, and they count no further.
+   A `BADSIG` line, whatever key made it, an `EXPKEYSIG`, `REVKEYSIG` or `EXPSIG` line, and an `ERRSIG` line for any reason but a missing key each refuse the release, even beside a good signature.
+   A `NO_PUBKEY` line, or an `ERRSIG` line for a missing key, is a signature by a key they do not ship, and refuses nothing by itself: beside a good signature they take the release and print a warning that names that key, and without one they refuse the release and name the key.
+4. They require `SHA256SUMS` to hold only `<64 hex>  <name>` lines that name exactly `IMAGE_DIGEST`, one node tarball and the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` under their repository paths, each once.
+   The three chain-config lines must carry the hashes that their own script release pins for the network, and they refuse the release when a hash differs or none is pinned.
+5. Before anything is installed, they check `IMAGE_DIGEST`, which must be one `<repository>@sha256:<64 hex>` line, and the tarball against their lines in `SHA256SUMS`, and they run the image only from the repository they take for the network.
+6. When a host builds the node from source instead, they check the signature on the release tag by the same rule.
+   A tag whose signature is bad, expired or revoked stops the build on any network; a tag they cannot verify, such as one signed by a key they do not ship, stops it on mainnet and only prints a warning on testnet.
 
 For maintainers this means:
 
-- The release files keep their names and formats: `SHA256SUMS` in `sha256sum` format with the chain-config lines under their repository paths, a detached ASCII-armored `SHA256SUMS.asc`, the tarball and `IMAGE_DIGEST`. A renamed or reformatted file stops every node update.
-- A new key that signs releases, whether a primary key that signs, as every key on the allowlist does today, or a subkey with the sign capability, reaches the scripts in a signed script release before it signs a node release; until then the scripts refuse that release with `NO_PUBKEY` or `ERRSIG`. An expired or revoked key stops verifying there as it does here.
-- The scripts require one valid signature. Raising `MIN_SIGNATURES` here does not raise what they require until they change too.
+- The release files keep their names and formats: `SHA256SUMS` in `sha256sum` format, naming exactly `IMAGE_DIGEST`, the node's tarball and the chain-config files under their repository paths, a detached ASCII-armored `SHA256SUMS.asc`, the tarball and `IMAGE_DIGEST`.
+  A renamed or reformatted file, or one more line in `SHA256SUMS`, stops every node update.
+- A release whose `committee.yaml`, `genesis.yaml` or `parameters.yaml` changed installs only on hosts whose script release pins the new hashes.
+  A change to one of those files on `main` therefore needs a signed script release with the new hashes before a node release cut from that commit installs anywhere.
+- A mainnet release candidate installs on no host the scripts manage; an operator installs one by hand, as [Installing a release](../getting-started/installing-a-release.md) describes.
+- A key signs a node release, or its tag, only once a signed script release ships it, whether it is a primary key that signs, as every key on the allowlist does today, or a subkey with the sign capability.
+  Hosts run a signed script release, not the scripts' `main`, and keep an older one until they update with `update-scripts.sh`, so compare `lib/release-keys/` in the latest signed script release with `KEYS.md` before a key signs.
+  A host whose script release does not ship the key refuses a node release that only that key signed, and names the key; when a key it ships signed the release too, it takes the release and warns about the other signature.
+  A mainnet host that builds from source refuses a tag signed by a key it does not ship.
+  A signature by a key that the host's copy shows expired or revoked refuses the release there even beside a good one, as it does here, so a key's new expiry date also has to reach the scripts in a signed script release.
+- The scripts tolerate a signature by a key they do not ship, but a release made here never carries one from outside the allowlist: `release-sign`, `release-verify` and `release-publish` refuse any signature in `SHA256SUMS.asc` that is not a good one by an allowlisted key.
+  So there is one rule to follow: every signature is a good one by an allowlisted key, and every key that signs ships in a signed script release before it signs.
+- The scripts count no signatures on a node release, so one good signature by a key they ship is enough there.
+  Raising `MIN_SIGNATURES` here raises what every release carries, not what the scripts check.
 
 ## When a step fails
 
 Every step prints `error:` and the reason when it stops.
 `etc/release.sh` exits with 1 when a check fails, 2 for a usage error or an unmet precondition, and 3 when GitHub, the registry, the RPC endpoint or a `git` or `docker` network call failed; `make` shows the code as `Error N`.
-GitHub API calls, `git fetch` and `git ls-remote`, registry lookups, the pull of the git-cliff image and the attestation check are retried before a step gives up with 3.
+GitHub API calls, `git fetch` and `git ls-remote`, the fetch of the `release` commit that `main` records, registry lookups, the pull of the git-cliff image and the attestation check are retried before a step gives up with 3.
 A request that GitHub refuses, with an HTTP 4xx other than 429, is not retried and exits with 1 or 2, and so does a tag push that `origin` rejects.
-`git push`, `docker push`, `docker pull`, `cargo update`, the image build, the submodule fetch and the alias move are tried once, and exit with 3 when they fail.
+`git push`, `docker push`, `docker pull`, `cargo update`, the image build, the `tn-contracts` submodule fetch and the alias move are tried once, and exit with 3 when they fail.
 A signature that gpg cannot make, usually because the YubiKey is not plugged in, exits with 2.
 After an exit code of 3, run the same command again.
 If `cargo update` or the image build fails the same way a second time, the cause is not an outage: the output above it shows it, such as a version conflict or a compile error.
@@ -323,10 +365,17 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | Step | Symptom | Fix |
 | --- | --- | --- |
 | 1 | `release-prep` refuses to start | The message names the precondition: a clean tracked tree, `HEAD` at `origin/main`, or a tag that already exists. |
+| 1 | `tracked files have local changes; prep needs a clean checkout of main`, and `git status --short` shows ` M release` | The `release` submodule is at another commit than `main` records, usually after a pull that moved the pointer. Run `git submodule update --init -- release`, then `release-prep` again. |
 | 1 | `release-prep` stops after it set the version | It restores `Cargo.toml`, `Cargo.lock` and `CHANGELOG.md` from `HEAD` as it exits, so fix the cause and run it again. |
 | 1 | `release-prep` finds the version's section lower down in `CHANGELOG.md` | That version was already released; choose the next one. |
 | 2, 3 | The `CHANGELOG.md` check fails on `release-base` | If you are tagging a later commit, set `RELEASE_COMMIT` to the release commit. If the release commit did not land alone, repeat step 1 on the new `main`. |
-| 2, 3 | The signing key is not on the allowlist | Check `git config --get user.signingkey` and `RELEASE_GPG_KEY`, and that your file on `main` holds your current signing key (`gpg --show-keys .github/maintainer-gpg-keys/<handle>.asc`). |
+| 2, 3 | The signing key is not on the allowlist | Check `git config --get user.signingkey` and `RELEASE_GPG_KEY`, and that your file at the `release` commit `main` records holds your current signing key (`gpg --show-keys release/keys/<handle>.asc` after `git submodule update --init -- release`). A key merged in `tn-release-signing` can sign only once `main` moves the pointer to it. |
+| 2 to 7 | `submodule layout: release is a submodule on refs/remotes/origin/main but is not checked out here; run git submodule update --init -- release` | Run `git submodule update --init -- release`, then the step again. If git answers `pathspec 'release' did not match any file(s) known to git`, the checkout's `HEAD` predates the submodule: run `git switch main && git pull --ff-only` first. |
+| 2 to 7 | `main must record the release submodule (tn-release-signing), but refs/remotes/origin/main has no submodule at release; ...` | No step can read a key until `main` records the `release` submodule again; keys are never read from this repository's own tree. |
+| 2 to 7 | `submodule layout: MIN_SIGNATURES=<n> in etc/release.sh is below the <N> signatures KEYS.md requires in release at <commit>, ...` | The pointer on `main` names a `KEYS.md` that requires more signatures than `etc/release.sh`. Raise `MIN_SIGNATURES` to at least `<N>` in a PR; it belongs in the PR that moves the pointer, as [Moving the submodule pointer](#moving-the-submodule-pointer) says. |
+| 2 to 7 | `submodule layout: release at <commit>, ... has no KEYS.md to read the signature threshold from`, or `submodule layout: KEYS.md in release at <commit>, ... must state the threshold on one line 'Signatures required: N'` | The pointer on `main` names a `tn-release-signing` commit without a usable threshold line. Fix `KEYS.md` there, then move the pointer to the fixed commit. |
+| 2 to 7 | `submodule layout: refs/remotes/origin/main records <commit> for release, but neither its checkout nor its origin has that commit` | The pointer names a commit that `tn-release-signing` does not have, such as one never pushed there. Move the pointer to a commit on its `main`. |
+| 2 to 7 | `git fetch in release from its origin failed after 3 attempts` | The step needed the `release` commit `main` records and could not fetch it. Run the step again; `git submodule update --init -- release` fetches that commit too. |
 | 2, 3 | The commit is not attested | On the build server, run `git switch --detach <commit> && ALLOW_STALE_BASE=1 make attest`, then `git switch main`. If CI failed on it, also run `gh run rerun <run-id>`. |
 | 3 | The tag is wrong | The tag stays: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one. Follow [Before publish](#before-publish) and release the next version. |
 | 4, 6 | `run make docker-login` | Run `make docker-login` on the build server. |
@@ -401,27 +450,51 @@ Instead:
 ## Adding a maintainer or changing the threshold
 
 - The new maintainer follows [YubiKey signing setup](yubikey-setup.md).
-- One PR adds `.github/maintainer-gpg-keys/<handle>.asc` and the maintainer's row in the `SECURITY.md` key table.
+- One PR to `tn-release-signing` adds `keys/<handle>.asc` and the maintainer's row in the `KEYS.md` table, following the rules in [Changing this table](https://github.com/Telcoin-Association/tn-release-signing/blob/main/KEYS.md#changing-this-table).
 - An existing maintainer reviews it and confirms the fingerprint with the new maintainer over a separate channel, such as a call, and against `https://github.com/<handle>.gpg`.
-- The key can sign as soon as the PR merges, because every check reads the allowlist from `main`.
+- Once it merges there, a PR here moves the `release` pointer to that commit, as [Moving the submodule pointer](#moving-the-submodule-pointer) describes.
+  The key can sign a release as soon as that PR merges, because every check reads the keys at the pointer on `main`.
+- The node deployment scripts carry maintainer keys of their own, so a new key also has to reach them before it signs a node release, as [What the deployment scripts check](#what-the-deployment-scripts-check) says.
+  A host trusts the keys in `lib/release-keys/` of the signed script release it runs, so a release installs there only with a good signature by one of those keys; compare the fingerprints in the latest signed script release, not in the scripts' `main`, with `KEYS.md` before a key signs a node release.
 
-The threshold is `MIN_SIGNATURES` in `etc/release.sh`, currently 1.
+`KEYS.md` states the threshold for every project that shares the allowlist, on its line `Signatures required: N`, currently 1.
+`MIN_SIGNATURES` in `etc/release.sh`, currently 1, may be higher than that line but never lower: every step that reads the keys reads the line at the commit `main` records for `release`, and stops with exit 1 when `MIN_SIGNATURES` is below it or the line is missing.
 `RELEASE_SIG_THRESHOLD` raises it for a single command, and can go neither below `MIN_SIGNATURES` nor above the number of allowlisted maintainers.
-To raise it for every release, change `MIN_SIGNATURES` in a PR that also updates the signatures-required line in `SECURITY.md` and tells operators on [Installing a release](../getting-started/installing-a-release.md) how many good signatures to expect.
+To raise it for every release, raise `MIN_SIGNATURES` in a PR that also tells operators on [Installing a release](../getting-started/installing-a-release.md) how many good signatures to expect.
+When the `Signatures required` line goes up in `tn-release-signing`, raise `MIN_SIGNATURES` no later than the PR that moves the pointer to that commit, because every step stops with exit 1 from then on until it does.
 Signatures count per maintainer handle, so several keys in one maintainer's file count once.
 With a threshold above 1, each signer runs `make release-sign` on their own laptop before anyone runs `make release-publish`.
 
 ## Rotating or revoking a key
 
-[Expiry, loss and rotation](yubikey-setup.md#expiry-loss-and-rotation) has the commands.
-The allowlist and `SECURITY.md` change like this:
+[Expiry, loss and rotation](https://github.com/Telcoin-Association/tn-release-signing/blob/main/docs/yubikey-setup.md#expiry-loss-and-rotation) in the shared YubiKey guide has the commands, and [Rotating or revoking a key](https://github.com/Telcoin-Association/tn-release-signing/blob/main/docs/signing.md#rotating-or-revoking-a-key) says how `keys/` and `KEYS.md` change in `tn-release-signing`.
+Every such change reaches this repository only when a PR moves the `release` pointer to a commit that carries it, as [Moving the submodule pointer](#moving-the-submodule-pointer) describes.
+After a revocation, move the pointer at once: releases here accept the revoked key until that PR merges.
+The deployment scripts carry their own copies of the keys, so a key that is added, replaced or removed also needs a signed script release there, and so does a key whose expiry date is extended.
 
-- for an extended expiry or a spare YubiKey's key, update `<handle>.asc` in place, and add a `SECURITY.md` row for a spare's key;
-- for a replacement YubiKey, which holds a new key, add that key to `<handle>.asc` with a new `SECURITY.md` row, and revoke the old key;
-- for a revoked key, after a lost YubiKey or a compromise, delete it from `<handle>.asc` (the whole file when no other key remains), mark its `SECURITY.md` row `revoked YYYY-MM-DD`, and remove it from GitHub as [Lost or broken YubiKey](yubikey-setup.md#lost-or-broken-yubikey) describes;
-- never add a placeholder file for a new maintainer; the file is added when the key exists.
-
-`release-verify` does not count a signature from an expired or revoked key, and it reads the keys from `main`.
-So once a key expires or is revoked, CI verification of the older releases it signed fails.
+`release-verify` refuses a signature file that carries a signature from an expired or revoked key, and it reads the keys at the pointer on `main`.
+So once a key expires, or the pointer moves past its revocation, CI verification of the older releases it signed fails.
 Extend keys before they expire.
 After revoking a compromised key, tell operators which releases are no longer trusted.
+
+## Moving the submodule pointer
+
+A change to the keys or the threshold in `tn-release-signing` reaches this repository's releases only when `main` records a commit of it that carries the change.
+To move the pointer, on a branch that starts at an up-to-date `main`:
+
+```sh
+git submodule update --init -- release &&
+git -C release fetch --quiet origin main &&
+git -C release checkout --quiet --detach FETCH_HEAD &&
+git diff --submodule=log -- release &&
+git -C release diff "$(git rev-parse HEAD:release)" HEAD -- keys KEYS.md yubikey-setup.sh &&
+git add release
+```
+
+The two `diff` commands show the commits the move brings in and their changes to the keys, the key table and the setup script, which is what the reviewer checks.
+If the new commit raises `Signatures required` above `MIN_SIGNATURES`, raise `MIN_SIGNATURES` in `etc/release.sh` in the same PR.
+Commit, and open a PR.
+[`CODEOWNERS`](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/CODEOWNERS) assigns `/release` and `/.gitmodules` to the maintainers who hold release keys, and the `main` ruleset requires a code owner's approval, so the move needs a key holder's review.
+The repository's admin role can bypass that ruleset, so the review is a check on every account but those, as [`.github/ACTIONS.md`](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md) says of every path `CODEOWNERS` lists.
+Once it merges, every machine that runs a step runs `git submodule update --init -- release` after its next pull of `main`.
+A move that changes the keys between `release-build` and `release-publish` also changes the key table in the generated release notes, so `release-publish` refuses the draft's body until the notes are generated again, as the failure table says.
