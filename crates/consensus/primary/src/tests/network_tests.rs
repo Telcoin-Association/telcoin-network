@@ -4532,6 +4532,13 @@ fn test_import_fault_is_peer_caused_whitelist() {
         PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(stalled())),
         Some(Penalty::Mild)
     ));
+    // So is a transfer that outlived its whole-transfer deadline (Mild, like a stall).
+    let late = || PackError::ImportDeadline { deadline: Duration::from_secs(230) };
+    assert!(peer_caused(cc(late())));
+    assert!(matches!(
+        PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(late())),
+        Some(Penalty::Mild)
+    ));
     // An import stopped at the free-space floor is this node's disk: never charged.
     let full = || Arc::new(std::io::Error::from(std::io::ErrorKind::StorageFull));
     assert!(!peer_caused(cc(PackError::IO(full()))));

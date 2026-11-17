@@ -1542,7 +1542,8 @@ where
             res = node_task_manager.until_exit(self.node_shutdown.clone()) => {
                 match res {
                     Ok(()) => Ok(()),
-                    Err(e) => Err(eyre!("Node task shutdown: {e}")),
+                    // a fork stop keeps its type, so the process exits with the fork's status
+                    Err(e) => Err(e.to_report("Node task shutdown")),
                 }
             }
 
@@ -1573,7 +1574,7 @@ where
         stop_result?;
         result?;
         match stopped.failed {
-            Some(e) => Err(eyre!("a node task failed as the node stopped: {e}")),
+            Some(e) => Err(e.to_report("a node task failed as the node stopped")),
             None => Ok(()),
         }
     }

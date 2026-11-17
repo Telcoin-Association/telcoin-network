@@ -1,6 +1,6 @@
 //! Task manager interface to spawn tasks to the tokio runtime.
 
-use crate::ShutdownNotifier;
+use crate::{error::NodeForked, ShutdownNotifier};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
     fmt::{Debug, Display},
@@ -52,6 +52,25 @@ impl TaskError {
     pub fn from_message(message: impl ToString) -> Self {
         let err = TaskStrErr(message.to_string());
         err.into()
+    }
+
+    /// Produce a TaskError from an `eyre::Report`: its message followed by the messages of its
+    /// causes (`{report:#}`). A fork stop ([`NodeForked::is_in`]) stays one, its message wrapped in
+    /// [`NodeForked`] again, so the fork crosses the task boundary as a type.
+    pub fn from_report(report: eyre::Report) -> Self {
+        let message = format!("{report:#}");
+        if NodeForked::is_in(&report) {
+            NodeForked::new(message).into()
+        } else {
+            Self::from_message(message)
+        }
+    }
+
+    /// Whether this is a fork stop: the error, or an error it was caused by, is a [`NodeForked`].
+    pub fn is_fork(&self) -> bool {
+        let error: &(dyn std::error::Error + 'static) = &*self.error;
+        std::iter::successors(Some(error), |error| error.source())
+            .any(|error| error.is::<NodeForked>())
     }
 }
 
@@ -755,13 +774,33 @@ pub enum TaskJoinError {
     CriticalExitError(String, TaskError),
 }
 
+impl TaskJoinError {
+    /// Whether the task ended with a fork stop as its error ([`TaskError::is_fork`]).
+    pub fn is_fork(&self) -> bool {
+        matches!(self, Self::CriticalExitError(_, error) if error.is_fork())
+    }
+
+    /// This error as the error of a stop, its message after `context` (`"{context}: {self}"`). A
+    /// fork stop ([`Self::is_fork`]) stays one: the report is a [`NodeForked`], so the process
+    /// exits with the fork's status.
+    #[track_caller]
+    pub fn to_report(&self, context: &str) -> eyre::Report {
+        let message = format!("{context}: {self}");
+        if self.is_fork() {
+            NodeForked::new(message).into()
+        } else {
+            eyre::eyre!(message)
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::{sync::Arc, time::Duration};
 
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
-    use crate::{ShutdownNotifier, TaskError, TaskJoinError, TaskManager};
+    use crate::{error::NodeForked, ShutdownNotifier, TaskError, TaskJoinError, TaskManager};
 
     struct Ping {
         ping_rx: Receiver<u32>,
@@ -1128,6 +1167,59 @@ mod test {
         };
         assert_eq!(name, "drains on the node shutdown");
         assert!(err.to_string().contains("the drain could not persist"), "{err}");
+    }
+
+    /// A critical task's fork stop reaches both ways a manager reports a failed critical task as a
+    /// fork, the join that ends on it and the join of a stop, and so does the stop's error built
+    /// from either, with the task's message kept. Another error, even one that reads like a fork,
+    /// is none.
+    #[tokio::test]
+    async fn a_fork_stop_stays_a_fork_across_the_task_boundary() {
+        // a fork found under more context, as a collection reports it
+        let fork = || {
+            TaskError::from_report(
+                eyre::Report::new(std::io::Error::other("refused"))
+                    .wrap_err(NodeForked::new("epoch 2: this node has forked"))
+                    .wrap_err("collection failed"),
+            )
+        };
+        let mut task_manager = TaskManager::default();
+        task_manager.spawn_critical_task("forked", async move { Err(fork()) });
+        let ended = task_manager.until_task_ends(ShutdownNotifier::default()).await;
+        let Err(err) = ended else {
+            panic!("expected the forked task's error, got {ended:?}");
+        };
+        assert!(err.is_fork(), "{err}");
+        let stop = err.to_report("Node task shutdown");
+        assert!(NodeForked::is_in(&stop), "{stop:#}");
+        assert_eq!(
+            stop.to_string(),
+            "Node task shutdown: Critical task forked has exited unexpectedly: collection failed: \
+             epoch 2: this node has forked: refused",
+        );
+
+        let mut task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::default();
+        let rx_forked = node_shutdown.subscribe();
+        task_manager.spawn_critical_task("forked as it stopped", async move {
+            rx_forked.await;
+            Err(fork())
+        });
+        node_shutdown.notify();
+        let stopped = task_manager.shutdown_tasks(Duration::from_secs(5)).await;
+        let Some(err) = stopped.failed else {
+            panic!("expected the forked task's error");
+        };
+        assert!(err.is_fork(), "{err}");
+        let stop = err.to_report("a node task failed as the node stopped");
+        assert!(NodeForked::is_in(&stop), "{stop:#}");
+
+        let other = TaskJoinError::CriticalExitError(
+            "engine".to_string(),
+            TaskError::from_report(eyre::eyre!("this node has forked")),
+        );
+        assert!(!other.is_fork());
+        assert!(!NodeForked::is_in(&other.to_report("Node task shutdown")));
     }
 
     /// A task spawned through a spawner whose manager has ended (a spawn racing a node stop) ends

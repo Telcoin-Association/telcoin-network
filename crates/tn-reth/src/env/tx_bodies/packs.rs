@@ -10,14 +10,20 @@
 //!   `ConsensusChain::install_generation` moves (an install renamed new files over an epoch, or an
 //!   epoch handoff swapped the live pack).
 //!
-//! At most [`DECODE_PERMITS`] pack reads run at once, so a burst of history reads never occupies
-//! more blocking threads than that, nor piles onto the live pack's read lock.
+//! At most [`DECODE_PERMITS`] pack reads run at once, and at most [`MAX_PERMIT_WAITERS`] threads
+//! wait for one: a read that finds that many waiting fails at once, and one still waiting at its
+//! resolve's deadline ([`PACK_WAIT`] after the resolve began) fails then, both as
+//! [`PermitTimeout`](super::TxBodyErrorKind::PermitTimeout). So a burst of history reads never
+//! has more than 128 blocking threads reading packs or waiting for a permit, nor piles onto the
+//! live pack's read lock. A read that waits for a pack being sealed or replaced sleeps between its
+//! tries without a permit, until the same deadline.
 
 use std::{
     collections::VecDeque,
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use parking_lot::{Condvar, Mutex};
@@ -27,12 +33,22 @@ use tn_storage::{
 };
 use tn_types::{Batch, Epoch, B256};
 
+use super::PACK_WAIT;
+
 /// How many closed epochs' readers are kept open (each holds about 4 MiB of bloom filters and six
 /// descriptors).
 pub(crate) const READERS: usize = 4;
 
 /// How many pack reads run at once.
 pub(crate) const DECODE_PERMITS: usize = 4;
+
+/// How many threads may wait for a pack-read permit: a read that finds this many waiting fails at
+/// once. With the [`DECODE_PERMITS`] holders that is 128 threads node-wide, half of the 256 threads
+/// each RPC server's blocking pool keeps beyond its server's blocking-IO permits
+/// (`rpc_blocking::THREADS_BEYOND_PERMITS`). A read of transactions stored by position holds a
+/// pool thread but no blocking-IO permit, so this keeps such reads, while they read a pack or wait
+/// for a permit, from taking the threads the permit holders' work waits for.
+pub(crate) const MAX_PERMIT_WAITERS: usize = 124;
 
 /// A batch read from one closed epoch's pack.
 pub trait EpochBatches: Send + Sync {
@@ -130,11 +146,19 @@ impl PackBatches for ChainPacks {
     }
 }
 
-/// A counting semaphore whose acquire blocks the calling thread.
+/// A counting semaphore whose acquire blocks the calling thread, up to a deadline, and refuses at
+/// once while [`MAX_PERMIT_WAITERS`] threads wait.
 #[derive(Debug)]
 struct Permits {
-    free: Mutex<usize>,
+    counts: Mutex<PermitCounts>,
     released: Condvar,
+}
+
+/// The free permits, and the threads waiting for one.
+#[derive(Debug)]
+struct PermitCounts {
+    free: usize,
+    waiting: usize,
 }
 
 /// One held permit, given back on drop.
@@ -142,22 +166,40 @@ pub(crate) struct Permit<'a>(&'a Permits);
 
 impl Permits {
     fn new(permits: usize) -> Self {
-        Self { free: Mutex::new(permits), released: Condvar::new() }
+        Self {
+            counts: Mutex::new(PermitCounts { free: permits, waiting: 0 }),
+            released: Condvar::new(),
+        }
     }
 
-    fn acquire(&self) -> Permit<'_> {
-        let mut free = self.free.lock();
-        while *free == 0 {
-            self.released.wait(&mut free);
+    /// A free permit at once, else the first one given back before `deadline`. `None` when none
+    /// is given back by then, or at once when [`MAX_PERMIT_WAITERS`] threads already wait.
+    fn acquire(&self, deadline: Instant) -> Option<Permit<'_>> {
+        let mut counts = self.counts.lock();
+        if counts.free == 0 {
+            if counts.waiting >= MAX_PERMIT_WAITERS {
+                return None;
+            }
+            counts.waiting += 1;
+            while counts.free == 0 {
+                if self.released.wait_until(&mut counts, deadline).timed_out() {
+                    break;
+                }
+            }
+            counts.waiting -= 1;
+            // a permit given back as the wait timed out is still taken
+            if counts.free == 0 {
+                return None;
+            }
         }
-        *free -= 1;
-        Permit(self)
+        counts.free -= 1;
+        Some(Permit(self))
     }
 }
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        *self.0.free.lock() += 1;
+        self.0.counts.lock().free += 1;
         self.0.released.notify_one();
     }
 }
@@ -175,6 +217,8 @@ pub struct PackSource {
     packs: Box<dyn PackBatches>,
     readers: Mutex<Readers>,
     permits: Permits,
+    /// How long one resolve may wait in all: [`PACK_WAIT`], shorter or longer only in tests.
+    wait: Duration,
 }
 
 impl fmt::Debug for PackSource {
@@ -190,12 +234,34 @@ impl PackSource {
             packs: Box::new(packs),
             readers: Mutex::new(Readers::default()),
             permits: Permits::new(DECODE_PERMITS),
+            wait: PACK_WAIT,
         }
     }
 
-    /// Hold one of the pack-read permits.
-    pub(crate) fn permit(&self) -> Permit<'_> {
-        self.permits.acquire()
+    /// This source, its resolves waiting up to `wait` in all instead of [`PACK_WAIT`].
+    #[cfg(test)]
+    pub(crate) fn with_wait(mut self, wait: Duration) -> Self {
+        self.wait = wait;
+        self
+    }
+
+    /// How long one resolve may wait in all, from when it begins: for pack-read permits, and for a
+    /// closed epoch's pack being sealed or replaced.
+    pub(crate) fn wait(&self) -> Duration {
+        self.wait
+    }
+
+    /// Hold one of the pack-read permits: `None` when none is given back before `deadline`, or at
+    /// once when [`MAX_PERMIT_WAITERS`] threads already wait for one.
+    pub(crate) fn permit(&self, deadline: Instant) -> Option<Permit<'_>> {
+        self.permits.acquire(deadline)
+    }
+
+    /// How many pack-read permits are free, and how many threads wait for one.
+    #[cfg(test)]
+    pub(crate) fn permit_counts(&self) -> (usize, usize) {
+        let counts = self.permits.counts.lock();
+        (counts.free, counts.waiting)
     }
 
     /// The live epoch's read (see [`PackBatches::live_batch`]).

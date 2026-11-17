@@ -96,6 +96,8 @@ LoadCredentialEncrypted=bls-passphrase:/etc/telcoin/bls-passphrase.cred
 ExecStart=/usr/local/bin/telcoin-network --bls-passphrase-source credential node --datadir /var/lib/telcoin --http
 ```
 
+A unit that restarts the node on failure (`Restart=on-failure`) also needs `RestartPreventExitStatus=10`: the node exits with status 10 when it has forked, and a restart meets the same fork (see [Exit status](../../docs/src/getting-started/validator-operations.md#exit-status)).
+
 systemd decrypts the credential when the unit starts and places it in the unit's credential directory, which it names in `CREDENTIALS_DIRECTORY`. The node reads the passphrase from there, so it never appears on the command line, in the unit's `Environment=`, or in the process environment. `LoadCredential=bls-passphrase:<path>` works the same way for an unencrypted file. To use another credential name, pass `--bls-passphrase-credential <NAME>` or set `TN_BLS_PASSPHRASE_CREDENTIAL`; an empty value keeps the default, `bls-passphrase`. The name is checked only when the `credential` source reads it.
 
 An existing unit that passes the passphrase through `Environment=TN_BLS_PASSPHRASE=...` or an `EnvironmentFile=` moves to the credential in five steps:

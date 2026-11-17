@@ -7,14 +7,14 @@ use std::{
     time::Duration,
 };
 
-use eyre::{bail, WrapErr as _};
+use eyre::WrapErr as _;
 use parking_lot::Mutex;
 use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
-    AuthorityIdentifier, BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch,
-    EpochCertificate, EpochDigest, EpochRecord, EpochVote, ShutdownNotifier, TaskError,
+    error::NodeForked, AuthorityIdentifier, BlsAggregateSignature, BlsPublicKey, BlsSignature,
+    Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, ShutdownNotifier, TaskError,
     TaskSpawner, TnReceiver as _, TnSender as _,
 };
 use tokio::sync::{
@@ -404,11 +404,13 @@ async fn manage_epoch_votes(
                                     // (records are deterministic, so ours is simply wrong) — fail-stop
                                     // rather than adopt the network's record and pretend to recover. The
                                     // error stops the node through the collector, so it exits non-zero.
-                                    bail!(
+                                    // Typed, so the process exits with the fork's own status.
+                                    return Err(NodeForked::new(format!(
                                         "epoch {}: the network certified epoch record {new_epoch_hash} \
                                          where this node computed {epoch_hash}; this node has forked",
                                         epoch_rec.epoch
-                                    );
+                                    ))
+                                    .into());
                                 } else {
                                     info!(
                                         target: "epoch-manager",
@@ -589,7 +591,7 @@ async fn handle_new_vote(
             )
             .await
             {
-                let _ = round_failed.send(TaskError::from_message(format!("{e:#}"))).await;
+                let _ = round_failed.send(TaskError::from_report(e)).await;
             }
             Ok(())
         });
@@ -2155,6 +2157,8 @@ mod epoch_vote_collector_tests {
         .await
         .expect_err("a digest mismatch must end the round with the fork");
         assert!(err.to_string().contains("this node has forked"), "unexpected error: {err:#}");
+        // typed, so the process exits with the fork's own status
+        assert!(NodeForked::is_in(&err), "the fork must be a NodeForked: {err:#}");
         assert!(
             !noticer.noticed(),
             "the round leaves the stop to its error, which the collector returns",
@@ -2502,6 +2506,93 @@ mod epoch_vote_collector_tests {
             err.to_string().contains("failed to save epoch cert after reaching quorum"),
             "unexpected error: {err}",
         );
+    }
+
+    /// A fork a round finds crosses the task boundary as a type: the round started by a peer's
+    /// vote for our uncertified record recovers the network's different certified record, its
+    /// [`NodeForked`] reaches the critical collector as a fork, the collector's error ends the
+    /// node's task manager as one, and the node's exit error built from it is one, so the process
+    /// exits with the fork's status rather than 1.
+    ///
+    /// Paused clock: the round reaches its peer recovery only after its vote windows time out.
+    #[tokio::test(start_paused = true)]
+    async fn test_fork_stops_the_collector_as_a_fork() {
+        let mut rng = StdRng::from_os_rng();
+        let pairs: Vec<BlsKeypair> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let public: Vec<BlsPublicKey> = pairs.iter().map(|pair| *pair.public()).collect();
+        let keys: Vec<KeyConfig> = pairs.into_iter().map(KeyConfig::new_with_testing_key).collect();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("fork_stops_the_collector").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: public.clone(),
+            next_committee: public.clone(),
+            ..Default::default()
+        };
+        let ours = EpochRecord {
+            epoch: 1,
+            committee: public.clone(),
+            next_committee: public.clone(),
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        // the network's record of epoch 1: the same committee, another next committee
+        let theirs = EpochRecord { next_committee: public[1..].to_vec(), ..ours.clone() };
+        assert_ne!(theirs.digest(), ours.digest());
+        consensus_chain.epochs().save_record(rec0).await.unwrap();
+        consensus_chain.epochs().save_record(ours.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+        let cert = make_cert(&theirs, &[&keys[0], &keys[1], &keys[2]]);
+
+        // the peer recovery is answered with the network's record
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        let peer = public[1];
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::SendRequestAny { reply, .. } = cmd {
+                    let _ = reply.send(Ok(NetworkResponseMessage {
+                        peer,
+                        result: PrimaryResponse::EpochRecord {
+                            record: theirs.clone(),
+                            certificate: cert.clone(),
+                        },
+                    }));
+                }
+            }
+        });
+
+        let consensus_bus = ConsensusBus::new();
+        let mut task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::new();
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            keys[0].clone(),
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.clone(),
+        );
+        // one peer's vote starts the round, which falls short of a quorum
+        consensus_bus.app().new_epoch_votes().send(ours.sign_vote(&keys[1])).await.unwrap();
+
+        let ended = task_manager.until_task_ends(node_shutdown).await;
+        let Err(err) = ended else {
+            panic!("expected the collector's error, got {ended:?}");
+        };
+        let TaskJoinError::CriticalExitError(name, task_error) = &err else {
+            panic!("expected the collector's error, got {err:?}");
+        };
+        assert_eq!(name, "Epoch Vote Collector");
+        assert!(task_error.to_string().contains("this node has forked"), "{task_error}");
+        assert!(task_error.is_fork(), "the collector's error must be a fork: {task_error}");
+        let exit = err.to_report("Node task shutdown");
+        assert!(NodeForked::is_in(&exit), "the node's exit error must be a fork: {exit:#}");
     }
 
     /// `my_vote` capture + timeout republish: our own vote is captured from the stream and, with
@@ -4382,8 +4473,8 @@ mod epoch_vote_collector_tests {
     struct ConflictingRound {
         /// The kind the round was given when it started.
         kind: RoundKind,
-        /// Whether the round ended with the fork as its error, which the collector returns to stop
-        /// the node.
+        /// Whether the round ended with the fork as its error, a [`NodeForked`], which the
+        /// collector returns to stop the node.
         stopped: bool,
         /// Whether the store holds a certificate for the network's record afterwards.
         adopted: bool,
@@ -4478,7 +4569,8 @@ mod epoch_vote_collector_tests {
             !noticer.noticed(),
             "the round leaves the stop to its error, which the collector returns"
         );
-        let stopped = fork.to_string().contains("this node has forked");
+        let stopped =
+            fork.to_string().contains("this node has forked") && NodeForked::is_in(&fork);
 
         let adopted = db.cert_by_digest(theirs_digest).await.is_some();
         let lines = lines.lock().clone();

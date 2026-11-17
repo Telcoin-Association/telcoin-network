@@ -3160,7 +3160,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   an operator who turned the limit off keeps unbounded scans. A lower default for
   `--rpc.max-blocks-per-filter` was not taken: TN's docs promise 100,000, it would refuse long
   ranges over quiet history that cost little, and it would still not bound a range of blocks that
-  each hold many receipts; the read bound follows the work instead. 50 reads per returnable log
+  each hold many receipts; the read bound follows the work instead, and since TN-0209 it counts
+  each block whose transactions the scan resolves from their consensus batch as 1,000 reads
+  more. 50 reads per returnable log
   leaves room for blocks whose blooms match a filter by chance. Queries within the bound return
   the same logs in the same order. Upstream reth has no such bound.
   *Can reach execution or storage*: no. RPC only: the count runs inside the log query after the
@@ -3384,3 +3386,105 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   for the same reads outside a scope. Mutation-checked: without the scope in
   `append_matching_block_logs`, or with the resolver keeping nothing in it, the block's batch is
   read once per transaction and the test fails. *Upstream*: no (TN's format).
+
+- **TN-0208** — Logs by block hash read the provider on the RPC blocking pool when the RPC cache
+  does not hold the block. *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (the `AtBlockHash` arm of
+  `EthFilterInner::logs_for_filter`, `logs_at_block_hash`; test
+  `logs_by_hash_read_the_provider_off_the_runtime`).
+  *Why*: for a block the cache does not hold, the arm read the header, the earliest block and the
+  transaction of each matching receipt (`append_matching_block_logs` with the provider) inside the
+  async handler, on the runtime that drives the RPC server, which in TN also runs the node's other
+  async tasks. Upstream those are static-file row reads; on a datadir that stores transactions by
+  batch position (TN-0201, TN-0202) the transaction reads go through TN's resolver, which can block
+  on a consensus-pack read and decode (once per block since TN-0204). The cache miss now runs the
+  way the range scan has since TN-0019: it takes a blocking-IO permit, runs the reads on the
+  server's blocking pool (`spawn_blocking_task`, which TN routes to its own pool) and awaits the
+  answer; a request dropped before its task starts skips the reads. The reads are the same calls in
+  the same order, moved unchanged into `logs_at_block_hash`, so every answer and error is the
+  same; a closed permit semaphore or a lost task answers `InternalError`, as in the range scan. A
+  block the cache holds is matched on the async side as before, without a permit.
+  `logs_at_block_hash` is synchronous, so the read scope `append_matching_block_logs` enters
+  (TN-0204) opens and closes on the one blocking thread. `eth_getLogs`, `eth_getFilterLogs` and
+  `EngineEthFilter::logs` reach the arm; `eth_getFilterChanges` serves a by-hash filter as a range
+  scan, and `logs` subscriptions match in-memory notifications.
+  *Can reach execution or storage*: no. RPC only: the same reads, on another thread.
+  *Tests*: `logs_by_hash_read_the_provider_off_the_runtime` (on a one-thread runtime, while another
+  thread holds the mock provider's header, body-index and block stores until the request holds a
+  permit; before the change the request blocked the runtime's thread until the holder gave up, and
+  took no permit; also the logs, a missing body index answered as the provider's error, and a
+  cached block answered with every permit taken).
+  *Upstream*: no; upstream has the same shape, where those reads are short.
+
+- **TN-0209** — A log range scan counts 1,000 reads for each block whose transactions it resolves
+  from their consensus batch. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`SCAN_READS_PER_RESOLVED_BLOCK`, the read count in
+  `get_logs_in_block_range_inner`; test `range_scan_counts_resolved_blocks`),
+  `crates/rpc/rpc-eth-types/src/tx_read_scope.rs` (`TxReadScope::kept`, counted by `keep`; test
+  `kept_counts_the_values_this_threads_scopes_keep`).
+  *Why*: on a datadir that stores transactions by batch position (TN-0201, TN-0202), matching a
+  block's logs on the provider path reads each matching transaction through TN's resolver, which
+  resolves the block's batch, once per block since TN-0204: from its decoded-batch cache, or with
+  a consensus-pack read, a decode and a digest check of the whole batch. TN-0193's read bound
+  counted receipts and logs only, so a block with one matching log counted two reads but could
+  cost a pack read, and one scan could resolve a batch for each block up to the 20,000-log
+  response limit while it held a blocking-IO permit and a pool thread. A block whose log matching
+  kept a batch in the thread's read scope now adds `SCAN_READS_PER_RESOLVED_BLOCK` (1,000) to the
+  scan's read count before the bound check, so under the default bound of 1,000,000 a scan
+  resolves at most 1,000 blocks, then ends with `QueryExceedsMaxReads` and TN-0193's retry range
+  (a single-block range is never refused). That error's text no longer says the query read
+  "receipts and logs", which the weight is neither: it is `query exceeds max reads N, retry with
+  the range A-B`, in the shape of the response limit's `query exceeds max results N, ...`. The scan reads `TxReadScope::kept`, this thread's count
+  of the values its scopes keep, before and after `append_matching_block_logs`; TN's resolver
+  keeps each batch it resolves in the scope (TN-0204), and only position rows reach it. The
+  matching runs on the scan's thread, with no await in it, in every mode: the cached mode passes a
+  block only when the RPC cache already holds it (no transaction is read then), and the parallel
+  range mode fetches only receipts on its other threads. A datadir that stores transactions
+  inline, a block the RPC cache holds and a provider without a resolver count as before. A batch
+  from the resolver's cache counts as one from a pack: the scan cannot tell them apart. The error
+  texts, the factor 50, the response limit, `eth_getFilterChanges`' cursor and logs by block hash
+  (TN-0208) are unchanged.
+  *Can reach execution or storage*: no. RPC only: the log query reads the count, and nothing on
+  the block execution or storage path reads the read scope's counter.
+  *Tests*: `range_scan_counts_resolved_blocks` (genesis and 300 blocks on a `BlockchainProvider`
+  in storage v2, each block with one transaction whose receipt has one matching log, scanned in
+  the range mode: stored by position, with a resolver that keeps each batch in the scope as TN's
+  does, a limit of 300 logs (15,000 reads) ends the scan at block 15 with the retry range 1-14,
+  after one resolve per block, and the retry range returns its 14 logs; stored inline, the same
+  scan returns all 300 logs and resolves nothing); `kept_counts_the_values_this_threads_scopes_keep`
+  (each keep in a scope counts, a replaced value and an inner scope's too; a keep outside a scope
+  and another thread's keeps do not); `range_scan_reads_are_bounded` and the other filter tests
+  unchanged. Mutation-checked, each failing a test: no weight added (the position-row scan
+  returns every log), the weight added for every block (the inline scan and
+  `range_scan_reads_are_bounded` are refused), and `keep` not counting (both tests).
+  *Upstream*: no (TN's format).
+
+- **TN-0210** — `debug_getRawBlock` and `debug_getRawTransactions` read the provider on the RPC
+  blocking pool. *Kind*: fix.
+  *Files*: `crates/rpc/rpc/src/debug.rs` (`raw_block`, `raw_transactions`; tests
+  `raw_block_reads_the_provider_off_the_runtime`,
+  `raw_transactions_read_the_provider_off_the_runtime`).
+  *Why*: both handlers read the block (`block_by_id`, `block_with_senders_by_id`) inside the
+  async method, on the runtime that drives the RPC server, which in TN also runs the node's other
+  async tasks. On a datadir that stores transactions by batch position (TN-0201, TN-0202) the
+  block's transactions go through TN's resolver, which can wait for a decode permit and then read
+  and decode a consensus pack, so a few such requests could hold every worker of that runtime
+  while other clients' reads kept the permits busy. Each handler now runs its read through the eth
+  API's `spawn_blocking_io` on the server's blocking pool, as `debug_getRawTransaction`
+  (`raw_transaction_by_hash`) runs its own, and like it takes no blocking-IO permit. The read is
+  the same call, and the closure returns the provider's result unconverted, so the handler turns
+  it into the answer as before (`to_rpc_result`, then `HeaderNotFound` for a missing block, or no
+  transactions) and every answer and error is the same; a lost blocking task answers
+  `InternalEthError`, as `debug_getRawTransaction`'s does. The encoding stays on the async side.
+  `debug_getRawHeader`, `debug_getRawReceipts`, `debug_codeByHash` and `debug_dbGet` still read
+  inline: headers, receipts and state, none of which goes through the resolver.
+  *Can reach execution or storage*: no. RPC only: the same reads, on another thread.
+  *Tests*: `raw_block_reads_the_provider_off_the_runtime` and
+  `raw_transactions_read_the_provider_off_the_runtime` (on a one-thread runtime, while another
+  thread holds the mock provider's block store until released or for 10 s, a request by hash must
+  leave the runtime's thread free to release it; before the change it blocked that thread until
+  the holder gave up; also the answers by hash and by number, for a missing block and for the
+  `finalized` tag, which the mock answers with a provider error, each equal to what the inline
+  read answered). Mutation-checked: with either handler's read put back inline, its test fails
+  after the holder's 10 s and the other handler's test passes.
+  *Upstream*: no; upstream has the same shape, where those reads are short.

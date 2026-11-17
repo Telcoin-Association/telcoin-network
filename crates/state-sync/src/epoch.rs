@@ -18,8 +18,8 @@ use tn_storage::{
     epoch_records::{EpochDbError, EpochRecordValidation},
 };
 use tn_types::{
-    AuthorityIdentifier, BlsPublicKey, ConsensusHeaderDigest, ConsensusNumHash, Epoch,
-    EpochCertificate, EpochRecord, Noticer, TaskError, TaskSpawner,
+    error::NodeForked, AuthorityIdentifier, BlsPublicKey, ConsensusHeaderDigest, ConsensusNumHash,
+    Epoch, EpochCertificate, EpochRecord, Noticer, TaskError, TaskSpawner,
 };
 use tracing::{debug, error, info};
 
@@ -504,7 +504,8 @@ const FINAL_STATE_MISMATCHES: &str = "tn_epoch.final_state_mismatches_total";
 /// is already certified), so this node's execution diverged from the one a quorum certified. It is
 /// counted in `tn_epoch_final_state_mismatches_total` and the node stops, as a committee validator
 /// does at the epoch vote: an observer or a node outside the committee would otherwise run on, and
-/// serve, a chain no quorum certified. A restart stops again, as the collector asks again.
+/// serve, a chain no quorum certified. A restart stops again, as the collector asks again. The
+/// error is a [`NodeForked`] stop, so the process exits with the fork's status.
 fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
     if matches!(e, EpochDbError::ConflictingRecord { .. }) {
         ::metrics::counter!(FINAL_STATE_MISMATCHES).increment(1);
@@ -515,12 +516,12 @@ fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
             "a certified epoch record from peers conflicts with this node's own record for the \
              epoch: this node's execution diverged from the certified chain, stopping the node",
         );
-        return Err(eyre::Report::new(e).wrap_err(format!(
+        return Err(eyre::Report::new(e).wrap_err(NodeForked::new(format!(
             "epoch {epoch}: a quorum certified an epoch record other than the one this node built \
              from its own execution, so this node's execution diverged - stopping the node rather \
              than run on a chain no quorum certified (do NOT delete chain-data: keep the datadir to \
              find the first block that differs)"
-        )));
+        ))));
     }
     e.stop_on_local_failure(format!("failed to save epoch record/cert for epoch {epoch}"))
 }
@@ -905,7 +906,7 @@ async fn spawn_epoch_record_collector_with(
                 &mut collection,
             )
             .await
-            .map_err(|e| TaskError::from_message(format!("{e:#}")))?;
+            .map_err(TaskError::from_report)?;
             last_epoch = pass.epoch;
             // no peer answered the pass: the gaps would go unanswered too
             if pass.definitive
@@ -920,7 +921,7 @@ async fn spawn_epoch_record_collector_with(
                     &node_shutdown,
                 )
                 .await
-                .map_err(|e| TaskError::from_message(format!("{e:#}")))?;
+                .map_err(TaskError::from_report)?;
                 gaps_retried_at = tokio::time::Instant::now();
             }
             certified_prefix_end(&consensus_chain, &metrics).await;
@@ -1366,11 +1367,13 @@ mod tests {
                 EpochDbError::ConflictingRecord { epoch: 1, stored: digest, offered: digest };
             let err = stop_on_local_failure(conflict, 1).expect_err("a conflict stops the node");
             assert!(format!("{err:#}").contains("diverged"), "unexpected error: {err:#}");
+            assert!(NodeForked::is_in(&err), "a conflict is a fork stop: {err:#}");
             let mismatch = EpochDbError::CertificateMismatch { record: digest, certified: digest };
             assert!(stop_on_local_failure(mismatch, 1).is_ok());
             let err = stop_on_local_failure(EpochDbError::SendFailed, 1)
                 .expect_err("a dead epoch store is local");
             assert!(format!("{err:#}").contains("epoch 1"), "unexpected error: {err:#}");
+            assert!(!NodeForked::is_in(&err), "a dead store is no fork: {err:#}");
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -2111,9 +2114,10 @@ mod tests {
         let handle = mock_epoch_record_network(HashMap::from([(1, (theirs, cert))]), peer, 1);
         let bus = ConsensusBus::new();
         let (metrics, snapshotter) = local_metrics();
+        // a fork stop, so the process exits with the fork's status
         let diverged = |err: &eyre::Report| {
             let text = format!("{err:#}");
-            text.contains("epoch 1") && text.contains("diverged")
+            text.contains("epoch 1") && text.contains("diverged") && NodeForked::is_in(err)
         };
 
         let mut collection = Collection::new(&metrics);
@@ -2152,6 +2156,7 @@ mod tests {
         };
         assert_eq!(name, "Epoch Record Collector");
         assert!(err.to_string().contains("diverged"), "unexpected error: {err}");
+        assert!(err.is_fork(), "the collector's error must be a fork: {err}");
         assert_eq!(chain.epochs().get_epoch_by_number(1).await, Some((ours, None)));
         Ok(())
     }
@@ -2180,6 +2185,7 @@ mod tests {
             .await
             .expect_err("a conflicting certified record fails startup");
         assert!(format!("{err:#}").contains("diverged"), "{err:#}");
+        assert!(NodeForked::is_in(&err), "a fork stop: {err:#}");
         Ok(())
     }
 

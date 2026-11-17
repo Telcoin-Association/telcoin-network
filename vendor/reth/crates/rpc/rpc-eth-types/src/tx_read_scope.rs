@@ -9,10 +9,18 @@
 //! the resolver's own cache holds. The scope holds one value, and drops it when it ends. Outside a
 //! scope nothing is kept, and a provider that resolves no batch never touches it.
 //!
+//! TN(TN-0209): the thread also counts the values its scopes keep ([`TxReadScope::kept`]), so a
+//! caller can tell whether a call resolved a batch: a log range scan weighs each such block.
+//!
 //! [`append_matching_block_logs`]: crate::logs_utils::append_matching_block_logs
 
 use alloy_primitives::B256;
-use std::{any::Any, cell::RefCell, marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 /// A value a scope keeps: the resolver's own type, behind [`Any`].
 pub type ScopedValue = Arc<dyn Any + Send + Sync>;
@@ -20,6 +28,8 @@ pub type ScopedValue = Arc<dyn Any + Send + Sync>;
 thread_local! {
     /// `None` outside a scope; inside one, the value it keeps and its key, if any.
     static SCOPE: RefCell<Option<Option<(B256, ScopedValue)>>> = const { RefCell::new(None) };
+    /// How many values this thread's scopes have kept, wrapping.
+    static KEPT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// This thread's transaction read scope, from [`TxReadScope::enter`] until the guard drops. A
@@ -56,13 +66,25 @@ impl TxReadScope {
         })
     }
 
-    /// Keep `value` under `key` in this thread's scope, in place of what it kept. Outside a scope
-    /// this does nothing.
+    /// Keep `value` under `key` in this thread's scope, in place of what it kept, and count it in
+    /// [`Self::kept`]. Outside a scope this does nothing.
     pub fn keep(key: B256, value: ScopedValue) {
-        let replaced = SCOPE
-            .with(|scope| scope.borrow_mut().as_mut().and_then(|kept| kept.replace((key, value))));
+        let replaced = SCOPE.with(|scope| {
+            scope.borrow_mut().as_mut().and_then(|kept| {
+                KEPT.with(|count| count.set(count.get().wrapping_add(1)));
+                kept.replace((key, value))
+            })
+        });
         // the value it kept drops here, outside the borrow
         drop(replaced);
+    }
+
+    /// TN(TN-0209): how many values this thread's scopes have kept ([`Self::keep`] inside a
+    /// scope) since the thread started, wrapping at `u64::MAX`. A caller that reads it before and
+    /// after a call on the same thread learns whether the call kept anything: with TN's resolver,
+    /// whether it resolved a batch.
+    pub fn kept() -> u64 {
+        KEPT.with(Cell::get)
     }
 }
 
@@ -135,5 +157,37 @@ mod tests {
         .join()
         .expect("the other thread");
         assert_eq!(TxReadScope::get::<u64>(&key).as_deref(), Some(&4));
+    }
+
+    /// TN(TN-0209): every value a scope keeps counts, a replaced one too; a keep outside a scope
+    /// and another thread's keeps do not.
+    #[test]
+    fn kept_counts_the_values_this_threads_scopes_keep() {
+        let key = B256::with_last_byte(5);
+        let start = TxReadScope::kept();
+        TxReadScope::keep(key, value(5));
+        assert_eq!(TxReadScope::kept(), start, "outside a scope nothing is kept");
+        {
+            let _scope = TxReadScope::enter();
+            TxReadScope::keep(key, value(5));
+            assert_eq!(TxReadScope::kept(), start + 1);
+            TxReadScope::keep(key, value(6));
+            assert_eq!(TxReadScope::kept(), start + 2, "a replaced value counts too");
+            {
+                let _inner = TxReadScope::enter();
+                TxReadScope::keep(key, value(7));
+            }
+            assert_eq!(TxReadScope::kept(), start + 3, "an inner scope's keep counts");
+            let other = std::thread::spawn(move || {
+                let _scope = TxReadScope::enter();
+                TxReadScope::keep(key, value(8));
+                TxReadScope::kept()
+            })
+            .join()
+            .expect("the other thread");
+            assert_eq!(other, 1, "the other thread counts its own");
+            assert_eq!(TxReadScope::kept(), start + 3, "and not this thread's");
+        }
+        assert_eq!(TxReadScope::kept(), start + 3, "the end of a scope keeps the count");
     }
 }

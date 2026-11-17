@@ -24,6 +24,12 @@
 //! API's own CPU pool (vendored TN-0182), not on this one, so those reads cannot keep it from a
 //! thread.
 //!
+//! A read of transactions a datadir stores by position holds a thread without a permit too, while
+//! it reads a consensus pack or waits for a pack-read permit; the resolver lets at most 128 threads
+//! node-wide do that (its 4 pack-read permits and `MAX_PERMIT_WAITERS` in `env::tx_bodies`), so
+//! with the permit holders they leave each pool at least 128 threads for the work the holders wait
+//! for.
+//!
 //! tokio starts a pool's blocking threads on demand and ends each after 10 seconds idle, so an
 //! idle pool keeps one thread: its runtime's worker, which drives the timers and I/O of the
 //! futures the blocking threads run.
