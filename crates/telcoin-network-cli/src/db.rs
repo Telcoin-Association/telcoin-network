@@ -954,13 +954,14 @@ fn records_db_recovery() -> &'static str {
 /// open for append) is skipped; repair it explicitly with `--epoch N` once the node is confirmed
 /// stopped.
 ///
-/// An interrupted install (`epoch-N.replaced` with no `epoch-N`) is reported, whatever `--epoch`
-/// names. When there is one, `--force` first runs the node's own start-time step on the epochs
-/// directory (`ConsensusChain::recover_incomplete_installs`), which puts each one back (and
-/// removes an aside left beside its `epoch-N`), so the restored epoch is then checked like any
-/// other. Repair-all mode counts an interrupted install as the epoch it puts back when it picks
-/// the latest epoch to skip, so the dry run skips (and checks) the same epochs `--force` does: a
-/// restored latest epoch is skipped like any latest epoch.
+/// An `--epoch` that names neither an `epoch-N` nor an interrupted install is refused before
+/// anything changes. An interrupted install (`epoch-N.replaced` with no `epoch-N`) is reported,
+/// whatever epoch `--epoch` names. When there is one, `--force` first runs the node's own
+/// start-time step on the epochs directory (`ConsensusChain::recover_incomplete_installs`), which
+/// puts each one back (and removes an aside left beside its `epoch-N`), so the restored epoch is
+/// then checked like any other. Repair-all mode counts an interrupted install as the epoch it puts
+/// back when it picks the latest epoch to skip, so the dry run skips (and checks) the same epochs
+/// `--force` does: a restored latest epoch is skipped like any latest epoch.
 #[derive(Debug, Args)]
 pub struct DbRepairArgs {
     /// Repair only this epoch. Without it, every epoch except the current/latest is repaired.
@@ -1004,7 +1005,17 @@ impl DbRepairArgs {
 
         // An interrupted install hides its epoch from the listing below. With `--force`, put each
         // back as the node's next start would, so the restored epoch is checked with the others.
+        // An `--epoch` that names neither is refused first, so a mistyped one changes nothing.
+        let list_epochs = || {
+            ConsensusPack::epoch_dirs(&epochs_dir)
+                .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))
+        };
         let interrupted = interrupted_installs(&epochs_dir)?;
+        if let Some(e) = self.epoch {
+            if !list_epochs()?.contains(&e) && !interrupted.contains(&e) {
+                bail!("epoch {e} not found under {}", epochs_dir.display());
+            }
+        }
         let (restored, interrupted) = if self.force && !interrupted.is_empty() {
             ConsensusChain::recover_incomplete_installs(&epochs_dir);
             let left = interrupted_installs(&epochs_dir)?;
@@ -1012,13 +1023,7 @@ impl DbRepairArgs {
         } else {
             (Vec::new(), interrupted)
         };
-        let all = ConsensusPack::epoch_dirs(&epochs_dir)
-            .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
-        if let Some(e) = self.epoch {
-            if !all.contains(&e) && !interrupted.contains(&e) {
-                bail!("epoch {e} not found under {}", epochs_dir.display());
-            }
-        }
+        let all = list_epochs()?;
         // `interrupted` is what is still to put back (after `--force`'s restore, only what it
         // failed to restore, and `all` holds what it restored), so both modes pick the same latest.
         let (mut targets, skipped_current) = repair_targets(&all, &interrupted, self.epoch);
@@ -2774,6 +2779,24 @@ mod tests {
             }
         }
         assert!(epochs.join("epoch-2").is_dir(), "--force put the interrupted install back");
+    }
+
+    /// `db repair --force` with an `--epoch` that names no epoch refuses before it puts back an
+    /// interrupted install, so a mistyped epoch changes nothing.
+    #[test]
+    fn db_repair_refuses_an_unknown_epoch_before_it_restores() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        let aside = epochs.join("epoch-2.replaced");
+        fs::create_dir_all(&aside).unwrap();
+        let err = super::DbRepairArgs { epoch: Some(9), force: true }
+            .run(datadir, &mut Vec::new())
+            .expect_err("there is no epoch 9");
+        assert!(format!("{err:#}").contains("epoch 9 not found"), "{err:#}");
+        assert!(aside.is_dir(), "the interrupted install is left as it was");
+        assert!(!epochs.join("epoch-2").exists(), "nothing was put back");
     }
 
     #[cfg(unix)]
