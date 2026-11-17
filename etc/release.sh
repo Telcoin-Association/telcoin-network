@@ -124,7 +124,11 @@ ORIG_PWD=        # setup: directory the script was started from
 SELF=            # setup: absolute path of this script
 DRY_RUN=0        # init_env
 REPO=            # init_env: owner/repo on GitHub
+OWNER=           # init_env: the owner of REPO in lower case, the ghcr namespace of the images
 IMAGE=           # init_env: ghcr.io/<owner>/PACKAGE, or RELEASE_IMAGE in a dry run; no tag
+COMPONENTS=node  # the components the release ships, in release order (see component_set)
+MANIFESTS=SHA256SUMS # the signed manifests the release ships, each signed in <manifest>.asc
+DIGESTS=         # record_digest: "component<TAB>sha256:<hex>" for each image digest known
 THRESHOLD=$MIN_SIGNATURES
 ALLOW_GNUPGHOME= # load_allowlist: keyring holding only main's allowlisted keys
 ALLOW_LIST=      # load_allowlist: "handle<TAB>primary fingerprint" lines
@@ -134,7 +138,10 @@ SIGNER_FPR=      # check_tag_signature: primary fingerprint that signed TAG
 SIGN_KEY=        # resolve_signing_key: key spec handed to gpg / git tag -u
 SIGN_FPR=        # resolve_signing_key: its primary fingerprint
 SIGN_HANDLE=     # resolve_signing_key: its allowlist handle
-D=               # check_image_digest_file: sha256:<hex> of IMAGE:TAG
+D=               # check_image_digest_file: sha256:<hex> of IMAGE:TAG, the node's C_D
+# component_set: one component's row of the table, valid until the next component_set.
+C_NAME='' C_PACKAGE='' C_IMAGE='' C_DOCKERFILE='' C_BIN='' C_TAR_BIN='' C_TARDIR='' C_TARBALL=''
+C_DIGEST_FILE='' C_MANIFEST='' C_CONFIG='' C_CONFIG_TEXT='' C_D=''
 REL_EXISTS=0     # release_state: GitHub release (or dry-run RELEASE_DIR) facts
 REL_DRAFT=
 REL_PRERELEASE=
@@ -239,20 +246,20 @@ physical_dir() {
     printf '%s%s\n' "${head%/}" "$rest"
 }
 
-# A dry-run image repository: localhost:PORT or 127.0.0.1:PORT, then a lowercase repository
-# path with no tag, digest or "..". Anything looser (such as "localhost:5000@host/x") could
-# send registry_digest's requests to another host.
+# $1 is a dry-run image repository: localhost:PORT or 127.0.0.1:PORT, then a lowercase
+# repository path with no tag, digest or "..". Anything looser (such as
+# "localhost:5000@host/x") could send registry_digest's requests to another host.
 is_local_image() {
-    local host=${IMAGE%%/*} path=${IMAGE#*/}
+    local host=${1%%/*} path=${1#*/}
     [[ "$host" =~ $LOCAL_HOST_RE ]] || return 1
-    [ "$path" != "$IMAGE" ] || return 1
+    [ "$path" != "$1" ] || return 1
     [[ "$path" =~ $LOCAL_PATH_RE ]] || return 1
     case "$path" in *..*) return 1 ;; esac
     return 0
 }
 
 require_local_image_in_dry_run() {
-    if [ "$DRY_RUN" = 1 ] && ! is_local_image; then
+    if [ "$DRY_RUN" = 1 ] && ! is_local_image "$IMAGE"; then
         die 2 "dry run: set RELEASE_IMAGE to a localhost: or 127.0.0.1: repository"
     fi
 }
@@ -397,6 +404,59 @@ channel_finals() {
     done <<EOF
 $1
 EOF
+}
+
+# ---------------------------------------------------------------------------------------------
+# Components
+#
+# A release is a set of components, each an image, a tarball holding the image's binary and a
+# digest file naming the image by digest, listed in a signed manifest. COMPONENTS names them in
+# release order. Every step that acts on an image, tarball, digest file or manifest reads it
+# from this table, the node's included.
+
+# The signed manifest that lists component $1's digest file and tarball. Its output is
+# captured, so callers pass a die on with `|| exit`.
+manifest_of() {
+    case "$1" in
+        node) printf '%s\n' SHA256SUMS ;;
+        *) die 2 "internal error: no manifest for the component '$1'" ;;
+    esac
+}
+
+# record_digest NAME DIGEST keeps the image digest (sha256:<hex>) of component NAME once it is
+# pushed, verified, or read from a draft's digest file that check_digest_package accepted;
+# digest_of NAME prints it, or nothing while it is unknown.
+record_digest() {
+    DIGESTS=$(printf '%s\n' "$DIGESTS" | awk -F'\t' -v n="$1" -v d="$2" 'NF && $1 != n { print } END { print n "\t" d }')
+}
+
+digest_of() {
+    printf '%s\n' "$DIGESTS" | awk -F'\t' -v n="$1" '$1 == n { d = $2 } END { print d }'
+}
+
+# Fills the C_* fields with component $1's row of the table. They hold until the next
+# component_set, so a loop body sets them before it reads them, and a function that calls
+# component_set overwrites its caller's fields unless its output is captured (a subshell).
+# One arm per component, so any field of a component may differ from the others'.
+component_set() {
+    case "$1" in
+        node)
+            C_PACKAGE=$PACKAGE
+            C_IMAGE=$IMAGE
+            C_DOCKERFILE=etc/Dockerfile
+            C_BIN=telcoin
+            C_TAR_BIN=telcoin-network
+            C_TARDIR=telcoin-network-$TAG-$TRIPLE
+            C_TARBALL=$TARBALL
+            C_DIGEST_FILE=IMAGE_DIGEST
+            C_CONFIG='null ["telcoin","node"]'
+            C_CONFIG_TEXT='no ENTRYPOINT and CMD ["telcoin","node"]'
+            ;;
+        *) die 2 "internal error: no component named '$1'" ;;
+    esac
+    C_NAME=$1
+    C_MANIFEST=$(manifest_of "$1") || exit
+    C_D=$(digest_of "$1") || exit
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -605,16 +665,16 @@ manifest_head() {
     curl "$@" "$url"
 }
 
-# registry_digest REF [first-push]: prints the digest the registry serves for IMAGE:REF, or
+# registry_digest REPO REF [first-push]: prints the digest the registry serves for REPO:REF, or
 # nothing when that tag does not exist. ghcr.io needs an anonymous pull token, which only works
 # for a public package; the dry-run localhost registry is plain http without a token. ghcr
 # answers 403 alike for a private package and for one that has never been pushed, so with
 # first-push an answer of 401 or 403 prints the word denied instead of stopping.
 registry_digest() {
-    local ref=$1 mode=${2:-} host path url token code digest attempt=1 out
+    local repo=$1 ref=$2 mode=${3:-} host path url token code digest attempt=1 out
     need curl
-    host=${IMAGE%%/*}
-    path=${IMAGE#*/}
+    host=${repo%%/*}
+    path=${repo#*/}
     out=$WORK/registry.out
     case "$host" in
         localhost:* | 127.0.0.1:*) url="http://$host/v2/$path/manifests/$ref" ;;
@@ -645,27 +705,27 @@ registry_digest() {
                     printf 'denied\n'
                     return 0
                 fi
-                die 2 "$IMAGE: the registry answered HTTP $code: package is not public, or has never been pushed (one-time setup after its first push: make it public, as the maintainer guide says)"
+                die 2 "$repo: the registry answered HTTP $code: package is not public, or has never been pushed (one-time setup after its first push: make it public, as the maintainer guide says)"
                 ;;
         esac
-        [ "$attempt" -lt 3 ] || die 3 "$IMAGE:$ref: registry unavailable after 3 attempts (last answer: $code)"
+        [ "$attempt" -lt 3 ] || die 3 "$repo:$ref: registry unavailable after 3 attempts (last answer: $code)"
         attempt=$((attempt + 1))
         sleep 5
     done
 }
 
-# build, after ghcr refused an anonymous read of IMAGE: the digest of IMAGE:TAG as the docker
-# login sees it, or nothing (with the answer on stderr) when the registry answers that the tag
-# is not found or access is denied (403 Forbidden included: ghcr answers that for a package
-# never pushed). Any other failure, such as DNS, a timeout or an expired login, is retried and
-# then stops with 3, so it never reads as "the login does not see TAG".
+# login_digest REPO: build, after ghcr refused an anonymous read of REPO: the digest of REPO:TAG
+# as the docker login sees it, or nothing (with the answer on stderr) when the registry answers
+# that the tag is not found or access is denied (403 Forbidden included: ghcr answers that for
+# a package never pushed). Any other failure, such as DNS, a timeout or an expired login, is
+# retried and then stops with 3, so it never reads as "the login does not see TAG".
 login_digest() {
-    local out digest last attempt=1
+    local repo=$1 out digest last attempt=1
     while :; do
-        if out=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{println .Manifest.Digest}}' 2>&1); then
+        if out=$(docker buildx imagetools inspect "$repo:$TAG" --format '{{println .Manifest.Digest}}' 2>&1); then
             digest=$(printf '%s\n' "$out" | awk 'NF { d = $1 } END { print d }')
             [[ "$digest" =~ $DIGEST_RE ]] ||
-                die 1 "docker buildx imagetools inspect $IMAGE:$TAG answered without a digest: $out"
+                die 1 "docker buildx imagetools inspect $repo:$TAG answered without a digest: $out"
             printf '%s\n' "$digest"
             return 0
         fi
@@ -673,12 +733,12 @@ login_digest() {
         case "$(printf '%s\n' "$out" | tr '[:upper:]' '[:lower:]')" in
             *"permission denied"*) ;;
             *"not found"* | *"manifest unknown"* | *"name unknown"* | *denied* | *"403 forbidden"*)
-                info "with the docker login, $IMAGE:$TAG does not resolve: $last"
+                info "with the docker login, $repo:$TAG does not resolve: $last"
                 return 0
                 ;;
         esac
         [ "$attempt" -lt 3 ] ||
-            die 3 "cannot ask the registry for $IMAGE:$TAG with the docker login after 3 attempts: $last (check the network, and run make docker-login if the login expired)"
+            die 3 "cannot ask the registry for $repo:$TAG with the docker login after 3 attempts: $last (check the network, and run make docker-login if the login expired)"
         attempt=$((attempt + 1))
         sleep 5
     done
@@ -1257,12 +1317,18 @@ chain_config_files() {
     for f in committee genesis parameters; do printf '%s/%s.yaml\n' "$CHAIN_CONFIGS" "$f"; done
 }
 
-# Every name SHA256SUMS lists, one per line: IMAGE_DIGEST, the tarball and the chain-config
-# files. The chain-config lines carry repository paths, so `sha256sum --check` run from the
-# root of a checkout of the tag checks the files there.
-sums_names() {
-    printf '%s\n' IMAGE_DIGEST "$TARBALL"
-    chain_config_files
+# Every name the manifest $1 lists, one per line: the digest file and the tarball of each
+# component it covers, and for SHA256SUMS the chain-config files. The chain-config lines carry
+# repository paths, so `sha256sum --check` run from the root of a checkout of the tag checks
+# the files there. It calls component_set, so its output is always captured (a subshell keeps
+# the caller's C_* fields), and callers pass a die on with `|| exit`.
+manifest_names() {
+    local manifest=$1 c
+    for c in $COMPONENTS; do
+        component_set "$c"
+        if [ "$C_MANIFEST" = "$manifest" ]; then printf '%s\n' "$C_DIGEST_FILE" "$C_TARBALL"; fi
+    done
+    if [ "$manifest" = SHA256SUMS ]; then chain_config_files; fi
 }
 
 # Writes the chain-config files as committed at COMMIT under $1, at their repository paths.
@@ -1290,43 +1356,57 @@ $(chain_config_files)
 EOF
 }
 
-# SHA256SUMS: "<hex>  <name>" for every name sums_names lists, C-locale sorted by name.
+# write_sums DIR MANIFEST: DIR/MANIFEST holds "<hex>  <name>" for every name manifest_names
+# lists, C-locale sorted by name, each hashed in DIR; for SHA256SUMS the chain-config files as
+# committed at COMMIT are staged into DIR first.
 write_sums() {
-    local dir=$1 digest_hex tar_hex cc_lines
-    digest_hex=$(sha256_hex "$dir/IMAGE_DIGEST")
-    tar_hex=$(sha256_hex "$dir/$TARBALL")
-    cc_lines=$(chain_config_sums "$dir") || exit
-    printf '%s  %s\n%s  %s\n%s\n' "$digest_hex" IMAGE_DIGEST "$tar_hex" "$TARBALL" "$cc_lines" |
-        LC_ALL=C sort -k2 >"$dir/SHA256SUMS"
+    local dir=$1 manifest=$2 names name hex lines=''
+    names=$(manifest_names "$manifest") || exit
+    if [ "$manifest" = SHA256SUMS ]; then stage_chain_configs "$dir"; fi
+    while IFS= read -r name; do
+        hex=$(sha256_hex "$dir/$name") || exit
+        lines="$lines$hex  $name"$'\n'
+    done <<EOF
+$names
+EOF
+    printf '%s' "$lines" | LC_ALL=C sort -k2 >"$dir/$manifest"
 }
 
-# The SHA256SUMS file $1 is in the strict two-space format and names exactly what sums_names
-# lists, each once: IMAGE_DIGEST, the tarball and the channel's three chain-config files.
+# check_sums_shape FILE MANIFEST: FILE is in the strict two-space format and names exactly what
+# manifest_names lists for MANIFEST, each once. For SHA256SUMS that is IMAGE_DIGEST, the
+# tarball and the channel's three chain-config files.
 check_sums_shape() {
-    local sums=$1 names want
+    local sums=$1 manifest=$2 names want
     awk '!/^[0-9a-f]+  [^ ]+$/ || length($1) != 64 { bad = 1 } END { exit bad }' "$sums" ||
-        die 1 "SHA256SUMS has a malformed line"
+        die 1 "$manifest has a malformed line"
     names=$(awk '{ print $2 }' "$sums" | LC_ALL=C sort)
-    want=$(sums_names | LC_ALL=C sort)
-    [ "$names" = "$want" ] ||
-        die 1 "SHA256SUMS must name exactly IMAGE_DIGEST, $TARBALL and the committee, genesis and parameters files in $CHAIN_CONFIGS"
+    want=$(manifest_names "$manifest") || exit
+    want=$(printf '%s\n' "$want" | LC_ALL=C sort)
+    if [ "$names" != "$want" ]; then
+        if [ "$manifest" = SHA256SUMS ]; then
+            die 1 "SHA256SUMS must name exactly IMAGE_DIGEST, $TARBALL and the committee, genesis and parameters files in $CHAIN_CONFIGS"
+        fi
+        die 1 "$manifest must name exactly $(printf '%s\n' "$want" | awk '{ printf "%s%s", sep, $0; sep = ", " } END { print "" }')"
+    fi
 }
 
-# SHA256SUMS in DIR has the right shape, and every hash matches: IMAGE_DIGEST and the tarball
-# beside it, and the chain-config files as committed at COMMIT, staged into DIR.
+# check_sums DIR MANIFEST: DIR/MANIFEST has the right shape, and every hash matches the file
+# beside it in DIR; for SHA256SUMS the chain-config files as committed at COMMIT, staged into
+# DIR.
 check_sums() {
-    local dir=$1
-    check_sums_shape "$dir/SHA256SUMS"
-    stage_chain_configs "$dir"
-    (cd "$dir" && sha256_check SHA256SUMS) >&2 || die 1 "SHA256SUMS does not match the files"
+    local dir=$1 manifest=$2
+    check_sums_shape "$dir/$manifest" "$manifest"
+    if [ "$manifest" = SHA256SUMS ]; then stage_chain_configs "$dir"; fi
+    (cd "$dir" && sha256_check "$manifest") >&2 || die 1 "$manifest does not match the files"
 }
 
-# $1 is an IMAGE_DIGEST file. It must hold exactly one line "IMAGE@sha256:<64 hex>", where IMAGE
-# is the package of the tag's channel (or the dry run's RELEASE_IMAGE): a mainnet tag never
-# names an image in tn-testnet, an adiri tag never one in tn-mainnet, neither names any other
-# repository, and the digest is well formed. Every refusal has one shape: what the file holds,
-# the tag's channel, its package and the expected line. $2, when given, replaces the advice at
-# the end of the refusal.
+# $1 is the digest file of the component that component_set chose (the node's IMAGE_DIGEST). It
+# must hold exactly one line "C_IMAGE@sha256:<64 hex>", where C_IMAGE is the component's image
+# (for the node, the package of the tag's channel, or the dry run's RELEASE_IMAGE): a mainnet
+# tag never names an image in tn-testnet, an adiri tag never one in tn-mainnet, neither names
+# any other repository, and the digest is well formed. Every refusal has one shape: what the
+# file holds, the tag's channel, its package and the expected line. $2, when given, replaces
+# the advice at the end of the refusal.
 check_digest_package() {
     local file=$1 advice=${2:-rebuild the draft with make release-build TAG=$TAG, or report it if the release is published} lines line repo digest problem=
     lines=$(awk 'END { print NR }' "$file") || die 1 "cannot read $file"
@@ -1337,74 +1417,84 @@ check_digest_package() {
         problem="holds $lines lines"
     elif [ "$repo" = "$line" ]; then
         problem="names '$line', which is not an image by digest"
-    elif [ "$repo" != "$IMAGE" ]; then
+    elif [ "$repo" != "$C_IMAGE" ]; then
         problem="names an image in $repo"
     elif ! [[ "$digest" =~ $DIGEST_RE ]]; then
-        problem="names $IMAGE with the malformed digest '$(printf '%s' "$digest" | tr -c '[:print:]' '?')'"
+        problem="names $C_IMAGE with the malformed digest '$(printf '%s' "$digest" | tr -c '[:print:]' '?')'"
     fi
     [ -z "$problem" ] ||
-        die 1 "IMAGE_DIGEST $problem, but $TAG is on the $CHANNEL channel, whose images are published only in $IMAGE (expected the one line $IMAGE@sha256:<64 hex>); $advice"
+        die 1 "$C_DIGEST_FILE $problem, but $TAG is on the $CHANNEL channel, whose images are published only in $C_IMAGE (expected the one line $C_IMAGE@sha256:<64 hex>); $advice"
 }
 
-# sign before it signs, verify before it counts signatures: SHA256SUMS in $1 lists exactly one
-# IMAGE_DIGEST, that line hashes the IMAGE_DIGEST file beside it, and the file names an image in
-# the tag's package. A maintainer signature therefore never covers an image in the other
-# network's package. $2 is passed on to check_digest_package as its advice.
+# check_sums_package DIR MANIFEST [ADVICE]: sign before it signs, verify before it counts
+# signatures. For each component MANIFEST covers, MANIFEST in DIR lists its digest file exactly
+# once, that line hashes the digest file beside it, and the file names an image in the
+# component's package. A maintainer signature therefore never covers an image in the other
+# network's package. ADVICE is passed on to check_digest_package. It calls component_set, so
+# the caller's C_* fields do not survive it.
 check_sums_package() {
-    local dir=$1 advice=${2:-} listed have
-    listed=$(awk '$2 == "IMAGE_DIGEST" { n++; h = $1 } END { if (n == 1) print h }' "$dir/SHA256SUMS") ||
-        die 1 "cannot read $dir/SHA256SUMS"
-    have=$(sha256_hex "$dir/IMAGE_DIGEST") || exit
-    if [ -z "$listed" ] || [ "$listed" != "$have" ]; then
-        die 1 "SHA256SUMS does not list the IMAGE_DIGEST beside it exactly once with its hash"
-    fi
-    check_digest_package "$dir/IMAGE_DIGEST" "$advice"
+    local dir=$1 manifest=$2 advice=${3:-} c listed have
+    for c in $COMPONENTS; do
+        component_set "$c"
+        [ "$C_MANIFEST" = "$manifest" ] || continue
+        listed=$(awk -v f="$C_DIGEST_FILE" '$2 == f { n++; h = $1 } END { if (n == 1) print h }' "$dir/$manifest") ||
+            die 1 "cannot read $dir/$manifest"
+        have=$(sha256_hex "$dir/$C_DIGEST_FILE") || exit
+        if [ -z "$listed" ] || [ "$listed" != "$have" ]; then
+            die 1 "$manifest does not list the $C_DIGEST_FILE beside it exactly once with its hash"
+        fi
+        check_digest_package "$dir/$C_DIGEST_FILE" "$advice"
+    done
 }
 
-# IMAGE_DIGEST is one line "IMAGE@sha256:<hex>" and the registry still serves IMAGE:TAG at that
-# digest. Sets D.
+# The digest file of the component that component_set chose, in DIR $1, is one line
+# "C_IMAGE@sha256:<hex>" and the registry still serves C_IMAGE:TAG at that digest. Sets C_D and
+# records it; for the node, D too.
 check_image_digest_file() {
-    local file=$1/IMAGE_DIGEST line reg
+    local file=$1/$C_DIGEST_FILE line reg
     check_digest_package "$file"
     line=$(cat "$file")
-    D=${line#"$IMAGE@"}
-    reg=$(registry_digest "$TAG")
-    [ "$reg" = "$D" ] || die 1 "IMAGE_DIGEST says $D but the registry serves $IMAGE:$TAG as ${reg:-nothing}"
+    C_D=${line#"$C_IMAGE@"}
+    reg=$(registry_digest "$C_IMAGE" "$TAG")
+    [ "$reg" = "$C_D" ] || die 1 "$C_DIGEST_FILE says $C_D but the registry serves $C_IMAGE:$TAG as ${reg:-nothing}"
+    record_digest "$C_NAME" "$C_D"
+    if [ "$C_NAME" = node ]; then D=$C_D; fi
 }
 
-# The tarball lists exactly the four files under its top-level directory (an exact
-# comparison, so nothing absolute and no ".."), and they extract as regular files into $2.
+# The tarball $1 of the component that component_set chose lists exactly the four files under
+# its top-level directory C_TARDIR (an exact comparison, so nothing absolute and no ".."): the
+# binary C_TAR_BIN and the three license files, and they extract as regular files into $2.
 check_tarball() {
-    local tarball=$1 dest=$2 dir listing want f
-    dir="telcoin-network-$TAG-$TRIPLE"
-    listing=$(tar -tzf "$tarball") || die 1 "cannot list $TARBALL"
+    local tarball=$1 dest=$2 dir=$C_TARDIR listing want f
+    listing=$(tar -tzf "$tarball") || die 1 "cannot list $C_TARBALL"
     listing=$(printf '%s\n' "$listing" | awk -v d="$dir/" '$0 != d' | LC_ALL=C sort)
-    want=$(printf '%s\n' "$dir/LICENSE-APACHE" "$dir/LICENSE-MIT" "$dir/NOTICE" "$dir/telcoin-network" | LC_ALL=C sort)
+    want=$(printf '%s\n' "$dir/LICENSE-APACHE" "$dir/LICENSE-MIT" "$dir/NOTICE" "$dir/$C_TAR_BIN" | LC_ALL=C sort)
     [ "$listing" = "$want" ] ||
-        die 1 "$TARBALL must hold exactly telcoin-network, LICENSE-APACHE, LICENSE-MIT and NOTICE under $dir/"
+        die 1 "$C_TARBALL must hold exactly $C_TAR_BIN, LICENSE-APACHE, LICENSE-MIT and NOTICE under $dir/"
     mkdir -p "$dest"
-    tar -xzf "$tarball" -C "$dest" || die 1 "cannot extract $TARBALL"
-    for f in telcoin-network LICENSE-APACHE LICENSE-MIT NOTICE; do
-        if [ ! -f "$dest/$dir/$f" ] || [ -L "$dest/$dir/$f" ]; then die 1 "$dir/$f in $TARBALL is not a regular file"; fi
+    tar -xzf "$tarball" -C "$dest" || die 1 "cannot extract $C_TARBALL"
+    for f in "$C_TAR_BIN" LICENSE-APACHE LICENSE-MIT NOTICE; do
+        if [ ! -f "$dest/$dir/$f" ] || [ -L "$dest/$dir/$f" ]; then die 1 "$dir/$f in $C_TARBALL is not a regular file"; fi
     done
-    [ -x "$dest/$dir/telcoin-network" ] || die 1 "$dir/telcoin-network in $TARBALL is not executable"
+    [ -x "$dest/$dir/$C_TAR_BIN" ] || die 1 "$dir/$C_TAR_BIN in $C_TARBALL is not executable"
 }
 
-# Copies /usr/local/bin/telcoin out of image $1 to $2, after checking that the image runs that
-# file: no ENTRYPOINT, CMD ["telcoin","node"] as in etc/Dockerfile, and no telcoin in
+# Copies /usr/local/bin/C_BIN out of image $1 to $2, after checking that the image runs that
+# file: the ENTRYPOINT and CMD of the component's Dockerfile (C_CONFIG; for the node no
+# ENTRYPOINT and CMD ["telcoin","node"], as in etc/Dockerfile), and no C_BIN in
 # /usr/local/sbin, the one PATH entry ahead of /usr/local/bin.
 image_binary() {
     local ref=$1 dest=$2 ctr cfg
     cfg=$(docker image inspect --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' "$ref") ||
         die 1 "docker image inspect $ref failed"
-    [ "$cfg" = 'null ["telcoin","node"]' ] ||
-        die 1 "$ref has ENTRYPOINT and CMD $cfg; expected no ENTRYPOINT and CMD [\"telcoin\",\"node\"]"
+    [ "$cfg" = "$C_CONFIG" ] ||
+        die 1 "$ref has ENTRYPOINT and CMD $cfg; expected $C_CONFIG_TEXT"
     ctr=$(docker create --platform linux/amd64 "$ref") || die 1 "docker create $ref failed"
     CONTAINERS="$CONTAINERS$ctr"$'\n'
-    if docker cp "$ctr:/usr/local/sbin/telcoin" - >/dev/null 2>&1; then
-        die 1 "$ref has a second telcoin in /usr/local/sbin, which PATH finds first"
+    if docker cp "$ctr:/usr/local/sbin/$C_BIN" - >/dev/null 2>&1; then
+        die 1 "$ref has a second $C_BIN in /usr/local/sbin, which PATH finds first"
     fi
-    docker cp "$ctr:/usr/local/bin/telcoin" "$dest" >/dev/null || die 1 "cannot copy /usr/local/bin/telcoin out of $ref"
+    docker cp "$ctr:/usr/local/bin/$C_BIN" "$dest" >/dev/null || die 1 "cannot copy /usr/local/bin/$C_BIN out of $ref"
     docker rm "$ctr" >/dev/null 2>&1 || true
 }
 
@@ -1416,8 +1506,8 @@ check_version_output() {
     local ref=$1 out version sha features n_lines feature has_adiri=no
     # --entrypoint: run the very file image_binary copied, not whatever ENTRYPOINT or PATH picks.
     out=$(docker run --rm --network none --platform linux/amd64 \
-        --entrypoint /usr/local/bin/telcoin "$ref" --version) ||
-        die 1 "$ref: /usr/local/bin/telcoin --version failed"
+        --entrypoint "/usr/local/bin/$C_BIN" "$ref" --version) ||
+        die 1 "$ref: /usr/local/bin/$C_BIN --version failed"
     # clap starts the first line with the program name: "telcoin-network-cli Version: X.Y.Z".
     version=$(printf '%s\n' "$out" | sed -n 's/^\([^ ]* \)\{0,1\}Version: //p')
     sha=$(printf '%s\n' "$out" | sed -n 's/^Commit SHA: //p')
@@ -1450,22 +1540,84 @@ EOF
 }
 
 # The release files that release_fetch put in DIR, before anyone counts or adds a signature:
-# each is the asset GitHub listed, SHA256SUMS matches them and the chain-config files at COMMIT,
-# IMAGE_DIGEST names what the registry serves for TAG, the tarball holds the four files, its
-# binary is byte for byte /usr/local/bin/telcoin in the image pulled by digest, and that binary
-# reports this release's version, commit and features. sign and verify both run it. Sets D.
+# each is the asset GitHub listed, and every manifest matches them (SHA256SUMS also the
+# chain-config files at COMMIT). Then for each component: its digest file names what the
+# registry serves for TAG, its tarball holds the four files, the tarball's binary is byte for
+# byte /usr/local/bin/C_BIN in the image pulled by digest (the node's: telcoin), and that binary
+# reports this release's version, commit and features. sign and verify both run it. Records
+# every component's digest and sets D. It calls component_set, so the caller's C_* fields do
+# not survive it.
 check_release_files() {
-    local dir=$1 tar_bin_hex image_bin_hex
+    local dir=$1 manifest c tar_bin_hex image_bin_hex
     check_fetched_digests "$dir"
-    check_sums "$dir"
-    check_image_digest_file "$dir"
-    check_tarball "$dir/$TARBALL" "$dir/x"
-    docker pull --platform linux/amd64 "$IMAGE@$D" >&2 || die 3 "docker pull $IMAGE@$D failed"
-    image_binary "$IMAGE@$D" "$dir/image-telcoin"
-    image_bin_hex=$(sha256_hex "$dir/image-telcoin")
-    tar_bin_hex=$(sha256_hex "$dir/x/telcoin-network-$TAG-$TRIPLE/telcoin-network")
-    [ "$image_bin_hex" = "$tar_bin_hex" ] || die 1 "the tarball's telcoin-network differs from /usr/local/bin/telcoin in $IMAGE@$D"
-    check_version_output "$IMAGE@$D"
+    for manifest in $MANIFESTS; do check_sums "$dir" "$manifest"; done
+    for c in $COMPONENTS; do
+        component_set "$c"
+        check_image_digest_file "$dir"
+        check_tarball "$dir/$C_TARBALL" "$dir/x"
+        docker pull --platform linux/amd64 "$C_IMAGE@$C_D" >&2 || die 3 "docker pull $C_IMAGE@$C_D failed"
+        image_binary "$C_IMAGE@$C_D" "$dir/image-$C_BIN"
+        image_bin_hex=$(sha256_hex "$dir/image-$C_BIN")
+        tar_bin_hex=$(sha256_hex "$dir/x/$C_TARDIR/$C_TAR_BIN")
+        [ "$image_bin_hex" = "$tar_bin_hex" ] ||
+            die 1 "the tarball's $C_TAR_BIN differs from /usr/local/bin/$C_BIN in $C_IMAGE@$C_D"
+        check_version_output "$C_IMAGE@$C_D"
+    done
+}
+
+# ---------------------------------------------------------------------------------------------
+# Build and publish steps of the component that component_set chose
+
+# build: builds C_IMAGE:TAG from C_DOCKERFILE in the tag's worktree BUILD_WT, without cache or
+# provenance, labelled with TAG and COMMIT. The cargo features select the node's network, so
+# only the node gets CARGO_FEATURES; every image gets GIT_SHA.
+build_image() {
+    set -- --builder "$RELEASE_BUILDER" --platform linux/amd64 -f "$BUILD_WT/$C_DOCKERFILE"
+    if [ "$C_NAME" = node ]; then
+        info "building $C_IMAGE:$TAG (features: ${FEATURES:-none})"
+        set -- "$@" --build-arg "CARGO_FEATURES=$FEATURES"
+    else
+        info "building $C_IMAGE:$TAG"
+    fi
+    docker buildx build "$@" --build-arg "GIT_SHA=$COMMIT" \
+        --label "org.opencontainers.image.version=$TAG" \
+        --label "org.opencontainers.image.revision=$COMMIT" \
+        --provenance=false --sbom=false --pull --no-cache --load \
+        -t "$C_IMAGE:$TAG" "$BUILD_WT" >&2 ||
+        die 3 "docker buildx build failed; a failed download (base image, apt, crates.io) is the usual cause, so run make release-build again, and report it if the output above shows a build error instead"
+}
+
+# pack_tarball RD STAGE: build. STAGE/C_TARDIR holds the binary C_TAR_BIN, which the caller
+# copied out of the image with image_binary, so the tarball carries the very bytes that are in
+# the image. Adds the license files at TAG and packs the directory into RD/C_TARBALL with fixed
+# modes, owners, order and mtime (COMMIT's committer date), so the same tag packs the same bytes.
+pack_tarball() {
+    local rd=$1 stage=$2 dir=$C_TARDIR mtime
+    cp "$BUILD_WT/LICENSE-APACHE" "$BUILD_WT/LICENSE-MIT" "$BUILD_WT/NOTICE" "$stage/$dir/" ||
+        die 1 "license files are missing at $TAG"
+    chmod 0755 "$stage/$dir" "$stage/$dir/$C_TAR_BIN"
+    chmod 0644 "$stage/$dir/LICENSE-APACHE" "$stage/$dir/LICENSE-MIT" "$stage/$dir/NOTICE"
+    mtime=$(git log -1 --format=%ct "$COMMIT")
+    LC_ALL=C tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$mtime" --format=gnu \
+        -cf - -C "$stage" "$dir" | gzip -n -9 >"$rd/$C_TARBALL" || die 1 "packaging $C_TARBALL failed"
+}
+
+# publish: points C_IMAGE:ALIAS at C_IMAGE@C_D, unless it points there already. The caller has
+# checked that the registry serves C_IMAGE:TAG at C_D, so the alias moves only inside the
+# component's package and only to the image that package serves for TAG, never to an image of
+# the other network.
+move_alias() {
+    local current
+    current=$(registry_digest "$C_IMAGE" "$ALIAS")
+    if [ "$current" = "$C_D" ]; then
+        info "$C_IMAGE:$ALIAS already points at $C_D"
+        return 0
+    fi
+    # --prefer-index=false copies the manifest as is, so the alias keeps digest C_D.
+    docker buildx imagetools create --prefer-index=false --tag "$C_IMAGE:$ALIAS" "$C_IMAGE@$C_D" >&2 ||
+        die 3 "cannot move $C_IMAGE:$ALIAS (if docker reported unauthorized or denied, run make docker-login and publish again)"
+    current=$(registry_digest "$C_IMAGE" "$ALIAS")
+    [ "$current" = "$C_D" ] || die 1 "$C_IMAGE:$ALIAS points at ${current:-nothing}, expected $C_D"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1500,9 +1652,11 @@ section_body() {
     '
 }
 
-# Renders the release body for TAG at COMMIT to stdout; $1 is the image digest, if known.
+# Renders the release body for TAG at COMMIT to stdout; $1 is the node's image digest, if
+# known. It calls component_set for the node, so the caller's C_* fields do not survive it.
 render_notes() {
     local digest=$1 body handle fpr digest_cell features_cell alias_cell cc_lines
+    component_set node
     git show "$COMMIT:CHANGELOG.md" >"$WORK/notes-changelog.md" 2>/dev/null ||
         die 1 "CHANGELOG.md does not exist at $COMMIT"
     body=$(section_body <"$WORK/notes-changelog.md")
@@ -1518,16 +1672,16 @@ render_notes() {
     if [ -n "$FEATURES" ]; then features_cell="\`$FEATURES\`"; fi
     alias_cell="none: a release candidate moves no image alias"
     if [ -n "$ALIAS" ]; then
-        alias_cell="publishing moves \`$IMAGE:$ALIAS\` to this image when it is the newest $CHANNEL release"
+        alias_cell="publishing moves \`$C_IMAGE:$ALIAS\` to this image when it is the newest $CHANNEL release"
     fi
     printf '## Artifacts\n\n| Item | Value |\n|---|---|\n'
     printf '| %s | %s |\n' \
         Channel "\`$CHANNEL\`" \
         Commit "\`$COMMIT\`" \
         "Cargo features" "$features_cell" \
-        Image "\`$IMAGE:$TAG\`" \
+        Image "\`$C_IMAGE:$TAG\`" \
         "Image digest" "$digest_cell" \
-        Tarball "\`$TARBALL\` (Linux x86_64)" \
+        Tarball "\`$C_TARBALL\` (Linux x86_64)" \
         Alias "$alias_cell"
     printf '\n'
 
@@ -1587,7 +1741,7 @@ EOF
     done <<EOF
 $ALLOW_LIST
 EOF
-    sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" -e "s|@VERSION@|$VERSION|g" -e "s|@IMAGE@|$IMAGE|g" \
+    sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" -e "s|@VERSION@|$VERSION|g" -e "s|@IMAGE@|$C_IMAGE|g" \
         -e "s|@CHANNEL@|$CHANNEL|g" <<'EOF'
 
 Tarball, only after the last line was `Signature and hashes verified` and the fingerprints matched:
@@ -1786,7 +1940,7 @@ create_draft() {
 
 # CI only: create the draft, or refresh the body of a draft the bot created earlier.
 cmd_draft() {
-    local notes=$WORK/notes.md digest='' line
+    local notes=$WORK/notes.md digest c line
     [ "${GITHUB_ACTIONS:-}" = true ] || die 2 "draft runs only in CI (GITHUB_ACTIONS=true)"
     COMMIT=$(tag_commit "$TAG")
     load_allowlist
@@ -1794,15 +1948,19 @@ cmd_draft() {
     if [ "$REL_EXISTS" = 1 ]; then
         [ "$REL_DRAFT" = true ] || die 1 "release $TAG is already published"
         [ "$REL_AUTHOR" = "$BOT_LOGIN" ] || die 1 "the draft for $TAG was created by $REL_AUTHOR, not $BOT_LOGIN"
-        # A re-run after the build keeps the digest the build put into the body, and stops on
-        # an IMAGE_DIGEST that is not one well-formed line in the tag's package.
-        if has_asset IMAGE_DIGEST; then
-            release_fetch "$WORK/draft" IMAGE_DIGEST
-            check_digest_package "$WORK/draft/IMAGE_DIGEST"
-            line=$(cat "$WORK/draft/IMAGE_DIGEST")
-            digest=${line#"$IMAGE@"}
-        fi
+        # A re-run after the build keeps the digests the build put into the body, and stops on
+        # a digest file that is not one well-formed line in its component's package.
+        for c in $COMPONENTS; do
+            component_set "$c"
+            if has_asset "$C_DIGEST_FILE"; then
+                release_fetch "$WORK/draft" "$C_DIGEST_FILE"
+                check_digest_package "$WORK/draft/$C_DIGEST_FILE"
+                line=$(cat "$WORK/draft/$C_DIGEST_FILE")
+                record_digest "$C_NAME" "${line#"$C_IMAGE@"}"
+            fi
+        done
     fi
+    digest=$(digest_of node) || exit
     render_notes "$digest" >"$notes"
     if [ "$DRY_RUN" = 1 ]; then
         mkdir -p "$RELEASE_DIR"
@@ -1948,7 +2106,7 @@ cmd_tag() {
 
 # build server: build image and tarball from the tag, push the image, attach the artifacts.
 cmd_build() {
-    local driver existing rd stage dir mtime want got repo_digests sums_hex
+    local driver manifest c existing rd stage want got repo_digests sums_hex
     if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
         die 2 "build runs on Linux x86_64 (this host is $(uname -s) $(uname -m))"
     fi
@@ -1967,31 +2125,36 @@ cmd_build() {
     [ "$REL_EXISTS" = 1 ] || die 2 "no draft release for $TAG yet; CI creates it when the tag is pushed"
     [ "$REL_DRAFT" = true ] || die 1 "release $TAG is already published"
     [ "$REL_AUTHOR" = "$BOT_LOGIN" ] || die 1 "the draft for $TAG was created by $REL_AUTHOR, not $BOT_LOGIN"
-    if has_asset SHA256SUMS.asc; then
-        die 1 "the draft for $TAG already carries SHA256SUMS.asc; a rebuild would void those signatures"
-    fi
-    existing=$(registry_digest "$TAG" first-push)
-    if [ "$existing" = denied ]; then
-        # ghcr refuses anonymous reads of a private package and of one never pushed alike, so
-        # the docker login looks again. When it sees TAG, the package is private and not new,
-        # and a rebuild now would only stop again after its push: the setup comes first. Only
-        # when the registry answers that TAG is not found (or denied) is this a first push,
-        # which needs RELEASE_FIRST_PUSH set to the package.
-        existing=$(login_digest) || exit
-        if [ -n "$existing" ]; then
-            die 2 "$IMAGE is private, not new, and already holds $IMAGE:$TAG ($existing): do the one-time setup first (make the package public and set its access list, as the maintainer guide says), then run make release-build TAG=$TAG again, with RELEASE_REBUILD=1 if the tag must be rebuilt"
-        elif [ -z "${RELEASE_FIRST_PUSH:-}" ]; then
-            die 2 "$IMAGE refuses anonymous reads and the docker login does not see $IMAGE:$TAG: if this is the first release image of the package $PACKAGE, run again with RELEASE_FIRST_PUSH=$PACKAGE; otherwise make the package public (maintainer guide, one-time setup)"
-        elif [ "$RELEASE_FIRST_PUSH" != "$PACKAGE" ]; then
-            die 2 "RELEASE_FIRST_PUSH is $RELEASE_FIRST_PUSH, but $TAG is on the $CHANNEL channel, whose package is $PACKAGE"
-        else
-            warn "RELEASE_FIRST_PUSH=$PACKAGE: pushing $IMAGE:$TAG as the first image of the package; build stops after the push until the package is public"
+    for manifest in $MANIFESTS; do
+        if has_asset "$manifest.asc"; then
+            die 1 "the draft for $TAG already carries $manifest.asc; a rebuild would void those signatures"
         fi
-    fi
-    if [ -n "$existing" ]; then
-        [ "${RELEASE_REBUILD:-}" = 1 ] || die 1 "$IMAGE:$TAG already exists ($existing); set RELEASE_REBUILD=1 to rebuild it"
-        warn "RELEASE_REBUILD=1: rebuilding $IMAGE:$TAG (the registry has $existing)"
-    fi
+    done
+    for c in $COMPONENTS; do
+        component_set "$c"
+        existing=$(registry_digest "$C_IMAGE" "$TAG" first-push)
+        if [ "$existing" = denied ]; then
+            # ghcr refuses anonymous reads of a private package and of one never pushed alike,
+            # so the docker login looks again. When it sees TAG, the package is private and not
+            # new, and a rebuild now would only stop again after its push: the setup comes
+            # first. Only when the registry answers that TAG is not found (or denied) is this a
+            # first push, which needs RELEASE_FIRST_PUSH set to the package.
+            existing=$(login_digest "$C_IMAGE") || exit
+            if [ -n "$existing" ]; then
+                die 2 "$C_IMAGE is private, not new, and already holds $C_IMAGE:$TAG ($existing): do the one-time setup first (make the package public and set its access list, as the maintainer guide says), then run make release-build TAG=$TAG again, with RELEASE_REBUILD=1 if the tag must be rebuilt"
+            elif [ -z "${RELEASE_FIRST_PUSH:-}" ]; then
+                die 2 "$C_IMAGE refuses anonymous reads and the docker login does not see $C_IMAGE:$TAG: if this is the first release image of the package $C_PACKAGE, run again with RELEASE_FIRST_PUSH=$C_PACKAGE; otherwise make the package public (maintainer guide, one-time setup)"
+            elif [ "$RELEASE_FIRST_PUSH" != "$C_PACKAGE" ]; then
+                die 2 "RELEASE_FIRST_PUSH is $RELEASE_FIRST_PUSH, but $TAG is on the $CHANNEL channel, whose package is $C_PACKAGE"
+            else
+                warn "RELEASE_FIRST_PUSH=$C_PACKAGE: pushing $C_IMAGE:$TAG as the first image of the package; build stops after the push until the package is public"
+            fi
+        fi
+        if [ -n "$existing" ]; then
+            [ "${RELEASE_REBUILD:-}" = 1 ] || die 1 "$C_IMAGE:$TAG already exists ($existing); set RELEASE_REBUILD=1 to rebuild it"
+            warn "RELEASE_REBUILD=1: rebuilding $C_IMAGE:$TAG (the registry has $existing)"
+        fi
+    done
 
     # Build from a pristine checkout of the tag, never from the working tree.
     umask 022
@@ -2003,57 +2166,55 @@ cmd_build() {
     got=$(git -C "$BUILD_WT/tn-contracts" rev-parse HEAD)
     [ "$want" = "$got" ] || die 1 "tn-contracts is at $got but $TAG records $want"
 
-    info "building $IMAGE:$TAG (features: ${FEATURES:-none})"
-    docker buildx build --builder "$RELEASE_BUILDER" --platform linux/amd64 \
-        -f "$BUILD_WT/etc/Dockerfile" \
-        --build-arg "CARGO_FEATURES=$FEATURES" --build-arg "GIT_SHA=$COMMIT" \
-        --label "org.opencontainers.image.version=$TAG" \
-        --label "org.opencontainers.image.revision=$COMMIT" \
-        --provenance=false --sbom=false --pull --no-cache --load \
-        -t "$IMAGE:$TAG" "$BUILD_WT" >&2 ||
-        die 3 "docker buildx build failed; a failed download (base image, apt, crates.io) is the usual cause, so run make release-build again, and report it if the output above shows a build error instead"
+    for c in $COMPONENTS; do
+        component_set "$c"
+        build_image
+    done
 
-    # One build: the tarball carries the very bytes that are in the image.
+    # One build: each tarball carries the very bytes that are in its image.
     rd="$(pwd)/$(release_dir "$TAG")"
     clear_release_dir "$rd"
     mkdir -p "$rd"
-    dir="telcoin-network-$TAG-$TRIPLE"
     stage=$WORK/stage
-    mkdir -p "$stage/$dir"
-    image_binary "$IMAGE:$TAG" "$stage/$dir/telcoin-network"
-    check_version_output "$IMAGE:$TAG"
-    cp "$BUILD_WT/LICENSE-APACHE" "$BUILD_WT/LICENSE-MIT" "$BUILD_WT/NOTICE" "$stage/$dir/" ||
-        die 1 "license files are missing at $TAG"
-    chmod 0755 "$stage/$dir" "$stage/$dir/telcoin-network"
-    chmod 0644 "$stage/$dir/LICENSE-APACHE" "$stage/$dir/LICENSE-MIT" "$stage/$dir/NOTICE"
-    mtime=$(git log -1 --format=%ct "$COMMIT")
-    LC_ALL=C tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$mtime" --format=gnu \
-        -cf - -C "$stage" "$dir" | gzip -n -9 >"$rd/$TARBALL" || die 1 "packaging $TARBALL failed"
+    for c in $COMPONENTS; do
+        component_set "$c"
+        mkdir -p "$stage/$C_TARDIR"
+        image_binary "$C_IMAGE:$TAG" "$stage/$C_TARDIR/$C_TAR_BIN"
+        check_version_output "$C_IMAGE:$TAG"
+        pack_tarball "$rd" "$stage"
+    done
 
-    info "pushing $IMAGE:$TAG"
-    docker push "$IMAGE:$TAG" >&2 || die 3 "docker push $IMAGE:$TAG failed"
-    D=$(registry_digest "$TAG" first-push)
-    if [ "$D" = denied ]; then
-        die 2 "$IMAGE:$TAG is pushed, but the package is not public: do its one-time setup (maintainer guide), then run make release-build TAG=$TAG again with RELEASE_REBUILD=1"
-    fi
-    [ -n "$D" ] || die 1 "the registry has no $IMAGE:$TAG after the push"
-    repo_digests=$(docker image inspect --format '{{json .RepoDigests}}' "$IMAGE:$TAG") ||
-        die 1 "docker image inspect $IMAGE:$TAG failed"
-    case "$repo_digests" in
-        *"\"$IMAGE@$D\""*) ;;
-        *) die 1 "the registry serves $D for $IMAGE:$TAG, which is not the image just built ($repo_digests)" ;;
-    esac
-    # cmd_verify below reads IMAGE_DIGEST back from the draft and refuses it unless it names
-    # an image in IMAGE, the tag's package.
-    printf '%s@%s\n' "$IMAGE" "$D" >"$rd/IMAGE_DIGEST"
-    write_sums "$rd"
+    for c in $COMPONENTS; do
+        component_set "$c"
+        info "pushing $C_IMAGE:$TAG"
+        docker push "$C_IMAGE:$TAG" >&2 || die 3 "docker push $C_IMAGE:$TAG failed"
+        C_D=$(registry_digest "$C_IMAGE" "$TAG" first-push)
+        if [ "$C_D" = denied ]; then
+            die 2 "$C_IMAGE:$TAG is pushed, but the package is not public: do its one-time setup (maintainer guide), then run make release-build TAG=$TAG again with RELEASE_REBUILD=1"
+        fi
+        [ -n "$C_D" ] || die 1 "the registry has no $C_IMAGE:$TAG after the push"
+        repo_digests=$(docker image inspect --format '{{json .RepoDigests}}' "$C_IMAGE:$TAG") ||
+            die 1 "docker image inspect $C_IMAGE:$TAG failed"
+        case "$repo_digests" in
+            *"\"$C_IMAGE@$C_D\""*) ;;
+            *) die 1 "the registry serves $C_D for $C_IMAGE:$TAG, which is not the image just built ($repo_digests)" ;;
+        esac
+        record_digest "$C_NAME" "$C_D"
+        if [ "$C_NAME" = node ]; then D=$C_D; fi
+        # cmd_verify below reads the digest file back from the draft and refuses it unless it
+        # names an image in C_IMAGE, the component's package.
+        printf '%s@%s\n' "$C_IMAGE" "$C_D" >"$rd/$C_DIGEST_FILE"
+    done
+    for manifest in $MANIFESTS; do write_sums "$rd" "$manifest"; done
 
     release_upload "$rd/IMAGE_DIGEST" "$rd/SHA256SUMS" "$rd/$TARBALL"
     render_notes "$D" >"$WORK/notes.md"
     release_set_notes "$WORK/notes.md"
     cmd_verify 1
-    sums_hex=$(sha256_hex "$rd/SHA256SUMS")
-    printf 'SHA256SUMS sha256: %s\n' "$sums_hex"
+    for manifest in $MANIFESTS; do
+        sums_hex=$(sha256_hex "$rd/$manifest")
+        printf '%s sha256: %s\n' "$manifest" "$sums_hex"
+    done
 }
 
 # sign: $1 is the sha256 of the SHA256SUMS about to be signed. It must equal the value build
@@ -2077,7 +2238,7 @@ check_build_sums_hash() {
 # laptop: re-check the draft's files as verify does, compare the SHA256SUMS hash with the one
 # build printed, then append this maintainer's detached signature to SHA256SUMS.asc.
 cmd_sign() {
-    local rd before after recount n_before n_after n_back sums_hex up_hex back_hex
+    local rd c manifest before after recount n_before n_after n_back sums_hex up_hex back_hex
     need docker tar gzip curl gpg
     require_docker
     check_tag if-cast
@@ -2106,11 +2267,16 @@ cmd_sign() {
     info "commit     $COMMIT"
     info "signer     @$SIGN_HANDLE $SIGN_FPR"
     info "signatures $n_before so far, $THRESHOLD required"
-    info "image      $IMAGE@$D"
+    for c in $COMPONENTS; do
+        component_set "$c"
+        info "image      $C_IMAGE@$C_D"
+    done
     info "SHA256SUMS sha256: $sums_hex"
     info "$(cat "$rd/SHA256SUMS")"
     check_build_sums_hash "$sums_hex"
-    check_sums_package "$rd" "do not sign it; rebuild the draft with make release-build TAG=$TAG"
+    for manifest in $MANIFESTS; do
+        check_sums_package "$rd" "$manifest" "do not sign it; rebuild the draft with make release-build TAG=$TAG"
+    done
     confirm "Sign SHA256SUMS for $TAG?"
     gpg --armor --detach-sign --local-user "$SIGN_KEY" --output "$WORK/new.asc" "$rd/SHA256SUMS" ||
         die 2 "gpg could not sign SHA256SUMS: is the YubiKey that holds $SIGN_FPR plugged in, and does gpg --card-status show it?"
@@ -2150,7 +2316,7 @@ cmd_sign() {
 # build server, CI, operators: re-check everything about a release. $1 = 1 allows a missing
 # SHA256SUMS.asc (build's own self-check before anyone has signed).
 cmd_verify() {
-    local allow_unsigned=$1 dir handles n=0
+    local allow_unsigned=$1 dir manifest handles n=0
     need docker tar gzip curl gpg
     require_docker
     check_tag always
@@ -2175,7 +2341,7 @@ cmd_verify() {
         release_fetch "$dir" IMAGE_DIGEST SHA256SUMS "$TARBALL"
     fi
     check_release_files "$dir"
-    check_sums_package "$dir"
+    for manifest in $MANIFESTS; do check_sums_package "$dir" "$manifest"; done
     if [ -f "$dir/SHA256SUMS.asc" ]; then
         handles=$(count_sigs "$dir/SHA256SUMS" "$dir/SHA256SUMS.asc") || exit
         n=$(printf '%s\n' "$handles" | count_lines)
@@ -2199,7 +2365,7 @@ published_versions() {
 
 # build server: verify, publish the draft, move the channel alias. Safe to re-run.
 cmd_publish() {
-    local published highest latest=--latest=false move_alias=0 current
+    local published highest latest=--latest=false alias_moves=0 c current
     need docker
     require_local_image_in_dry_run
     fetch_tag
@@ -2209,21 +2375,27 @@ cmd_publish() {
     published=$(published_versions) || exit
     highest=$(printf '%s\n%s\n' "$published" "$VERSION" | version_max)
     if [ -z "$RC" ] && [ "$highest" = "$VERSION" ]; then
-        move_alias=1
+        alias_moves=1
         if [ "$CHANNEL" = mainnet ]; then latest=--latest; fi
     fi
     # Checked before anything is made public: the alias move needs the registry credential.
-    if [ "$move_alias" = 1 ]; then require_registry_login; fi
+    if [ "$alias_moves" = 1 ]; then require_registry_login; fi
 
     info "tag      $TAG (commit $COMMIT)"
-    info "image    $IMAGE@$D"
+    for c in $COMPONENTS; do
+        component_set "$c"
+        info "image    $C_IMAGE@$C_D"
+    done
     if [ "$REL_DRAFT" = true ]; then
         info "release  draft -> published, prerelease=$PRERELEASE, $latest"
     else
         info "release  already published"
     fi
-    if [ "$move_alias" = 1 ]; then
-        info "alias    $IMAGE:$ALIAS -> $D"
+    if [ "$alias_moves" = 1 ]; then
+        for c in $COMPONENTS; do
+            component_set "$c"
+            info "alias    $C_IMAGE:$ALIAS -> $C_D"
+        done
     else
         info "alias    none moves (release candidate, or not the newest $CHANNEL release)"
     fi
@@ -2239,26 +2411,23 @@ cmd_publish() {
             gh_run release edit "$TAG" --repo "$REPO" --draft=false "--prerelease=$PRERELEASE" "$latest" >&2
         fi
     fi
-    # Catches a change between the check above and the edit, before the alias points at D.
+    # Catches a change between the check above and the edit, before an alias points at a digest.
     check_assets_unchanged "the release is public: follow After publish in the maintainer guide"
-    if [ "$move_alias" = 1 ]; then
-        # The alias moves only inside IMAGE, the tag's package, and only to the digest that this
-        # package serves for TAG, so it never points at an image of the other network.
-        current=$(registry_digest "$TAG")
-        [ "$current" = "$D" ] ||
-            die 1 "$IMAGE:$TAG is ${current:-missing}, not $D; $IMAGE:$ALIAS moves only to the image this package serves for $TAG"
-        current=$(registry_digest "$ALIAS")
-        if [ "$current" = "$D" ]; then
-            info "$IMAGE:$ALIAS already points at $D"
-        else
-            # --prefer-index=false copies the manifest as is, so the alias keeps digest D.
-            docker buildx imagetools create --prefer-index=false --tag "$IMAGE:$ALIAS" "$IMAGE@$D" >&2 ||
-                die 3 "cannot move $IMAGE:$ALIAS (if docker reported unauthorized or denied, run make docker-login and publish again)"
-            current=$(registry_digest "$ALIAS")
-            [ "$current" = "$D" ] || die 1 "$IMAGE:$ALIAS points at ${current:-nothing}, expected $D"
-        fi
+    if [ "$alias_moves" = 1 ]; then
+        # Every package still serves TAG at the verified digest before the first alias moves,
+        # so no alias moves while another package's image is in doubt.
+        for c in $COMPONENTS; do
+            component_set "$c"
+            current=$(registry_digest "$C_IMAGE" "$TAG")
+            [ "$current" = "$C_D" ] ||
+                die 1 "$C_IMAGE:$TAG is ${current:-missing}, not $C_D; $C_IMAGE:$ALIAS moves only to the image this package serves for $TAG"
+        done
+        for c in $COMPONENTS; do
+            component_set "$c"
+            move_alias
+        done
     fi
-    printf 'published %s image=%s@%s alias=%s\n' "$TAG" "$IMAGE" "$D" "$(if [ "$move_alias" = 1 ]; then printf '%s' "$ALIAS"; else printf none; fi)"
+    printf 'published %s image=%s@%s alias=%s\n' "$TAG" "$IMAGE" "$D" "$(if [ "$alias_moves" = 1 ]; then printf '%s' "$ALIAS"; else printf none; fi)"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -2326,12 +2495,13 @@ init_env() {
     # The image is the tag's package under the repository owner: RELEASE_REPO and
     # GITHUB_REPOSITORY name the GitHub repository and give the image only their owner.
     [ -n "$PACKAGE" ] || die 2 "internal error: init_env runs only after parse_tag"
+    OWNER=$(lower "${REPO%%/*}")
     if [ -n "${RELEASE_IMAGE:-}" ]; then
         IMAGE=$RELEASE_IMAGE
-        is_local_image ||
+        is_local_image "$IMAGE" ||
             die 2 "RELEASE_IMAGE must be localhost:PORT/ or 127.0.0.1:PORT/ and a lowercase repository path without a tag or digest, e.g. 127.0.0.1:5000/tn"
     else
-        IMAGE=ghcr.io/$(lower "${REPO%%/*}")/$PACKAGE
+        IMAGE=ghcr.io/$OWNER/$PACKAGE
     fi
 
     if [ -n "${RELEASE_MAIN_REF:-}" ]; then MAIN_REF=$RELEASE_MAIN_REF; fi
