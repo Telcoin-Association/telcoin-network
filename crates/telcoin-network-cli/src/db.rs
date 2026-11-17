@@ -211,7 +211,9 @@ enum DbSubcommand {
     /// datadir whose consensus database lacks the pack of an epoch the node cannot fetch again,
     /// one at or below the epoch it resumes from (one bootstrapped with `db load-state` lacks
     /// every epoch below the restored one): the rebuild re-executes every epoch from 0 from the
-    /// node's own packs. A missing pack after the resume epoch passes, as
+    /// node's own packs. A pack below the resume epoch counts only when it is the whole epoch,
+    /// checked against this node's epoch records (a stalled rebuild's stub refuses): it reads
+    /// every past pack, the dry run too. A missing pack after the resume epoch passes, as
     /// the next start fetches it from peers. `--for-swap` skips that refusal
     /// for the side-observer swap. Refuses, in both modes, a datadir an unfinished `db load-state`
     /// left, as the node does. Without `--force` it prints what would move and changes nothing.
