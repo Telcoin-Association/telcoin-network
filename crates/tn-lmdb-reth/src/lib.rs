@@ -333,7 +333,8 @@
 //! `_multi_leaf`) runs the scripts of seed 1 and pins their counts by class and the dup table's
 //! cursor calls, so a class whose share moved fails.
 //! `random_scripts_match_mdbx_multi_leaf` (and `_heavy`) runs the same scripts on tables seeded
-//! with 250 rows under one `PlainStorageState` key and 250 `CanonicalHeaders`, the drawn keys and
+//! with 250 rows under one `PlainStorageState` key, two under a later key and 250
+//! `CanonicalHeaders`, the drawn keys and
 //! slots spread over them and the dup values in a wide encoding (subkeys that differ past their
 //! first byte, rests of several lengths), so the cursor writes and moves run inside multi-leaf
 //! nested trees and composite trees; in every run the dup table's skipped cursor calls must stay

@@ -688,13 +688,22 @@ fn is_past_epoch(data_file: &Path, epoch: Epoch) -> bool {
 }
 
 /// Whether the epochs directory holding `data_file`'s `epoch-N` directory also holds a later
-/// epoch. `false` when the layout cannot be read (e.g. a bare data file outside an epochs dir).
+/// epoch, an interrupted install's included. `false` when the layout cannot be read (e.g. a bare
+/// data file outside an epochs dir).
 fn later_epoch_exists(data_file: &Path, epoch: Epoch) -> bool {
-    data_file
-        .parent()
-        .and_then(Path::parent)
-        .and_then(|epochs_dir| ConsensusPack::epoch_dirs(epochs_dir).ok())
-        .is_some_and(|epochs| epochs.last().is_some_and(|&last| last > epoch))
+    newest_epoch_beside(data_file).is_some_and(|newest| newest > epoch)
+}
+
+/// The newest epoch in the epochs directory holding `data_file`'s `epoch-N` directory (or an
+/// interrupted install's `epoch-N.replaced`). An interrupted install counts as the epoch it
+/// holds, which the node's next start puts back as `epoch-N` before it opens anything. `None`
+/// when the directory cannot be listed or holds no epoch.
+fn newest_epoch_beside(data_file: &Path) -> Option<Epoch> {
+    let epochs_dir = data_file.parent()?.parent()?;
+    let newest = ConsensusPack::epoch_dirs(epochs_dir).ok()?.last().copied();
+    // an unreadable listing of installs leaves the `epoch-N` directories to decide
+    let interrupted = ConsensusChain::interrupted_installs(epochs_dir).unwrap_or_default();
+    newest.max(interrupted.last().copied())
 }
 
 /// For a legacy (pre-v2) pack whose unacked tail is truncatable, say how it goes away: the
@@ -779,30 +788,30 @@ fn resolve_data_file_and_epoch(
 /// just after an epoch transition the previous epoch is briefly padded-and-unsealed while it
 /// finishes closing, and a catching-up node holds an older epoch open while newer epoch dirs
 /// already exist. So warn on two signals, whatever the epoch number: (a) it is the highest
-/// `epoch-NN` dir (the usual live epoch), or (b) the pack carries no clean-close sentinel
-/// (`opened_unclean` — a writer is still finishing it). Never refuses — validation is read-only and
-/// is valid once the node is stopped.
+/// `epoch-NN` dir (the usual live epoch; an interrupted install counts as its epoch), or (b) the
+/// pack carries no clean-close sentinel (`opened_unclean` — a writer is still finishing it). Never
+/// refuses — validation is read-only and is valid once the node is stopped.
 fn warn_if_current_epoch(data_file: &Path, epoch: Epoch) {
-    let is_highest = data_file
-        .parent()
-        .and_then(Path::parent)
-        .and_then(|epochs_dir| ConsensusPack::epoch_dirs(epochs_dir).ok())
-        .is_some_and(|all| all.last().copied() == Some(epoch));
-    // `None` if the pack cannot be opened — leave that to the classifier/validator below.
-    let unsealed = matches!(pack_unsealed_version(data_file, epoch), Some((_, true)));
-    if is_highest || unsealed {
-        let why = if is_highest {
-            "it is the current/latest epoch a running node holds open for append"
-        } else {
-            "it has no clean-close sentinel — a writer may still be finishing it (an epoch just \
-             transitioned, or a catching-up node holds it open)"
-        };
+    if let Some(why) = live_epoch_reason(data_file, epoch) {
         eprintln!(
             "WARNING: epoch {epoch} may be written by a running node ({why}). `db validate` maps it \
              read-only; if the node truncates or grows the file concurrently this command can crash \
              (SIGBUS). Validate it only with the node STOPPED. (Node data is not modified either way.)"
         );
     }
+}
+
+/// Why [`warn_if_current_epoch`] warns on `epoch`'s pack at `data_file`, or `None` when it does
+/// not. The highest epoch counts an interrupted install ([`newest_epoch_beside`]).
+fn live_epoch_reason(data_file: &Path, epoch: Epoch) -> Option<&'static str> {
+    if newest_epoch_beside(data_file) == Some(epoch) {
+        return Some("it is the current/latest epoch a running node holds open for append");
+    }
+    // `None` if the pack cannot be opened — leave that to the classifier/validator below.
+    matches!(pack_unsealed_version(data_file, epoch), Some((_, true))).then_some(
+        "it has no clean-close sentinel — a writer may still be finishing it (an epoch just \
+         transitioned, or a catching-up node holds it open)",
+    )
 }
 
 /// Parse an epoch out of an `epoch-NN` directory name, or out of an interrupted install's
@@ -2798,6 +2807,38 @@ mod tests {
             !super::later_epoch_exists(&bare.path().join(super::DATA_NAME), 0),
             "a bare data file has no epochs beside it"
         );
+    }
+
+    /// An interrupted install (`epoch-N.replaced` with no `epoch-N`) is the epoch the node's next
+    /// start puts back, so it counts as the newest epoch: the epoch before it is past (its tail
+    /// needs `db repair`, the node never truncates it), and the live-epoch warning names the
+    /// install's epoch, not the one before it.
+    #[test]
+    fn an_interrupted_install_counts_as_the_newest_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["epoch-2", "epoch-3", "epoch-4.replaced"] {
+            fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        let data = |name: &str| dir.path().join(name).join(super::DATA_NAME);
+        assert_eq!(super::newest_epoch_beside(&data("epoch-3")), Some(4));
+        assert!(
+            super::later_epoch_exists(&data("epoch-3"), 3),
+            "epoch 4's install follows epoch 3"
+        );
+        assert!(!super::later_epoch_exists(&data("epoch-4.replaced"), 4), "epoch 4 is the newest");
+        assert!(
+            super::require_current_epoch_for_tail(&data("epoch-3"), 3).is_err(),
+            "without a hint, epoch 3 is past once epoch 4 is put back"
+        );
+        assert_eq!(super::live_epoch_reason(&data("epoch-3"), 3), None, "epoch 3 is not live");
+        assert!(
+            super::live_epoch_reason(&data("epoch-4.replaced"), 4).is_some(),
+            "the install's epoch is the one a running node writes"
+        );
+
+        fs::remove_dir(dir.path().join("epoch-4.replaced")).unwrap();
+        assert_eq!(super::newest_epoch_beside(&data("epoch-3")), Some(3));
+        assert!(!super::later_epoch_exists(&data("epoch-3"), 3), "epoch 3 is the newest again");
     }
 
     /// Whether a pack is a past epoch comes from the latest-consensus hint the node resumes from,
