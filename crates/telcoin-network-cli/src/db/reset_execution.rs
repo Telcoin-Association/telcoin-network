@@ -206,16 +206,18 @@ fn runs(ranges: &[(Epoch, Epoch)]) -> String {
 /// validates against this node's records of it and of the epoch before, and ends with the epoch's
 /// final output as its record names it). A header-and-meta stub a rebuild that stalled at a lost
 /// pack created, or a sealed prefix, is a gap of its own, since the next rebuild would stall there
-/// again; a past pack the check cannot judge (a record missing or unreadable, or epoch 0 without
-/// the genesis committee) refuses too. The check reads each past pack once, small next to the
-/// re-execution it guards. A datadir with no pack and no hint past epoch 0 starts as a new node
-/// does and syncs from genesis, so it passes.
-fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
+/// again. A past pack the check cannot judge (a record missing, as a stop at an epoch boundary
+/// before the record was written leaves it, or unreadable, or epoch 0 without the genesis
+/// committee) counts as present, as it did before the check: the check refuses only what it
+/// proves, and the reset names the unchecked packs as a warning, which this returns. The check
+/// reads each past pack once, small next to the re-execution it guards. A datadir with no pack and
+/// no hint past epoch 0 starts as a new node does and syncs from genesis, so it passes.
+fn refuse_missing_packs(datadir: &Path) -> eyre::Result<Vec<(Epoch, String)>> {
     let epochs = datadir.to_path_buf().epochs_db_path();
     if !exists(&epochs)? {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let mut present = Vec::new();
+    let mut present: Vec<Epoch> = Vec::new();
     for entry in fs::read_dir(&epochs)
         .wrap_err_with(|| format!("failed to list the epoch packs in {}", epochs.display()))?
     {
@@ -236,49 +238,34 @@ fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
     let end = match present.last() {
         Some(&latest) => latest.max(resume),
         None if resume > 0 => resume,
-        None => return Ok(()),
+        None => return Ok(Vec::new()),
     };
     let missing = split_ranges(&missing_ranges(&present, end), resume);
     // A past pack the node holds is judged against its records of the epoch and of the one
     // before: a rebuild stops at one that is not the whole epoch (the header-and-meta stub a
-    // rebuild that stalled at a lost pack leaves, a sealed prefix). The walk stops at the first
-    // pack it cannot judge, which refuses too.
+    // rebuild that stalled at a lost pack leaves, a sealed prefix). One the check cannot judge
+    // counts as present and is returned for the reset to warn about.
     let mut incomplete = Vec::new();
-    let mut unchecked = None;
+    let mut unchecked = Vec::new();
+    let mut genesis = None;
     for &epoch in present.iter().take_while(|&&epoch| epoch < resume) {
-        let genesis = match epoch {
-            0 => match super::load_genesis_committee(&datadir.to_path_buf()) {
-                Ok(committee) => Some(committee),
+        if epoch == 0 {
+            match super::load_genesis_committee(&datadir.to_path_buf()) {
+                Ok(committee) => genesis = Some(committee),
                 Err(e) => {
-                    unchecked = Some((epoch, format!("{e:#}")));
-                    break;
+                    unchecked.push((epoch, format!("{e:#}")));
+                    continue;
                 }
-            },
-            _ => None,
-        };
+            }
+        }
         match ConsensusChain::past_pack_check(&epochs, epoch, genesis.as_ref()) {
             PastPackCheck::Complete => {}
             PastPackCheck::Incomplete(why) => incomplete.push((epoch, why)),
-            PastPackCheck::Unchecked(why) => {
-                unchecked = Some((epoch, why));
-                break;
-            }
+            PastPackCheck::Unchecked(why) => unchecked.push((epoch, why)),
         }
     }
     if missing.at_or_below.is_empty() && incomplete.is_empty() {
-        if let Some((epoch, why)) = unchecked {
-            bail!(
-                "{} cannot be checked for a rebuild from genesis, so nothing has moved: the \
-                 rebuild re-executes every epoch from 0 from this datadir's own consensus packs, \
-                 the reset checks each pack below the epoch the node resumes from (epoch {resume}) \
-                 against this node's epoch records first, and the pack of epoch {epoch} could not \
-                 be checked: {why}. Fix that and run the reset again. For the side-observer swap, \
-                 which copies a synced observer's execution database in instead of rebuilding, \
-                 pass `--for-swap`",
-                datadir.display(),
-            );
-        }
-        return Ok(());
+        return Ok(unchecked);
     }
     let held = match present.last() {
         Some(latest) => format!("packs up to epoch {latest}"),
@@ -354,10 +341,10 @@ fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
              `epoch-N` directory from a backup taken after that epoch closed.",
         );
     }
-    if let Some((epoch, why)) = unchecked {
+    for (epoch, why) in &unchecked {
         ways.push_str(&format!(
             " The pack of epoch {epoch} could not be checked against this node's epoch records \
-             ({why}), and the packs after it below epoch {resume} were not checked."
+             ({why})."
         ));
     }
     if resume_lost {
@@ -432,6 +419,10 @@ pub(crate) struct ResetPlan {
     /// Moved entries that are links: the reset moves the link, not what it points to, and the
     /// next start creates a new entry in the datadir, on the datadir's filesystem.
     pub(crate) links: Vec<(PathBuf, PathBuf)>,
+    /// Past packs the rebuild's check could not judge against this node's epoch records, with
+    /// why (a record missing or unreadable, or epoch 0 without the genesis committee). They count
+    /// as present; the rebuild re-executes them as they are.
+    pub(crate) unchecked: Vec<(Epoch, String)>,
 }
 
 /// The bytes the files under `path` hold (their lengths), not following links.
@@ -514,23 +505,27 @@ pub(crate) fn reset_execution(
     // the node refuses this datadir until `db load-state` is rerun, which redoes the restore
     refuse_interrupted_load_state(datadir)?;
     let partials = partial_resets(datadir)?;
-    if mode == ResetMode::Rebuild {
-        if let Err(refusal) = refuse_missing_packs(datadir) {
-            // a swap's reset stopped between its moves is finished by a swap's rerun, which skips
-            // this check: the node's refusal sends the operator here first
-            for partial in &partials {
-                if !is_empty_dir(partial)? {
-                    bail!(
-                        "{refusal:#}. This datadir also holds the unfinished reset {}: if it was \
-                         started with `--for-swap`, `db reset-execution --for-swap --force` \
-                         finishes it",
-                        partial.display(),
-                    );
+    let unchecked = match mode {
+        ResetMode::Rebuild => match refuse_missing_packs(datadir) {
+            Ok(unchecked) => unchecked,
+            Err(refusal) => {
+                // a swap's reset stopped between its moves is finished by a swap's rerun, which
+                // skips this check: the node's refusal sends the operator here first
+                for partial in &partials {
+                    if !is_empty_dir(partial)? {
+                        bail!(
+                            "{refusal:#}. This datadir also holds the unfinished reset {}: if it \
+                             was started with `--for-swap`, `db reset-execution --for-swap \
+                             --force` finishes it",
+                            partial.display(),
+                        );
+                    }
                 }
+                return Err(refusal);
             }
-            return Err(refusal);
-        }
-    }
+        },
+        ResetMode::Swap => Vec::new(),
+    };
 
     let entries = execution_entries(datadir)?;
     if partials.len() > 1 {
@@ -611,7 +606,7 @@ pub(crate) fn reset_execution(
             );
         }
     }
-    let plan = ResetPlan { moves, target, resumes, moved_bytes, available_bytes, links };
+    let plan = ResetPlan { moves, target, resumes, moved_bytes, available_bytes, links, unchecked };
     if !force {
         return Ok(plan);
     }
@@ -1109,27 +1104,27 @@ mod tests {
             assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
         }
 
-        // a past pack that cannot be checked refuses, naming why: epoch 0's without the genesis
-        // committee it chains to, any without this node's records
+        // a past pack the check cannot judge counts as present, as it did before the check, and
+        // `ResetPlan::unchecked` names it for a warning: epoch 0's without the genesis committee
+        // it chains to, any without this node's record (as a stop at an epoch boundary before the
+        // record was written leaves the last one)
         let (dir, _) = synced_datadir(3);
         let root = dir.path();
         let epochs = root.join("consensus-db/epochs");
         let committee = root.to_path_buf().committee_path();
         let yaml = fs::read(&committee).unwrap();
         fs::remove_file(&committee).unwrap();
-        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
-        assert!(err.contains("cannot be checked for a rebuild from genesis, so nothing has moved"));
-        assert!(
-            err.contains("the pack of epoch 0 could not be checked: failed to load genesis"),
-            "{err}"
-        );
-        assert!(err.contains("pass `--for-swap`"), "{err}");
+        let plan = reset_execution(root, false, ResetMode::Rebuild).expect("no proven gap");
+        let unchecked: Vec<_> = plan.unchecked.iter().map(|(epoch, _)| *epoch).collect();
+        assert_eq!(unchecked, [0], "{:?}", plan.unchecked);
+        assert!(plan.unchecked[0].1.contains("failed to load genesis"), "{:?}", plan.unchecked);
         fs::write(&committee, yaml).unwrap();
         let records = epochs.join(tn_storage::epoch_records::RECORDS_NAME);
         let aside = root.join("records-aside");
         fs::rename(&records, &aside).unwrap();
-        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
-        assert!(err.contains("the pack of epoch 0 could not be checked: "), "{err}");
+        let plan = reset_execution(root, false, ResetMode::Rebuild).expect("no proven gap");
+        let unchecked: Vec<_> = plan.unchecked.iter().map(|(epoch, _)| *epoch).collect();
+        assert_eq!(unchecked, [0, 1, 2], "every past pack, each named: {:?}", plan.unchecked);
         // beside a lost pack, the refusal names both
         fs::remove_dir_all(epochs.join("epoch-1")).unwrap();
         let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());

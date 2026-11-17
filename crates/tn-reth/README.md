@@ -1261,7 +1261,9 @@ bootstrapped with `db load-state` does (it holds consensus only from the restore
 that lost a past pack or the resume epoch's does. A past pack counts only when it is the whole
 epoch: it validates against this node's epoch records and ends with the epoch's final output, so a
 header-and-meta stub a stalled rebuild left, or a sealed prefix, refuses too (the check reads each
-past pack once), and so does a past pack it cannot check against the records. The rebuild
+past pack once). A past pack it cannot check against the records (a record missing, as a stop at
+an epoch boundary can leave it, or unreadable) counts as present, and the reset names it in a
+warning. The rebuild
 re-executes every epoch from 0 from the node's own packs, and the node fetches only the packs of the
 epochs after the one it resumes from, so every start would stop at the gap. A pack missing after
 that epoch does not refuse: the next start fetches it from peers. Such a node puts back each lost

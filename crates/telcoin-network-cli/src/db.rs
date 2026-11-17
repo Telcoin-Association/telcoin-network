@@ -336,6 +336,14 @@ impl DbResetExecutionArgs {
                 link.display(),
             )?;
         }
+        for (epoch, why) in &plan.unchecked {
+            writeln!(
+                warn,
+                "warning: the pack of epoch {epoch} was not checked against this node's epoch \
+                 records ({why}); the rebuild re-executes it as it is and stops there if it is not \
+                 the whole epoch"
+            )?;
+        }
         let available = plan
             .available_bytes
             .map_or_else(|| "an unknown amount".to_owned(), |bytes| human_bytes(bytes as f64));
@@ -3298,6 +3306,7 @@ mod tests {
             moved_bytes: 2 << 30,
             available_bytes: Some(1 << 30),
             links: vec![(PathBuf::from("db"), PathBuf::from("/elsewhere/db"))],
+            unchecked: vec![(2, "this node holds no record of epoch 2".to_owned())],
         };
         for force in [false, true] {
             let args = super::DbResetExecutionArgs { force, for_swap: false };
@@ -3307,9 +3316,13 @@ mod tests {
             assert!(!out.contains("warning"), "the report holds no warning: {out}");
             assert!(out.contains("db, static_files") && out.contains("free"), "{out}");
             let warnings: Vec<_> = warn.lines().collect();
-            assert_eq!(warnings.len(), 2, "{warn}");
+            assert_eq!(warnings.len(), 3, "{warn}");
             assert!(warnings[0].starts_with("warning: db is a link to /elsewhere/db"), "{warn}");
-            assert!(warnings[1].starts_with("warning: less is free"), "{warn}");
+            assert!(
+                warnings[1].starts_with("warning: the pack of epoch 2 was not checked"),
+                "{warn}"
+            );
+            assert!(warnings[2].starts_with("warning: less is free"), "{warn}");
         }
     }
 
