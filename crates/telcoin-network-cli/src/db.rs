@@ -27,8 +27,9 @@ use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs};
 use tn_reth::{
     db_check, db_table_stats, iter_static_files, migrate_reth_db, refuse_pending_migration,
     snapshot::{check_scaffold_window, SnapshotRestorer},
-    DatabaseArgs, DbCheckReport, DbTableStat, RethCommand, RethConfig, RethEnv, StaticFileProvider,
-    TNPrimitives, DB_CHECK_NEEDS_STOPPED_NODE, DB_TABLE_STATS_NEEDS_STOPPED_NODE,
+    DatabaseArgs, DatadirFormat, DbCheckReport, DbTableStat, RethCommand, RethConfig, RethEnv,
+    StaticFileProvider, TNPrimitives, TxBodies, DB_CHECK_NEEDS_STOPPED_NODE,
+    DB_TABLE_STATS_NEEDS_STOPPED_NODE,
 };
 use tn_storage::{
     consensus::{ConsensusChain, PastPackCheck},
@@ -66,7 +67,10 @@ pub struct DbCommand {
 enum DbSubcommand {
     /// Report the execution database's static files and table sizes.
     ///
-    /// Prints the static files, then each table of the reth database (rows, pages and size).
+    /// Prints the static files, then the storage format the reth database records (its layout,
+    /// and whether it stores each transaction inline or as its position in the consensus packs,
+    /// which then hold its only copy), then each table of the reth database (rows, pages and
+    /// size).
     /// Read-only (changes no file). The default (tn-lmdb) build needs the node stopped: it refuses
     /// while a node holds the datadir, and holds the datadir while it runs, so a node started
     /// meanwhile is refused until the report finishes. It never migrates: it refuses an MDBX
@@ -225,10 +229,12 @@ enum DbSubcommand {
     /// `execution-reset-<UTC time>` under the datadir (renames, never deletes: moving them back
     /// undoes it); the consensus database, keys and config stay. The node MUST be stopped: it
     /// refuses while a node holds the datadir, and holds the datadir while it runs. Refuses a
-    /// datadir whose consensus database lacks the pack of an epoch below its latest one that the
-    /// node cannot fetch again, one at or below the epoch it resumes from (one bootstrapped with
-    /// `db load-state` lacks every epoch below the restored one): the rebuild re-executes every
-    /// epoch from 0 from the node's own packs. A missing pack after the resume epoch passes, as
+    /// datadir whose consensus database lacks the pack of an epoch the node cannot fetch again,
+    /// one at or below the epoch it resumes from (one bootstrapped with `db load-state` lacks
+    /// every epoch below the restored one): the rebuild re-executes every epoch from 0 from the
+    /// node's own packs. A pack below the resume epoch counts only when it is the whole epoch,
+    /// checked against this node's epoch records (a stalled rebuild's stub refuses): it reads
+    /// every past pack, the dry run too. A missing pack after the resume epoch passes, as
     /// the next start fetches it from peers. `--for-swap` skips that refusal
     /// for the side-observer swap. Refuses, in both modes, a datadir an unfinished `db load-state`
     /// left, as the node does. Without `--force` it prints what would move and changes nothing.
@@ -347,6 +353,14 @@ impl DbResetExecutionArgs {
                 link.display(),
             )?;
         }
+        for (epoch, why) in &plan.unchecked {
+            writeln!(
+                warn,
+                "warning: the pack of epoch {epoch} was not checked against this node's epoch \
+                 records ({why}); the rebuild re-executes it as it is and stops there if it is not \
+                 the whole epoch"
+            )?;
+        }
         let available = plan
             .available_bytes
             .map_or_else(|| "an unknown amount".to_owned(), |bytes| human_bytes(bytes as f64));
@@ -412,8 +426,30 @@ fn print_stats(datadir: &PathBuf, out: &mut impl std::io::Write) -> eyre::Result
     }
     writeln!(out)?;
     let db_stats = db_table_stats(&datadir.reth_db_path())?;
+    let format = DatadirFormat::stored(&datadir.reth_db_path())?;
+    writeln!(out, "{}", storage_format_line(format))?;
     writeln!(out, "{}", stats_table(&db_stats))?;
     Ok(())
+}
+
+/// The line `db stats` prints for the storage format the datadir's reth database records
+/// ([`DatadirFormat::stored`]), in the words of the start's `reth datadir: storage format` log
+/// line: where the datadir keeps its transactions decides whether its consensus packs are their
+/// only copy.
+fn storage_format_line(format: Option<DatadirFormat>) -> String {
+    match format {
+        Some(DatadirFormat { layout, tx_bodies: TxBodies::Pointers }) => format!(
+            "storage format: layout {layout}, transactions by position (tx_bodies=pointers): each \
+             is stored as its position in a batch of the consensus packs, which hold its only copy"
+        ),
+        Some(DatadirFormat { layout, tx_bodies: TxBodies::Inline }) => format!(
+            "storage format: layout {layout}, transactions inline (tx_bodies=inline): each is \
+             stored in the static files"
+        ),
+        None => "storage format: no marker, a datadir from before it: layout v1, transactions \
+                 inline (tx_bodies=inline), which the node's next start records"
+            .to_string(),
+    }
 }
 
 impl DbCommand {
@@ -3473,6 +3509,11 @@ mod tests {
                 .execute(datadir.clone())
                 .expect_err("an unfinished reset");
             assert!(format!("{err:#}").contains("did not finish"), "{name}: {err:#}");
+            // a swap's reset is finished by a swap's rerun, which skips the pack check
+            assert!(
+                format!("{err:#}").contains("with `--for-swap` if it was the side-observer swap's"),
+                "{name}: {err:#}"
+            );
         }
     }
 
@@ -3613,6 +3654,7 @@ mod tests {
             moved_bytes: 2 << 30,
             available_bytes: Some(1 << 30),
             links: vec![(PathBuf::from("db"), PathBuf::from("/elsewhere/db"))],
+            unchecked: vec![(2, "this node holds no record of epoch 2".to_owned())],
         };
         for force in [false, true] {
             let args = super::DbResetExecutionArgs { force, for_swap: false };
@@ -3622,9 +3664,13 @@ mod tests {
             assert!(!out.contains("warning"), "the report holds no warning: {out}");
             assert!(out.contains("db, static_files") && out.contains("free"), "{out}");
             let warnings: Vec<_> = warn.lines().collect();
-            assert_eq!(warnings.len(), 2, "{warn}");
+            assert_eq!(warnings.len(), 3, "{warn}");
             assert!(warnings[0].starts_with("warning: db is a link to /elsewhere/db"), "{warn}");
-            assert!(warnings[1].starts_with("warning: less is free"), "{warn}");
+            assert!(
+                warnings[1].starts_with("warning: the pack of epoch 2 was not checked"),
+                "{warn}"
+            );
+            assert!(warnings[2].starts_with("warning: less is free"), "{warn}");
         }
     }
 
@@ -3659,6 +3705,56 @@ mod tests {
         let printed = String::from_utf8(out).unwrap();
         assert!(printed.contains("(no static files directory found at"), "{printed}");
         assert!(!format!("{err:#}").contains("static files"), "fails on the tables: {err:#}");
+    }
+
+    /// `db stats` prints the datadir's storage format, as its reth database's marker records it:
+    /// its layout and whether it stores each transaction inline or as a position in the consensus
+    /// packs, the start log line's `tx_bodies`; a datadir from before the marker is named so.
+    #[test]
+    fn db_stats_prints_the_storage_format() {
+        use tn_config::TelcoinDirs as _;
+        use tn_reth::{DatadirFormat, RethChainSpec, StorageLayout, TxBodies};
+        let chain: std::sync::Arc<RethChainSpec> =
+            std::sync::Arc::new(tn_types::test_genesis().into());
+        let mut formats =
+            vec![DatadirFormat { layout: StorageLayout::V1, tx_bodies: TxBodies::Inline }];
+        if StorageLayout::V2.is_supported() {
+            formats.push(DatadirFormat { layout: StorageLayout::V2, tx_bodies: TxBodies::Inline });
+            formats
+                .push(DatadirFormat { layout: StorageLayout::V2, tx_bodies: TxBodies::Pointers });
+        }
+        for format in formats {
+            let dir = tempfile::tempdir().unwrap();
+            let datadir = dir.path().to_path_buf();
+            {
+                // the env's tasks run on this runtime, which its end stops with them
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let _entered = runtime.enter();
+                let task_manager = tn_types::TaskManager::new("db stats test");
+                let _env = tn_reth::RethEnv::new_for_temp_chain_with_format(
+                    chain.clone(),
+                    datadir.reth_db_path(),
+                    &task_manager,
+                    format,
+                )
+                .unwrap();
+            }
+            let mut out = Vec::new();
+            super::print_stats(&datadir, &mut out).unwrap();
+            let printed = String::from_utf8(out).unwrap();
+            let line = match format.tx_bodies {
+                TxBodies::Pointers => format!(
+                    "storage format: layout {}, transactions by position (tx_bodies=pointers)",
+                    format.layout
+                ),
+                TxBodies::Inline => format!(
+                    "storage format: layout {}, transactions inline (tx_bodies=inline)",
+                    format.layout
+                ),
+            };
+            assert!(printed.contains(&line), "{format}: {printed}");
+        }
+        assert!(super::storage_format_line(None).contains("no marker"));
     }
 
     /// `db stats` holds the datadir lock only when the reth database cannot be read beside a

@@ -214,6 +214,29 @@ impl DatadirFormat {
     }
 }
 
+impl DatadirFormat {
+    /// The format TN's marker records for the reth database in directory `path`, read for a report
+    /// (`telcoin-network db stats`), or `None` when the database holds no marker: a datadir from
+    /// before the marker, every one layout v1 with its transactions inline, until the node's next
+    /// open records it. Read-only: it opens the database read-only and writes nothing, so on the
+    /// tn-lmdb build it needs the node stopped and refuses what
+    /// [`db_table_stats`](super::database::db_table_stats) refuses. A marker the node's open
+    /// refuses (one that does not parse, or of a version this binary does not read) is an error.
+    pub fn stored(path: &std::path::Path) -> eyre::Result<Option<Self>> {
+        use reth_db::{tables, transaction::DbTx as _, Database as _};
+        #[cfg(not(feature = "mdbx"))]
+        let db = super::database::open_tn_lmdb_read_only(path)?;
+        #[cfg(feature = "mdbx")]
+        let db = {
+            super::database::check_backend(path)?;
+            reth_db::mdbx::open_db_read_only(path, reth_db::mdbx::DatabaseArguments::default())?
+        };
+        let row = db.view(|tx| tx.get::<tables::Metadata>(TN_LAYOUT_KEY.to_string()))??;
+        Ok(stored_marker(row)?
+            .map(|marker| Self { layout: marker.layout, tx_bodies: marker.tx_bodies() }))
+    }
+}
+
 impl fmt::Display for DatadirFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "layout {}, transactions {}", self.layout, self.tx_bodies)

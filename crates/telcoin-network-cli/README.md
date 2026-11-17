@@ -459,8 +459,8 @@ Complete tree after the node has run:
 the `telcoin-network db` commands: what each does and checks, whether it needs the node stopped, and
 whether it writes. Each prints the datadir it acts on to stderr first.
 
-`telcoin-network db stats` prints the static files and each table of the execution database:
-rows, pages and size. The default (tn-lmdb) build needs the node stopped: it refuses while a node
+`telcoin-network db stats` prints the static files, the storage format (the layout, and
+`tx_bodies=pointers` or `inline`) and each table of the execution database: rows, pages and size. The default (tn-lmdb) build needs the node stopped: it refuses while a node
 holds the datadir, and holds the datadir while it runs, so a node started meanwhile is refused
 until the report finishes. It never runs the MDBX to tn-lmdb migration: an MDBX database not yet
 migrated is refused until the node has started once, and an `mdbx.dat` the node refuses too

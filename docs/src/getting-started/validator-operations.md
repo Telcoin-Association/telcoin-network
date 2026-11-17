@@ -245,7 +245,7 @@ A command exits with status 1 when it fails or finds damage that needs action. T
 
 | Command | What it does | Node stopped | Writes |
 | --- | --- | --- | --- |
-| `db stats` | Reports the execution database: its static files, then each table's rows, pages and size | Yes | No |
+| `db stats` | Reports the execution database: its static files, its storage format, then each table's rows, pages and size | Yes | No |
 | `db check` | Checks every page's checksum and the structure of the execution database, `db/tn-lmdb.dat` | Yes | No |
 | `db tndb-stat` | Reports the consensus database (tndb): for each of `epoch`, `kad` and `cache`, its generation, live and dead bytes, and each table's rows and index state | Yes | No |
 | `db validate --epoch <N>`, `db validate --all`, or `db validate <path>` | Checks one epoch's consensus pack (`<datadir>/consensus-db/epochs/epoch-<N>`; for an interrupted install, the `epoch-<N>.replaced` copy the next start puts back), every epoch's in turn from the lowest present to the newest (a missing one fails, except one after the epoch the node resumes from, which its next start fetches), or the pack at a path (an `epoch-<N>` directory or its `data` file, anywhere): a torn tail, or damage that loses data, with what to do. With `--epoch` or `--all`, a past epoch's pack is also checked against this node's epoch records, and fails when it does not end with its epoch's final output | Only for the newest epoch, or a pack not sealed yet; a sealed past epoch can be checked while the node runs | No |
@@ -295,6 +295,7 @@ A full disk does not damage the node's files: once there is room, a start resume
 ### Consensus database backups
 
 A datadir that stores transactions by their position in the consensus packs (the format new datadirs get: the tn-reth README's "Transactions stored by position") needs every pack its execution database points into, and nothing fetches a past epoch's pack again: a node that loses one refuses to start, naming the missing epochs.
+The start log line `reth datadir: storage format` names a datadir's format (`tx_bodies=pointers` or `inline`), and `telcoin-network db stats` prints it.
 Its recovery is a backup, or another node's sealed copy of the lost epoch (`db import-epoch` verifies one), or starting over as a new node (the tn-reth README's "Recovery").
 `db validate` and `db repair` name the same recovery for a pack whose data is damaged.
 Keep a backup.

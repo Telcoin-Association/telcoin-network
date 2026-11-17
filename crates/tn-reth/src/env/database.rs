@@ -225,7 +225,7 @@ fn open_tn_lmdb_with(
 /// ([`MIGRATING_DIR`], a partial copy beside an unchanged MDBX database), naming it and its size,
 /// and never removes it.
 #[cfg(feature = "mdbx")]
-fn check_backend(path: &Path) -> eyre::Result<()> {
+pub(super) fn check_backend(path: &Path) -> eyre::Result<()> {
     let tn_lmdb = path.join(TN_LMDB_DATA_FILE);
     if file_exists(&tn_lmdb)? {
         eyre::bail!(
@@ -447,7 +447,7 @@ pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
 /// `mdbx.dat` is refused; no `tn-lmdb.dat` is no database), and a database another handle holds
 /// (the adapter reports it as MDBX's `MDBX_BUSY`) is refused saying to stop the node.
 #[cfg(not(feature = "mdbx"))]
-fn open_tn_lmdb_read_only(path: &Path) -> eyre::Result<tn_lmdb_reth::TnLmdbEnv> {
+pub(super) fn open_tn_lmdb_read_only(path: &Path) -> eyre::Result<tn_lmdb_reth::TnLmdbEnv> {
     use reth_db::{mdbx::Error as MdbxError, DatabaseError};
     use tn_lmdb_reth::{TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
 
