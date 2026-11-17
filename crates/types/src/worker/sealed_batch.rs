@@ -396,6 +396,13 @@ pub enum BatchValidationError {
         /// Hash of the offending transaction.
         hash: BlockHash,
     },
+
+    /// An EIP-7702 transaction authorizes an account other than its outer sender.
+    #[error("EIP-7702 authorizations must belong to the transaction sender. Tx hash: {hash}")]
+    NonSelfAuthorization {
+        /// Hash of the transaction carrying the foreign authorization.
+        hash: BlockHash,
+    },
     /// The batch contains a transaction declaring less gas than the intrinsic
     /// cost it is guaranteed to owe: `BASE_TX_GAS + PER_EMPTY_ACCOUNT_COST * N`
     /// for `N` EIP-7702 authorization tuples.

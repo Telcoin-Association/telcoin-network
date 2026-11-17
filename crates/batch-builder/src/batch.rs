@@ -92,16 +92,29 @@ pub fn build_batch<P: TxPool>(
         let tx = pool_tx.to_consensus();
 
         // ignore any transaction type outside the executable allowlist (the
-        // predicate admits legacy, EIP-2930, EIP-1559, and EIP-7702), and the
-        // symmetric bound: an EIP-7702 transaction whose authorization list
-        // falls outside 1..=max_tx_authorizations(epoch). The batch validator
-        // rejects a batch carrying either with a Medium peer penalty, so
-        // packing one would cost this node reputation on every vote request.
-        // The 4844 arm discards blob transactions; the else arm handles the
-        // out-of-bounds authorization list and is default-deny for any future
-        // decodable type outside the allowlist (no such type exists today).
-        // Both feed `remove_unsupported_txs` below so the transaction and its
-        // descendants leave the pool
+        // predicate admits legacy, EIP-2930, EIP-1559, and EIP-7702), the
+        // symmetric bound (an EIP-7702 transaction whose authorization list
+        // falls outside 1..=max_tx_authorizations(epoch)), and the
+        // self-authorization policy (an EIP-7702 transaction whose list carries
+        // a tuple that does not recover to the outer signer, see
+        // `tn_types::batch_allowlisted_authorities`). The batch validator
+        // rejects a batch carrying any of the three with a Medium peer penalty
+        // (`InvalidAuthorizationList`, `NonSelfAuthorization`), so packing one
+        // would cost this node reputation on every vote request.
+        // The 4844 arm discards blob transactions. The foreign-authority arm
+        // routes an in-bounds EIP-7702 transaction that fails only the third
+        // predicate to `ignore_non_self_authorization`. The final arm handles
+        // the out-of-bounds authorization list and is default-deny for any
+        // future decodable type outside the allowlist (no such type exists
+        // today). The last two arms feed `remove_unsupported_txs` below so the
+        // transaction and its descendants leave the pool.
+        //
+        // Reachability: the foreign-authority arm IS reachable in production.
+        // Independent worker pools do not share reth's pending-authority
+        // reservations, so a type-0x04 transaction carrying another account's
+        // tuple can reach this loop (issue #1334). The peer validator rejects
+        // such a batch with `NonSelfAuthorization` at Medium penalty, so the
+        // producer must drop it here.
         //
         // Reachability: the authorization-list half cannot fire in production.
         // `max_tx_authorizations` is derived from `max_batch_gas`
@@ -125,15 +138,26 @@ pub fn build_batch<P: TxPool>(
         // fit the batch at all.
         if !tn_types::batch_allowlisted_tx_type(&tx)
             || !tn_types::batch_allowlisted_authorization_list(&*tx, epoch)
+            || !tn_types::batch_allowlisted_authorities(&*tx, tx.signer())
         {
-            if tx.is_eip4844() {
-                best_txs.ignore_eip4844(&pool_tx);
-                debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
-                blob_transactions.push(*tx.hash());
-            } else {
-                best_txs.ignore_denylist_type(&pool_tx);
-                debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted or out-of-bounds 7702 tx invalid");
-                unsupported_transactions.push(*tx.hash());
+            match () {
+                _ if tx.is_eip4844() => {
+                    best_txs.ignore_eip4844(&pool_tx);
+                    debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
+                    blob_transactions.push(*tx.hash());
+                }
+                _ if tx.is_eip7702()
+                    && tn_types::batch_allowlisted_authorization_list(&*tx, epoch) =>
+                {
+                    best_txs.ignore_non_self_authorization(&pool_tx);
+                    debug!(target: "worker::batch_builder", ?pool_tx, "marking foreign-authority 7702 tx invalid");
+                    unsupported_transactions.push(*tx.hash());
+                }
+                _ => {
+                    best_txs.ignore_denylist_type(&pool_tx);
+                    debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted or out-of-bounds 7702 tx invalid");
+                    unsupported_transactions.push(*tx.hash());
+                }
             }
             continue;
         }
@@ -191,7 +215,9 @@ pub fn build_batch<P: TxPool>(
     // remove any blob transactions that were submitted
     pool.remove_eip4844_txs(blob_transactions);
 
-    // remove any non-allowlisted transaction types that were submitted
+    // remove any non-allowlisted transaction types, out-of-bounds EIP-7702
+    // authorization lists, and foreign-authority EIP-7702 transactions that
+    // were submitted (all carried by `unsupported_transactions`)
     pool.remove_unsupported_txs(unsupported_transactions);
 
     // construct changed_accounts for the optimistic pool update

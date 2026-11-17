@@ -48,6 +48,8 @@ mod code {
     /// An `eth_sendRawTransaction` payload decoded to an EIP-7702 transaction
     /// whose authorization list is empty or longer than the network's cap.
     pub(super) const INVALID_AUTHORIZATION_LIST: i32 = -32009;
+    /// An EIP-7702 transaction attempts to authorize another account.
+    pub(super) const NON_SELF_AUTHORIZATION: i32 = -32010;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -80,6 +82,8 @@ pub(crate) enum GatewayError {
     /// whose authorization list is empty or longer than the network's cap, so
     /// no batch could ever carry it.
     InvalidAuthorizationList,
+    /// An EIP-7702 authorization belongs to someone other than the outer sender.
+    NonSelfAuthorization,
     /// The request body could not be read (e.g. the client aborted mid-body).
     UnreadableBody,
 }
@@ -97,7 +101,8 @@ impl GatewayError {
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction
             | Self::UnsupportedTransactionType
-            | Self::InvalidAuthorizationList => StatusCode::BAD_REQUEST,
+            | Self::InvalidAuthorizationList
+            | Self::NonSelfAuthorization => StatusCode::BAD_REQUEST,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
         }
     }
@@ -115,6 +120,7 @@ impl GatewayError {
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::InvalidAuthorizationList => code::INVALID_AUTHORIZATION_LIST,
+            Self::NonSelfAuthorization => code::NON_SELF_AUTHORIZATION,
             Self::UnreadableBody => code::INVALID_REQUEST,
         }
     }
@@ -139,6 +145,9 @@ impl GatewayError {
             Self::InvalidAuthorizationList => {
                 "EIP-7702 authorization list length is outside the accepted range"
             }
+            Self::NonSelfAuthorization => {
+                "EIP-7702 authorizations must belong to the transaction sender"
+            }
             Self::UnreadableBody => "request body could not be read",
         }
     }
@@ -159,6 +168,7 @@ impl GatewayError {
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType => "unsupported_transaction_type",
             Self::InvalidAuthorizationList => "invalid_authorization_list",
+            Self::NonSelfAuthorization => "non_self_authorization",
             Self::UnreadableBody => "unreadable_body",
         }
     }
@@ -494,6 +504,7 @@ mod tests {
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
         assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
         assert_eq!(GatewayError::InvalidAuthorizationList.code(), -32009);
+        assert_eq!(GatewayError::NonSelfAuthorization.code(), -32010);
     }
 
     #[test]
@@ -514,6 +525,7 @@ mod tests {
             "unsupported_transaction_type"
         );
         assert_eq!(GatewayError::InvalidAuthorizationList.reason(), "invalid_authorization_list");
+        assert_eq!(GatewayError::NonSelfAuthorization.reason(), "non_self_authorization");
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
     }
 }

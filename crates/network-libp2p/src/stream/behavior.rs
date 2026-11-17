@@ -118,9 +118,9 @@ pub(crate) struct StreamBehavior {
     pending: Vec<PendingOpen>,
     /// Peers with at least one established connection.
     connected: HashSet<PeerId>,
-    /// Per-peer inbound rate windows.
+    /// Per-peer inbound rate windows, evicted on disconnect and swept once expired.
     inbound: HashMap<PeerId, InboundWindow>,
-    /// Periodic timer that expires stale pending opens.
+    /// Periodic timer that expires stale pending opens and expired rate windows.
     sweep: Interval,
 }
 
@@ -269,6 +269,17 @@ impl StreamBehavior {
         window.count += 1;
         window.count > MAX_INBOUND_PER_WINDOW
     }
+
+    /// Drop inbound rate windows whose window has expired.
+    ///
+    /// [`Self::inbound_rate_limited`] treats an expired window and a missing window the same
+    /// way: the next stream starts a fresh window. Sweeping by age bounds the map even when a
+    /// peer's `ConnectionClosed` never reaches [`Self::on_disconnected`], the same disconnect
+    /// back-pressure leak as the peer manager's put-record windows (issue #1290).
+    fn sweep_stale_windows(&mut self) {
+        let now = Instant::now();
+        self.inbound.retain(|_, window| now.duration_since(window.started) < INBOUND_RATE_WINDOW);
+    }
 }
 
 impl NetworkBehaviour for StreamBehavior {
@@ -346,9 +357,10 @@ impl NetworkBehaviour for StreamBehavior {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
-        // Expire stale opens on each timer tick.
+        // Expire stale opens and drop expired rate windows on each timer tick.
         while self.sweep.poll_tick(cx).is_ready() {
             self.expire_stale();
+            self.sweep_stale_windows();
         }
 
         // Emit pending events.
@@ -549,6 +561,43 @@ mod tests {
         behavior.inbound.get_mut(&peer).expect("window exists").started =
             Instant::now() - INBOUND_RATE_WINDOW;
         assert!(!behavior.inbound_rate_limited(peer));
+    }
+
+    #[tokio::test]
+    async fn stale_inbound_window_swept() {
+        let mut behavior = StreamBehavior::new(test_sync_protocol());
+        let stale = PeerId::random();
+        let fresh = PeerId::random();
+        behavior.inbound_rate_limited(stale);
+        behavior.inbound_rate_limited(fresh);
+        // back-date one window past the interval, as if the peer's disconnect was missed
+        behavior.inbound.get_mut(&stale).expect("window exists").started =
+            Instant::now() - INBOUND_RATE_WINDOW;
+
+        behavior.sweep_stale_windows();
+
+        // the expired window is swept; the live one is kept
+        assert!(!behavior.inbound.contains_key(&stale));
+        assert!(behavior.inbound.contains_key(&fresh));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_tick_sweeps_stale_inbound_window() {
+        let mut behavior = StreamBehavior::new(test_sync_protocol());
+        let stale = PeerId::random();
+        behavior.inbound_rate_limited(stale);
+        // back-date the window past the interval, as if the peer's disconnect was missed
+        behavior.inbound.get_mut(&stale).expect("window exists").started =
+            Instant::now() - INBOUND_RATE_WINDOW;
+
+        // the first poll registers the sweep timer; advancing the paused clock past the
+        // interval makes its tick ready, so the second poll runs the sweep
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let _ = behavior.poll(&mut cx);
+        tokio::time::advance(SWEEP_INTERVAL).await;
+        let _ = behavior.poll(&mut cx);
+
+        assert!(!behavior.inbound.contains_key(&stale));
     }
 
     #[tokio::test]

@@ -216,6 +216,30 @@ pub struct AuthorizationListLengthExceeded {
     max: u64,
 }
 
+/// Pool rejection for a transaction that authorizes an account other than its outer sender.
+#[derive(Debug)]
+pub struct NonSelfAuthorization;
+
+impl std::fmt::Display for NonSelfAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EIP-7702 authorizations must belong to the transaction sender")
+    }
+}
+
+impl std::error::Error for NonSelfAuthorization {}
+
+impl PoolTransactionError for NonSelfAuthorization {
+    /// The signed authorities cannot change, so retrying this transaction cannot fix it.
+    fn is_bad_transaction(&self) -> bool {
+        true
+    }
+
+    /// Expose the concrete policy rejection to RPC callers and tests.
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Error outcome for a survivor the inner validator returned no outcome for.
 ///
 /// Reachable only if the wrapped validator violates its one-outcome-per-input contract;
@@ -326,6 +350,29 @@ where
             Screened::Admitted(origin, transaction)
         }
     }
+
+    /// Check self-installation only after reth accepts the transaction's gas, fees, balance,
+    /// nonce and signature, preserving reth's cheap rejection of unfunded or under-gassed input.
+    fn enforce_self_authorizations(
+        outcome: TransactionValidationOutcome<V::Transaction>,
+    ) -> TransactionValidationOutcome<V::Transaction> {
+        match outcome {
+            TransactionValidationOutcome::Valid { transaction, .. }
+                if !tn_types::batch_allowlisted_authorities(
+                    transaction.transaction(),
+                    transaction.transaction().sender(),
+                ) =>
+            {
+                TransactionValidationOutcome::Invalid(
+                    transaction.into_transaction(),
+                    InvalidPoolTransactionError::Other(Box::new(NonSelfAuthorization)),
+                )
+            }
+            outcome @ (TransactionValidationOutcome::Valid { .. }
+            | TransactionValidationOutcome::Invalid(..)
+            | TransactionValidationOutcome::Error(..)) => outcome,
+        }
+    }
 }
 
 impl<V> TransactionValidator for TnPoolValidator<V>
@@ -348,9 +395,9 @@ where
     ) -> TransactionValidationOutcome<Self::Transaction> {
         match self.screen(origin, transaction) {
             Screened::Rejected(outcome) => outcome,
-            Screened::Admitted(origin, transaction) => {
-                self.inner.validate_transaction(origin, transaction).await
-            }
+            Screened::Admitted(origin, transaction) => Self::enforce_self_authorizations(
+                self.inner.validate_transaction(origin, transaction).await,
+            ),
         }
     }
 
@@ -411,7 +458,7 @@ where
                  error outcome and surplus outcomes are dropped"
             );
         }
-        let mut inner_outcomes = inner_outcomes.into_iter();
+        let mut inner_outcomes = inner_outcomes.into_iter().map(Self::enforce_self_authorizations);
         let mut remaining_hashes = survivor_hashes.into_iter();
         slots
             .into_iter()
@@ -1075,6 +1122,14 @@ impl BestTxns {
             })),
         );
     }
+
+    /// Skip a foreign authorization and its sender's descendants for this batch selection.
+    pub fn ignore_non_self_authorization(&mut self, pool_tx: &Arc<PoolTxn>) {
+        self.inner.mark_invalid(
+            pool_tx,
+            &InvalidPoolTransactionError::Other(Box::new(NonSelfAuthorization)),
+        );
+    }
 }
 
 impl Iterator for BestTxns {
@@ -1119,11 +1174,12 @@ mod tests {
     };
     use rand::{rngs::StdRng, SeedableRng as _};
     use reth_chainspec::EthChainSpec as _;
+    use reth_transaction_pool::validate::ValidTransaction;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tn_types::{
-        test_genesis, Address, Bytes, Encodable2718 as _, GenesisAccount, TaskManager,
-        MIN_PROTOCOL_BASE_FEE, U256,
+        test_genesis, Address, Authorization, Bytes, Encodable2718 as _, GenesisAccount,
+        TaskManager, TxEip7702, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Build a pool over a chain whose genesis funds the factory's sender, so a rejected
@@ -1413,6 +1469,108 @@ mod tests {
             &[hashes[1], hashes[3]],
             "the inner validator must see exactly the survivors, in order"
         );
+    }
+
+    /// Inner validator that accepts every transaction. Its `Valid` outcome reaches the
+    /// self-authorization check, which runs only after reth's own validation passes.
+    #[derive(Debug, Default)]
+    struct AcceptingValidator;
+
+    impl TransactionValidator for AcceptingValidator {
+        type Transaction = EthPooledTransaction;
+        type Block = tn_types::Block;
+
+        async fn validate_transaction(
+            &self,
+            _origin: TransactionOrigin,
+            transaction: Self::Transaction,
+        ) -> TransactionValidationOutcome<Self::Transaction> {
+            TransactionValidationOutcome::Valid {
+                balance: U256::MAX,
+                state_nonce: 0,
+                bytecode_hash: None,
+                transaction: ValidTransaction::Valid(transaction),
+                propagate: false,
+                authorities: None,
+            }
+        }
+    }
+
+    /// True when the outcome is the pool's rejection of a foreign authorization.
+    fn is_non_self_authorization(
+        outcome: &TransactionValidationOutcome<EthPooledTransaction>,
+    ) -> bool {
+        matches!(
+            outcome,
+            TransactionValidationOutcome::Invalid(_, InvalidPoolTransactionError::Other(boxed))
+                if boxed.as_any().downcast_ref::<NonSelfAuthorization>().is_some()
+        )
+    }
+
+    /// Recover a signed transaction into its pooled form for direct validator calls.
+    fn pooled(transaction: &TransactionSigned) -> EthPooledTransaction {
+        recover_pooled_transaction(&transaction.encoded_2718()).expect("pooled txn")
+    }
+
+    /// The batched path rejects a foreign authorization in its own slot and keeps every
+    /// other outcome in input order. The single path yields the same rejection.
+    #[tokio::test]
+    async fn validate_transactions_rejects_foreign_authorizations_in_place() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let chain_id = chain.chain_id();
+        let mut alice = TransactionFactory::new_random();
+        let bob = TransactionFactory::new_random();
+
+        let own = alice.create_eip7702(chain_id, None, 7);
+        let foreign = pooled(&bob.sign_eip7702(TxEip7702 {
+            chain_id,
+            gas_limit: 100_000,
+            max_fee_per_gas: 7,
+            to: alice.address(),
+            authorization_list: vec![alice.sign_authorization(Authorization {
+                chain_id: U256::from(chain_id),
+                address: Address::ZERO,
+                nonce: 1,
+            })],
+            ..Default::default()
+        }));
+        let ordinary = alice.create_eip1559(
+            chain.clone(),
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+
+        let inputs = vec![pooled(&own), foreign.clone(), pooled(&ordinary)];
+        let hashes: Vec<TxHash> = inputs.iter().map(|tx| *tx.hash()).collect();
+
+        let validator = TnPoolValidator::new(AcceptingValidator);
+        let outcomes = validator
+            .validate_transactions(inputs.into_iter().map(|tx| (TransactionOrigin::External, tx)))
+            .await;
+
+        assert_eq!(outcomes.len(), hashes.len(), "one outcome per input");
+        assert!(
+            outcomes.iter().zip(&hashes).all(|(outcome, hash)| outcome.tx_hash() == *hash),
+            "outcomes must keep input order"
+        );
+        assert!(
+            outcomes.get(1).is_some_and(is_non_self_authorization),
+            "the foreign authorization must be rejected in place"
+        );
+        assert!(
+            [0, 2].into_iter().all(|i| {
+                outcomes
+                    .get(i)
+                    .is_some_and(|o| matches!(o, TransactionValidationOutcome::Valid { .. }))
+            }),
+            "self-authorized and ordinary transactions stay valid"
+        );
+
+        let single = validator.validate_transaction(TransactionOrigin::External, foreign).await;
+        assert!(is_non_self_authorization(&single), "the single path rejects the same input");
     }
 
     #[tokio::test]

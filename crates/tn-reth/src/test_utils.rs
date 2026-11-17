@@ -507,6 +507,21 @@ impl TransactionFactory {
         TransactionSigned::new_unhashed(tx.into(), signature)
     }
 
+    /// Sign an authorization with this account's key without changing its transaction nonce.
+    pub fn sign_authorization(
+        &self,
+        authorization: Authorization,
+    ) -> alloy::eips::eip7702::SignedAuthorization {
+        let signature = self.sign_hash(authorization.signature_hash());
+        authorization.into_signed(signature)
+    }
+
+    /// Sign a fully specified set-code transaction, preserving its explicit outer nonce.
+    pub fn sign_eip7702(&self, transaction: TxEip7702) -> TransactionSigned {
+        let signature = self.sign_hash(transaction.signature_hash());
+        TransactionSigned::new_unhashed(transaction.into(), signature)
+    }
+
     /// Create a signed EIP-7702 set-code transaction whose authorization list is
     /// padded with `num_authorizations` tuples, for exercising the gas-penalty
     /// path against a padded list.

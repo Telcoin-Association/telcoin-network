@@ -92,8 +92,11 @@ pub(crate) async fn proxy(
     }
 
     // Shallow pre-flight for raw-transaction submissions: reject a payload the
-    // worker would also reject (undecodable, or an EIP-4844 blob) before paying
-    // for an upstream round-trip. The screen recovers the request id itself on
+    // worker would also reject (undecodable, an EIP-4844 blob, an over-cap
+    // authorization list, an unrecoverable outer signature, or a foreign
+    // authorization; the `screen_raw_transaction` doc comment lists the arms)
+    // before paying for an upstream round-trip. The screen recovers the request
+    // id itself on
     // the paths that reject, so nothing here re-parses the body.
     if let Some((err, id)) = screen_raw_transaction(body.as_ref()) {
         warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
@@ -223,10 +226,24 @@ fn classify_error(err: reqwest::Error) -> GatewayError {
 /// like every other member the screen does not use, so a request that is
 /// forwarded never materializes its id at all (see [`ScreenFields`]).
 ///
-/// The decode uses the same pooled wire format the worker's RPC accepts and
-/// never recovers the signer, so it cannot reject a transaction the worker
-/// would have accepted (no false rejections); it only front-runs a rejection
-/// the worker would issue anyway.
+/// The decode uses the same pooled wire format the worker's RPC accepts. For
+/// every type other than `0x04` the screen does not recover the signer. For a
+/// type-`0x04` payload it first recovers the outer signer. A type-`0x04`
+/// payload whose outer signature does not recover is rejected as malformed
+/// (`InvalidTransaction`) before the authority check, so `NonSelfAuthorization`
+/// (-32010) always names a real foreign authority. Only then does it recover
+/// each recoverable tuple authority
+/// (`tn_types::batch_allowlisted_signed_authorities`) and reject a list that
+/// carries a foreign authority. Every rejection mirrors a rejection the worker
+/// pool issues anyway, so the screen still cannot reject a transaction the
+/// worker would have accepted (no false rejections); it only front-runs the
+/// worker.
+///
+/// Cost bound: the screen performs one outer signer recovery plus at most
+/// `tn_types::max_tx_authorizations` tuple recoveries per type-`0x04` payload,
+/// because the list-length arm runs first. The rate limiter, when configured,
+/// is the outermost router layer (see [`crate::server`]) and runs before the
+/// handler reaches this screen.
 fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
     // Fast path: skip JSON parsing entirely unless the method name is present.
     if !mentions_send_raw_transaction(body) {
@@ -267,6 +284,15 @@ fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
             // no-false-rejection property documented above.
             Ok(tx) if !tn_types::batch_allowlisted_authorization_list(&tx, 0) => {
                 Some(GatewayError::InvalidAuthorizationList)
+            }
+            // An outer signature that does not recover is a malformed
+            // transaction, not a foreign authority. Reject it here so the arm
+            // below only fires for a list that names a real foreign authority.
+            Ok(PooledTransaction::Eip7702(signed)) if signed.recover_signer().is_err() => {
+                Some(GatewayError::InvalidTransaction)
+            }
+            Ok(tx) if !tn_types::batch_allowlisted_signed_authorities(&tx) => {
+                Some(GatewayError::NonSelfAuthorization)
             }
             Ok(_) => None,
         }
@@ -539,6 +565,12 @@ mod tests {
             Ok(tx) if !tn_types::batch_allowlisted_authorization_list(&tx, 0) => {
                 Some((GatewayError::InvalidAuthorizationList, id))
             }
+            Ok(PooledTransaction::Eip7702(signed)) if signed.recover_signer().is_err() => {
+                Some((GatewayError::InvalidTransaction, id))
+            }
+            Ok(tx) if !tn_types::batch_allowlisted_signed_authorities(&tx) => {
+                Some((GatewayError::NonSelfAuthorization, id))
+            }
             Ok(_) => None,
         }
     }
@@ -760,19 +792,18 @@ mod tests {
         assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
     }
 
-    #[test]
-    fn eip7702_typed_payload_is_forwarded() {
-        use tn_types::{
-            Address, Authorization, Encodable2718, EthSignature, SignableTransaction, TxEip7702,
-            U256,
-        };
-
-        // A well-formed type-`0x04` (EIP-7702) set-code transaction is on the
-        // executable allowlist and must be forwarded. The screen is decode-only
-        // and never recovers signers, so dummy signatures suffice.
-        let dummy_signature = EthSignature::new(U256::from(1), U256::from(1), false);
+    /// Sign both layers independently, so the screen checks the actual authority, not a dummy.
+    fn signed_eip7702_raw_hex(authority_key: u8, sender_key: u8) -> Result<String, &'static str> {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync as _};
+        use tn_types::{Address, Authorization, SignableTransaction as _, TxEip7702, U256};
+        let authority =
+            PrivateKeySigner::from_slice(&[authority_key; 32]).map_err(|_| "authority key")?;
+        let sender = PrivateKeySigner::from_slice(&[sender_key; 32]).map_err(|_| "sender key")?;
         let authorization =
             Authorization { chain_id: U256::from(2017), address: Address::ZERO, nonce: 1 };
+        let signature = authority
+            .sign_hash_sync(&authorization.signature_hash())
+            .map_err(|_| "authority signature")?;
         let tx = TxEip7702 {
             chain_id: 2017,
             nonce: 0,
@@ -782,12 +813,34 @@ mod tests {
             to: Address::ZERO,
             value: U256::ZERO,
             access_list: Default::default(),
-            authorization_list: vec![authorization.into_signed(dummy_signature)],
+            authorization_list: vec![authorization.into_signed(signature)],
             input: Default::default(),
         };
-        let raw = tx.into_signed(dummy_signature).encoded_2718();
-        let raw_hex = format!("0x{}", tn_types::hex::encode(raw));
+        sender.sign_hash_sync(&tx.signature_hash()).map_err(|_| "outer signature").map(
+            |signature| {
+                format!("0x{}", tn_types::hex::encode(tx.into_signed(signature).encoded_2718()))
+            },
+        )
+    }
+
+    /// A self-installation is forwarded for ordinary pool validation.
+    #[test]
+    fn eip7702_typed_payload_is_forwarded() -> Result<(), &'static str> {
+        let raw_hex = signed_eip7702_raw_hex(1, 1)?;
         assert!(screen_err(&send_raw(&format!("[\"{raw_hex}\"]"))).is_none());
+        Ok(())
+    }
+
+    /// A funded worker cannot admit a foreign authority, so reject it before forwarding too.
+    #[test]
+    fn foreign_authorization_is_rejected_with_request_id() -> Result<(), &'static str> {
+        let raw_hex = signed_eip7702_raw_hex(1, 2)?;
+        let body = send_raw(&format!("[\"{raw_hex}\"]"));
+        let (error, id) = screen_raw_transaction(&body).ok_or("foreign authorization forwarded")?;
+        assert!(matches!(error, GatewayError::NonSelfAuthorization));
+        assert_eq!(id, RequestId::from_id(serde_json::json!(1)));
+        assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
+        Ok(())
     }
 
     #[test]
@@ -800,8 +853,9 @@ mod tests {
         // A type-`0x04` transaction whose authorization list exceeds the
         // network cap can never execute (see
         // `tn_types::batch_allowlisted_authorization_list`), so the screen
-        // rejects it before the upstream round-trip. Dummy signatures suffice:
-        // the screen reads the list length and never recovers signers.
+        // rejects it before the upstream round-trip. Dummy signatures suffice
+        // for this case: the list-length arm fires before the authority arm,
+        // so the screen never reaches signer recovery here.
         let dummy_signature = EthSignature::new(U256::from(1), U256::from(1), false);
         let over_cap = usize::try_from(tn_types::max_tx_authorizations(0))
             .expect("cap fits usize")
@@ -829,6 +883,52 @@ mod tests {
         let raw_hex = format!("0x{}", tn_types::hex::encode(raw));
         let err = screen_err(&send_raw(&format!("[\"{raw_hex}\"]")));
         assert!(matches!(err, Some(GatewayError::InvalidAuthorizationList)));
+    }
+
+    /// A bounded type-`0x04` payload with one real tuple but an outer signature
+    /// that does not recover is malformed. The screen must report it as such
+    /// and must not blame a foreign authority.
+    #[test]
+    fn unrecoverable_outer_signature_is_rejected_as_malformed_not_foreign(
+    ) -> Result<(), &'static str> {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync as _};
+        use tn_types::{
+            Address, Authorization, Encodable2718, EthSignature, SignableTransaction as _,
+            TxEip7702, U256,
+        };
+
+        let authority = PrivateKeySigner::from_slice(&[1u8; 32]).map_err(|_| "authority key")?;
+        let authorization =
+            Authorization { chain_id: U256::from(2017), address: Address::ZERO, nonce: 1 };
+        let signature = authority
+            .sign_hash_sync(&authorization.signature_hash())
+            .map_err(|_| "authority signature")?;
+        let tx = TxEip7702 {
+            chain_id: 2017,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list: vec![authorization.into_signed(signature)],
+            input: Default::default(),
+        };
+        // `r = s = 0` decodes as RLP but is not a valid scalar pair, so outer
+        // recovery fails on every key. (`r = s = 1` would recover to some
+        // address, because `x = 1` is a point on secp256k1.)
+        let dummy_signature = EthSignature::new(U256::ZERO, U256::ZERO, false);
+        let raw = tx.into_signed(dummy_signature).encoded_2718();
+        let raw_hex = format!("0x{}", tn_types::hex::encode(raw));
+        let body = send_raw(&format!("[\"{raw_hex}\"]"));
+        let (error, id) =
+            screen_raw_transaction(&body).ok_or("unrecoverable outer signature forwarded")?;
+        assert!(matches!(error, GatewayError::InvalidTransaction));
+        assert!(!matches!(error, GatewayError::NonSelfAuthorization));
+        assert_eq!(id, RequestId::from_id(serde_json::json!(1)));
+        assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
+        Ok(())
     }
 
     #[test]

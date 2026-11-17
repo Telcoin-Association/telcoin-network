@@ -130,10 +130,42 @@ pub fn batch_allowlisted_authorization_list<T: TransactionTrait>(tx: &T, epoch: 
                 .is_ok_and(|len| (1..=max_tx_authorizations(epoch)).contains(&len))
         })
 }
+
+/// Whether every recoverable EIP-7702 authority is the outer transaction sender.
+///
+/// Independent worker pools cannot reserve another pool's pending authorities. Requiring
+/// self-installation prevents a transaction from changing a different sender's nonce or installing
+/// code that can spend that sender's previously undelegated balance (issue #1334). Calls to an
+/// already delegated account remain available to sponsors through ordinary transactions.
+///
+/// Unrecoverable tuples cannot change an account and are skipped, as in EIP-7702. Recoverable
+/// foreign tuples are rejected even when their chain ID or nonce would make them inert today.
+/// Callers must bound the authorization-list length before recovery.
+pub fn batch_allowlisted_authorities<T: TransactionTrait>(tx: &T, sender: Address) -> bool {
+    tx.authorization_list().is_none_or(|list| {
+        list.iter()
+            .filter_map(|authorization| authorization.recover_authority().ok())
+            .all(|authority| authority == sender)
+    })
+}
+
+/// Apply the self-installation policy to a signed envelope, recovering its outer sender only
+/// for EIP-7702. Callers must enforce the authorization-list bound first.
+pub fn batch_allowlisted_signed_authorities<
+    T: TransactionTrait + alloy::consensus::transaction::SignerRecoverable,
+>(
+    tx: &T,
+) -> bool {
+    !tx.is_eip7702()
+        || tx.recover_signer().is_ok_and(|sender| batch_allowlisted_authorities(tx, sender))
+}
 pub use reth_primitives::{
     Account, Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt,
     Recovered, RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
 };
+
+#[cfg(test)]
+mod authorization_tests;
 
 #[cfg(test)]
 mod allowlist_tests {
