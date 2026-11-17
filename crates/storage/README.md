@@ -262,7 +262,9 @@ whole `consensus-db` from an older backup lacks the later packs), or
 start the node over (crates/tn-reth/README.md, "Transactions stored by position"), and never delete the
 `epoch-N` directory, which a datadir storing transactions by position needs at every start. Only the
 newest epoch's torn-empty meta or all-zero data file holds no output: the node creates (or
-re-initializes) that epoch again when it enters it. Its read-only recovery checks
+re-initializes) that epoch again when it enters it. The epoch the node resumes from is not entered
+but opened to resume (`open_append_exists`), and the start refuses its all-zero data file, so `db
+repair` gives it a whole restore point or a start over instead (`ConsensusChain::start_resumes`). Its read-only recovery checks
 (shared with `db repair`'s dry run) read the position index's entries straight from the file, so an
 index a crash left unsealed attests the same output boundaries it does to the writable open.
 
@@ -501,7 +503,12 @@ or `--all` for every epoch there, in turn) walks a pack's `data` stream read-onl
 issues. A check it could not run is an error, never a verdict: a data log it cannot open or read
 (in the validation walk, the index cross-check's walk, the incomplete-output check) fails the
 command, and the recovery check reports an unopenable log as "recoverability unknown", so a
-transient failure never reads as a truncatable tail or a skipped index check. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
+transient failure never reads as a truncatable tail or a skipped index check. The datadir forms
+(`--epoch N`, `--all`) then judge a past epoch's pack (one before the epoch the latest-consensus
+hint resumes) against the local epoch records, as `db import-epoch` judges a pack in place
+(`ConsensusChain::past_pack_check`): one that does not end with the final output of its epoch's
+record fails; one the records cannot judge (no record of the epoch yet, say) is reported unchecked,
+and the epoch the node resumes from, still being written, is never judged. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported with
 its recovery (above), never "fixed". A read the disk failed (opening the data log included, for the validation
@@ -510,8 +517,8 @@ too), any other OS failure (a sync, a rename, an unlink), a failure the environm
 sync or seal (recovery seals its rebuilt indexes before it cuts the log), is no verdict on the epoch:
 it is reported as an error to rerun once the cause is fixed, never as unrepairable. A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
 drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. Only the newest
-epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory) was
-complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
+epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory, or
+an interrupted install of one, `epoch-N.replaced` with no `epoch-N`) was complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
 read-side heal, `db migrate`, `db repair` and `db validate`, even when its indexes cannot attest its
 length. A legacy v0
 (batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. An

@@ -17,7 +17,7 @@ use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
 use human_bytes::human_bytes;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -31,7 +31,7 @@ use tn_reth::{
     TNPrimitives, DB_CHECK_NEEDS_STOPPED_NODE, DB_TABLE_STATS_NEEDS_STOPPED_NODE,
 };
 use tn_storage::{
-    consensus::ConsensusChain,
+    consensus::{ConsensusChain, PastPackCheck},
     consensus_pack::{
         legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, ConsensusPack,
         EpochMigrate, EpochRepair, DATA_NAME, SENTINEL_MIN_VERSION,
@@ -39,8 +39,8 @@ use tn_storage::{
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::{ExecStatePackReader, VerifyReport},
     pack_validate::{
-        classify_physical_corruption, incomplete_trailing_output, recovery_refusal,
-        validate_pack_file, validate_pack_file_bounded, Verdict,
+        classify_physical_corruption, incomplete_trailing_output, lost_pack_remedy,
+        recovery_refusal, validate_pack_file, validate_pack_file_bounded, Verdict,
     },
 };
 use tn_types::{
@@ -109,12 +109,20 @@ enum DbSubcommand {
     /// Walks the pack's `data` log and reports integrity issues: a torn tail that a restart or `db
     /// repair` truncates, or damage that loses data, with what to do about it. Takes a pack's path
     /// (an `epoch-<N>` directory or its `data` file, anywhere), or `--epoch N` alone for
-    /// `<datadir>/consensus-db/epochs/epoch-<N>`, or `--all` for every epoch of the datadir. Takes
-    /// no datadir lock. Read-only (changes no file). Validate the newest epoch, or one whose
-    /// pack is not sealed yet, only with the node STOPPED: a running node may truncate or grow
-    /// that file under this command, which can then crash (SIGBUS; the node's data is not harmed),
-    /// and the command warns when it sees such a pack. A sealed past epoch can be validated while
-    /// the node runs. Exits non-zero for damage, and for a torn tail in a past epoch (which only
+    /// `<datadir>/consensus-db/epochs/epoch-<N>` (for an interrupted install, the last good copy
+    /// `epoch-<N>.replaced` the node's next start puts back), or `--all` for every epoch of the
+    /// datadir (from its lowest pack to its newest, failing on a missing past one). Takes no
+    /// datadir lock. Read-only (changes no file). Validate the newest epoch, or one whose pack is
+    /// not sealed yet, only with the node STOPPED: a running node may truncate or grow that file
+    /// under this command, which can then crash (SIGBUS; the node's data is not harmed), and the
+    /// command warns when it sees such a pack. A sealed past epoch can be validated while the node
+    /// runs. With `--epoch N` or `--all`, a past epoch's pack (one before the epoch the node
+    /// resumes from) that validates is then checked against the datadir's epoch records: it must
+    /// end with the final output the local record of its epoch names, and is INVALID when it does
+    /// not (a prefix of the epoch, a pack holding only its meta, another chain's pack); one the
+    /// records cannot judge yet (no record of its epoch, say) is reported not checked. A pack
+    /// named by its path is checked for its integrity only. Exits non-zero for damage, for a
+    /// pack that is not its whole past epoch, and for a torn tail in a past epoch (which only
     /// `db repair` truncates); with `--all`, when any epoch fails.
     Validate(DbValidateArgs),
 
@@ -129,13 +137,17 @@ enum DbSubcommand {
     /// open); name it with `--epoch N` once the node is stopped. The node MUST be stopped: it
     /// refuses while a node holds the datadir, and holds the datadir while it runs. The dry run
     /// reports what `--force` would do and changes nothing; it exits 0 when it finds only what
-    /// `--force` would repair. Exits non-zero when anything is unrepairable or a check failed.
+    /// `--force` would repair. It does not open an interrupted install's copy: it names the ones
+    /// `--force` checks once it has put them back, and `db validate --epoch N` checks a copy now.
+    /// Exits non-zero when anything is unrepairable or a check failed.
     Repair(DbRepairArgs),
 
     /// Migrate legacy consensus packs to v2 (dry run unless --force).
     ///
     /// Rewrites each legacy (pre-v2) epoch pack into a v2 data log (header-first), rebuilds its
-    /// indexes, and seals it; the node also migrates an epoch's pack when it opens or reads it.
+    /// indexes, and seals it. The node migrates a pack itself only when it resumes its epoch or
+    /// reads the epoch's consensus data (for a peer, or a consensus lookup); reads of its
+    /// transactions by position fail on a legacy pack until it is migrated.
     /// The node MUST be stopped: it refuses while a node holds the datadir, and holds the datadir
     /// while it runs. Without `--force` it reports what it would migrate and changes nothing. A
     /// pack whose committed data is damaged is reported with its recovery, never truncated. Exits
@@ -464,7 +476,8 @@ impl DbCommand {
 #[derive(Debug, Args)]
 pub struct DbValidateArgs {
     /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one. Without it,
-    /// `--epoch N` names `<datadir>/consensus-db/epochs/epoch-<N>`, and `--all` every epoch there.
+    /// `--epoch N` names `<datadir>/consensus-db/epochs/epoch-<N>` (for an interrupted install,
+    /// its last good copy, `epoch-<N>.replaced`), and `--all` every epoch there.
     ///
     /// The `data` stream is self-contained for validation — the sidecar `idx`/`hash`/`bhash`
     /// indexes are not required.
@@ -477,8 +490,10 @@ pub struct DbValidateArgs {
     #[arg(long)]
     pub epoch: Option<Epoch>,
 
-    /// Validate every epoch's pack under `<datadir>/consensus-db/epochs`, in order, and fail if
-    /// any fails. It warns on the newest epoch, which a running node writes. For an interrupted
+    /// Validate every epoch's pack under `<datadir>/consensus-db/epochs`, in order, from the
+    /// lowest present to the newest, and fail if any fails or a past one is missing (one after
+    /// the epoch the node resumes from is reported missing without failing: the node's next start
+    /// fetches it). It warns on the newest epoch, which a running node writes. For an interrupted
     /// install it validates the last good copy (`epoch-N.replaced`) the node's next start puts
     /// back as the missing `epoch-N`.
     #[arg(long, conflicts_with_all = ["path", "epoch"])]
@@ -489,22 +504,38 @@ impl DbValidateArgs {
     /// Validate the pack(s) named, under `datadir` when no path is given, and print the reports
     /// to stdout.
     fn execute(&self, datadir: &PathBuf) -> eyre::Result<()> {
+        self.run(datadir, &mut std::io::stdout())
+    }
+
+    /// [`Self::execute`], printing the reports to `out` (warnings and progress stay on stderr).
+    fn run(&self, datadir: &PathBuf, out: &mut impl std::io::Write) -> eyre::Result<()> {
         match (&self.path, self.epoch, self.all) {
-            (Some(path), epoch, _) => validate_pack(path, epoch),
-            (None, _, true) => validate_all(&datadir.epochs_db_path()),
-            (None, Some(epoch), false) => {
-                validate_pack(&datadir.epochs_db_path().join(format!("epoch-{epoch}")), Some(epoch))
+            (Some(path), epoch, _) => {
+                validate_pack(path, epoch, out)?;
+                writeln!(
+                    out,
+                    "not checked against the epoch records: a pack named by its path is checked \
+                     for its integrity only; `telcoin-network db validate --epoch N` also checks a \
+                     past epoch's pack in the datadir against the datadir's epoch records"
+                )?;
+                Ok(())
             }
+            (None, _, true) => validate_all(datadir, out),
+            (None, Some(epoch), false) => validate_epoch(datadir, epoch, out),
             (None, None, false) => bail!("name the pack: a PATH, `--epoch N` or `--all`"),
         }
     }
 }
 
-/// `db validate --all`: validate every epoch's pack under `epochs_dir` in order, and fail naming
-/// the epochs that failed. An interrupted install's epoch is reported as one, and its last good
-/// copy (`epoch-N.replaced`), which the node's next start puts back as `epoch-N`, is validated
-/// in its place.
-fn validate_all(epochs_dir: &Path) -> eyre::Result<()> {
+/// `db validate --all`: validate every epoch's pack under `epochs_dir` in order, from the lowest
+/// present (a datadir bootstrapped with `db load-state` starts at its restored epoch) to the
+/// newest, and fail naming the epochs that failed. An interrupted install's epoch is reported as
+/// one, and its last good copy (`epoch-N.replaced`), which the node's next start puts back as
+/// `epoch-N`, is validated in its place. An epoch in that range with no pack is reported missing:
+/// it fails at or below the epoch the node resumes from (nothing fetches it again, and the start
+/// refuses the resume epoch without its pack), while one after it is fetched by the next start.
+fn validate_all(datadir: &PathBuf, out: &mut impl std::io::Write) -> eyre::Result<()> {
+    let epochs_dir = &datadir.epochs_db_path();
     if !epochs_dir.is_dir() {
         bail!("no consensus epochs directory at {}", epochs_dir.display());
     }
@@ -512,44 +543,161 @@ fn validate_all(epochs_dir: &Path) -> eyre::Result<()> {
     let epochs = ConsensusPack::epoch_dirs(epochs_dir)
         .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
     // an interrupted install has no `epoch-N`, so no epoch is in both lists
-    let packs: BTreeMap<Epoch, PathBuf> = epochs
-        .iter()
-        .map(|&epoch| (epoch, epochs_dir.join(format!("epoch-{epoch}"))))
-        .chain(
-            interrupted
-                .iter()
-                .map(|&epoch| (epoch, epochs_dir.join(format!("epoch-{epoch}.replaced")))),
-        )
-        .collect();
+    let packs: BTreeSet<Epoch> = epochs.iter().chain(&interrupted).copied().collect();
+    let (Some(&lowest), Some(&newest)) = (packs.first(), packs.last()) else {
+        writeln!(out, "0 epoch pack(s) under {} validated", epochs_dir.display())?;
+        return Ok(());
+    };
+    // with no hint, every epoch below the newest is past
+    let resume = ConsensusChain::resume_epoch(epochs_dir).unwrap_or(newest);
     let mut failed = Vec::new();
-    for (&epoch, pack) in &packs {
-        if interrupted.contains(&epoch) {
-            println!("epoch {epoch}: {}", interrupted_install_note(epoch));
-            println!("epoch {epoch} (its last good copy, {}):", pack.display());
-        } else {
-            println!("epoch {epoch}:");
+    let mut fetched = Vec::new();
+    for epoch in lowest..=newest {
+        if !packs.contains(&epoch) {
+            let missing = format!(
+                "epoch {epoch}: MISSING — no `epoch-{epoch}` and no interrupted install of it \
+                 (`epoch-{epoch}.replaced`)"
+            );
+            if epoch > resume {
+                writeln!(
+                    out,
+                    "{missing}; it is after the epoch the node resumes from ({resume}), so the \
+                     node's next start fetches it from peers."
+                )?;
+                fetched.push(epoch.to_string());
+            } else if epoch == resume {
+                writeln!(
+                    out,
+                    "{missing}, and it is the epoch the node resumes from: its start opens this \
+                     epoch's pack to resume it and refuses without it. With the node stopped, \
+                     restore a whole restore point or start the node over as a new one; a \
+                     validator restored or started over either way stays stopped until the \
+                     network has closed the last epoch it took part in."
+                )?;
+                failed.push(epoch.to_string());
+            } else {
+                writeln!(out, "{missing}. {}", lost_pack_remedy(format!("epoch-{epoch}")))?;
+                failed.push(epoch.to_string());
+            }
+            continue;
         }
-        if let Err(e) = validate_pack(pack, Some(epoch)) {
-            println!("epoch {epoch}: FAILED: {e:#}");
+        if !interrupted.contains(&epoch) {
+            writeln!(out, "epoch {epoch}:")?;
+        }
+        if let Err(e) = validate_epoch(datadir, epoch, out) {
+            writeln!(out, "epoch {epoch}: FAILED: {e:#}")?;
             failed.push(epoch.to_string());
         }
     }
+    let count = newest - lowest + 1;
     if !failed.is_empty() {
         bail!(
-            "{} of {} epoch pack(s) under {} failed: epoch(s) {} (see the reports above)",
+            "{} of {count} epoch pack(s) under {} failed or are missing: epoch(s) {} (see the \
+             reports above)",
             failed.len(),
-            packs.len(),
             epochs_dir.display(),
             failed.join(", ")
         );
     }
-    println!("{} epoch pack(s) under {} validated", packs.len(), epochs_dir.display());
+    let fetched = if fetched.is_empty() {
+        String::new()
+    } else {
+        format!("; epoch(s) {} missing, fetched by the next start", fetched.join(", "))
+    };
+    writeln!(
+        out,
+        "{} epoch pack(s) under {} validated{fetched}",
+        packs.len(),
+        epochs_dir.display()
+    )?;
+    Ok(())
+}
+
+/// Validate `epoch`'s pack under `datadir`'s epochs directory as the node's next start reads it,
+/// and print the report to `out`: its `epoch-N`, or for an interrupted install (no `epoch-N`, an
+/// `epoch-N.replaced`) the last good copy the start puts back, named first. A past epoch's pack
+/// that validates is then checked against the datadir's epoch records
+/// ([`check_against_records`]). `db validate --epoch N`, and each epoch of `--all`.
+fn validate_epoch(
+    datadir: &PathBuf,
+    epoch: Epoch,
+    out: &mut impl std::io::Write,
+) -> eyre::Result<()> {
+    let epochs_dir = datadir.epochs_db_path();
+    let live = epochs_dir.join(format!("epoch-{epoch}"));
+    let aside = epochs_dir.join(format!("epoch-{epoch}.replaced"));
+    // the test `interrupted_installs` makes: an aside with no `epoch-N` beside it
+    if matches!(live.try_exists(), Ok(false)) && aside.is_dir() {
+        writeln!(out, "epoch {epoch}: {}", interrupted_install_note(epoch))?;
+        writeln!(out, "epoch {epoch} (its last good copy, {}):", aside.display())?;
+        validate_pack(&aside, Some(epoch), out)?;
+    } else {
+        validate_pack(&live, Some(epoch), out)?;
+    }
+    check_against_records(datadir, &epochs_dir, epoch, out)
+}
+
+/// After `epoch`'s pack under `epochs_dir` validated: for a past epoch ([`is_past_epoch`]), check
+/// it against the datadir's epoch records ([`ConsensusChain::past_pack_check`], the rule `db
+/// import-epoch` judges a pack in place by) and fail when it is not the whole epoch (a prefix of
+/// it, a pack holding only its meta, another chain's pack), or say why the records could not judge
+/// it. Epoch 0 is judged against the genesis committee in `datadir`.
+///
+/// `db validate` takes no lock and may run beside a live node, so this reads only what such a node
+/// no longer writes: a past epoch's pack was sealed when the next epoch began, and the epoch the
+/// node resumes from (or a later one), whose pack ends where the node stopped, is never judged. The
+/// records log is read as the node's open recovers it, up to its last whole record, so a record
+/// the node has not written yet (or is writing) leaves the epoch unchecked, never failed.
+fn check_against_records(
+    datadir: &PathBuf,
+    epochs_dir: &Path,
+    epoch: Epoch,
+    out: &mut impl std::io::Write,
+) -> eyre::Result<()> {
+    let data_file = epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME);
+    if !is_past_epoch(&data_file, epoch) {
+        writeln!(
+            out,
+            "epoch {epoch}: not checked against the epoch records: it is not a past epoch (the \
+             node resumes from it or has yet to reach it), so its pack ends where the node stopped"
+        )?;
+        return Ok(());
+    }
+    let genesis = if epoch == 0 {
+        match load_genesis_committee(datadir) {
+            Ok(committee) => Some(committee),
+            Err(e) => {
+                writeln!(out, "epoch 0: not checked against the epoch records: {e:#}")?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    match ConsensusChain::past_pack_check(epochs_dir, epoch, genesis.as_ref()) {
+        PastPackCheck::Complete => writeln!(
+            out,
+            "epoch {epoch}: checked against the epoch records: it ends with the final output the \
+             local record of epoch {epoch} names"
+        )?,
+        PastPackCheck::Incomplete(why) => {
+            writeln!(out, "INVALID: {why}")?;
+            bail!("epoch {epoch}'s pack is not the whole epoch (see report above)");
+        }
+        PastPackCheck::Unchecked(why) => {
+            writeln!(out, "epoch {epoch}: not checked against the epoch records: {why}")?
+        }
+    }
     Ok(())
 }
 
 /// Validate the pack at `path` (of `epoch`, else the epoch its `epoch-NN` directory names) and
-/// print the report to stdout.
-fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
+/// print the report to `out`.
+fn validate_pack(
+    path: &Path,
+    epoch: Option<Epoch>,
+    out: &mut impl std::io::Write,
+) -> eyre::Result<()> {
     let (data_file, epoch) = resolve_data_file_and_epoch(path, epoch)?;
 
     // Warn (do not refuse) if this looks like the current/latest epoch a running node may hold
@@ -562,15 +710,18 @@ fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
     if matches!(pack_unsealed_version(&data_file, epoch), Some((0, _))) {
         return match legacy_migration_dry_run(&data_file, epoch) {
             Ok(outputs) => {
-                println!(
+                writeln!(
+                    out,
                     "legacy v0 pack: a dry run of its migration to v2 copies {outputs} \
-                     output(s) cleanly; `db migrate --force`, or the node when it opens or \
-                     reads this epoch, converts it."
-                );
+                     output(s) cleanly; `telcoin-network db migrate --force` converts it. Until \
+                     then reads of its transactions by position fail: the node converts it only \
+                     when it resumes this epoch or reads its consensus data (for a peer, or a \
+                     consensus lookup), never for a transaction read."
+                )?;
                 Ok(())
             }
             Err(why) => {
-                println!("legacy v0 pack: its migration to v2 refuses: {why}");
+                writeln!(out, "legacy v0 pack: its migration to v2 refuses: {why}")?;
                 bail!("pack {} is INVALID (see report above)", data_file.display());
             }
         };
@@ -582,7 +733,8 @@ fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
     if let Some(corruption) = classify_physical_corruption(&data_file, epoch)
         .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
     {
-        print!("{corruption}");
+        // a torn epoch meta's action depends on whether this is a past epoch, so place it
+        write!(out, "{}", corruption.report(epoch_is_past(&data_file, epoch)))?;
         // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
         // committed prefix before it must still be logically checked — otherwise `db validate`
         // reports nothing useful for the normal shape of any crashed current epoch. Bound the
@@ -596,10 +748,13 @@ fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
         // pack's tail is judged by the migration. Say so instead of promising a self-heal.
         if corruption.kind.is_truncatable() {
             if let Some(why) = recovery_refusal(&data_file, epoch) {
-                println!("NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}");
+                writeln!(
+                    out,
+                    "NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}"
+                )?;
                 bail!("pack {} is corrupt (see report above)", data_file.display());
             }
-            print_legacy_tail_note(&data_file, epoch);
+            print_legacy_tail_note(&data_file, epoch, out)?;
         }
         if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
             let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
@@ -607,7 +762,7 @@ fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
             match validate_pack_file_bounded(&data_file, epoch, None, Some(bound)) {
                 Ok(report) => {
                     prefix_invalid = report.verdict == Verdict::Invalid;
-                    print!("{report}");
+                    write!(out, "{report}")?;
                 }
                 Err(e) => {
                     // The prefix could not be checked, so it cannot be reported healthy.
@@ -622,7 +777,7 @@ fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
         if !corruption.kind.is_truncatable() || prefix_invalid {
             bail!("pack {} is corrupt (see report above)", data_file.display());
         }
-        return require_current_epoch_for_tail(&data_file, epoch);
+        return require_current_epoch_for_tail(&data_file, epoch, out);
     }
 
     // Every record frames, but an unclean pack can still end in an incomplete output whose
@@ -632,34 +787,36 @@ fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
         .map_err(|e| eyre!("failed to check pack {}: {e}", data_file.display()))?
     {
         if let Some(why) = recovery_refusal(&data_file, epoch) {
-            println!(
+            writeln!(
+                out,
                 "NOT TRUNCATABLE: the pack was not cleanly closed and its last output is \
                  incomplete (bytes past offset {end}), but recovery would refuse to truncate \
                  it: {why}"
-            );
+            )?;
             bail!("pack {} is corrupt (see report above)", data_file.display());
         }
-        println!(
+        writeln!(
+            out,
             "TRUNCATABLE: the pack was not cleanly closed and its last output is incomplete \
              (bytes past offset {end}); this unacked in-flight write is truncated by a node \
              restart or `db repair --force`."
-        );
-        print_legacy_tail_note(&data_file, epoch);
+        )?;
+        print_legacy_tail_note(&data_file, epoch, out)?;
         eprintln!("\nValidating the complete prefix (up to byte {end})...");
         let report = validate_pack_file_bounded(&data_file, epoch, None, Some(end))
             .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
-        print!("{report}");
+        write!(out, "{report}")?;
         if report.verdict == Verdict::Invalid {
             bail!("pack {} is INVALID (see report above)", data_file.display());
         }
-        return require_current_epoch_for_tail(&data_file, epoch);
+        return require_current_epoch_for_tail(&data_file, epoch, out);
     }
 
     let report = validate_pack_file(&data_file, epoch, None)
         .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
 
-    // Report goes to stdout (tracing/logs go to stderr/file).
-    print!("{report}");
+    // Report goes to `out`, stdout (tracing/logs go to stderr/file).
+    write!(out, "{report}")?;
     // Non-zero exit on an INVALID verdict so automation can tell a healthy datadir from a
     // corrupt one by exit status.
     if report.verdict == Verdict::Invalid {
@@ -670,16 +827,22 @@ fn validate_pack(path: &Path, epoch: Option<Epoch>) -> eyre::Result<()> {
 
 /// A truncatable tail heals only where the node opens the epoch for append: the epoch it resumes
 /// (or one it has yet to reach). The node only reads a past epoch and never truncates it, so there
-/// the tail needs `db repair`: report that and fail. A legacy (pre-v2) pack is exempt, since the
-/// node migrates it to v2 when it reads the epoch, which drops the tail.
-fn require_current_epoch_for_tail(data_file: &Path, epoch: Epoch) -> eyre::Result<()> {
+/// the tail needs `db repair`: report that and fail. A legacy (pre-v2) pack is exempt: its
+/// migration to v2 drops the tail (`db migrate --force`, or the node when it resumes the epoch or
+/// reads its consensus data), as [`print_legacy_tail_note`] says.
+fn require_current_epoch_for_tail(
+    data_file: &Path,
+    epoch: Epoch,
+    out: &mut impl std::io::Write,
+) -> eyre::Result<()> {
     let legacy = pack_unsealed_version(data_file, epoch)
         .is_some_and(|(version, _)| version < SENTINEL_MIN_VERSION);
     if !legacy && is_past_epoch(data_file, epoch) {
-        println!(
+        writeln!(
+            out,
             "ACTION NEEDED: epoch {epoch} is a past epoch, which the node only reads and never \
              truncates: stop the node and run `telcoin-network db repair --epoch {epoch} --force`."
-        );
+        )?;
         bail!("pack {} needs `db repair` (see report above)", data_file.display());
     }
     Ok(())
@@ -687,20 +850,27 @@ fn require_current_epoch_for_tail(data_file: &Path, epoch: Epoch) -> eyre::Resul
 
 /// Whether `epoch` is before the epoch the node resumes from, read from the latest-consensus hint
 /// in the epochs directory holding `data_file`'s `epoch-N` directory (what the node itself opens
-/// for append). Falls back to the directory listing when there is no hint.
+/// for append). Falls back to the directory listing when there is no hint; `false` when neither
+/// can be read.
 fn is_past_epoch(data_file: &Path, epoch: Epoch) -> bool {
+    epoch_is_past(data_file, epoch).unwrap_or(false)
+}
+
+/// [`is_past_epoch`], or `None` when neither the hint nor the directory listing can be read (a
+/// bare data file outside an epochs directory).
+fn epoch_is_past(data_file: &Path, epoch: Epoch) -> Option<bool> {
     let resume = data_file.parent().and_then(Path::parent).and_then(ConsensusChain::resume_epoch);
     match resume {
-        Some(resume) => epoch < resume,
-        None => later_epoch_exists(data_file, epoch),
+        Some(resume) => Some(epoch < resume),
+        None => later_epoch_beside(data_file, epoch),
     }
 }
 
 /// Whether the epochs directory holding `data_file`'s `epoch-N` directory also holds a later
-/// epoch, an interrupted install's included. `false` when the layout cannot be read (e.g. a bare
+/// epoch, an interrupted install's included. `None` when the layout cannot be read (e.g. a bare
 /// data file outside an epochs dir).
-fn later_epoch_exists(data_file: &Path, epoch: Epoch) -> bool {
-    newest_epoch_beside(data_file).is_some_and(|newest| newest > epoch)
+fn later_epoch_beside(data_file: &Path, epoch: Epoch) -> Option<bool> {
+    newest_epoch_beside(data_file).map(|newest| newest > epoch)
 }
 
 /// The newest epoch in the epochs directory holding `data_file`'s `epoch-N` directory (or an
@@ -716,17 +886,26 @@ fn newest_epoch_beside(data_file: &Path) -> Option<Epoch> {
 }
 
 /// For a legacy (pre-v2) pack whose unacked tail is truncatable, say how it goes away: the
-/// migration to v2 drops it, whether run by `db migrate` or by the node when it opens or reads the
-/// epoch. (A v2 pack's tail is covered by the printed corruption's recommended action.)
-fn print_legacy_tail_note(data_file: &Path, epoch: Epoch) {
+/// migration to v2 drops it, run by `db migrate --force`, or by the node only when it resumes the
+/// epoch or reads its consensus data (a read of its transactions by position fails instead). (A
+/// v2 pack's tail is covered by the printed corruption's recommended action.)
+fn print_legacy_tail_note(
+    data_file: &Path,
+    epoch: Epoch,
+    out: &mut impl std::io::Write,
+) -> eyre::Result<()> {
     if let Some((version, _)) = pack_unsealed_version(data_file, epoch) {
         if version < SENTINEL_MIN_VERSION {
-            println!(
-                "note: legacy (v{version}) pack — migrating it to v2 (`db migrate --force`, or the \
-                 node when it opens or reads this epoch) drops this unacked tail."
-            );
+            writeln!(
+                out,
+                "note: legacy (v{version}) pack — its migration to v2 drops this unacked tail: \
+                 `telcoin-network db migrate --force` converts it. Until then reads of its \
+                 transactions by position fail: the node converts it only when it resumes this \
+                 epoch or reads its consensus data (for a peer, or a consensus lookup)."
+            )?;
         }
     }
+    Ok(())
 }
 
 /// Resolve the user-supplied `path` to a concrete `data` file and an epoch.
@@ -915,13 +1094,16 @@ fn records_db_recovery() -> &'static str {
 /// open for append) is skipped; repair it explicitly with `--epoch N` once the node is confirmed
 /// stopped.
 ///
-/// An interrupted install (`epoch-N.replaced` with no `epoch-N`) is reported, whatever `--epoch`
-/// names. When there is one, `--force` first runs the node's own start-time step on the epochs
-/// directory (`ConsensusChain::recover_incomplete_installs`), which puts each one back (and
-/// removes an aside left beside its `epoch-N`), so the restored epoch is then checked like any
-/// other. Repair-all mode counts an interrupted install as the epoch it puts back when it picks
-/// the latest epoch to skip, so the dry run skips (and checks) the same epochs `--force` does: a
-/// restored latest epoch is skipped like any latest epoch.
+/// An `--epoch` that names neither an `epoch-N` nor an interrupted install is refused before
+/// anything changes. An interrupted install (`epoch-N.replaced` with no `epoch-N`) is reported,
+/// whatever epoch `--epoch` names. When there is one, `--force` first runs the node's own
+/// start-time step on the epochs directory (`ConsensusChain::recover_incomplete_installs`), which
+/// puts each one back (and removes an aside left beside its `epoch-N`), so the restored epoch is
+/// then checked like any other, and counted once. Repair-all mode counts an interrupted install as
+/// the epoch it puts back when it picks the latest epoch to skip, so the dry run skips the same
+/// epochs `--force` does: a restored latest epoch is skipped like any latest epoch. The dry run
+/// does not open an interrupted install's copy: it names each one `--force` checks once it has put
+/// it back, and `telcoin-network db validate --epoch N` checks that copy now.
 #[derive(Debug, Args)]
 pub struct DbRepairArgs {
     /// Repair only this epoch. Without it, every epoch except the current/latest is repaired.
@@ -965,7 +1147,17 @@ impl DbRepairArgs {
 
         // An interrupted install hides its epoch from the listing below. With `--force`, put each
         // back as the node's next start would, so the restored epoch is checked with the others.
+        // An `--epoch` that names neither is refused first, so a mistyped one changes nothing.
+        let list_epochs = || {
+            ConsensusPack::epoch_dirs(&epochs_dir)
+                .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))
+        };
         let interrupted = interrupted_installs(&epochs_dir)?;
+        if let Some(e) = self.epoch {
+            if !list_epochs()?.contains(&e) && !interrupted.contains(&e) {
+                bail!("epoch {e} not found under {}", epochs_dir.display());
+            }
+        }
         let (restored, interrupted) = if self.force && !interrupted.is_empty() {
             ConsensusChain::recover_incomplete_installs(&epochs_dir);
             let left = interrupted_installs(&epochs_dir)?;
@@ -973,16 +1165,18 @@ impl DbRepairArgs {
         } else {
             (Vec::new(), interrupted)
         };
-        let all = ConsensusPack::epoch_dirs(&epochs_dir)
-            .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
-        if let Some(e) = self.epoch {
-            if !all.contains(&e) && !interrupted.contains(&e) {
-                bail!("epoch {e} not found under {}", epochs_dir.display());
-            }
-        }
+        let all = list_epochs()?;
         // `interrupted` is what is still to put back (after `--force`'s restore, only what it
         // failed to restore, and `all` holds what it restored), so both modes pick the same latest.
         let (mut targets, skipped_current) = repair_targets(&all, &interrupted, self.epoch);
+        // the dry run's interrupted installs that `--force` checks once it has put them back (the
+        // one `--epoch` names, or every one but the skipped latest): the dry run does not open
+        // their copies
+        let checked_once_restored: Vec<Epoch> = interrupted
+            .iter()
+            .copied()
+            .filter(|&e| self.epoch.map_or(Some(e) != skipped_current, |named| named == e))
+            .collect();
         targets.retain(|e| !interrupted.contains(e));
         if let Some(cur) = skipped_current {
             writeln!(
@@ -1022,6 +1216,15 @@ impl DbRepairArgs {
                         "epoch {epoch}: ERROR — {note}, but putting it back failed: with the node \
                          stopped, rename `epoch-{epoch}.replaced` to `epoch-{epoch}`"
                     )?;
+                } else if checked_once_restored.contains(epoch) {
+                    actionable += 1;
+                    writeln!(
+                        out,
+                        "epoch {epoch}: would restore, then check — {note}; `--force` puts it \
+                         back, then repairs or migrates its copy as it does any epoch's pack (this \
+                         dry run does not open the copy: `telcoin-network db validate --epoch \
+                         {epoch}` checks it now)"
+                    )?;
                 } else {
                     actionable += 1;
                     writeln!(
@@ -1034,7 +1237,10 @@ impl DbRepairArgs {
                 match ConsensusPack::repair_epoch(&epochs_dir, *epoch, self.force).await {
                     Ok(EpochRepair::Healthy) => writeln!(out, "epoch {epoch}: OK")?,
                     Ok(EpochRepair::Repaired(what)) => {
-                        actionable += 1;
+                        // an epoch put back above is counted once
+                        if !restored.contains(epoch) {
+                            actionable += 1;
+                        }
                         writeln!(out, "epoch {epoch}: REPAIRED — {what}")?;
                     }
                     Ok(EpochRepair::WouldRepair(what)) => {
@@ -2715,7 +2921,9 @@ mod tests {
     /// Repair-all mode skips the same latest epoch in the dry run as with `--force` when that epoch
     /// is an interrupted install: the dry run leaves `epoch-2.replaced` in place, `--force` puts it
     /// back as `epoch-2` first, and both skip epoch 2 and check epoch 1, so the dry run previews
-    /// what `--force` does.
+    /// what `--force` does. The dry run does not open an interrupted install's copy, so it says
+    /// which ones `--force` checks once it has put them back (and how to check one now), and a
+    /// restored epoch that is then repaired counts once.
     #[test]
     fn db_repair_skips_the_same_latest_epoch_in_both_modes_beside_an_interrupted_install() {
         use tn_config::TelcoinDirs as _;
@@ -2739,8 +2947,63 @@ mod tests {
                     "force {force}: epoch {epoch} is checked: {report}"
                 );
             }
+            if !force {
+                // the skipped latest epoch is put back, not checked
+                assert!(report.contains("epoch 2: would restore — "), "{report}");
+                assert!(!report.contains("then check"), "{report}");
+                // named, it is checked once put back
+                let mut out = Vec::new();
+                let _ =
+                    super::DbRepairArgs { epoch: Some(2), force }.run(datadir.clone(), &mut out);
+                let report = String::from_utf8(out).unwrap();
+                assert!(report.contains("epoch 2: would restore, then check — "), "{report}");
+                assert!(report.contains("`telcoin-network db validate --epoch 2`"), "{report}");
+            }
         }
         assert!(epochs.join("epoch-2").is_dir(), "--force put the interrupted install back");
+
+        // an interrupted install below the latest epoch is checked once put back, and counted once
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        // meta-only packs with no indexes: `db repair` rebuilds the indexes
+        for epoch in [1, 2] {
+            write_meta_only_pack(&epochs, epoch);
+        }
+        fs::rename(epochs.join("epoch-1"), epochs.join("epoch-1.replaced")).unwrap();
+        let mut out = Vec::new();
+        super::DbRepairArgs { epoch: None, force: false }
+            .run(datadir.clone(), &mut out)
+            .expect("the dry run finds only what --force does");
+        let report = String::from_utf8(out).unwrap();
+        assert!(report.contains("epoch 1: would restore, then check — "), "{report}");
+        assert!(report.contains("epoch 2: SKIPPED"), "{report}");
+        let mut out = Vec::new();
+        super::DbRepairArgs { epoch: None, force: true }
+            .run(datadir.clone(), &mut out)
+            .expect("--force puts epoch 1 back and repairs it");
+        let report = String::from_utf8(out).unwrap();
+        assert!(report.contains("epoch 1: RESTORED"), "{report}");
+        assert!(report.contains("epoch 1: REPAIRED"), "{report}");
+        assert!(report.contains("summary: 1 epoch(s) repaired"), "counted once: {report}");
+    }
+
+    /// `db repair --force` with an `--epoch` that names no epoch refuses before it puts back an
+    /// interrupted install, so a mistyped epoch changes nothing.
+    #[test]
+    fn db_repair_refuses_an_unknown_epoch_before_it_restores() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        let aside = epochs.join("epoch-2.replaced");
+        fs::create_dir_all(&aside).unwrap();
+        let err = super::DbRepairArgs { epoch: Some(9), force: true }
+            .run(datadir, &mut Vec::new())
+            .expect_err("there is no epoch 9");
+        assert!(format!("{err:#}").contains("epoch 9 not found"), "{err:#}");
+        assert!(aside.is_dir(), "the interrupted install is left as it was");
+        assert!(!epochs.join("epoch-2").exists(), "nothing was put back");
     }
 
     #[cfg(unix)]
@@ -2887,6 +3150,61 @@ mod tests {
         assert!(format!("{err:#}").contains("INTERRUPTED INSTALL"), "{err:#}");
     }
 
+    /// A torn epoch meta's report gives only the action for where the epoch stands: beside an
+    /// interrupted install of a later epoch (which the node's next start puts back) it is a past
+    /// epoch, whose outputs are lost, so `db validate --epoch N` neither advises removing it nor
+    /// warns that it is the latest epoch; with no later epoch it is the newest, which may be
+    /// removed.
+    #[test]
+    fn db_validate_counts_an_interrupted_install_as_a_later_epoch_for_a_torn_meta() {
+        use tn_config::TelcoinDirs as _;
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+            consensus_pack::{PackRecord, PACK_VERSION},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        let epoch_dir = epochs.join("epoch-1");
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let data_file = epoch_dir.join(super::DATA_NAME);
+        // a header, then a meta size prefix claiming more bytes than follow it
+        drop(
+            Pack::<PackRecord>::open(&data_file, 1, false, PackCompression::ZStd, PACK_VERSION)
+                .expect("create pack"),
+        );
+        let mut bytes = fs::read(&data_file).unwrap();
+        bytes.truncate(DATA_HEADER_BYTES);
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 10]);
+        fs::write(&data_file, &bytes).unwrap();
+        fs::create_dir_all(epochs.join("epoch-2.replaced")).unwrap();
+
+        let validate = || {
+            let mut out = Vec::new();
+            let args = super::DbValidateArgs { path: None, epoch: Some(1), all: false };
+            let result = args.run(&datadir, &mut out);
+            (result, String::from_utf8(out).unwrap())
+        };
+        let (result, report) = validate();
+        assert!(result.is_err(), "a torn epoch meta fails validation");
+        assert!(report.contains("torn epoch-meta record"), "{report}");
+        assert!(report.contains("This is a past epoch"), "{report}");
+        assert!(!report.contains("remove this `epoch-N` directory"), "{report}");
+        assert!(
+            !super::live_epoch_reason(&data_file, 1).is_some_and(|why| why.contains("latest")),
+            "epoch 1 is not the latest epoch beside epoch 2's install"
+        );
+
+        // with no later epoch, it is the newest: only the removal branch is given
+        fs::remove_dir(epochs.join("epoch-2.replaced")).unwrap();
+        let (result, report) = validate();
+        assert!(result.is_err(), "a torn epoch meta fails validation");
+        assert!(report.contains("This is the node's newest epoch"), "{report}");
+        assert!(report.contains("remove this `epoch-N` directory"), "{report}");
+        assert!(!report.contains("past epoch"), "{report}");
+    }
+
     /// `db --help` lists each command on one line, with the details in the command's own help,
     /// and names both databases; `validate` says itself when the node must be stopped.
     #[test]
@@ -3015,17 +3333,24 @@ mod tests {
     /// A torn tail is only self-healing in the current epoch; whether a pack is a past epoch is
     /// read from the epochs directory beside it.
     #[test]
-    fn later_epoch_exists_reads_the_epochs_directory() {
+    fn later_epoch_beside_reads_the_epochs_directory() {
         let dir = tempfile::tempdir().unwrap();
         for epoch in [3, 4] {
             fs::create_dir_all(dir.path().join(format!("epoch-{epoch}"))).unwrap();
         }
         let data = |epoch: u32| dir.path().join(format!("epoch-{epoch}")).join(super::DATA_NAME);
-        assert!(super::later_epoch_exists(&data(3), 3), "epoch 4 follows epoch 3");
-        assert!(!super::later_epoch_exists(&data(4), 4), "epoch 4 is the latest");
+        assert_eq!(super::later_epoch_beside(&data(3), 3), Some(true), "epoch 4 follows epoch 3");
+        assert_eq!(super::later_epoch_beside(&data(4), 4), Some(false), "epoch 4 is the latest");
+        // an interrupted install of epoch 5 is a later epoch: the node's next start puts it back
+        fs::create_dir_all(dir.path().join("epoch-5.replaced")).unwrap();
+        assert_eq!(
+            super::later_epoch_beside(&data(4), 4),
+            Some(true),
+            "epoch 5's install follows epoch 4"
+        );
         let bare = tempfile::tempdir().unwrap();
         assert!(
-            !super::later_epoch_exists(&bare.path().join(super::DATA_NAME), 0),
+            super::later_epoch_beside(&bare.path().join(super::DATA_NAME), 0).is_none(),
             "a bare data file has no epochs beside it"
         );
     }
@@ -3043,12 +3368,17 @@ mod tests {
         let data = |name: &str| dir.path().join(name).join(super::DATA_NAME);
         assert_eq!(super::newest_epoch_beside(&data("epoch-3")), Some(4));
         assert!(
-            super::later_epoch_exists(&data("epoch-3"), 3),
+            super::later_epoch_beside(&data("epoch-3"), 3) == Some(true),
             "epoch 4's install follows epoch 3"
         );
-        assert!(!super::later_epoch_exists(&data("epoch-4.replaced"), 4), "epoch 4 is the newest");
+        assert_eq!(
+            super::later_epoch_beside(&data("epoch-4.replaced"), 4),
+            Some(false),
+            "epoch 4 is the newest"
+        );
         assert!(
-            super::require_current_epoch_for_tail(&data("epoch-3"), 3).is_err(),
+            super::require_current_epoch_for_tail(&data("epoch-3"), 3, &mut std::io::sink())
+                .is_err(),
             "without a hint, epoch 3 is past once epoch 4 is put back"
         );
         assert_eq!(super::live_epoch_reason(&data("epoch-3"), 3), None, "epoch 3 is not live");
@@ -3059,7 +3389,11 @@ mod tests {
 
         fs::remove_dir(dir.path().join("epoch-4.replaced")).unwrap();
         assert_eq!(super::newest_epoch_beside(&data("epoch-3")), Some(3));
-        assert!(!super::later_epoch_exists(&data("epoch-3"), 3), "epoch 3 is the newest again");
+        assert_eq!(
+            super::later_epoch_beside(&data("epoch-3"), 3),
+            Some(false),
+            "epoch 3 is the newest again"
+        );
     }
 
     /// Whether a pack is a past epoch comes from the latest-consensus hint the node resumes from,
@@ -3085,7 +3419,10 @@ mod tests {
             fs::write(dir.path().join("consensus_slot1"), &slot).unwrap();
             fs::write(dir.path().join("consensus_slot2"), []).unwrap();
         };
-        let past = |epoch: u32| super::require_current_epoch_for_tail(&data(epoch), epoch).is_err();
+        let past = |epoch: u32| {
+            super::require_current_epoch_for_tail(&data(epoch), epoch, &mut std::io::sink())
+                .is_err()
+        };
 
         assert!(past(3), "without a hint the directory listing decides: epoch 4 follows epoch 3");
         write_hint(3);
@@ -3488,8 +3825,11 @@ mod tests {
             pack.commit().unwrap();
         };
         let validate = || {
-            super::DbValidateArgs { path: Some(epoch_dir.clone()), epoch: None, all: false }
-                .execute(&dir.path().to_path_buf())
+            let mut out = Vec::new();
+            let result =
+                super::DbValidateArgs { path: Some(epoch_dir.clone()), epoch: None, all: false }
+                    .run(&dir.path().to_path_buf(), &mut out);
+            (result, String::from_utf8(out).unwrap())
         };
 
         // The meta's committee must decode (a real committee of more than one authority).
@@ -3501,12 +3841,17 @@ mod tests {
             PackRecord::EpochMeta(EpochMeta { committee: committee.build(), ..Default::default() });
         write_v0(std::slice::from_ref(&meta));
         assert_eq!(super::legacy_migration_dry_run(&data_file, 0), Ok(0));
-        assert!(validate().is_ok(), "a v0 pack that migrates cleanly validates");
+        let (result, report) = validate();
+        assert!(result.is_ok(), "a v0 pack that migrates cleanly validates: {report}");
+        // only `db migrate` converts it: the node's transaction reads of it fail until then
+        assert!(report.contains("`telcoin-network db migrate --force` converts it"), "{report}");
+        assert!(report.contains("reads of its transactions by position fail"), "{report}");
+        assert!(!report.contains("when it opens or reads"), "{report}");
 
         // A batch with no consensus header after it belongs to no output: the migration refuses.
         write_v0(&[meta, PackRecord::Batch(tn_types::Batch::default())]);
         assert!(super::legacy_migration_dry_run(&data_file, 0).is_err());
-        assert!(validate().is_err(), "a v0 pack the migration refuses fails validation");
+        assert!(validate().0.is_err(), "a v0 pack the migration refuses fails validation");
     }
 
     #[test]
@@ -4961,9 +5306,9 @@ mod tests {
         }
     }
 
-    /// `db validate --all` validates an interrupted install's last good copy, which the node's
-    /// next start puts back, in place of its missing `epoch-N`, and fails naming the epoch when
-    /// that copy does not validate, as `--epoch N` fails for it.
+    /// `db validate --all` and `--epoch N` validate an interrupted install's last good copy, which
+    /// the node's next start puts back, in place of its missing `epoch-N`: both pass a healthy
+    /// copy, and both fail a damaged one, `--all` naming the epoch.
     #[test]
     fn db_validate_all_validates_an_interrupted_installs_copy() {
         use tn_config::TelcoinDirs as _;
@@ -4980,6 +5325,7 @@ mod tests {
                 .execute(datadir.clone())
         };
         validate(None, true).expect("every epoch validates, the interrupted install's copy too");
+        validate(Some(1), false).expect("epoch 1's copy validates");
 
         // damage the copy past its meta: `--all` fails naming epoch 1, as `--epoch 1` does
         let data = epochs.join("epoch-1.replaced").join(super::DATA_NAME);
@@ -4990,7 +5336,174 @@ mod tests {
         let err = validate(None, true).expect_err("the interrupted install's copy is damaged");
         assert!(format!("{err:#}").contains("1 of 3 epoch pack(s)"), "{err:#}");
         assert!(format!("{err:#}").contains("epoch(s) 1 "), "{err:#}");
-        let _ = validate(Some(1), false).expect_err("epoch 1 is an interrupted install");
+        let _ = validate(Some(1), false).expect_err("epoch 1's copy is damaged");
+    }
+
+    /// `db validate --all` walks every epoch from the lowest pack present to the newest: a missing
+    /// past epoch fails, named, as does a missing resume epoch, while one after the resume epoch is
+    /// named as fetched by the next start without failing. A datadir starting at a later epoch (as
+    /// `db load-state` leaves one) is not missing the epochs below its lowest pack.
+    #[test]
+    fn db_validate_all_fails_naming_a_missing_epoch() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        for epoch in 0..=3 {
+            write_meta_only_pack(&epochs, epoch);
+        }
+        let validate_all = || {
+            let mut out = Vec::new();
+            let args = super::DbValidateArgs { path: None, epoch: None, all: true };
+            let result = args.run(&datadir, &mut out);
+            (result, String::from_utf8(out).unwrap())
+        };
+        let hint = |epoch| {
+            super::ConsensusChain::write_latest_consensus_hint(&epochs, epoch, 100).unwrap()
+        };
+        hint(3);
+        fs::remove_dir_all(epochs.join("epoch-1")).unwrap();
+        let (result, report) = validate_all();
+        let err = format!("{:#}", result.expect_err("a past epoch is missing"));
+        assert!(report.contains("epoch 1: MISSING"), "{report}");
+        assert!(report.contains("db import-epoch"), "the lost-pack remedy: {report}");
+        assert!(err.contains("1 of 4 epoch pack(s)"), "{err}");
+        assert!(err.contains("epoch(s) 1 "), "{err}");
+
+        // the resume epoch missing fails too: the start refuses without it
+        hint(1);
+        let (result, report) = validate_all();
+        assert!(result.is_err(), "{report}");
+        assert!(report.contains("it is the epoch the node resumes from"), "{report}");
+
+        // after the resume epoch, the next start fetches it
+        hint(0);
+        let (result, report) = validate_all();
+        result.expect("a missing epoch after the resume epoch is fetched by the next start");
+        assert!(report.contains("epoch 1: MISSING"), "{report}");
+        assert!(report.contains("the node's next start fetches it from peers"), "{report}");
+        assert!(report.contains("epoch(s) 1 missing, fetched by the next start"), "{report}");
+
+        // packs 2..=3 alone, as a datadir restored at epoch 2 holds them, miss nothing
+        hint(3);
+        fs::remove_dir_all(epochs.join("epoch-0")).unwrap();
+        let (result, report) = validate_all();
+        result.expect("no epoch is missing from 2 to 3");
+        assert!(!report.contains("MISSING"), "{report}");
+    }
+
+    /// `db validate --epoch N` and `--all` check a past epoch's pack against the datadir's epoch
+    /// records after it validates: a pack holding only its meta, below the epoch the node resumes
+    /// from, is INVALID once the record of its epoch names a final output, and only reported not
+    /// checked while that record is not written yet. The path form checks integrity only, and
+    /// the epoch the node resumes from is never judged.
+    #[test]
+    fn db_validate_checks_a_past_pack_against_the_epoch_records() {
+        use tn_config::TelcoinDirs as _;
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression},
+            consensus_pack::{EpochMeta, PackRecord, PACK_VERSION},
+            epoch_records::EpochRecordDb,
+        };
+        use tn_types::{ConsensusNumHash, EpochRecord, B256};
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        let signers = test_signers(40, 4);
+        let keys: Vec<_> = signers.iter().map(|signer| signer.public_key()).collect();
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            final_consensus: ConsensusNumHash { number: 3, hash: B256::repeat_byte(3).into() },
+            ..Default::default()
+        };
+        let record1 = EpochRecord {
+            epoch: 1,
+            committee: keys.clone(),
+            next_committee: keys,
+            parent_hash: record0.digest(),
+            final_consensus: ConsensusNumHash { number: 6, hash: B256::repeat_byte(6).into() },
+            ..Default::default()
+        };
+        // epoch 1's pack holds only its meta, chained to record 0: whole as far as it goes
+        write_meta_only_pack(&epochs, 0);
+        write_meta_only_pack(&epochs, 2);
+        let mut committee = tn_types::CommitteeBuilder::new(1);
+        for (i, signer) in signers.iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        let meta = PackRecord::EpochMeta(EpochMeta {
+            epoch: 1,
+            committee: committee.build(),
+            start_consensus_number: 4,
+            genesis_exec_state: record0.final_state,
+            genesis_consensus: record0.final_consensus,
+        });
+        fs::create_dir_all(epochs.join("epoch-1")).unwrap();
+        let mut pack = Pack::<PackRecord>::open(
+            epochs.join("epoch-1").join(super::DATA_NAME),
+            1,
+            false,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )
+        .unwrap();
+        pack.append(&meta).unwrap();
+        pack.commit().unwrap();
+        drop(pack);
+        super::ConsensusChain::write_latest_consensus_hint(&epochs, 2, 7).unwrap();
+        let save = |records: &[&EpochRecord]| {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let db = EpochRecordDb::open(&epochs).unwrap();
+                for record in records {
+                    db.save_record((*record).clone()).await.unwrap();
+                }
+                db.persist().await.unwrap();
+                db.close().await;
+            });
+        };
+        let validate = |path: Option<std::path::PathBuf>, epoch, all| {
+            let mut out = Vec::new();
+            let result = super::DbValidateArgs { path, epoch, all }.run(&datadir, &mut out);
+            (result, String::from_utf8(out).unwrap())
+        };
+
+        // the record of epoch 1 is not written yet (the epoch just closed): not checked
+        save(&[&record0]);
+        let (result, report) = validate(None, Some(1), false);
+        result.expect("a pack its records cannot judge yet passes");
+        assert!(
+            report.contains("not checked against the epoch records: this node holds no record"),
+            "{report}"
+        );
+
+        // with it written, the pack is not the whole epoch
+        save(&[&record1]);
+        let (result, report) = validate(None, Some(1), false);
+        assert!(result.is_err(), "{report}");
+        assert!(report.contains("INVALID: "), "{report}");
+        assert!(report.contains("not the epoch's certified final output 6"), "{report}");
+        let (result, report) = validate(None, None, true);
+        let err = format!("{:#}", result.expect_err("--all fails for epoch 1"));
+        assert!(err.contains("epoch(s) 1 "), "{err}");
+        assert!(report.contains("epoch 0: not checked against the epoch records"), "{report}");
+        assert!(
+            report.contains("epoch 2: not checked against the epoch records: it is not a past"),
+            "{report}"
+        );
+
+        // the path form checks integrity only
+        let (result, report) = validate(Some(epochs.join("epoch-1")), None, false);
+        result.expect("the path form checks integrity only");
+        assert!(report.contains("not checked against the epoch records"), "{report}");
+
+        // the epoch the node resumes from is the node's to write: never judged
+        super::ConsensusChain::write_latest_consensus_hint(&epochs, 1, 4).unwrap();
+        let (result, report) = validate(None, Some(1), false);
+        result.expect("the resume epoch is not judged against the records");
+        assert!(report.contains("it is not a past epoch"), "{report}");
     }
 
     /// `db import-epoch` parses its epoch, copy and `--force`, needs both of the first two, and
