@@ -30,8 +30,8 @@
 # Exit codes:
 #   0  ok
 #   1  a policy or verification check failed
-#   2  usage or precondition: bad TAG, missing tool, wrong host, missing draft, or a prompt
-#      with no TTY and no RELEASE_YES=1
+#   2  usage or precondition: bad TAG, missing tool, wrong host, missing draft, a release
+#      submodule that is not checked out, or a prompt with no TTY and no RELEASE_YES=1
 #   3  an external service (adiri RPC, GitHub API, registry) stayed unavailable after retries
 #
 # Images: one ghcr package per network, chosen by the tag alone. A mainnet tag (vX.Y.Z or
@@ -41,6 +41,16 @@
 # publish and draft refuse an IMAGE_DIGEST that names an image anywhere else, and the channel
 # alias (latest, adiri) moves only inside the package. A package comes into existence with its
 # first push, which build makes only with RELEASE_FIRST_PUSH set to the package.
+#
+# Maintainer keys: the allowlist (release/keys/*.asc) and the signature threshold (the line
+# "Signatures required: N" of release/KEYS.md) come from the tn-release-signing submodule at
+# release/, at the commit MAIN_REF records for it. They are read from the submodule's object
+# store, which fetches that commit from the submodule's origin when it lacks it, never from the
+# checked-out files, the tag or this repository's own tree; a MAIN_REF without the submodule
+# stops every step that needs a key. A tag therefore cannot introduce a key: the pointer is
+# read from main, and moving it needs a code owner's review. MIN_SIGNATURES may exceed the
+# threshold KEYS.md states but not fall below it (exit 1). Each checkout needs
+# `git submodule update --init -- release` after pulling main.
 #
 # Environment (all optional):
 #   RELEASE_REPO                   owner/repo of the GitHub repository; default
@@ -67,7 +77,8 @@
 # A dry run never calls gh or git push and pushes images only to RELEASE_IMAGE.
 #   RELEASE_IMAGE                  image repository on localhost:PORT/ or 127.0.0.1:PORT/; it
 #                                  replaces the whole image name, package included
-#   RELEASE_ALLOWLIST_DIR          directory of *.asc used instead of main's allowlist
+#   RELEASE_ALLOWLIST_DIR          directory of *.asc used instead of main's allowlist; needs
+#                                  no submodule, and KEYS.md's threshold is not read
 #   RELEASE_MAIN_REF               ref used instead of refs/remotes/origin/main; no fetch
 #   RELEASE_ATTESTATION=skip       skip the on-chain attestation check
 #   RELEASE_DIR                    directory that stands in for the GitHub draft release
@@ -86,7 +97,10 @@ DEFAULT_REPO=Telcoin-Association/telcoin-network
 TRIPLE=x86_64-unknown-linux-gnu
 MIN_SIGNATURES=1
 MAIN_REF=refs/remotes/origin/main
-ALLOWLIST_PATH=.github/maintainer-gpg-keys
+# The tn-release-signing submodule and the allowlist inside it, the values the shared
+# release/release.sh takes as SELF_REPO_PATH and KEYS_PATH in its submodule layout.
+SIGNING_PATH=release
+ALLOWLIST_PATH=$SIGNING_PATH/keys
 GIT_CLIFF_IMAGE=ghcr.io/orhun/git-cliff/git-cliff:2.10.1@sha256:6ba0d1fcb051bd7b154cfb19c4b2b3bfa2c22c475f5285fc30606777b6573119
 ARTIFACT_ROOT=target/release-artifacts
 
@@ -264,6 +278,66 @@ require_registry_login() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# The tn-release-signing submodule
+#
+# See "Maintainer keys" at the top: MAIN_REF records the submodule at SIGNING_PATH as a gitlink
+# (mode 160000), and load_allowlist reads from the submodule's object store at that commit.
+
+# The commit MAIN_REF records for SIGNING_PATH when that is a gitlink, else nothing. Call after
+# require_main_ref. Its output is captured, so callers pass a die on with `|| exit`.
+main_gitlink() {
+    local entry
+    entry=$(git ls-tree "$MAIN_REF" "$SIGNING_PATH") || die 2 "cannot list $SIGNING_PATH on $MAIN_REF"
+    printf '%s\n' "$entry" | awk '$1 == "160000" && $2 == "commit" { print $3 }'
+}
+
+# git -C on the empty directory of a submodule that is not checked out would read this
+# repository instead, so the submodule must be the top of a work tree of its own.
+require_submodule_checkout() {
+    local prefix
+    if prefix=$(git -C "$SIGNING_PATH" rev-parse --show-prefix 2>/dev/null) && [ -z "$prefix" ]; then
+        return 0
+    fi
+    die 2 "submodule layout: $SIGNING_PATH is a submodule on $MAIN_REF but is not checked out here; run git submodule update --init -- $SIGNING_PATH"
+}
+
+# KEYS.md at commit $1 of the submodule states the signature threshold, on its one line
+# "Signatures required: N", for every project that records that commit; MIN_SIGNATURES may
+# require more, never fewer. Call after submodule_fetch.
+check_keys_threshold() {
+    local gitlink=$1 sub=$SIGNING_PATH text required
+    text=$(git -C "$sub" show "$gitlink:KEYS.md" 2>/dev/null) ||
+        die 1 "submodule layout: $sub at $gitlink, the commit $MAIN_REF records, has no KEYS.md to read the signature threshold from"
+    required=$(printf '%s\n' "$text" | awk '
+        /^Signatures required: *[0-9]+\.?[ \t]*$/ { n++; v = $0; sub(/^Signatures required: */, "", v); sub(/\.?[ \t]*$/, "", v) }
+        END { if (n == 1) print v + 0 }')
+    [ -n "$required" ] ||
+        die 1 "submodule layout: KEYS.md in $sub at $gitlink, the commit $MAIN_REF records, must state the threshold on one line 'Signatures required: N'"
+    [ "$MIN_SIGNATURES" -ge "$required" ] ||
+        die 1 "submodule layout: MIN_SIGNATURES=$MIN_SIGNATURES in etc/release.sh is below the $required signatures KEYS.md requires in $sub at $gitlink, the commit $MAIN_REF records; raise it to at least $required"
+}
+
+# Makes commit $1 of the submodule present in its object store. A checkout made before main
+# moved the pointer, or a shallow one (CI), lacks it: fetch it from the submodule's origin by
+# id, or the origin's branches where a server refuses an id it does not advertise. Retried
+# like git_fetch.
+submodule_fetch() {
+    local sha=$1 sub=$SIGNING_PATH attempt=1
+    if git -C "$sub" cat-file -e "$sha^{commit}" 2>/dev/null; then return 0; fi
+    git -C "$sub" remote get-url origin >/dev/null 2>&1 ||
+        die 2 "submodule layout: $sub lacks $sha, the commit $MAIN_REF records, and has no remote named origin to fetch it from"
+    info "submodule layout: fetching $sha, the commit $MAIN_REF records, into $sub from its origin"
+    until git -C "$sub" fetch --quiet --no-tags origin "$sha" 2>/dev/null ||
+        git -C "$sub" fetch --quiet --no-tags origin; do
+        [ "$attempt" -lt 3 ] || die 3 "git fetch in $sub from its origin failed after 3 attempts"
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    git -C "$sub" cat-file -e "$sha^{commit}" 2>/dev/null ||
+        die 1 "submodule layout: $MAIN_REF records $sha for $sub, but neither its checkout nor its origin has that commit"
+}
+
+# ---------------------------------------------------------------------------------------------
 # Tag grammar
 
 # Splits TAG into the variables `parse` prints. Exit 2 for anything but a release tag.
@@ -339,10 +413,17 @@ primary_fprs() {
 }
 
 # Imports the maintainer keys from main (never from the tagged tree) into a private keyring.
+# main holds no key files, only the gitlink of the submodule at SIGNING_PATH, so they are read
+# from the submodule's object store at the commit MAIN_REF records, never from its checkout:
+# neither a tag nor a checkout can add a key. The threshold KEYS.md states at that commit is
+# checked there too (check_keys_threshold).
 # Sets ALLOW_GNUPGHOME and ALLOW_LIST ("handle<TAB>primary fingerprint", one line per primary
 # key; a file may hold several during a rotation). Thresholds count distinct handles.
+# ALLOW_LIST is in the byte order of the handles, each file's keys in the file's order: a glob
+# sorts in the locale's collation, and render_notes prints ALLOW_LIST as the body's key table,
+# which publish compares line for line with the body another machine wrote.
 load_allowlist() {
-    local src where names name file fprs fpr handles
+    local src where names name file fprs fpr handles repo rev gitlink
     if [ -n "$ALLOW_GNUPGHOME" ]; then return 0; fi
     need gpg
     src=$WORK/allowlist
@@ -358,13 +439,24 @@ load_allowlist() {
         done
     else
         require_main_ref
-        where="$MAIN_REF:$ALLOWLIST_PATH"
-        names=$(git ls-tree --name-only "$where" 2>/dev/null) ||
-            die 1 "$ALLOWLIST_PATH does not exist on $MAIN_REF"
+        gitlink=$(main_gitlink) || exit
+        # No fallback to a directory of this repository: keys committed here would bypass the
+        # review that moving the submodule pointer gets.
+        [ -n "$gitlink" ] ||
+            die 1 "main must record the $SIGNING_PATH submodule (tn-release-signing), but $MAIN_REF has no submodule at $SIGNING_PATH; maintainer keys are never read from this repository's own tree"
+        require_submodule_checkout
+        submodule_fetch "$gitlink"
+        check_keys_threshold "$gitlink"
+        repo=$SIGNING_PATH
+        rev="$gitlink:${ALLOWLIST_PATH#"$SIGNING_PATH"/}"
+        where="$SIGNING_PATH submodule $rev"
+        info "submodule layout: maintainer keys from $SIGNING_PATH at $gitlink, the commit $MAIN_REF records"
+        names=$(git -C "$repo" ls-tree --name-only "$rev" 2>/dev/null) ||
+            die 1 "$ALLOWLIST_PATH does not exist on $MAIN_REF (submodule layout: $SIGNING_PATH at $gitlink has no ${ALLOWLIST_PATH#"$SIGNING_PATH"/})"
         while IFS= read -r name; do
             case "$name" in *.asc*) ;; *) continue ;; esac
             allowlist_name "$name" "$where"
-            git show "$where/$name" >"$src/$name" || die 1 "cannot read $where/$name"
+            git -C "$repo" show "$rev/$name" >"$src/$name" || die 1 "cannot read $where/$name"
         done <<EOF
 $names
 EOF
@@ -396,7 +488,7 @@ EOF
         gpg --homedir "$ALLOW_GNUPGHOME" --batch --quiet --import "$file" >/dev/null 2>&1 ||
             die 1 "cannot import $where/$name"
     done
-    ALLOW_LIST=$(cat "$WORK/allowlist.tsv")
+    ALLOW_LIST=$(LC_ALL=C sort -s -t $'\t' -k1,1 "$WORK/allowlist.tsv")
     [ -n "$ALLOW_LIST" ] || die 1 "no maintainer keys in $where"
     handles=$(cut -f1 "$WORK/allowlist.tsv" | LC_ALL=C sort -u | count_lines)
     [ "$THRESHOLD" -le "$handles" ] ||
@@ -1469,10 +1561,11 @@ REPO=@REPO@
 BASE="https://github.com/$REPO/releases/download/$TAG"
 if [ -n "$(ls -A)" ]; then echo "Run these commands in a new, empty directory" >&2; false; fi &&
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
+git -C tn-main submodule update --init --depth 1 -- release &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
 git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
-for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
-gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
+for k in tn-main/release/keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
+gpg --show-keys --with-fingerprint tn-main/release/keys/*.asc &&
 curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" "$BASE/telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
 gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
 awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
@@ -1482,7 +1575,7 @@ echo "Signature and hashes verified"
 
 If the last line `Signature and hashes verified` is missing, the files are not verified; stop, do not extract or run anything from this release, and report it.
 
-Then check the key fingerprints: every primary key fingerprint `gpg --show-keys` printed, including the one after `signed by primary key`, must appear in the maintainer release keys table in `tn-main/SECURITY.md` (the same `main` checkout, also [on GitHub](https://github.com/@REPO@/blob/main/SECURITY.md#maintainer-release-keys)) with a Status that is not `revoked`, and in `https://github.com/<handle>.gpg`, where `<handle>` is the key file's name without `.asc`. Stop on any mismatch.
+Then check the key fingerprints: every primary key fingerprint `gpg --show-keys` printed, including the one after `signed by primary key`, must appear in the key table of `tn-main/release/KEYS.md` (the same `main` checkout) with a Status that is not `revoked`, and in `https://github.com/<handle>.gpg`, where `<handle>` is the key file's name without `.asc`. Stop on any mismatch.
 
 Maintainer release keys on `main` when these notes were written:
 
@@ -1516,10 +1609,11 @@ REPO=@REPO@
 BASE="https://github.com/$REPO/releases/download/$TAG"
 if [ -n "$(ls -A)" ]; then echo "Run these commands in a new, empty directory" >&2; false; fi &&
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
+git -C tn-main submodule update --init --depth 1 -- release &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
 git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
-for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
-gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
+for k in tn-main/release/keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
+gpg --show-keys --with-fingerprint tn-main/release/keys/*.asc &&
 curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
 gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
 awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
@@ -1551,7 +1645,7 @@ When a check fails, do not extract, install or run anything from this release:
 - Any of `BADSIG`, `ERRSIG`, `EXPSIG`, `EXPKEYSIG` or `REVKEYSIG` stops the block even when another signature in `SHA256SUMS.asc` is good.
 - `sha256sum` prints `FAILED`: a file differs from its signed hash. Check `TAG` and run the block again in a new, empty directory; if it fails again, report it.
 - `sha256sum` prints `FAILED open or read` for a `chain-configs/` file: `git archive` did not extract it. Check that the tag was fetched; if it was, report it.
-- A fingerprint is missing from `SECURITY.md` or GitHub, differs, or has the Status `revoked`. Report it.
+- A fingerprint is missing from `tn-main/release/KEYS.md` or GitHub, differs, or has the Status `revoked`. Report it.
 - `IMAGE_DIGEST does not name an image in @IMAGE@ by digest`: it names another package, such as the other network's, or no digest. Report it.
 - `Commit SHA` is not the tag's commit, or `Build Features` does not match the tag. Report it.
 - `exec format error`, or Docker warns that the image platform does not match the host: the release is Linux x86_64 only. Use an x86_64 host, or build from source.
@@ -2188,6 +2282,10 @@ usage: etc/release.sh <subcommand> <TAG> [options]
 
 TAG is vX.Y.Z, vX.Y.Z-rcN, vX.Y.Z-adiri or vX.Y.Z-adiri-rcN. A mainnet tag's image goes to
 the ghcr package tn-mainnet, an adiri tag's to tn-testnet.
+The maintainer keys (release/keys/*.asc) and the signature threshold (release/KEYS.md) come
+from the tn-release-signing submodule at the commit main records for release/, so a tag cannot
+introduce a key, and moving that pointer needs a code owner's review. After pulling main, run
+git submodule update --init -- release in this checkout.
 See the header of this file for the environment variables and exit codes.
 EOF
     exit 2

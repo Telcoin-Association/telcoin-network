@@ -15,13 +15,18 @@
 #
 # Every job checks out main as it stands when the job starts, never the tagged tree,
 # and takes etc/release.sh, .github/scripts/verify_commit_hash.sh and the key allowlist
-# (.github/maintainer-gpg-keys) from there, for the reason the `attest` job in pr.yaml
+# (release/keys) from there, for the reason the `attest` job in pr.yaml
 # gives: a tag on a commit that edits a script or adds a key would otherwise be judged
 # by its own edit. This file itself is not covered by that. GitHub reads the job
 # definitions from the tagged commit (for a dispatch, from the branch it is run on), so
 # who may push a `v*` tag is decided by the tag ruleset, a repository setting
 # (.github/ACTIONS.md, "Release workflow"). The ruleset limits who can create, move or
 # delete a `v*` tag and nothing else; it does not limit who can write releases.
+#
+# release/ is a submodule, the tn-release-signing repository that holds the maintainer
+# keys. etc/release.sh reads them at the commit main records for it and needs the
+# submodule checked out to do so, which is why every checkout below sets
+# `submodules: true`.
 #
 # The post-publish check (`verify-release`) is detective only. The release is already
 # public when it runs, so a failure is an alarm for a maintainer, not a gate.
@@ -119,6 +124,7 @@ jobs:
         with:
           ref: refs/heads/main
           fetch-depth: 0
+          submodules: true
           persist-credentials: false
 
       # This step supplies `cast` for the read-only registry call, whose answer decides
@@ -195,6 +201,7 @@ jobs:
         with:
           ref: refs/heads/main
           fetch-depth: 0
+          submodules: true
           persist-credentials: false
 
       - name: Create or update the draft release
@@ -222,6 +229,7 @@ jobs:
         with:
           ref: refs/heads/main
           fetch-depth: 0
+          submodules: true
           persist-credentials: false
 
       # This step supplies `cast` for the read-only registry call, whose answer decides

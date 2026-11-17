@@ -2,3 +2,6 @@
 	path = tn-contracts
 	url = https://github.com/Telcoin-Association/tn-contracts.git
 	branch = master
+[submodule "release"]
+	path = release
+	url = https://github.com/Telcoin-Association/tn-release-signing.git
