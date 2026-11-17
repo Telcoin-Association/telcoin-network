@@ -262,7 +262,9 @@ whole `consensus-db` from an older backup lacks the later packs), or
 start the node over (crates/tn-reth/README.md, "Transactions stored by position"), and never delete the
 `epoch-N` directory, which a datadir storing transactions by position needs at every start. Only the
 newest epoch's torn-empty meta or all-zero data file holds no output: the node creates (or
-re-initializes) that epoch again when it enters it. Its read-only recovery checks
+re-initializes) that epoch again when it enters it. The epoch the node resumes from is not entered
+but opened to resume (`open_append_exists`), and the start refuses its all-zero data file, so `db
+repair` gives it a whole restore point or a start over instead (`ConsensusChain::start_resumes`). Its read-only recovery checks
 (shared with `db repair`'s dry run) read the position index's entries straight from the file, so an
 index a crash left unsealed attests the same output boundaries it does to the writable open.
 

@@ -182,6 +182,18 @@ impl LatestConsensus {
         buffer
     }
 
+    /// The `(epoch, number)` [`Self::new`] would resume from under `base_path`, read without
+    /// creating or writing the slot files: the higher of the two slots, an unreadable or missing
+    /// slot counting as `(0, 0)` exactly as `new` treats it.
+    fn read_point(base_path: &Path) -> (Epoch, u64) {
+        ["consensus_slot1", "consensus_slot2"]
+            .into_iter()
+            .filter_map(|name| File::open(base_path.join(name)).ok())
+            .map(|mut slot| Self::read_slot(&mut slot).unwrap_or((0, 0)))
+            .max()
+            .unwrap_or((0, 0))
+    }
+
     /// The epoch [`Self::new`] would resume from under `base_path`, read without creating or
     /// writing the slot files: the higher of the two slots' epochs, an unreadable slot counting as
     /// `(0, 0)` exactly as `new` treats it. `None` when neither slot file exists.
@@ -1289,6 +1301,16 @@ impl ConsensusChain {
     /// `None` when there are no slot files.
     pub fn resume_epoch(base_path: &Path) -> Option<Epoch> {
         LatestConsensus::read_epoch(base_path)
+    }
+
+    /// Whether the node's start on the epochs directory `base_path` opens `epoch`'s pack to resume
+    /// it (`open_append_exists`, which needs the pack's epoch meta and creates nothing), rather
+    /// than creating the epoch (`open_append`, which re-initializes an all-zero data file): the
+    /// epoch the latest-consensus hint resumes, unless the hint is at `(0, 0)` (or missing), where
+    /// the start creates epoch 0. Read without creating or writing the slot files.
+    pub(crate) fn start_resumes(base_path: &Path, epoch: Epoch) -> bool {
+        let (resume, number) = LatestConsensus::read_point(base_path);
+        resume == epoch && (resume, number) != (0, 0)
     }
 
     /// Remove any leftover `staging-*`, `import-*`, or `epoch-*.migrating` directories under
