@@ -81,15 +81,25 @@ services:
     environment:
       - RUST_LOG=info,genesis=debug,engine=debug
       - TN_BLS_PASSPHRASE=local
+      # Address funded at genesis. The default has no key in this repository, so to sign
+      # transactions set TN_DEV_FUNDED_ACCOUNT to an address you hold the key for, in the shell
+      # or etc/.env. It applies to a new genesis only (after `make down`).
+      - TN_DEV_FUNDED_ACCOUNT=${TN_DEV_FUNDED_ACCOUNT:-0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a}
     user: "root"
     command:
       - "bash"
       - "/genesis.sh"
+    # Genesis reads every validator's node-info, so it starts only once each setup has exited 0,
+    # and `up` fails when one of them fails.
     depends_on:
-      - setup1
-      - setup2
-      - setup3
-      - setup4
+      setup1:
+        condition: service_completed_successfully
+      setup2:
+        condition: service_completed_successfully
+      setup3:
+        condition: service_completed_successfully
+      setup4:
+        condition: service_completed_successfully
     volumes:
       - ./genesis.sh:/genesis.sh
       - sharedgenesisdir:/home/nonroot/data/genesis
@@ -106,8 +116,10 @@ services:
   validator1:
     container_name: validator1
     image: local-telcoin-network:latest
+    # Starts once genesis.sh has exited 0, so the chain config is in place.
     depends_on:
-      - comittee
+      comittee:
+        condition: service_completed_successfully
     environment:
       # engine=debug logs execution as hashes and counts; the output and block struct dumps
       # need engine::dump=trace, the per-transaction EVM lines engine::evm=trace.
@@ -139,7 +151,8 @@ services:
     container_name: validator2
     image: local-telcoin-network:latest
     depends_on:
-      - comittee
+      comittee:
+        condition: service_completed_successfully
     environment:
       - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup2 service
@@ -169,7 +182,8 @@ services:
     container_name: validator3
     image: local-telcoin-network:latest
     depends_on:
-      - comittee
+      comittee:
+        condition: service_completed_successfully
     environment:
       - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup3 service
@@ -199,7 +213,8 @@ services:
     container_name: validator4
     image: local-telcoin-network:latest
     depends_on:
-      - comittee
+      comittee:
+        condition: service_completed_successfully
     environment:
       - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup4 service

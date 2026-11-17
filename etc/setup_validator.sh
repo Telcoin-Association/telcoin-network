@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 USER_ID=1101
 
@@ -6,9 +7,9 @@ USER_ID=1101
 if [ ! -d /home/nonroot/data/node-keys ]; then
     echo "creating validator keys"
     export TN_BLS_PASSPHRASE="local"
-    /usr/local/bin/telcoin keytool generate validator --datadir /home/nonroot/data --address "${EXECUTION_ADDRESS}"  --external-primary-addr ${PRIMARY_LISTENER_MULTIADDR} --external-worker-addrs ${WORKER_LISTENER_MULTIADDR}
+    /usr/local/bin/telcoin keytool generate validator --datadir /home/nonroot/data --address "${EXECUTION_ADDRESS}" --external-primary-addr "${PRIMARY_LISTENER_MULTIADDR}" --external-worker-addrs "${WORKER_LISTENER_MULTIADDR}"
 
-    chown -R ${USER_ID}:${USER_ID} /home/nonroot/data
+    chown -R "${USER_ID}:${USER_ID}" /home/nonroot/data
 
     echo "Keys generated and ownership/permissions set"
 
