@@ -4569,8 +4569,7 @@ mod epoch_vote_collector_tests {
             !noticer.noticed(),
             "the round leaves the stop to its error, which the collector returns"
         );
-        let stopped =
-            fork.to_string().contains("this node has forked") && NodeForked::is_in(&fork);
+        let stopped = fork.to_string().contains("this node has forked") && NodeForked::is_in(&fork);
 
         let adopted = db.cert_by_digest(theirs_digest).await.is_some();
         let lines = lines.lock().clone();
