@@ -482,10 +482,14 @@ impl TaskManager {
         do_exit: bool,
     ) -> Result<(), TaskJoinError> {
         let rx_shutdown = shutdown.subscribe();
+        // One signal listener for the whole wait. A listener made inside the loop is dropped
+        // whenever another branch wins the select, and a signal that arrives before the next
+        // one is made is lost: the node then ignores a SIGTERM sent while tasks come and go.
+        let mut exit = pin!(Self::exit(do_exit));
         let mut result = Ok(());
         loop {
             tokio::select! {
-                _ = Self::exit(do_exit) => {
+                _ = &mut exit => {
                     tracing::info!(target: "tn::tasks", "{}: Node exiting", self.name);
                     break;
                 },
@@ -1186,5 +1190,44 @@ mod test {
             "{registered} entries left by {} finished tasks",
             3 * N
         );
+    }
+
+    /// Regression: `until_exit` made a new SIGTERM listener on every turn of its loop, so a
+    /// signal that arrived while a task was being added or reaped (between two listeners) was
+    /// lost and the node kept running. With tasks coming and going the whole time, every SIGTERM
+    /// must end the wait.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sigterm_ends_until_exit_while_tasks_come_and_go() {
+        use tokio::signal::unix::{signal, SignalKind};
+        // keeps the process's SIGTERM handler installed, so a signal never kills the test
+        let _installed = signal(SignalKind::terminate()).expect("sigterm handler");
+        for round in 0..40 {
+            let mut manager = TaskManager::new("sigterm");
+            let spawner = manager.get_spawner();
+            let churn = tokio::spawn(async move {
+                loop {
+                    spawner.spawn_task("short", async { Ok(()) });
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                }
+            });
+            let kill = tokio::spawn(async {
+                // after `until_exit` began its wait
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let status = std::process::Command::new("kill")
+                    .args(["-TERM", &std::process::id().to_string()])
+                    .status()
+                    .expect("kill runs");
+                assert!(status.success(), "kill -TERM failed");
+            });
+            let ended = tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.until_exit(ShutdownNotifier::new()),
+            )
+            .await;
+            churn.abort();
+            kill.await.expect("kill task");
+            assert!(ended.is_ok(), "round {round}: the SIGTERM did not end until_exit");
+        }
     }
 }
