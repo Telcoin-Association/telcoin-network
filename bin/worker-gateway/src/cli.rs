@@ -59,7 +59,7 @@ const MIN_QUIET_V6_PREFIX: u8 = 32;
 
 /// Mostly stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, long_version = crate::version::LONG_VERSION, about, long_about = None)]
 pub(crate) struct Cli {
     /// Address the gateway listens on for client JSON-RPC, and for its own
     /// `/health` (liveness) and `/ready` (readiness) endpoints.

@@ -23,6 +23,7 @@ mod ratelimit;
 mod readiness;
 mod server;
 mod telemetry;
+mod version;
 
 use std::io::IsTerminal as _;
 

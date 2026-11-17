@@ -5,9 +5,10 @@
 # paths the API's build needs: a rust:1.94 builder stage compiles a single
 # stripped release binary, which is copied into a slim debian runtime that runs
 # as a non-root user (uid 1101). Build from the repository root so the whole
-# workspace is in the build context:
+# workspace is in the build context, and pass the commit for `--version`:
 #
-#   docker build -f bin/node-record-api/Dockerfile -t telcoin-node-record-api:<tag> .
+#   docker build -f bin/node-record-api/Dockerfile \
+#     --build-arg GIT_SHA=$(git rev-parse HEAD) -t telcoin-node-record-api:<tag> .
 #
 # The build context needs the tn-contracts submodule checked out (run
 # `make init-submodules` first): the API's dependency graph reaches tn-config,
@@ -64,6 +65,13 @@ COPY patches/ ./patches/
 # The vendored reth: the root Cargo.toml's reth-* dependencies are paths into it.
 COPY vendor/ ./vendor/
 
+# GIT_SHA is the full commit hash `--version` prints: src/version.rs reads
+# VERGEN_GIT_SHA at compile time, so the build needs neither the .git dir nor
+# the git binary. Declared here, after the COPY steps, so a new commit leaves
+# the layers above cached. Defaults to `unknown` for ad-hoc builds.
+ARG GIT_SHA=unknown
+ENV VERGEN_GIT_SHA=${GIT_SHA}
+
 # Build only the API binary, then move it out of the cache mount so the
 # runtime stage can COPY it. --locked makes the build fail instead of resolving
 # versions other than the ones in Cargo.lock.
@@ -76,6 +84,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 # production image (pinned by index digest, see the top of this file)
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+
+# OCI image annotations, as the node image has them: the source label links the
+# ghcr.io package page back to the repository.
+LABEL org.opencontainers.image.source="https://github.com/Telcoin-Association/telcoin-network" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.title="node-record-api" \
+      org.opencontainers.image.description="Telcoin Network node-record API — JSON directory of validators' DHT-advertised RPC endpoints"
 
 # The optional --rpc-url may be https: reqwest is built with rustls and the
 # system root store, so ca-certificates is required at runtime.
