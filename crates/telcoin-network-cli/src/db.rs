@@ -131,7 +131,9 @@ enum DbSubcommand {
     /// open); name it with `--epoch N` once the node is stopped. The node MUST be stopped: it
     /// refuses while a node holds the datadir, and holds the datadir while it runs. The dry run
     /// reports what `--force` would do and changes nothing; it exits 0 when it finds only what
-    /// `--force` would repair. Exits non-zero when anything is unrepairable or a check failed.
+    /// `--force` would repair. It does not open an interrupted install's copy: it names the ones
+    /// `--force` checks once it has put them back, and `db validate --epoch N` checks a copy now.
+    /// Exits non-zero when anything is unrepairable or a check failed.
     Repair(DbRepairArgs),
 
     /// Migrate legacy consensus packs to v2 (dry run unless --force).
@@ -959,9 +961,11 @@ fn records_db_recovery() -> &'static str {
 /// whatever epoch `--epoch` names. When there is one, `--force` first runs the node's own
 /// start-time step on the epochs directory (`ConsensusChain::recover_incomplete_installs`), which
 /// puts each one back (and removes an aside left beside its `epoch-N`), so the restored epoch is
-/// then checked like any other. Repair-all mode counts an interrupted install as the epoch it puts
-/// back when it picks the latest epoch to skip, so the dry run skips (and checks) the same epochs
-/// `--force` does: a restored latest epoch is skipped like any latest epoch.
+/// then checked like any other, and counted once. Repair-all mode counts an interrupted install as
+/// the epoch it puts back when it picks the latest epoch to skip, so the dry run skips the same
+/// epochs `--force` does: a restored latest epoch is skipped like any latest epoch. The dry run
+/// does not open an interrupted install's copy: it names each one `--force` checks once it has put
+/// it back, and `telcoin-network db validate --epoch N` checks that copy now.
 #[derive(Debug, Args)]
 pub struct DbRepairArgs {
     /// Repair only this epoch. Without it, every epoch except the current/latest is repaired.
@@ -1027,6 +1031,14 @@ impl DbRepairArgs {
         // `interrupted` is what is still to put back (after `--force`'s restore, only what it
         // failed to restore, and `all` holds what it restored), so both modes pick the same latest.
         let (mut targets, skipped_current) = repair_targets(&all, &interrupted, self.epoch);
+        // the dry run's interrupted installs that `--force` checks once it has put them back (the
+        // one `--epoch` names, or every one but the skipped latest): the dry run does not open
+        // their copies
+        let checked_once_restored: Vec<Epoch> = interrupted
+            .iter()
+            .copied()
+            .filter(|&e| self.epoch.map_or(Some(e) != skipped_current, |named| named == e))
+            .collect();
         targets.retain(|e| !interrupted.contains(e));
         if let Some(cur) = skipped_current {
             writeln!(
@@ -1066,6 +1078,15 @@ impl DbRepairArgs {
                         "epoch {epoch}: ERROR — {note}, but putting it back failed: with the node \
                          stopped, rename `epoch-{epoch}.replaced` to `epoch-{epoch}`"
                     )?;
+                } else if checked_once_restored.contains(epoch) {
+                    actionable += 1;
+                    writeln!(
+                        out,
+                        "epoch {epoch}: would restore, then check — {note}; `--force` puts it \
+                         back, then repairs or migrates its copy as it does any epoch's pack (this \
+                         dry run does not open the copy: `telcoin-network db validate --epoch \
+                         {epoch}` checks it now)"
+                    )?;
                 } else {
                     actionable += 1;
                     writeln!(
@@ -1078,7 +1099,10 @@ impl DbRepairArgs {
                 match ConsensusPack::repair_epoch(&epochs_dir, *epoch, self.force).await {
                     Ok(EpochRepair::Healthy) => writeln!(out, "epoch {epoch}: OK")?,
                     Ok(EpochRepair::Repaired(what)) => {
-                        actionable += 1;
+                        // an epoch put back above is counted once
+                        if !restored.contains(epoch) {
+                            actionable += 1;
+                        }
                         writeln!(out, "epoch {epoch}: REPAIRED — {what}")?;
                     }
                     Ok(EpochRepair::WouldRepair(what)) => {
@@ -2753,7 +2777,9 @@ mod tests {
     /// Repair-all mode skips the same latest epoch in the dry run as with `--force` when that epoch
     /// is an interrupted install: the dry run leaves `epoch-2.replaced` in place, `--force` puts it
     /// back as `epoch-2` first, and both skip epoch 2 and check epoch 1, so the dry run previews
-    /// what `--force` does.
+    /// what `--force` does. The dry run does not open an interrupted install's copy, so it says
+    /// which ones `--force` checks once it has put them back (and how to check one now), and a
+    /// restored epoch that is then repaired counts once.
     #[test]
     fn db_repair_skips_the_same_latest_epoch_in_both_modes_beside_an_interrupted_install() {
         use tn_config::TelcoinDirs as _;
@@ -2777,8 +2803,45 @@ mod tests {
                     "force {force}: epoch {epoch} is checked: {report}"
                 );
             }
+            if !force {
+                // the skipped latest epoch is put back, not checked
+                assert!(report.contains("epoch 2: would restore — "), "{report}");
+                assert!(!report.contains("then check"), "{report}");
+                // named, it is checked once put back
+                let mut out = Vec::new();
+                let _ =
+                    super::DbRepairArgs { epoch: Some(2), force }.run(datadir.clone(), &mut out);
+                let report = String::from_utf8(out).unwrap();
+                assert!(report.contains("epoch 2: would restore, then check — "), "{report}");
+                assert!(report.contains("`telcoin-network db validate --epoch 2`"), "{report}");
+            }
         }
         assert!(epochs.join("epoch-2").is_dir(), "--force put the interrupted install back");
+
+        // an interrupted install below the latest epoch is checked once put back, and counted once
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let epochs = datadir.epochs_db_path();
+        // meta-only packs with no indexes: `db repair` rebuilds the indexes
+        for epoch in [1, 2] {
+            write_meta_only_pack(&epochs, epoch);
+        }
+        fs::rename(epochs.join("epoch-1"), epochs.join("epoch-1.replaced")).unwrap();
+        let mut out = Vec::new();
+        super::DbRepairArgs { epoch: None, force: false }
+            .run(datadir.clone(), &mut out)
+            .expect("the dry run finds only what --force does");
+        let report = String::from_utf8(out).unwrap();
+        assert!(report.contains("epoch 1: would restore, then check — "), "{report}");
+        assert!(report.contains("epoch 2: SKIPPED"), "{report}");
+        let mut out = Vec::new();
+        super::DbRepairArgs { epoch: None, force: true }
+            .run(datadir.clone(), &mut out)
+            .expect("--force puts epoch 1 back and repairs it");
+        let report = String::from_utf8(out).unwrap();
+        assert!(report.contains("epoch 1: RESTORED"), "{report}");
+        assert!(report.contains("epoch 1: REPAIRED"), "{report}");
+        assert!(report.contains("summary: 1 epoch(s) repaired"), "counted once: {report}");
     }
 
     /// `db repair --force` with an `--epoch` that names no epoch refuses before it puts back an
