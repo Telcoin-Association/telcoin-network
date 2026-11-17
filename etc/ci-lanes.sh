@@ -167,15 +167,16 @@ print(",".join(sorted(
 )))'
 }
 
-# Rebuild the gateway image's build context from HEAD, resolve the workspace in it and check
-# the gateway in it. bin/worker-gateway/Dockerfile copies only the paths it names
+# `check_image_context DOCKERFILE PACKAGE BIN`: rebuild an edge image's build context from
+# HEAD, resolve the workspace in it and check PACKAGE's binary BIN in it. The edge Dockerfiles
+# (bin/worker-gateway/Dockerfile, bin/node-record-api/Dockerfile) copy only the paths they name
 # (etc/Dockerfile copies everything), and cargo cannot load the workspace when an explicit
 # member or a [patch.crates-io] path source is missing, even for `-p`. The metadata call
-# resolves dependencies on purpose: `--no-deps` would hide a missing patch source. Takes an
-# optional Dockerfile path so the check can be pointed at another copy of the file.
-check_gateway_image_context() {
-    local dockerfile=${1:-bin/worker-gateway/Dockerfile}
-    local line word tmp
+# resolves dependencies on purpose: `--no-deps` would hide a missing patch source. DOCKERFILE
+# is read for its COPY list only, so the check can be pointed at another copy of the file.
+check_image_context() {
+    local dockerfile=$1 package=$2 bin=$3
+    local line word tmp pin contracts=0
     local -a words paths=()
     # `COPY [--flag]... <src>... <dest>`: keep the sources. A `COPY --from=` line copies out
     # of another build stage, not out of the context, so it is skipped.
@@ -183,11 +184,13 @@ check_gateway_image_context() {
         read -r -a words <<<"$line"
         [[ " ${words[*]} " == *" --from="* ]] && continue
         for word in "${words[@]:1:${#words[@]}-2}"; do
-            [[ $word == --* ]] || paths+=("$word")
+            [[ $word == --* ]] && continue
+            [[ ${word%/} == tn-contracts ]] && contracts=1
+            paths+=("$word")
         done
     done < <(grep -E '^COPY[[:space:]]' "$dockerfile")
     if ((${#paths[@]} == 0)); then
-        echo "check_gateway_image_context: no COPY sources in $dockerfile" >&2
+        echo "check_image_context: no COPY sources in $dockerfile" >&2
         return 1
     fi
     tmp=$(mktemp -d)
@@ -195,37 +198,210 @@ check_gateway_image_context() {
     (
         trap 'rm -rf -- "$tmp"' EXIT
         # The sources go to git quoted, so git, not the shell, expands a glob such as
-        # `Cargo*`. The tn-contracts submodule archives as an empty directory, which is all
-        # cargo metadata needs; the gateway's own dependencies (tn-types, tn-metrics) read
-        # nothing from it. Without `-m`, tar would keep the commit time as every file's
-        # mtime, and cargo, which keys a path crate's fingerprint on its path relative to
-        # the workspace root, would then judge the copied path crates fresh against the
-        # shared target dir whenever the checkout had been checked after the commit, so a
-        # missing input would go unnoticed. `-m` stamps the copy with the extraction time,
-        # so every path crate recompiles under the copy's path.
+        # `Cargo*`. Without `-m`, tar would keep the commit time as every file's mtime, and
+        # cargo, which keys a path crate's fingerprint on its path relative to the workspace
+        # root, would then judge the copied path crates fresh against the shared target dir
+        # whenever the checkout had been checked after the commit, so a missing input would
+        # go unnoticed. `-m` stamps the copy with the extraction time, so every path crate
+        # recompiles under the copy's path.
         git archive HEAD -- "${paths[@]}" | tar -xm -C "$tmp"
+        # The tn-contracts submodule archives as an empty directory, and tn-config embeds
+        # the contract artifacts with include_str!, so an image whose graph reaches
+        # tn-config (node-record-api's does) fails to compile on that. When the image
+        # copies tn-contracts/, fill it from the submodule at the commit HEAD pins, the one
+        # a checkout with submodules (CI's, the release build's) puts there.
+        if ((contracts)); then
+            pin=$(git rev-parse HEAD:tn-contracts)
+            if [[ ! -e tn-contracts/.git ]] || ! git -C tn-contracts cat-file -e "$pin^{commit}" 2>/dev/null; then
+                echo "check_image_context: $dockerfile copies tn-contracts/, and the submodule" \
+                    "does not have commit $pin, which HEAD pins; run" \
+                    "\`git submodule update --init tn-contracts\`" >&2
+                exit 1
+            fi
+            git -C tn-contracts archive "$pin" | tar -xm -C "$tmp/tn-contracts"
+        fi
         # --offline needs every locked crate source in CARGO_HOME.
         run cargo fetch --locked
         # `run` traces to stdout, which this redirect would discard with the JSON, so
         # trace the call here: a failure then follows its own command line in the log.
         echo "+ cargo metadata --locked --offline --format-version 1 --manifest-path $tmp/Cargo.toml"
         cargo metadata --locked --offline --format-version 1 --manifest-path "$tmp/Cargo.toml" >/dev/null
-        # Resolving the workspace is not enough: a compile-time input of the gateway's
-        # dependencies, such as the chain-configs/ files tn-types reads with
-        # include_str!, can be missing from the COPY list and still resolve, so check
-        # the gateway in the copy too. This does not replace the standalone build in
-        # lane_test_default: that build links the production binary with the
-        # gateway's own feature set, and this check proves compile-time inputs such
-        # as chain-configs/ are in the image's COPY set. The shared target dir reuses
-        # the registry crates; the path crates recompile under the copy's path on every
-        # run, because `tar -xm` above makes their sources newer than any output.
+        # Resolving the workspace is not enough: a compile-time input of the binary's
+        # dependencies, such as the chain-configs/ files tn-types reads with include_str!
+        # or the contract artifacts tn-config embeds, can be missing from the COPY list and
+        # still resolve, so check the binary in the copy too. This does not replace the
+        # standalone builds in lane_test_default: those link the production binaries with
+        # each package's own feature set, and this check proves compile-time inputs such as
+        # chain-configs/ are in the image's COPY set. The shared target dir reuses the
+        # registry crates; the path crates recompile under the copy's path on every run,
+        # because `tar -xm` above makes their sources newer than any output.
         CARGO_TARGET_DIR="$PWD/target" run cargo check --locked --offline \
-            -p tn-worker-gateway --bin worker-gateway --manifest-path "$tmp/Cargo.toml"
+            -p "$package" --bin "$bin" --manifest-path "$tmp/Cargo.toml"
     )
-    echo "gateway image context resolves and compiles: ${paths[*]}"
+    echo "$bin image context resolves and compiles: ${paths[*]}"
+}
+
+# The instructions of Dockerfile "$1", one per line, with comment lines dropped and continued
+# lines joined, so a rule can read an instruction that spans lines (the cargo build's RUN does).
+dockerfile_instructions() {
+    local line ins=
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*# ]] && continue
+        line=${line%"${line##*[![:space:]]}"}
+        if [[ $line == *\\ ]]; then
+            ins+="${line%\\} "
+            continue
+        fi
+        ins+=$line
+        ins=${ins#"${ins%%[![:space:]]*}"}
+        if [[ -n $ins ]]; then
+            printf '%s\n' "$ins"
+        fi
+        ins=
+    done <"$1"
+    if [[ -n $ins ]]; then
+        printf '%s\n' "$ins"
+    fi
+}
+
+# One broken rule of check_release_dockerfiles: the file, what the rule expects, what the file
+# has. Counts into the caller's `broken`.
+contract_broken() {
+    echo "check_release_dockerfiles: $1: expected $2; found $3" >&2
+    broken=$((broken + 1))
+}
+
+# `check_release_dockerfiles NODE GATEWAY NODE_RECORD_API`: the three Dockerfiles etc/release.sh
+# builds a release from (etc/Dockerfile, bin/worker-gateway/Dockerfile,
+# bin/node-record-api/Dockerfile), checked statically against what the script relies on:
+#   - every FROM pinned by digest, so a re-pushed base tag cannot change a release build;
+#   - one RUSTUP_TOOLCHAIN, in effect at each cargo build, so one rustc builds every binary of a
+#     release;
+#   - `ARG GIT_SHA` then `ENV VERGEN_GIT_SHA=${GIT_SHA}` in the cargo build's stage, ahead of it:
+#     the only way the tagged commit reaches `--version`, which the script checks;
+#   - the cargo build passes --locked;
+#   - the final stage installs the binary at /usr/local/bin/<bin> and starts it the way the
+#     script expects: the node through CMD ["telcoin", "node"] and no ENTRYPOINT, each edge
+#     service through ENTRYPOINT ["<bin>"] and no CMD.
+# The script finds a break only when it builds or verifies a tag, and a pushed tag cannot be
+# moved, so a break found there leaves that tag unreleasable. Hence this runs on every pull
+# request. Each rule is checked and reported on its own, so one run lists every break.
+check_release_dockerfiles() {
+    local entry file bin ins kw args image cargo_build froms builds copies
+    local broken=0 ref_toolchain='' ref_file=''
+    # Reset at each FROM: what the stage has set so far, so after the last instruction they
+    # describe the final stage.
+    local git_sha_arg git_sha_env toolchain entrypoint cmd installed
+    local digest_re='@sha256:[0-9a-f]{64}$'
+    local from_re='^(--[^[:space:]]*[[:space:]]+)*([^[:space:]]+)'
+    local arg_re='(^|[[:space:]])GIT_SHA(=[^[:space:]]*)?([[:space:]]|$)'
+    local toolchain_re='(^|[[:space:]])RUSTUP_TOOLCHAIN=([^[:space:]]*)'
+    for entry in "$1:telcoin" "$2:worker-gateway" "$3:node-record-api"; do
+        file=${entry%:*} bin=${entry##*:}
+        if [[ ! -f $file ]]; then
+            contract_broken "$file" "a Dockerfile" "no such file"
+            continue
+        fi
+        froms=0 builds=0
+        while IFS= read -r ins; do
+            kw=${ins%%[[:space:]]*}
+            args=${ins#"$kw"}
+            args=${args#"${args%%[![:space:]]*}"}
+            case $kw in
+            FROM)
+                froms=$((froms + 1))
+                git_sha_arg=0 git_sha_env=0 toolchain='' entrypoint='' cmd='' installed=0 copies=''
+                image=''
+                if [[ $args =~ $from_re ]]; then
+                    image=${BASH_REMATCH[2]}
+                fi
+                if ! [[ $image =~ $digest_re ]]; then
+                    contract_broken "$file" "every FROM pinned by digest (<image>@sha256:<64 hex>)" "FROM $args"
+                fi
+                ;;
+            ARG)
+                if [[ $args =~ $arg_re ]]; then
+                    git_sha_arg=1
+                fi
+                ;;
+            ENV)
+                if ((git_sha_arg)) && [[ " $args " == *[[:space:]]"VERGEN_GIT_SHA=\${GIT_SHA}"[[:space:]]* ]]; then
+                    git_sha_env=1
+                fi
+                if [[ $args =~ $toolchain_re ]]; then
+                    toolchain=${BASH_REMATCH[2]//\"/}
+                fi
+                ;;
+            RUN)
+                [[ $args == *"cargo build"* ]] || continue
+                builds=$((builds + 1))
+                # The cargo build's own command, up to the next shell operator.
+                cargo_build="cargo build${args#*cargo build}"
+                cargo_build=${cargo_build%%[;&|]*}
+                cargo_build=${cargo_build%"${cargo_build##*[![:space:]]}"}
+                if [[ " $cargo_build " != *[[:space:]]--locked[[:space:]]* ]]; then
+                    contract_broken "$file" "the cargo build to pass --locked" "$cargo_build"
+                fi
+                if ((!git_sha_arg)); then
+                    contract_broken "$file" "ARG GIT_SHA before the cargo build, in its stage" "none there"
+                fi
+                if ((!git_sha_env)); then
+                    contract_broken "$file" "ENV VERGEN_GIT_SHA=\${GIT_SHA} after ARG GIT_SHA and before the cargo build, in its stage" "none there"
+                fi
+                if [[ -z $toolchain ]]; then
+                    contract_broken "$file" "ENV RUSTUP_TOOLCHAIN=<version> before the cargo build, in its stage" "none there"
+                elif [[ -z $ref_toolchain ]]; then
+                    ref_toolchain=$toolchain ref_file=$file
+                elif [[ $toolchain != "$ref_toolchain" ]]; then
+                    contract_broken "$file" "RUSTUP_TOOLCHAIN=$ref_toolchain at the cargo build, as $ref_file sets it" "RUSTUP_TOOLCHAIN=$toolchain"
+                fi
+                ;;
+            ENTRYPOINT) entrypoint=$args ;;
+            CMD) cmd=$args ;;
+            COPY)
+                copies+="${copies:+, }COPY $args"
+                if [[ ${args##*[[:space:]]} == "/usr/local/bin/$bin" ]]; then
+                    installed=1
+                fi
+                ;;
+            esac
+        done < <(dockerfile_instructions "$file")
+        if ((froms == 0)); then
+            contract_broken "$file" "a FROM instruction" "none"
+            continue
+        fi
+        if ((builds == 0)); then
+            contract_broken "$file" "a RUN instruction that runs cargo build" "none"
+        fi
+        if ((!installed)); then
+            contract_broken "$file" "the final stage to install the binary at /usr/local/bin/$bin" "${copies:-no COPY in the final stage}"
+        fi
+        if [[ $bin == telcoin ]]; then
+            if [[ -n $entrypoint ]]; then
+                contract_broken "$file" "no ENTRYPOINT in the final stage" "ENTRYPOINT $entrypoint"
+            fi
+            if [[ $cmd != '["telcoin", "node"]' ]]; then
+                contract_broken "$file" 'CMD ["telcoin", "node"] in the final stage' "${cmd:+CMD }${cmd:-no CMD}"
+            fi
+        else
+            if [[ $entrypoint != "[\"$bin\"]" ]]; then
+                contract_broken "$file" "ENTRYPOINT [\"$bin\"] in the final stage" "${entrypoint:+ENTRYPOINT }${entrypoint:-no ENTRYPOINT}"
+            fi
+            if [[ -n $cmd ]]; then
+                contract_broken "$file" "no CMD in the final stage" "CMD $cmd"
+            fi
+        fi
+    done
+    if ((broken)); then
+        echo "check_release_dockerfiles: $broken rule(s) broken" >&2
+        return 1
+    fi
+    echo "release Dockerfiles keep the contract etc/release.sh relies on: $1 $2 $3"
 }
 
 lane_test_default() {
+    # Static and cheap, so it runs first.
+    check_release_dockerfiles etc/Dockerfile bin/worker-gateway/Dockerfile bin/node-record-api/Dockerfile
     run python3 -B -I -m unittest discover -s tools/network-budget -p 'test_*.py'
     # This lane is the tn-lmdb lane, and the release is the tn-lmdb build, only while no crate
     # turns tn-reth's `mdbx` feature on: every backend test checks "this build's engine", so a
@@ -236,17 +412,20 @@ lane_test_default() {
     # Keep this library-only: workspace tests unify dev-dependency features and can
     # hide missing dependency features in tn-types/test-utils.
     run cargo check --locked -p tn-types --features test-utils --lib
-    # The gateway image copies only the paths its Dockerfile names, so a new workspace
-    # member, patch source or compile-time input (such as chain-configs/) missing from
-    # that COPY list fails here.
-    check_gateway_image_context
-    # The gateway ships as its own binary (bin/worker-gateway/Dockerfile builds it with
-    # -p), but the workspace build below unifies features across every member, so a
-    # feature the gateway needs and does not enable on its own dependencies still
-    # compiles there, and neither `cargo check` nor the test build links the production
-    # binary. Build it alone so a missing feature or a link failure fails here;
-    # `check_gateway_image_context` above covers the image's COPY list.
+    # The edge images copy only the paths their Dockerfiles name, so a new workspace member,
+    # patch source or compile-time input (such as chain-configs/ or tn-contracts/) missing
+    # from a COPY list fails here.
+    check_image_context bin/worker-gateway/Dockerfile tn-worker-gateway worker-gateway
+    check_image_context bin/node-record-api/Dockerfile tn-node-record-api node-record-api
+    # The edge services ship as their own binaries (their Dockerfiles build each with -p),
+    # but the workspace build below unifies features across every member, so a feature one
+    # of them needs and does not enable on its own dependencies still compiles there, and
+    # neither `cargo check` nor the test build links the production binaries. Build each
+    # alone, in its own cargo call (one call for both would unify their features), so a
+    # missing feature or a link failure fails here; `check_image_context` above covers the
+    # images' COPY lists.
     run cargo build --locked -p tn-worker-gateway --bin worker-gateway
+    run cargo build --locked -p tn-node-record-api --bin node-record-api
     run cargo nextest run --locked --workspace "${run_mode[@]}"
     # New tn-lmdb datadirs are storage layout v2, so the run above gives every temp chain v2,
     # and layout v1 on tn-lmdb, which every testnet datadir migrated from MDBX keeps until it is
