@@ -1085,7 +1085,8 @@ CHANGES.md TN-0200..0203.
     validate --epoch N` reports the pack's damage and `db repair` fixes what it can
     (crates/storage/README.md); otherwise `db import-epoch` replaces that epoch's pack with a
     verified copy, from a backup taken after it closed or another node's, or start over as above.
-  - `handoff_timeout`: a closed epoch's pack stayed unsealed or mid-install for a second. During
+  - `handoff_timeout`: a closed epoch's pack was still unsealed or mid-install when the read's
+    one-second deadline passed (the second also covers any wait for a pack-read permit). During
     an epoch handoff it passes; if it stays, a past epoch's pack was left unsealed: `db
     validate`.
 - **Moving between formats.** An inline datadir becomes a version-2 one only by a rebuild: `db

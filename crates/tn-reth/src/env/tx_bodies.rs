@@ -122,9 +122,13 @@ pub enum TxBodyErrorKind {
     /// The batch's transactions exceed what the cache's offsets address (4 GiB).
     #[error("the batch's transactions exceed 4 GiB")]
     BatchTooLarge,
-    /// The epoch's pack stayed unsealed, or its replacement unfinished, for [`PACK_WAIT`]: an
-    /// epoch handoff that did not finish, or a past epoch left unsealed (`db validate`).
-    #[error("the epoch's consensus pack stayed unsealed or mid-install for {0:?}")]
+    /// The epoch's pack was still unsealed, or its replacement unfinished, when the read's
+    /// deadline passed ([`PACK_WAIT`] after its pack read began, which also covers its waits for
+    /// a pack-read permit): an epoch handoff that did not finish, or a past epoch left unsealed
+    /// (`db validate`).
+    #[error(
+        "the epoch's consensus pack was still unsealed or mid-install at the read's {0:?} deadline"
+    )]
     HandoffTimeout(Duration),
     /// The node's pack reads were all busy: no pack-read permit was given back before the read's
     /// deadline ([`PACK_WAIT`] after its pack read began), or too many reads already waited for

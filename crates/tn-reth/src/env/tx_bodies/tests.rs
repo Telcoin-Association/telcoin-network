@@ -404,8 +404,14 @@ fn an_unsealed_or_installing_pack_is_waited_for() -> eyre::Result<()> {
     packs.generation.fetch_add(1, Ordering::SeqCst);
     packs.script.lock().extend([Scripted::Unsealed; 200]);
     let started = Instant::now();
-    assert!(matches!(kind(resolve(&source, 5, &b, &[0])), TxBodyErrorKind::HandoffTimeout(_)));
+    let timed_out = kind(resolve(&source, 5, &b, &[0]));
+    assert!(matches!(timed_out, TxBodyErrorKind::HandoffTimeout(_)));
     assert!(started.elapsed() >= PACK_WAIT, "{:?}", started.elapsed());
+    // the second is the read's whole deadline, not how long the pack was seen unsealed
+    assert_eq!(
+        timed_out.to_string(),
+        "the epoch's consensus pack was still unsealed or mid-install at the read's 1s deadline"
+    );
     Ok(())
 }
 
