@@ -5298,7 +5298,13 @@ mod tests {
     ) -> (SocketAddr, Notifier) {
         let mock = Router::new().route(
             "/",
-            post(move || async move { (status, [(header::CONTENT_TYPE, content_type)], body) }),
+            // read the request to its end before answering: an answer sent while the gateway
+            // is still writing a large request closes the connection under that write, and the
+            // gateway then reports the upstream as unreachable instead of relaying the answer
+            post(move |request: axum::body::Body| async move {
+                let _ = axum::body::to_bytes(request, usize::MAX).await;
+                (status, [(header::CONTENT_TYPE, content_type)], body)
+            }),
         );
         spawn(mock).await
     }

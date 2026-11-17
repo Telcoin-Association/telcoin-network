@@ -14,12 +14,17 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
-use super::{export_retention::PublishOutcome, run_epoch::retry_provider_faults};
-use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
+use super::{
+    export_retention::PublishOutcome,
+    run_epoch::{check_output_continuity, retry_provider_faults, OutputContinuity},
+};
+use crate::{
+    engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics, primary::PrimaryNode,
+};
 use eyre::{eyre, WrapErr as _};
 use std::{collections::BTreeSet, path::Path, time::Duration};
 use tn_config::TelcoinDirs;
-use tn_reth::{recover_raw_transaction, RethEnv};
+use tn_reth::{recover_raw_transaction, PoolError, PoolErrorKind, RethEnv};
 use tn_storage::{
     consensus_pack::DATA_NAME,
     tables::{
@@ -30,7 +35,7 @@ use tn_storage::{
 use tn_types::{
     deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, Certificate,
     ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Database as TNDatabase, DbTxMut as _,
-    Epoch, EpochDigest, EpochRecord, Header, SealedHeader, Table, TnReceiver, VoteInfo,
+    Epoch, EpochDigest, EpochRecord, Header, SealedHeader, Table, TnReceiver, VoteInfo, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -118,10 +123,164 @@ async fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
 /// Whether an orphaned batch can be removed from the durable recovery cache.
 #[derive(Debug, PartialEq, Eq)]
 enum OrphanBatchRecovery {
-    /// Forwarding accepted the batch, or an active pool considered every transaction.
-    Complete,
+    /// Forwarding accepted the batch, or an active pool considered every transaction. The counts
+    /// are what the pool did with the batch's transactions (all zero for a forwarded batch).
+    Complete(OrphanTxCounts),
     /// No active pool was available; retain the batch for the next recovery attempt.
     Retry,
+}
+
+/// What the orphan re-pool did with one transaction, the `result` label of
+/// `tn_node.orphan_txs_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrphanTxResult {
+    /// The pool accepted the transaction.
+    Repooled,
+    /// The bytes failed to decode, or the signer failed to recover.
+    Invalid,
+    /// The pool already held the transaction ([`PoolErrorKind::AlreadyImported`]): a retried
+    /// pass found what a cancelled one had pooled, or the transaction came back through RPC or a
+    /// peer. Harmless.
+    AlreadyPooled,
+    /// The executed state holds a higher nonce for the sender
+    /// ([`PoolErrorKind::InvalidTransaction`] whose error `is_nonce_too_low`): a transaction
+    /// with this sender and nonce has executed, this one or a replacement.
+    RefusedNonceTooLow,
+    /// Any other refusal: the pool's size or per-sender limits, a cheaper replacement of a
+    /// pooled transaction, another validation failure, or a failed state read during validation.
+    /// Only these can be a loss.
+    RefusedOther,
+}
+
+impl OrphanTxResult {
+    /// Every result, in label order, for touching every series of a finished batch.
+    const ALL: [Self; 5] = [
+        Self::Repooled,
+        Self::Invalid,
+        Self::AlreadyPooled,
+        Self::RefusedNonceTooLow,
+        Self::RefusedOther,
+    ];
+
+    /// Classify a pool refusal by its error kind.
+    ///
+    /// The match names every kind, so a new kind in a reth upgrade must be placed here by hand.
+    fn refused(error: &PoolError) -> Self {
+        match &error.kind {
+            PoolErrorKind::AlreadyImported => Self::AlreadyPooled,
+            PoolErrorKind::InvalidTransaction(invalid) if invalid.is_nonce_too_low() => {
+                Self::RefusedNonceTooLow
+            }
+            PoolErrorKind::InvalidTransaction(_)
+            | PoolErrorKind::ReplacementUnderpriced
+            | PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(_)
+            | PoolErrorKind::SpammerExceededCapacity(_)
+            | PoolErrorKind::DiscardedOnInsert
+            | PoolErrorKind::ExistingConflictingTransactionType(..)
+            | PoolErrorKind::Other(_) => Self::RefusedOther,
+        }
+    }
+
+    /// The static `result` label value.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Repooled => "repooled",
+            Self::Invalid => "invalid",
+            Self::AlreadyPooled => "already_pooled",
+            Self::RefusedNonceTooLow => "refused_nonce_too_low",
+            Self::RefusedOther => "refused_other",
+        }
+    }
+}
+
+/// Per-result transaction counts of the orphan re-pool, for one batch or a whole recovery pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OrphanTxCounts {
+    /// Transactions the pool accepted.
+    repooled: u64,
+    /// Transactions that failed to decode or to recover a signer.
+    invalid: u64,
+    /// Transactions the pool already held.
+    already_pooled: u64,
+    /// Transactions refused as nonce too low.
+    refused_nonce_too_low: u64,
+    /// Transactions refused for any other reason.
+    refused_other: u64,
+}
+
+impl OrphanTxCounts {
+    /// The count of one result.
+    const fn get(&self, result: OrphanTxResult) -> u64 {
+        match result {
+            OrphanTxResult::Repooled => self.repooled,
+            OrphanTxResult::Invalid => self.invalid,
+            OrphanTxResult::AlreadyPooled => self.already_pooled,
+            OrphanTxResult::RefusedNonceTooLow => self.refused_nonce_too_low,
+            OrphanTxResult::RefusedOther => self.refused_other,
+        }
+    }
+
+    /// Count one transaction's result.
+    fn note(mut self, result: OrphanTxResult) -> Self {
+        let count = match result {
+            OrphanTxResult::Repooled => &mut self.repooled,
+            OrphanTxResult::Invalid => &mut self.invalid,
+            OrphanTxResult::AlreadyPooled => &mut self.already_pooled,
+            OrphanTxResult::RefusedNonceTooLow => &mut self.refused_nonce_too_low,
+            OrphanTxResult::RefusedOther => &mut self.refused_other,
+        };
+        *count = count.saturating_add(1);
+        self
+    }
+
+    /// Add another batch's counts.
+    fn add(self, other: Self) -> Self {
+        Self {
+            repooled: self.repooled.saturating_add(other.repooled),
+            invalid: self.invalid.saturating_add(other.invalid),
+            already_pooled: self.already_pooled.saturating_add(other.already_pooled),
+            refused_nonce_too_low: self
+                .refused_nonce_too_low
+                .saturating_add(other.refused_nonce_too_low),
+            refused_other: self.refused_other.saturating_add(other.refused_other),
+        }
+    }
+
+    /// Add one batch's counts to `tn_node.orphan_txs_total`. Every `result` series is touched,
+    /// by 0 when the batch had none, so each exists once a batch has been re-pooled.
+    fn record(self) {
+        OrphanTxResult::ALL.into_iter().for_each(|result| {
+            metrics::counter!("tn_node.orphan_txs_total", "result" => result.label())
+                .increment(self.get(result));
+        });
+    }
+}
+
+/// The path that finished an orphaned batch, the `path` label of `tn_node.orphan_batches_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrphanBatchPath {
+    /// Re-pooled into the pool of the worker that built the batch.
+    OwnWorker,
+    /// Re-pooled into worker 0's pool, because the batch's worker is no longer active.
+    Worker0Fallback,
+    /// Disbursed through the batch's worker by a node that is not an active CVV.
+    NonValidator,
+}
+
+impl OrphanBatchPath {
+    /// The static `path` label value.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::OwnWorker => "own_worker",
+            Self::Worker0Fallback => "worker0_fallback",
+            Self::NonValidator => "non_validator",
+        }
+    }
+
+    /// Count one finished batch on `tn_node.orphan_batches_total`.
+    fn record(self) {
+        metrics::counter!("tn_node.orphan_batches_total", "path" => self.label()).increment(1);
+    }
 }
 
 /// Hand every transaction in `batch` back to an active worker's mempool.
@@ -129,6 +288,31 @@ enum OrphanBatchRecovery {
 /// Pools can outlive their workers, so only the current epoch's `active_workers` are eligible.
 /// A removed worker falls back to worker 0. Invalid or refused transactions are logged and
 /// discarded under the pool's normal validation rules; a missing pool leaves the batch cached.
+///
+/// Each transaction is counted once on `tn_node.orphan_txs_total{result}`, and the batch once
+/// on `tn_node.orphan_batches_total{path}`, when the whole batch has been handled. A cancelled
+/// batch counts nothing and is counted by the attempt that finishes it; the transactions the
+/// cancelled attempt already pooled are then counted as `already_pooled`. The batch is counted
+/// again when it stays cached after its counts were recorded: a crash before the cache removal
+/// is durable (the restarted node re-pools it into an empty pool), or a failed removal.
+///
+/// A refusal is classified by the pool's error kind ([`OrphanTxResult::refused`]):
+/// `already_pooled`, `refused_nonce_too_low` or `refused_other`. A nonce-too-low refusal could
+/// mean two things: the transaction, or another with the same sender and nonce, already
+/// executed, which is expected (a batch can be orphaned and its transactions still land); or a
+/// transaction that never executed was refused because the pool's view of the sender's nonce
+/// ran ahead of the executed state, which would be a loss. The counter alone cannot tell them
+/// apart; the fleet reads it against the generator's list of transactions that never landed.
+///
+/// On this pool the second case does not arise from the batch builder's update of the pool
+/// after each sealed batch (`update_canonical_state` with the batch's changed accounts,
+/// `crates/batch-builder/src/lib.rs` ≈ :673-678), because that update only moves the pool's
+/// per-sender record. Admission checks the nonce in the validator against `client.latest()`,
+/// the executed state (`vendor/reth/crates/transaction-pool/src/validate/eth.rs` ≈ :237, :549,
+/// :638-651), and the insert then overwrites the per-sender record with that executed nonce
+/// (`vendor/reth/crates/transaction-pool/src/pool/txpool.rs` ≈ :754-768). A
+/// `refused_nonce_too_low` transaction is therefore one whose sender and nonce have executed:
+/// this one or a replacement.
 async fn repool_batch_txns(
     pools: &[tn_reth::WorkerTxPool],
     active_workers: usize,
@@ -136,31 +320,45 @@ async fn repool_batch_txns(
 ) -> OrphanBatchRecovery {
     use futures::StreamExt as _;
     let worker_id = usize::from(batch.worker_id);
-    let pool = pools.get(worker_id).filter(|_| worker_id < active_workers).or_else(|| {
-        warn!(target: "epoch-manager", worker_id, active_workers, pools = pools.len(),
-            transactions = batch.transactions().len(),
-            "orphaned batch has no active worker pool; trying worker 0");
-        pools.first().filter(|_| active_workers > 0)
-    });
-    futures::future::OptionFuture::from(pool.map(|pool| async move {
-        futures::stream::iter(batch.transactions())
-            .filter_map(|tx_bytes| async move {
-                recover_raw_transaction(tx_bytes)
-                    .inspect_err(|error| {
+    let pool = pools
+        .get(worker_id)
+        .filter(|_| worker_id < active_workers)
+        .map(|pool| (pool, OrphanBatchPath::OwnWorker))
+        .or_else(|| {
+            warn!(target: "epoch-manager", worker_id, active_workers, pools = pools.len(),
+                transactions = batch.transactions().len(),
+                "orphaned batch has no active worker pool; trying worker 0");
+            pools
+                .first()
+                .filter(|_| active_workers > 0)
+                .map(|pool| (pool, OrphanBatchPath::Worker0Fallback))
+        });
+    futures::future::OptionFuture::from(pool.map(|(pool, path)| async move {
+        let counts = futures::stream::iter(batch.transactions())
+            .fold(OrphanTxCounts::default(), |counts, tx_bytes| async move {
+                let result = match recover_raw_transaction(tx_bytes) {
+                    Err(error) => {
                         debug!(target: "epoch-manager", worker_id, ?error,
                             "invalid orphaned transaction");
-                    })
-                    .ok()
-            })
-            .for_each(|recovered| async move {
-                let _ =
-                    pool.add_recovered_transaction_external(recovered).await.inspect_err(|error| {
-                        debug!(target: "epoch-manager", worker_id, ?error,
-                            "pool refused an orphaned transaction");
-                    });
+                        OrphanTxResult::Invalid
+                    }
+                    Ok(recovered) => {
+                        match pool.add_recovered_transaction_external(recovered).await {
+                            Ok(_) => OrphanTxResult::Repooled,
+                            Err(error) => {
+                                debug!(target: "epoch-manager", worker_id, ?error,
+                                    "pool refused an orphaned transaction");
+                                OrphanTxResult::refused(&error)
+                            }
+                        }
+                    }
+                };
+                counts.note(result)
             })
             .await;
-        OrphanBatchRecovery::Complete
+        counts.record();
+        path.record();
+        OrphanBatchRecovery::Complete(counts)
     }))
     .await
     .unwrap_or_else(|| {
@@ -187,24 +385,25 @@ where
 {
     use futures::{StreamExt as _, TryStreamExt as _};
     let batches = orphan_batches.len();
-    let (processed_batches, processed_transactions) = futures::stream::iter(orphan_batches)
+    let (processed_batches, processed_transactions, txs) = futures::stream::iter(orphan_batches)
         .map(Ok)
         .try_fold(
-            (0usize, 0usize),
-            |(processed_batches, processed_transactions), (digest, batch)| {
+            (0usize, 0usize, OrphanTxCounts::default()),
+            |(processed_batches, processed_transactions, txs), (digest, batch)| {
                 let transactions = batch.transactions().len();
                 let recovery = recover(digest, batch);
                 async move {
                     match recovery.await {
-                        OrphanBatchRecovery::Complete => {
+                        OrphanBatchRecovery::Complete(counts) => {
                             consensus_db.remove::<OurNodeBatchesCache>(&digest)?;
                             Ok::<_, eyre::Report>((
                                 processed_batches + 1,
                                 processed_transactions + transactions,
+                                txs.add(counts),
                             ))
                         }
                         OrphanBatchRecovery::Retry => {
-                            Ok((processed_batches, processed_transactions))
+                            Ok((processed_batches, processed_transactions, txs))
                         }
                     }
                 }
@@ -212,6 +411,10 @@ where
         )
         .await?;
     info!(target: "epoch-manager", batches, processed_batches, processed_transactions,
+        txs_repooled = txs.repooled, txs_invalid = txs.invalid,
+        txs_already_pooled = txs.already_pooled,
+        txs_refused_nonce_too_low = txs.refused_nonce_too_low,
+        txs_refused_other = txs.refused_other,
         "Finished processing orphaned batches");
     Ok(())
 }
@@ -273,7 +476,8 @@ where
                                 debug!(target: "epoch-manager", worker_id = batch.worker_id, ?error,
                                     "orphaned batch disbursal refused; re-pooling");
                             }).is_ok()) {
-                                OrphanBatchRecovery::Complete
+                                OrphanBatchPath::NonValidator.record();
+                                OrphanBatchRecovery::Complete(OrphanTxCounts::default())
                             } else {
                                 repool_batch_txns(pools, workers.len(), &batch).await
                             }
@@ -307,17 +511,74 @@ where
     /// sequence (`close_epoch`, then `write_epoch_record`) can commit the epoch's
     /// record.
     ///
-    /// A forwarding failure (the engine channel closed) also returns `None`: the
-    /// caller must not wait on execution of output the engine never received, and
-    /// the dead channel resurfaces as a hard error at the next forwarding attempt
-    /// after re-entry.
+    /// A forwarding failure (the engine channel closed before it accepted the
+    /// output) also returns `None`: the caller must not wait on execution of
+    /// output the engine never received, and the dead channel resurfaces as a hard
+    /// error at the next forwarding attempt after re-entry. A forwarded output is
+    /// one accepted into the engine channel; a receiver dropped in the instant
+    /// between `reserve` and the write loses it without an error, and the engine's
+    /// exit then ends the node (it is a critical task).
+    ///
+    /// Phase 1 applies the live forward's continuity rule
+    /// ([`check_output_continuity`]) to what it takes off the queue: an output
+    /// already forwarded is skipped, and one that does not directly follow the
+    /// last output forwarded to the engine is refused with an error that stops the
+    /// node, before the engine gets past the gap (on restart the replay forwards
+    /// the missing output from the consensus DB). No honest path reaches the
+    /// refusal: the subscriber queues outputs in order, and the live forward hands
+    /// over every output it takes (`wait_for_epoch_boundary` is cancel safe). It
+    /// is there so a regression stops a node cleanly instead of forking its
+    /// execution.
+    ///
+    /// No honest path reaches the skip either, for the same reasons. A skip logs
+    /// the output's number and digest with `path = "leftover_queue"` and counts in
+    /// `tn_node.leftover_outputs_skipped_total`: a count above zero says an output
+    /// was queued twice.
+    ///
+    /// The queue phase holds the output it took across `process_output`'s wait
+    /// for room. That is safe only while nothing in the epoch loop races this
+    /// drain (only the node's exit drops it, and the restart replay forwards the
+    /// output from the consensus pack): do not put the drain under a `select!`.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-    ) -> Option<ConsensusHeaderDigest> {
+    ) -> eyre::Result<Option<ConsensusHeaderDigest>> {
         // Phase 1: drain the consensus_output queue
         while let Ok(output) = consensus_output.try_recv() {
+            let last_forwarded = self.last_forwarded_consensus_number;
+            match check_output_continuity(last_forwarded, output.number()) {
+                OutputContinuity::Stale => {
+                    // none on an honest run (see the doc): a count says an output was queued twice
+                    metrics::counter!("tn_node.leftover_outputs_skipped_total").increment(1);
+                    warn!(
+                        target: "epoch-manager",
+                        number = output.number(),
+                        last_forwarded,
+                        digest = ?output.consensus_header_hash(),
+                        path = "leftover_queue",
+                        "skipping already-forwarded consensus output",
+                    );
+                    continue;
+                }
+                OutputContinuity::Gap => {
+                    metrics::counter!("tn_node.leftover_output_gaps_total").increment(1);
+                    error!(
+                        target: "epoch-manager",
+                        number = output.number(),
+                        last_forwarded,
+                        "leftover consensus output does not follow the last output forwarded to \
+                         the engine: stopping the node before the engine executes past the gap",
+                    );
+                    return Err(eyre!(
+                        "leftover consensus output gap: expected {} but received {} - stopping \
+                         the node; a restart replays the missing output from the consensus DB",
+                        last_forwarded + 1,
+                        output.number(),
+                    ));
+                }
+                OutputContinuity::Next => {}
+            }
             let result = if output.reaches_epoch_boundary(self.epoch_boundary) {
                 // stash the boundary header for the caller's close-and-write sequence
                 self.last_consensus_header = Some(output.clone().into());
@@ -330,10 +591,10 @@ where
             // block on forever in wait_for_consensus_execution
             if let Err(e) = self.process_output(to_engine, output).await {
                 error!(target: "epoch-manager", "error sending leftover consensus output to engine: {}", e);
-                return None;
+                return Ok(None);
             }
             if result.is_some() {
-                return result;
+                return Ok(result);
             }
         }
 
@@ -360,10 +621,10 @@ where
                         // the caller would block on forever in wait_for_consensus_execution
                         if let Err(e) = self.process_output(to_engine, output).await {
                             error!(target: "epoch-manager", number, "error sending leftover consensus output to engine: {}", e);
-                            return None;
+                            return Ok(None);
                         }
                         if result.is_some() {
-                            return result;
+                            return Ok(result);
                         }
                     }
                     Err(e) => {
@@ -374,7 +635,7 @@ where
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Persist the finalized [`EpochRecord`] for the just-completed epoch and
@@ -398,6 +659,12 @@ where
     /// executed means this node's execution has diverged from the chain the record commits to, so
     /// the close returns an error and the node stops before it publishes the record.
     ///
+    /// The closing block must also be the block where the epoch-closing calls ran for the record's
+    /// `final_consensus` ([`closing_block_check`]): a fresh record is checked before any committee
+    /// read and before it is saved, voted on or published, a stored one (reused, or this node's own
+    /// uncertified record 0 before it is built again) after its `final_state` compare. A block that
+    /// fails stops the node the same way.
+    ///
     /// When building a fresh record, the previous epoch's `next_committee` must
     /// match this epoch's committee; a mismatch means the committee handoff is
     /// inconsistent and is treated as an error rather than silently recorded.
@@ -406,9 +673,30 @@ where
         epoch: Epoch,
         engine: &ExecutionNode,
     ) -> eyre::Result<()> {
+        self.write_epoch_record_on(epoch, engine, RecordCheckPath::Built).await
+    }
+
+    /// [`Self::write_epoch_record`], with `build_path` naming where a fresh record is built in a
+    /// refusal: [`RecordCheckPath::Built`] at a close, [`RecordCheckPath::Rederived`] from
+    /// [`Self::recover_previous_epoch_record`].
+    async fn write_epoch_record_on(
+        &mut self,
+        epoch: Epoch,
+        engine: &ExecutionNode,
+        build_path: RecordCheckPath,
+    ) -> eyre::Result<()> {
         // The epoch-closing block, sampled ONCE: a reused record is compared with it below, and a
-        // new record commits it as `final_state` (see the pinning comment further down).
-        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
+        // new record commits it as `final_state` (see the pinning comment further down). The whole
+        // header is kept for its closing markers, `None` when nothing is executed yet; the watch
+        // borrow ends with this statement.
+        let executed = {
+            let blocks = self.consensus_bus.recent_blocks().borrow();
+            (!blocks.is_empty()).then(|| blocks.latest_execution_block())
+        };
+        // a stored record is compared with the default header when nothing is executed, as it
+        // always was
+        let closing_block = executed.clone().unwrap_or_default();
+        let parent_state = closing_block.num_hash();
 
         // Epoch 0 will have a "dummy" epoch record to make the initial committee available to code
         // using these records. In this case there will not be a cert so we want to overwrite this
@@ -417,9 +705,10 @@ where
         // dummy epoch 0 record with the proper record and would break sync. An uncertified record
         // 0 that is not the dummy (this node's own, still waiting for its certificate; the dummy
         // is the one record with a default `final_state`) goes through the replay guard first, so
-        // a closing block that differs stops the node as at any other epoch, logged and counted.
-        // It is then built again: the build is deterministic, so `save_record` accepts an
-        // identical record and refuses a different one (`ConflictingRecord`), which stops the node.
+        // a closing block that differs, or that lacks the closing markers, stops the node as at
+        // any other epoch, logged and counted. It is then built again: the build is
+        // deterministic, so `save_record` accepts an identical record and refuses a different one
+        // (`ConflictingRecord`), which stops the node.
         //
         // A failed read answers `None` here, never a reason to skip the guard: the record is then
         // built and `save_record` compares the whole stored record (its digest) with the new one.
@@ -428,17 +717,58 @@ where
                 Some((epoch_rec, cert.is_some()))
             }
             Some((epoch_rec, None)) if epoch_rec.final_state != BlockNumHash::default() => {
-                self.check_stored_record(&epoch_rec, false, parent_state, engine).await?;
+                self.check_stored_record(
+                    &epoch_rec,
+                    false,
+                    &closing_block,
+                    self.closing_seed_for(&epoch_rec),
+                    RecordCheckPath::Stored,
+                    engine,
+                )
+                .await?;
                 None
             }
             _ => None,
         };
         if let Some((epoch_rec, certified)) = stored {
             // We already have this record: check it against our own closing block, then reuse it.
-            self.check_stored_record(&epoch_rec, certified, parent_state, engine).await?;
+            let found = self
+                .check_stored_record(
+                    &epoch_rec,
+                    certified,
+                    &closing_block,
+                    self.closing_seed_for(&epoch_rec),
+                    RecordCheckPath::Stored,
+                    engine,
+                )
+                .await?;
+            let branch = match found {
+                StoredFinalState::Matches => "stored_matched",
+                StoredFinalState::Restored { .. } => "stored_restored",
+            };
+            log_published_record(&epoch_rec, branch);
             self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
             return Ok(());
         }
+
+        // The boundary consensus header this record commits as `final_consensus`, taken before
+        // any committee read: the closing block must be where the epoch-closing calls ran for it,
+        // or nothing of the record is read, saved, voted on or published. The re-derive path of
+        // `recover_previous_epoch_record` arrives here with the header it looked up by the closing
+        // block's own beacon root, so this adds the seed compare that path lacks.
+        let last_consensus_header = self.last_consensus_header.take().ok_or_else(|| {
+            eyre!("epoch {epoch} reached write_epoch_record without its boundary consensus header")
+        })?;
+        let final_consensus =
+            ConsensusNumHash::new(last_consensus_header.number, last_consensus_header.digest());
+        require_closing_block(
+            executed.as_ref(),
+            epoch,
+            final_consensus,
+            Some(last_consensus_header.sub_dag.randomness()),
+            build_path,
+            false,
+        )?;
 
         // CLOSE-TIME READS, INTENTIONALLY POST-BURN: these committee reads see the on-chain
         // state at epoch CLOSE, not the epoch-start pin used by the entry path. That is by
@@ -503,10 +833,6 @@ where
         } else {
             self.consensus_chain.epochs().record_by_epoch(epoch - 1).await
         };
-        let last_consensus_header = self.last_consensus_header.take().ok_or_else(|| {
-            eyre!("epoch {epoch} reached write_epoch_record without its boundary consensus header")
-        })?;
-        let target_hash = last_consensus_header.digest();
 
         let epoch_rec = build_epoch_record(
             epoch,
@@ -514,7 +840,7 @@ where
             next_committee_keys,
             prev_record.as_ref(),
             parent_state,
-            ConsensusNumHash::new(last_consensus_header.number, target_hash),
+            final_consensus,
         )?;
 
         self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
@@ -522,6 +848,7 @@ where
         // the record just saved — fatal for epoch 0, which has no peer-fetch anchor — so
         // flush it durably here before publishing
         self.consensus_chain.epochs().persist().await?;
+        log_published_record(&epoch_rec, "built");
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
         Ok(())
     }
@@ -593,10 +920,14 @@ where
                             epoch_start_header.hash()
                         )
                     })?;
+                // the closing seed would need a consensus-store read here, so the entry compares
+                // the closing marker's length only
                 self.check_stored_record(
                     &record,
                     cert.is_some(),
-                    epoch_start_header.num_hash(),
+                    epoch_start_header,
+                    None,
+                    RecordCheckPath::Entry,
                     engine,
                 )
                 .await?;
@@ -675,7 +1006,7 @@ where
         // committees at the closing block and chains on record N-2, and build_epoch_record's
         // continuity check hard-errors rather than persisting a divergent record if inputs are off.
         self.last_consensus_header = Some(boundary_header);
-        self.write_epoch_record(previous_epoch, engine).await?;
+        self.write_epoch_record_on(previous_epoch, engine, RecordCheckPath::Rederived).await?;
 
         // every close path persists the record before it clears the epoch tables, so a missing
         // record means the clear never ran either. clearing here deletes nothing epoch
@@ -705,7 +1036,9 @@ where
 
     /// The replay guard: compare a stored epoch record's `final_state` with `local`, the closing
     /// block this node executed for that epoch, and return an error that stops the node when they
-    /// differ ([`check_stored_final_state`] decides).
+    /// differ ([`check_stored_final_state`] decides). When they match, `local` must also be the
+    /// block where the epoch-closing calls ran for the record's `final_consensus`
+    /// ([`require_closing_block`], with the closing seed `seed` when the caller holds it).
     ///
     /// `certified` is only reported: a record with a certificate is the committee's, one without
     /// is this node's own from an earlier execution. Either way a different `final_state` means
@@ -714,17 +1047,32 @@ where
     /// attests, so the node stops instead of running on.
     ///
     /// The restored-state floor is an in-memory value read when the reth env opened, so this makes
-    /// no read that could fail.
+    /// no read that could fail. A closing block below it is compared in neither way; the floor
+    /// block itself, whose header the restore imported, is compared in both.
     async fn check_stored_record(
         &self,
         stored: &EpochRecord,
         certified: bool,
-        local: BlockNumHash,
+        local: &SealedHeader,
+        seed: Option<B256>,
+        path: RecordCheckPath,
         engine: &ExecutionNode,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<StoredFinalState> {
         let restored_floor = engine.get_reth_env().await.restored_state_floor();
-        match check_stored_final_state(stored, certified, local, restored_floor) {
-            Ok(StoredFinalState::Matches) => Ok(()),
+        match check_stored_final_state(stored, certified, local.num_hash(), restored_floor) {
+            Ok(StoredFinalState::Matches) => {
+                // compared after `final_state`, so a record naming another block is reported
+                // as a `FinalStateMismatch` first
+                require_closing_block(
+                    Some(local),
+                    stored.epoch,
+                    stored.final_consensus,
+                    seed,
+                    path,
+                    certified,
+                )?;
+                Ok(StoredFinalState::Matches)
+            }
             Ok(StoredFinalState::Restored { floor }) => {
                 debug!(
                     target: "epoch-manager",
@@ -734,7 +1082,7 @@ where
                     "stored epoch record not compared: its closing block is below this datadir's \
                      restored-state floor, so this node holds only a scaffolded header for it",
                 );
-                Ok(())
+                Ok(StoredFinalState::Restored { floor })
             }
             Err(mismatch) => {
                 self.metrics.final_state_mismatches_total.increment(1);
@@ -752,6 +1100,19 @@ where
                 Err(mismatch.into())
             }
         }
+    }
+
+    /// The committee-shuffle seed a stored `record`'s closing block must carry as its `extra_data`:
+    /// that of the boundary consensus header this node closed on, when it is the header the record
+    /// commits as `final_consensus`. `None` otherwise, and the closing-block check then compares
+    /// the marker's length only.
+    fn closing_seed_for(&self, record: &EpochRecord) -> Option<B256> {
+        self.last_consensus_header
+            .as_ref()
+            .filter(|header| {
+                ConsensusNumHash::new(header.number, header.digest()) == record.final_consensus
+            })
+            .map(|header| header.sub_dag.randomness())
     }
 
     /// Clear the epoch tables when [`stale_epoch_table_row`] finds a row of an epoch older than
@@ -1292,6 +1653,266 @@ pub(super) fn check_stored_final_state(
     }
 }
 
+/// Where an epoch record's closing block was checked: the `path` field of the refusal's log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecordCheckPath {
+    /// A record this node builds at the close, before it is saved.
+    Built,
+    /// A record this node builds at an epoch entry because a kill at the previous boundary left
+    /// it unwritten (`recover_previous_epoch_record`), before it is saved.
+    Rederived,
+    /// A stored record this node checks at the close: one it reuses, or its own uncertified
+    /// record 0 before the close builds that record again.
+    Stored,
+    /// The previous epoch's stored record, at the entry of the next epoch.
+    Entry,
+}
+
+impl RecordCheckPath {
+    /// The path's static name.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Built => "built",
+            Self::Rederived => "rederived",
+            Self::Stored => "stored",
+            Self::Entry => "entry",
+        }
+    }
+
+    /// What stopping the node prevents on this path: the `reason` field of the refusal's log line
+    /// and the end of its error text. A record being built is not saved yet; a stored one already
+    /// is, and running on would build on a chain no epoch record attests.
+    pub(super) fn halt_reason(self) -> &'static str {
+        match self {
+            Self::Built | Self::Rederived => {
+                "save, vote on or publish a record that commits another block"
+            }
+            Self::Stored | Self::Entry => "run on a chain no epoch record attests",
+        }
+    }
+}
+
+/// What [`closing_block_check`] found: [`ClosingBlockCheck::Ok`], or the first comparison the
+/// block failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClosingBlockCheck {
+    /// The block carries every closing marker of the record's epoch and `final_consensus`.
+    Ok,
+    /// There is no block to check: this node has executed nothing yet (an empty recent-blocks
+    /// ring at a close). Set by [`require_closing_block`], never by [`closing_block_check`].
+    NoBlock,
+    /// The block's `parent_beacon_block_root` is absent or is not the `final_consensus` digest:
+    /// it was built from another consensus output.
+    BeaconRoot,
+    /// The block's nonce carries another epoch than the record's.
+    NonceEpoch,
+    /// The block's `extra_data` is not 32 bytes: no epoch-closing calls ran in it.
+    ExtraDataLength,
+    /// The block's `extra_data` is 32 bytes but not the closing output's committee-shuffle seed.
+    ExtraDataSeed,
+}
+
+impl ClosingBlockCheck {
+    /// The static name: the `result` label of `tn_epoch.epoch_record_closing_block_check_total`
+    /// and the `check` field of the refusal's log line.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NoBlock => "no_block",
+            Self::BeaconRoot => "beacon_root",
+            Self::NonceEpoch => "nonce_epoch",
+            Self::ExtraDataLength => "extra_data_length",
+            Self::ExtraDataSeed => "extra_data_seed",
+        }
+    }
+
+    /// What the failed comparison means, for the refusal's error text.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Ok => "it carries every closing marker",
+            Self::NoBlock => "this node has executed no block yet",
+            Self::BeaconRoot => {
+                "its parent_beacon_block_root is not that consensus header's digest"
+            }
+            Self::NonceEpoch => "its nonce carries another epoch",
+            Self::ExtraDataLength => "its extra_data is not the 32-byte epoch-closing marker",
+            Self::ExtraDataSeed => {
+                "its extra_data is not that consensus output's committee-shuffle seed"
+            }
+        }
+    }
+}
+
+/// Whether `block` is the block where the epoch-closing calls of `epoch` ran for the record whose
+/// `final_consensus` is given, compared the way the engine builds that block:
+///
+/// - (a) every block of a consensus output carries the output's digest as its
+///   `parent_beacon_block_root`, so it must be `final_consensus.hash`;
+/// - (b) its nonce is the output leader's (`epoch << 32 | round`, read back by
+///   [`deconstruct_nonce`]), so it must carry `epoch`;
+/// - (c) only the output's last block runs the epoch-closing calls, and the engine records the
+///   output's committee-shuffle seed in that block's `extra_data` (empty on every other block), so
+///   it must be 32 bytes, and equal to `seed` when the caller holds the boundary consensus header.
+///   With the `adiri` feature (c) is skipped for epochs at or below `ADIRI_DUP_BATCH_EPOCH`
+///   ([`closing_marker_checked`]).
+///
+/// Returns the first comparison that fails, in that order. The block's number and hash are the
+/// caller's to compare: this checks the block's own markers only.
+pub(super) fn closing_block_check(
+    block: &SealedHeader,
+    epoch: Epoch,
+    final_consensus: ConsensusNumHash,
+    seed: Option<B256>,
+) -> ClosingBlockCheck {
+    if block.parent_beacon_block_root != Some(final_consensus.hash.into()) {
+        return ClosingBlockCheck::BeaconRoot;
+    }
+    let (nonce_epoch, _round) = deconstruct_nonce(block.nonce.into());
+    if nonce_epoch != epoch {
+        return ClosingBlockCheck::NonceEpoch;
+    }
+    if !closing_marker_checked(epoch) {
+        return ClosingBlockCheck::Ok;
+    }
+    if block.extra_data.len() != B256::len_bytes() {
+        return ClosingBlockCheck::ExtraDataLength;
+    }
+    if seed.is_some_and(|seed| block.extra_data.as_ref() != seed.as_slice()) {
+        return ClosingBlockCheck::ExtraDataSeed;
+    }
+    ClosingBlockCheck::Ok
+}
+
+/// Whether comparison (c) of [`closing_block_check`], the closing block's `extra_data`, applies to
+/// `epoch`.
+///
+/// adiri's epochs at or below `ADIRI_DUP_BATCH_EPOCH` (160) executed outputs holding more batch
+/// digests than batches, which the engine tolerates there (`tn-engine`'s payload builder). The
+/// close flag goes to the batch whose index reaches the digest count, so on such an output it
+/// lands on no block and the last block carries no marker. Every other epoch is compared.
+#[cfg(feature = "adiri")]
+fn closing_marker_checked(epoch: Epoch) -> bool {
+    epoch > tn_types::forks::ADIRI_DUP_BATCH_EPOCH
+}
+
+/// Whether comparison (c) of [`closing_block_check`], the closing block's `extra_data`, applies to
+/// `epoch`: always, outside the `adiri` build.
+#[cfg(not(feature = "adiri"))]
+fn closing_marker_checked(_epoch: Epoch) -> bool {
+    true
+}
+
+/// Run [`closing_block_check`] on `block`, the `final_state` of `epoch`'s record, count the
+/// result in `tn_epoch.epoch_record_closing_block_check_total`, and refuse a block that fails it
+/// with an `error` line and a [`ClosingBlockMismatch`], which stops the node. No block at all
+/// (`None`: nothing executed) is refused as [`ClosingBlockCheck::NoBlock`].
+///
+/// `path` and `certified` are only reported.
+pub(super) fn require_closing_block(
+    block: Option<&SealedHeader>,
+    epoch: Epoch,
+    final_consensus: ConsensusNumHash,
+    seed: Option<B256>,
+    path: RecordCheckPath,
+    certified: bool,
+) -> Result<(), ClosingBlockMismatch> {
+    let check = block.map_or(ClosingBlockCheck::NoBlock, |block| {
+        closing_block_check(block, epoch, final_consensus, seed)
+    });
+    EpochMetrics::record_closing_block_check(check.as_str());
+    if check == ClosingBlockCheck::Ok {
+        return Ok(());
+    }
+    // the log fields of a missing block are the default header's
+    let block = block.cloned().unwrap_or_default();
+    let (nonce_epoch, _round) = deconstruct_nonce(block.nonce.into());
+    error!(
+        target: "epoch-manager",
+        epoch,
+        path = path.as_str(),
+        check = check.as_str(),
+        reason = path.halt_reason(),
+        certified,
+        block_number = block.number,
+        block_hash = %block.hash(),
+        beacon_root = ?block.parent_beacon_block_root,
+        nonce_epoch,
+        extra_data = %block.extra_data,
+        seed = ?seed,
+        final_consensus_number = final_consensus.number,
+        final_consensus_hash = %final_consensus.hash,
+        "epoch record final_state is not the block where the epoch-closing calls ran, stopping \
+         the node",
+    );
+    Err(ClosingBlockMismatch {
+        epoch,
+        path,
+        check,
+        certified,
+        block: block.num_hash(),
+        final_consensus,
+    })
+}
+
+/// An epoch record whose `final_state` block is not where the epoch-closing calls ran for its
+/// `final_consensus`. Returned by [`require_closing_block`]; it stops the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ClosingBlockMismatch {
+    /// The record's epoch.
+    pub(super) epoch: Epoch,
+    /// Where the record was checked.
+    pub(super) path: RecordCheckPath,
+    /// The comparison the block failed.
+    pub(super) check: ClosingBlockCheck,
+    /// Whether the stored record carries a certificate (a record being built has none).
+    pub(super) certified: bool,
+    /// The block the record commits, or would commit, as `final_state`.
+    pub(super) block: BlockNumHash,
+    /// The consensus header the record commits as `final_consensus`.
+    pub(super) final_consensus: ConsensusNumHash,
+}
+
+impl std::fmt::Display for ClosingBlockMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { epoch, path, check, certified, block, final_consensus } = self;
+        let kind = if *certified { "certified" } else { "uncertified" };
+        write!(
+            f,
+            "epoch {epoch}: block {} ({}), the final_state of the {kind} epoch record ({} path), \
+             is not the block where the epoch-closing calls ran for consensus header {} ({}): {} \
+             - stopping the node rather than {} (do NOT delete chain-data: keep the datadir)",
+            block.number,
+            block.hash,
+            path.as_str(),
+            final_consensus.number,
+            final_consensus.hash,
+            check.describe(),
+            path.halt_reason(),
+        )
+    }
+}
+
+impl std::error::Error for ClosingBlockMismatch {}
+
+/// Log the record this node publishes as its own on `epoch_record_watch`: `branch` is `built` for
+/// a record built at this close, `stored_matched` for a stored record whose closing block this
+/// node checked (one it executed, or the restored-state floor block the restore imported),
+/// `stored_restored` for one whose closing block is below this datadir's restored-state floor and
+/// was not compared.
+fn log_published_record(record: &EpochRecord, branch: &'static str) {
+    info!(
+        target: "epoch-manager",
+        epoch = record.epoch,
+        final_state_number = record.final_state.number,
+        final_state_hash = %record.final_state.hash,
+        final_consensus_number = record.final_consensus.number,
+        final_consensus_hash = %record.final_consensus.hash,
+        digest = %record.digest(),
+        branch,
+        "epoch record published",
+    );
+}
+
 /// Decode which consensus header the executed closing block points to, and verify it closes the
 /// epoch we intend to re-derive.
 ///
@@ -1469,10 +2090,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(
+        assert!(matches!(
             repool_batch_txns(&pools, active_workers, &batch).await,
-            OrphanBatchRecovery::Complete
-        );
+            OrphanBatchRecovery::Complete(_)
+        ));
         pools.iter().enumerate().for_each(|(index, pool)| {
             assert_eq!(pool.get(&hash).is_some(), index == expected_pool);
         });
@@ -1535,7 +2156,7 @@ mod tests {
         let mut recovery =
             Box::pin(recover_orphan_batches(&db, snapshot, |digest, _| async move {
                 if digest == completed {
-                    OrphanBatchRecovery::Complete
+                    OrphanBatchRecovery::Complete(OrphanTxCounts::default())
                 } else {
                     std::future::pending().await
                 }
@@ -1550,7 +2171,7 @@ mod tests {
         assert!(db.contains_key::<OurNodeBatchesCache>(&new_batch)?);
 
         recover_orphan_batches(&db, vec![(interrupted, batch)], |_, _| async {
-            OrphanBatchRecovery::Complete
+            OrphanBatchRecovery::Complete(OrphanTxCounts::default())
         })
         .await?;
         db.persist::<OurNodeBatchesCache>().await?;
@@ -2063,6 +2684,52 @@ mod tests {
         });
     }
 
+    /// The committee-shuffle seed the closing blocks of these tests carry.
+    const CLOSING_SEED: B256 = B256::repeat_byte(0x5e);
+
+    /// A header for `block` with the closing markers the engine writes into the last block of
+    /// `epoch`'s closing output `final_consensus`: the output digest as the beacon root, the
+    /// leader's nonce (`epoch << 32 | round`) and the seed as the 32-byte `extra_data`.
+    fn closing_header(
+        block: BlockNumHash,
+        epoch: Epoch,
+        final_consensus: ConsensusNumHash,
+        seed: B256,
+    ) -> SealedHeader {
+        let header = ExecHeader {
+            number: block.number,
+            parent_beacon_block_root: Some(final_consensus.hash.into()),
+            nonce: (((epoch as u64) << 32) | 7).into(),
+            extra_data: Bytes::copy_from_slice(seed.as_slice()),
+            ..Default::default()
+        };
+        SealedHeader::new(header, block.hash)
+    }
+
+    /// The closing block `record` names, with the markers it commits to and [`CLOSING_SEED`].
+    fn closing_header_of(record: &EpochRecord) -> SealedHeader {
+        closing_header(record.final_state, record.epoch, record.final_consensus, CLOSING_SEED)
+    }
+
+    /// Make `header` the last block the bus reports executed.
+    fn execute_header(
+        manager: &EpochManager<std::path::PathBuf, DatabaseType>,
+        header: SealedHeader,
+    ) {
+        manager
+            .consensus_bus
+            .recent_blocks()
+            .send_modify(|blocks| blocks.push_latest(0, ConsensusNumHash::default(), Some(header)));
+    }
+
+    /// Execute `record`'s closing block, markers included ([`closing_header_of`]).
+    fn execute_closing(
+        manager: &EpochManager<std::path::PathBuf, DatabaseType>,
+        record: &EpochRecord,
+    ) {
+        execute_header(manager, closing_header_of(record));
+    }
+
     /// A certificate for `record`. Storage checks only that it names the record's digest.
     fn certificate_for(record: &EpochRecord) -> tn_types::EpochCertificate {
         tn_types::EpochCertificate {
@@ -2124,7 +2791,7 @@ mod tests {
             let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
             let closing = block(20, 0x20);
             let record = store_epoch1_record(&manager, &keys, closing, certify).await?;
-            execute_to(&manager, closing);
+            execute_closing(&manager, &record);
             manager.write_epoch_record(1, &engine).await?;
             assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record));
         }
@@ -2208,7 +2875,7 @@ mod tests {
         assert_eq!(mismatch, FinalStateMismatch { epoch: 0, certified: true, recorded, local });
         assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None, "not published");
 
-        execute_to(&manager, recorded);
+        execute_closing(&manager, &record0);
         manager.write_epoch_record(0, &engine).await?;
         assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record0));
         Ok(())
@@ -2272,8 +2939,17 @@ mod tests {
             .ok_or_else(|| eyre!("genesis header"))?
             .num_hash();
         assert_ne!(dummy.final_state, genesis, "a compare with the dummy would refuse the close");
-        execute_to(&manager, genesis);
-        manager.last_consensus_header = Some(tn_types::ConsensusHeader::default());
+        let boundary = tn_types::ConsensusHeader::default();
+        execute_header(
+            &manager,
+            closing_header(
+                genesis,
+                0,
+                ConsensusNumHash::new(boundary.number, boundary.digest()),
+                boundary.sub_dag.randomness(),
+            ),
+        );
+        manager.last_consensus_header = Some(boundary);
 
         manager.write_epoch_record(0, &engine).await?;
         let (record, cert) = manager
@@ -2302,7 +2978,7 @@ mod tests {
         let scaffolded = block(floor - 1, 0x21);
         execute_to(&manager, scaffolded);
         manager.write_epoch_record(1, &engine).await?;
-        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record));
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record.clone()));
         manager.recover_previous_epoch_record(2, &header_of(scaffolded), &engine).await?;
 
         for local in [block(floor, 0x21), block(floor + 1, 0x21)] {
@@ -2315,9 +2991,10 @@ mod tests {
             assert_eq!(mismatch.local, local);
         }
 
-        execute_to(&manager, recorded);
+        // the floor block as the restore imported it: the closing markers included
+        execute_closing(&manager, &record);
         manager.write_epoch_record(1, &engine).await?;
-        manager.recover_previous_epoch_record(2, &header_of(recorded), &engine).await?;
+        manager.recover_previous_epoch_record(2, &closing_header_of(&record), &engine).await?;
         Ok(())
     }
 
@@ -2330,14 +3007,1447 @@ mod tests {
         let temp = tempfile::TempDir::with_prefix("replay_guard_entry")?;
         let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
         let recorded = block(20, 0x20);
-        store_epoch1_record(&manager, &keys, recorded, true).await?;
+        let record = store_epoch1_record(&manager, &keys, recorded, true).await?;
 
-        manager.recover_previous_epoch_record(2, &header_of(recorded), &engine).await?;
+        manager.recover_previous_epoch_record(2, &closing_header_of(&record), &engine).await?;
         let local = block(20, 0x21);
         let mismatch = expect_mismatch(
             manager.recover_previous_epoch_record(2, &header_of(local), &engine).await,
         );
         assert_eq!(mismatch, FinalStateMismatch { epoch: 1, certified: true, recorded, local });
         Ok(())
+    }
+
+    /// An epoch above adiri's early-epoch exemption, so the checks on it compare `extra_data` in
+    /// every build.
+    const CHECKED_EPOCH: Epoch = 200;
+
+    /// The boundary consensus header of the closing output in these tests.
+    fn boundary_header() -> tn_types::ConsensusHeader {
+        tn_types::ConsensusHeader { number: 9, ..Default::default() }
+    }
+
+    /// `header`'s number and digest, as a record commits it in `final_consensus`.
+    fn num_hash_of(header: &tn_types::ConsensusHeader) -> ConsensusNumHash {
+        ConsensusNumHash::new(header.number, header.digest())
+    }
+
+    /// What a failed `extra_data` comparison `check` yields at `epoch`: itself, or
+    /// [`ClosingBlockCheck::Ok`] where the build skips the marker (adiri's early epochs).
+    fn marker_result(epoch: Epoch, check: ClosingBlockCheck) -> ClosingBlockCheck {
+        if closing_marker_checked(epoch) {
+            check
+        } else {
+            ClosingBlockCheck::Ok
+        }
+    }
+
+    /// `closing` with `change` applied to its header and its hash kept.
+    fn altered(closing: &SealedHeader, change: impl FnOnce(&mut ExecHeader)) -> SealedHeader {
+        let mut header = closing.header().clone();
+        change(&mut header);
+        SealedHeader::new(header, closing.hash())
+    }
+
+    /// The [`ClosingBlockMismatch`] a refused close or entry returned.
+    fn expect_refusal(result: eyre::Result<impl std::fmt::Debug>) -> ClosingBlockMismatch {
+        let err = result.expect_err("a block without the record's closing markers stops the node");
+        err.downcast_ref::<ClosingBlockMismatch>()
+            .cloned()
+            .unwrap_or_else(|| panic!("not a closing-block refusal: {err:#}"))
+    }
+
+    /// The fields of every `epoch record published` line the thread logs while this is its
+    /// default subscriber, plus `target`.
+    #[derive(Clone, Default)]
+    struct PublishedLines(
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    );
+
+    impl PublishedLines {
+        /// The lines captured so far.
+        fn lines(&self) -> Vec<std::collections::BTreeMap<String, String>> {
+            self.0.lock().expect("capture lock").clone()
+        }
+    }
+
+    /// Field values as text: strings unquoted, everything else as its `Debug` (`Display` for the
+    /// `%` fields).
+    #[derive(Default)]
+    struct FieldText(std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldText {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl tracing::Subscriber for PublishedLines {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            // the published line's target only: nothing else is formatted
+            metadata.target() == "epoch-manager"
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = FieldText::default();
+            event.record(&mut fields);
+            if fields.0.get("message").map(String::as_str) == Some("epoch record published") {
+                fields.0.insert("target".to_string(), event.metadata().target().to_string());
+                self.0.lock().expect("capture lock").push(fields.0);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Assert `line` is the `epoch record published` line for `record` with `branch`.
+    fn assert_published_line(
+        line: &std::collections::BTreeMap<String, String>,
+        record: &EpochRecord,
+        branch: &str,
+    ) {
+        let expected = [
+            ("target", "epoch-manager".to_string()),
+            ("epoch", record.epoch.to_string()),
+            ("final_state_number", record.final_state.number.to_string()),
+            ("final_state_hash", record.final_state.hash.to_string()),
+            ("final_consensus_number", record.final_consensus.number.to_string()),
+            ("final_consensus_hash", record.final_consensus.hash.to_string()),
+            ("digest", record.digest().to_string()),
+            ("branch", branch.to_string()),
+        ];
+        for (field, value) in expected {
+            assert_eq!(line.get(field), Some(&value), "field {field} of {line:?}");
+        }
+    }
+
+    /// The check names the first comparison a block fails, in the order (a) beacon root, (b) nonce
+    /// epoch, (c) the 32-byte marker, then the seed; without a seed only the length is compared.
+    #[test]
+    fn closing_block_check_names_the_comparison_that_fails() {
+        let final_consensus = ConsensusNumHash::new(9, B256::repeat_byte(0x09).into());
+        let closing = closing_header(block(42, 0x42), CHECKED_EPOCH, final_consensus, CLOSING_SEED);
+        let check = |header: &SealedHeader, seed: Option<B256>| {
+            closing_block_check(header, CHECKED_EPOCH, final_consensus, seed)
+        };
+        assert_eq!(check(&closing, Some(CLOSING_SEED)), ClosingBlockCheck::Ok);
+        assert_eq!(check(&closing, None), ClosingBlockCheck::Ok);
+
+        let other_output = altered(&closing, |h| {
+            h.parent_beacon_block_root = Some(B256::repeat_byte(0x0a));
+        });
+        let no_beacon_root = altered(&closing, |h| h.parent_beacon_block_root = None);
+        let other_epoch =
+            altered(&closing, |h| h.nonce = (((CHECKED_EPOCH as u64) + 1) << 32).into());
+        // an earlier block of the closing output: same beacon root and nonce, no marker
+        let earlier_block = altered(&closing, |h| h.extra_data = Bytes::new());
+        let short_marker = altered(&closing, |h| h.extra_data = Bytes::from(vec![0x5e; 31]));
+        let long_marker = altered(&closing, |h| h.extra_data = Bytes::from(vec![0x5e; 33]));
+        let other_seed = altered(&closing, |h| {
+            h.extra_data = Bytes::copy_from_slice(B256::repeat_byte(0x0c).as_slice());
+        });
+        let both_wrong = altered(&other_output, |h| h.nonce = 0_u64.into());
+        for (case, header, seed, expected) in [
+            (
+                "another output's block",
+                &other_output,
+                Some(CLOSING_SEED),
+                ClosingBlockCheck::BeaconRoot,
+            ),
+            ("no beacon root", &no_beacon_root, Some(CLOSING_SEED), ClosingBlockCheck::BeaconRoot),
+            (
+                "a default header (no beacon root)",
+                &SealedHeader::default(),
+                None,
+                ClosingBlockCheck::BeaconRoot,
+            ),
+            (
+                "another epoch's block",
+                &other_epoch,
+                Some(CLOSING_SEED),
+                ClosingBlockCheck::NonceEpoch,
+            ),
+            (
+                "an earlier block",
+                &earlier_block,
+                Some(CLOSING_SEED),
+                ClosingBlockCheck::ExtraDataLength,
+            ),
+            ("an earlier block, no seed", &earlier_block, None, ClosingBlockCheck::ExtraDataLength),
+            ("31 bytes", &short_marker, None, ClosingBlockCheck::ExtraDataLength),
+            ("33 bytes", &long_marker, None, ClosingBlockCheck::ExtraDataLength),
+            ("another seed", &other_seed, Some(CLOSING_SEED), ClosingBlockCheck::ExtraDataSeed),
+            ("another seed, none held", &other_seed, None, ClosingBlockCheck::Ok),
+            (
+                "the first failure wins",
+                &both_wrong,
+                Some(CLOSING_SEED),
+                ClosingBlockCheck::BeaconRoot,
+            ),
+        ] {
+            assert_eq!(check(header, seed), expected, "{case}");
+        }
+
+        let labels = [
+            ClosingBlockCheck::Ok,
+            ClosingBlockCheck::BeaconRoot,
+            ClosingBlockCheck::NonceEpoch,
+            ClosingBlockCheck::ExtraDataLength,
+            ClosingBlockCheck::ExtraDataSeed,
+        ]
+        .map(ClosingBlockCheck::as_str);
+        assert_eq!(
+            labels,
+            ["ok", "beacon_root", "nonce_epoch", "extra_data_length", "extra_data_seed"]
+        );
+    }
+
+    /// Comparison (c) is skipped only in the adiri build and only for its epochs at or below
+    /// `ADIRI_DUP_BATCH_EPOCH` (160), where the closing flag could land on no block; (a) and (b)
+    /// are still compared there.
+    #[test]
+    fn the_closing_marker_is_skipped_only_for_adiri_early_epochs() {
+        #[cfg(feature = "adiri")]
+        assert_eq!(tn_types::forks::ADIRI_DUP_BATCH_EPOCH, 160);
+        let final_consensus = ConsensusNumHash::new(9, B256::repeat_byte(0x09).into());
+        let unmarked = |epoch: Epoch| {
+            altered(&closing_header(block(42, 0x42), epoch, final_consensus, CLOSING_SEED), |h| {
+                h.extra_data = Bytes::new();
+            })
+        };
+        let early = closing_block_check(&unmarked(160), 160, final_consensus, None);
+        if cfg!(feature = "adiri") {
+            assert_eq!(early, ClosingBlockCheck::Ok, "adiri epoch 160 is not compared");
+        } else {
+            assert_eq!(early, ClosingBlockCheck::ExtraDataLength, "only adiri skips epoch 160");
+        }
+        assert_eq!(
+            closing_block_check(&unmarked(161), 161, final_consensus, None),
+            ClosingBlockCheck::ExtraDataLength,
+            "epoch 161 is compared in every build"
+        );
+        assert_eq!(
+            closing_block_check(&unmarked(161), 160, final_consensus, None),
+            ClosingBlockCheck::NonceEpoch,
+            "the nonce is compared at every epoch"
+        );
+        assert_eq!(closing_marker_checked(0), !cfg!(feature = "adiri"));
+        assert!(closing_marker_checked(161));
+    }
+
+    /// The block the engine builds from the last batch of an epoch-closing output passes the check
+    /// against that output, seed included: the rule is the payload builder's own encoding. The
+    /// output's earlier batch builds a block with the same beacon root and nonce but no marker,
+    /// and a block of an earlier, non-closing output is not the closing output's block.
+    #[tokio::test]
+    async fn a_closing_block_the_engine_builds_passes_the_check() -> eyre::Result<()> {
+        use tn_reth::{
+            payload::TNPayload,
+            test_utils::{
+                consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+                test_genesis_with_consensus_registry,
+            },
+        };
+
+        let chain: std::sync::Arc<RethChainSpec> =
+            std::sync::Arc::new(test_genesis_with_consensus_registry(4).into());
+        let temp = tempfile::TempDir::with_prefix("closing_block_check_engine")?;
+        let tasks = TaskManager::new("closing block check engine");
+        let reth_env = RethEnv::new_for_temp_chain(chain, temp.path(), &tasks, None)?;
+        // the engine's payload for batch `index` of `output`: every block of an output carries
+        // the output digest as its beacon root, as `tn-engine`'s payload builder passes it
+        let build = |parent: SealedHeader,
+                     output: &ConsensusOutput,
+                     index: usize|
+         -> eyre::Result<SealedHeader> {
+            let gas_limit = parent.gas_limit;
+            let payload = TNPayload::new(
+                parent,
+                Address::random(),
+                index,
+                B256::random(),
+                output,
+                output.consensus_header_hash().into(),
+                MIN_PROTOCOL_BASE_FEE,
+                gas_limit,
+                B256::random(),
+                0,
+            );
+            let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+            Ok(block.recovered_block.clone_sealed_header())
+        };
+        let genesis =
+            reth_env.sealed_header_by_number(0)?.ok_or_else(|| eyre!("the genesis header"))?;
+        let open = consensus_output_for_tests(1, 0, 1, false);
+        let inner = build(genesis, &open, 0)?;
+        // a closing output of two batches: the payload builder builds one block per batch and
+        // flags only the last
+        let base: tn_types::ConsensusHeader = consensus_output_for_tests(3, 0, 2, true).into();
+        let closing_output = ConsensusOutput::new(
+            base.sub_dag,
+            base.parent_hash,
+            base.number,
+            true,
+            std::collections::VecDeque::from([B256::repeat_byte(1), B256::repeat_byte(2)]),
+            Vec::new(),
+        );
+        let first = build(inner.clone(), &closing_output, 0)?;
+        eyre::ensure!(reth_env.epoch_state_from_canonical_tip()?.epoch == 0, "not closed yet");
+        let closing = build(first.clone(), &closing_output, 1)?;
+        eyre::ensure!(reth_env.epoch_state_from_canonical_tip()?.epoch == 1, "epoch 0 closed");
+
+        let final_consensus = closing_output.num_hash();
+        let seed = Some(closing_output.committee_shuffle_seed());
+        assert_eq!(closing_block_check(&closing, 0, final_consensus, seed), ClosingBlockCheck::Ok);
+        assert_eq!(
+            closing_block_check(&closing, 1, final_consensus, seed),
+            ClosingBlockCheck::NonceEpoch
+        );
+        assert_eq!(
+            closing_block_check(&first, 0, final_consensus, seed),
+            marker_result(0, ClosingBlockCheck::ExtraDataLength),
+            "the closing output's earlier batch builds a block without the marker"
+        );
+        assert!(first.extra_data.is_empty() && inner.extra_data.is_empty(), "unmarked blocks");
+        assert_eq!(
+            closing_block_check(&inner, 0, open.num_hash(), None),
+            marker_result(0, ClosingBlockCheck::ExtraDataLength),
+            "a non-closing output's block carries no marker"
+        );
+        assert_eq!(
+            closing_block_check(&inner, 0, final_consensus, seed),
+            ClosingBlockCheck::BeaconRoot,
+            "an earlier output's block is not the closing output's"
+        );
+        Ok(())
+    }
+
+    /// The build path checks the ring tip before it reads a committee or saves anything: a tip
+    /// that fails any one comparison stops the close with that comparison named, and leaves no
+    /// record saved or published. A genuine closing tip passes the check and goes on to the
+    /// committee read (which fails here, at a synthetic block, with another error).
+    #[tokio::test]
+    async fn a_closing_block_without_its_markers_stops_the_build_before_the_save(
+    ) -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("closing_check_build")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            final_state: block(10, 0x10),
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save(record0.clone(), certificate_for(&record0)).await?;
+        let boundary = boundary_header();
+        let final_consensus = num_hash_of(&boundary);
+        let seed = boundary.sub_dag.randomness();
+        assert_ne!(seed, B256::repeat_byte(0x0c), "fixture: another seed differs");
+        let tip = block(20, 0x20);
+        let closing = closing_header(tip, 1, final_consensus, seed);
+
+        for (case, header, expected) in [
+            (
+                "another output's block",
+                altered(&closing, |h| h.parent_beacon_block_root = Some(B256::repeat_byte(0x0b))),
+                ClosingBlockCheck::BeaconRoot,
+            ),
+            (
+                "another epoch's block",
+                altered(&closing, |h| h.nonce = (2_u64 << 32).into()),
+                ClosingBlockCheck::NonceEpoch,
+            ),
+            (
+                "an earlier block of the closing output",
+                altered(&closing, |h| h.extra_data = Bytes::new()),
+                marker_result(1, ClosingBlockCheck::ExtraDataLength),
+            ),
+            (
+                "another seed",
+                altered(&closing, |h| {
+                    h.extra_data = Bytes::copy_from_slice(B256::repeat_byte(0x0c).as_slice());
+                }),
+                marker_result(1, ClosingBlockCheck::ExtraDataSeed),
+            ),
+        ] {
+            execute_header(&manager, header);
+            manager.last_consensus_header = Some(boundary.clone());
+            let result = manager.write_epoch_record(1, &engine).await;
+            if expected == ClosingBlockCheck::Ok {
+                // a marker the build skips: past the check, to the committee read that fails
+                let err = result.expect_err("no committee can be read at a synthetic block");
+                assert!(err.downcast_ref::<ClosingBlockMismatch>().is_none(), "{case}: {err:#}");
+                continue;
+            }
+            let refused = expect_refusal(result);
+            assert_eq!(
+                refused,
+                ClosingBlockMismatch {
+                    epoch: 1,
+                    path: RecordCheckPath::Built,
+                    check: expected,
+                    certified: false,
+                    block: tip,
+                    final_consensus,
+                },
+                "{case}"
+            );
+            let message = refused.to_string();
+            for part in ["epoch 1", "uncertified", "built path", &tip.hash.to_string()] {
+                assert!(message.contains(part), "{case}: {part} missing from: {message}");
+            }
+            assert!(
+                manager.consensus_chain.epochs().get_epoch_by_number(1).await.is_none(),
+                "{case}: nothing saved"
+            );
+            assert_eq!(
+                *manager.consensus_bus.epoch_record_watch().borrow(),
+                None,
+                "{case}: nothing published"
+            );
+        }
+
+        execute_header(&manager, closing);
+        manager.last_consensus_header = Some(boundary);
+        let err = manager
+            .write_epoch_record(1, &engine)
+            .await
+            .expect_err("no committee can be read at a synthetic block");
+        assert!(err.downcast_ref::<ClosingBlockMismatch>().is_none(), "past the check: {err:#}");
+        assert!(format!("{err:#}").contains("failed committee read"), "{err:#}");
+        assert!(manager.consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
+        Ok(())
+    }
+
+    /// A genuine close is unchanged by the check: the record `write_epoch_record` saves and
+    /// publishes is the one `build_epoch_record` makes from the same closing block, committees and
+    /// boundary header, and the close logs it once as `epoch record published`, branch `built`.
+    ///
+    /// The digest itself cannot be pinned here: the test genesis stamps the current second, so
+    /// the closing block's hash changes from run to run.
+    #[tokio::test]
+    async fn a_genuine_close_saves_the_same_record_and_logs_it_published() -> eyre::Result<()> {
+        let lines = PublishedLines::default();
+        let _logs = tracing::subscriber::set_default(lines.clone());
+        let temp = tempfile::TempDir::with_prefix("closing_check_golden")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save_dummy_epoch0(dummy).await?;
+        let genesis = engine
+            .get_reth_env()
+            .await
+            .sealed_header_by_number(0)?
+            .ok_or_else(|| eyre!("genesis header"))?
+            .num_hash();
+        let boundary = boundary_header();
+        let final_consensus = num_hash_of(&boundary);
+        execute_header(
+            &manager,
+            closing_header(genesis, 0, final_consensus, boundary.sub_dag.randomness()),
+        );
+        manager.last_consensus_header = Some(boundary);
+
+        manager.write_epoch_record(0, &engine).await?;
+        let (record, cert) = manager
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(0)
+            .await
+            .ok_or_else(|| eyre!("record 0"))?;
+        assert!(cert.is_none());
+        let expected = build_epoch_record(
+            0,
+            record.committee.clone(),
+            record.next_committee.clone(),
+            None,
+            genesis,
+            final_consensus,
+        )?;
+        assert_eq!(record, expected);
+        assert_eq!(record.digest(), expected.digest());
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(expected.clone()));
+
+        let lines = lines.lines();
+        assert_eq!(lines.len(), 1, "one line per published record: {lines:?}");
+        assert_published_line(&lines[0], &expected, "built");
+        Ok(())
+    }
+
+    /// A stored record whose `final_state` is the closing block but whose markers are not stops
+    /// the close, unpublished: another output's beacon root always, another seed when the node
+    /// holds the boundary header the record commits. A boundary header the record does not commit
+    /// gives no seed (the length only). A record that matches is reused and logged as published,
+    /// branch `stored_matched`.
+    #[tokio::test]
+    async fn a_stored_record_without_the_closing_markers_stops_the_close() -> eyre::Result<()> {
+        let lines = PublishedLines::default();
+        let _logs = tracing::subscriber::set_default(lines.clone());
+        let temp = tempfile::TempDir::with_prefix("closing_check_stored")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let closing = block(20, 0x20);
+        let boundary = boundary_header();
+        let epochs = manager.consensus_chain.epochs();
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            final_state: block(10, 0x10),
+            ..Default::default()
+        };
+        epochs.save(record0.clone(), certificate_for(&record0)).await?;
+        let record = EpochRecord {
+            epoch: 1,
+            committee: keys.clone(),
+            next_committee: keys,
+            parent_hash: record0.digest(),
+            final_state: closing,
+            final_consensus: num_hash_of(&boundary),
+        };
+        epochs.save(record.clone(), certificate_for(&record)).await?;
+
+        let another_output = ConsensusNumHash::new(9, B256::repeat_byte(0x0b).into());
+        execute_header(&manager, closing_header(closing, 1, another_output, CLOSING_SEED));
+        let refused = expect_refusal(manager.write_epoch_record(1, &engine).await);
+        assert_eq!(
+            refused,
+            ClosingBlockMismatch {
+                epoch: 1,
+                path: RecordCheckPath::Stored,
+                check: ClosingBlockCheck::BeaconRoot,
+                certified: true,
+                block: closing,
+                final_consensus: record.final_consensus,
+            }
+        );
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None, "not published");
+
+        // the boundary header this node closed on, the one the record commits, gives the seed the
+        // marker must equal (a build that skips the marker at this epoch has nothing to refuse)
+        assert_ne!(boundary.sub_dag.randomness(), CLOSING_SEED, "fixture: the seeds differ");
+        execute_closing(&manager, &record);
+        if closing_marker_checked(record.epoch) {
+            manager.last_consensus_header = Some(boundary.clone());
+            let refused = expect_refusal(manager.write_epoch_record(1, &engine).await);
+            assert_eq!(refused.check, ClosingBlockCheck::ExtraDataSeed);
+            assert_eq!(refused.path, RecordCheckPath::Stored);
+            assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None);
+        }
+        assert!(lines.lines().is_empty(), "a refused record is not logged as published");
+
+        // a held boundary header the record does not commit gives no seed: the length is compared
+        let unrelated = tn_types::ConsensusHeader { number: 10, ..Default::default() };
+        assert_ne!(num_hash_of(&unrelated), record.final_consensus, "fixture: another header");
+        manager.last_consensus_header = Some(unrelated);
+        manager.write_epoch_record(1, &engine).await?;
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record.clone()));
+
+        // the record's own boundary header and a block carrying its seed
+        execute_header(
+            &manager,
+            closing_header(closing, 1, record.final_consensus, boundary.sub_dag.randomness()),
+        );
+        manager.last_consensus_header = Some(boundary);
+        manager.write_epoch_record(1, &engine).await?;
+        let lines = lines.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            assert_published_line(line, &record, "stored_matched");
+        }
+        Ok(())
+    }
+
+    /// Entering epoch 2, epoch 1's record is checked against the entry pin's markers too: a pin
+    /// at the recorded number and hash whose nonce carries another epoch, or that carries no
+    /// closing marker, stops the entry. The entry holds no seed, so another 32-byte marker passes.
+    #[tokio::test]
+    async fn epoch_entry_stops_on_a_closing_block_without_the_records_markers() -> eyre::Result<()>
+    {
+        let temp = tempfile::TempDir::with_prefix("closing_check_entry")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let recorded = block(20, 0x20);
+        let record = store_epoch1_record(&manager, &keys, recorded, true).await?;
+        let pin = closing_header_of(&record);
+
+        for (case, header, expected) in [
+            (
+                "another epoch's block",
+                altered(&pin, |h| h.nonce = (2_u64 << 32).into()),
+                ClosingBlockCheck::NonceEpoch,
+            ),
+            (
+                "no marker",
+                altered(&pin, |h| h.extra_data = Bytes::new()),
+                marker_result(1, ClosingBlockCheck::ExtraDataLength),
+            ),
+        ] {
+            let result = manager.recover_previous_epoch_record(2, &header, &engine).await;
+            if expected == ClosingBlockCheck::Ok {
+                // a marker the build skips at this epoch
+                result?;
+                continue;
+            }
+            let refused = expect_refusal(result);
+            assert_eq!(
+                refused,
+                ClosingBlockMismatch {
+                    epoch: 1,
+                    path: RecordCheckPath::Entry,
+                    check: expected,
+                    certified: true,
+                    block: recorded,
+                    final_consensus: record.final_consensus,
+                },
+                "{case}"
+            );
+        }
+
+        let other_seed = altered(&pin, |h| {
+            h.extra_data = Bytes::copy_from_slice(B256::repeat_byte(0x0c).as_slice());
+        });
+        manager.recover_previous_epoch_record(2, &other_seed, &engine).await?;
+        manager.recover_previous_epoch_record(2, &pin, &engine).await?;
+        Ok(())
+    }
+
+    /// Below the restored-state floor nothing of the record is compared, its closing markers
+    /// included: a closing block there without them is reused at the close (published, branch
+    /// `stored_restored`) and passes the entry. With the floor at that block, the restore imported
+    /// its real header, so the same block is compared and refused at the close and the entry.
+    #[tokio::test]
+    async fn the_restored_floor_skips_the_closing_markers_too() -> eyre::Result<()> {
+        let lines = PublishedLines::default();
+        let _logs = tracing::subscriber::set_default(lines.clone());
+        let restored = block(20, 0x20);
+
+        let temp = tempfile::TempDir::with_prefix("closing_check_below_floor")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, Some(21)).await?;
+        let record = store_epoch1_record(&manager, &keys, restored, true).await?;
+        execute_to(&manager, restored);
+        manager.write_epoch_record(1, &engine).await?;
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record.clone()));
+        manager.recover_previous_epoch_record(2, &header_of(restored), &engine).await?;
+        let published = lines.lines();
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert_published_line(&published[0], &record, "stored_restored");
+
+        let temp = tempfile::TempDir::with_prefix("closing_check_at_floor")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, Some(20)).await?;
+        store_epoch1_record(&manager, &keys, restored, true).await?;
+        execute_to(&manager, restored);
+        let refused = expect_refusal(manager.write_epoch_record(1, &engine).await);
+        assert_eq!(
+            (refused.path, refused.check),
+            (RecordCheckPath::Stored, ClosingBlockCheck::BeaconRoot)
+        );
+        let refused = expect_refusal(
+            manager.recover_previous_epoch_record(2, &header_of(restored), &engine).await,
+        );
+        assert_eq!(
+            (refused.path, refused.check),
+            (RecordCheckPath::Entry, ClosingBlockCheck::BeaconRoot)
+        );
+        Ok(())
+    }
+
+    /// A manager that closed epoch 0 once, at genesis over the dummy record, from
+    /// [`boundary_header`]'s output: it holds this node's own uncertified record 0, returned with
+    /// the closing block it commits, markers included.
+    async fn closed_epoch0(
+        temp: &tempfile::TempDir,
+    ) -> eyre::Result<(
+        EpochManager<std::path::PathBuf, DatabaseType>,
+        ExecutionNode,
+        TaskManager,
+        EpochRecord,
+        SealedHeader,
+    )> {
+        let (mut manager, engine, tasks, keys) = guard_manager(temp, None).await?;
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save_dummy_epoch0(dummy).await?;
+        let genesis = engine
+            .get_reth_env()
+            .await
+            .sealed_header_by_number(0)?
+            .ok_or_else(|| eyre!("genesis header"))?
+            .num_hash();
+        let boundary = boundary_header();
+        let closing =
+            closing_header(genesis, 0, num_hash_of(&boundary), boundary.sub_dag.randomness());
+        execute_header(&manager, closing.clone());
+        manager.last_consensus_header = Some(boundary);
+        manager.write_epoch_record(0, &engine).await?;
+        let (record0, cert) = manager
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(0)
+            .await
+            .ok_or_else(|| eyre!("record 0"))?;
+        eyre::ensure!(
+            cert.is_none() && record0.final_state == genesis,
+            "fixture: this node's own uncertified record 0"
+        );
+        Ok((manager, engine, tasks, record0, closing))
+    }
+
+    /// This node's own uncertified record 0 gets the closing-block check where the replay guard
+    /// compares it, before the close builds record 0 again: a closing block at the recorded number
+    /// and hash without the markers stops the close there (`path=stored`; the build's own check
+    /// would name `built`), unpublished, and a marker other than the seed of the boundary header
+    /// the record commits is refused the same way. The record is already stored, so the refusal
+    /// says the stop keeps the node from running on, as the `final_state` refusal on this record
+    /// does. The stored record stays as it was.
+    #[tokio::test]
+    async fn own_uncertified_record0_without_the_closing_markers_stops_the_close_before_the_rebuild(
+    ) -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("closing_check_own_epoch0")?;
+        let (mut manager, engine, _tasks, record0, closing) = closed_epoch0(&temp).await?;
+        manager.consensus_bus.epoch_record_watch().send_replace(None);
+
+        execute_to(&manager, record0.final_state);
+        manager.last_consensus_header = Some(boundary_header());
+        let refused = expect_refusal(manager.write_epoch_record(0, &engine).await);
+        assert_eq!(
+            refused,
+            ClosingBlockMismatch {
+                epoch: 0,
+                path: RecordCheckPath::Stored,
+                check: ClosingBlockCheck::BeaconRoot,
+                certified: false,
+                block: record0.final_state,
+                final_consensus: record0.final_consensus,
+            }
+        );
+        let message = refused.to_string();
+        assert!(
+            message.contains("(stored path)")
+                && message.contains("rather than run on a chain no epoch record attests"),
+            "{message}"
+        );
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None, "not published");
+
+        // the boundary header this node closed on is the one the record commits, so its seed is
+        // compared (a build that skips the marker at this epoch has nothing to refuse)
+        if closing_marker_checked(0) {
+            assert_ne!(
+                boundary_header().sub_dag.randomness(),
+                CLOSING_SEED,
+                "fixture: seeds differ"
+            );
+            execute_header(
+                &manager,
+                altered(&closing, |h| {
+                    h.extra_data = Bytes::copy_from_slice(CLOSING_SEED.as_slice())
+                }),
+            );
+            manager.last_consensus_header = Some(boundary_header());
+            let refused = expect_refusal(manager.write_epoch_record(0, &engine).await);
+            assert_eq!(
+                (refused.path, refused.check),
+                (RecordCheckPath::Stored, ClosingBlockCheck::ExtraDataSeed)
+            );
+            assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None);
+        }
+
+        let (stored, cert) = manager
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(0)
+            .await
+            .ok_or_else(|| eyre!("record 0"))?;
+        assert_eq!((stored, cert.is_none()), (record0, true), "the stored record is unchanged");
+        Ok(())
+    }
+
+    /// Closing epoch 0 again over this node's own uncertified record 0 checks the closing block
+    /// twice, as the stored record before the rebuild and as the record built again, and counts
+    /// both: two `ok` results for that one close, nothing else. The rebuilt record is the stored
+    /// one and is published again.
+    #[tokio::test]
+    async fn a_reclose_over_own_record0_counts_the_closing_block_check_twice() -> eyre::Result<()> {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let temp = tempfile::TempDir::with_prefix("closing_check_own_epoch0_count")?;
+        let (mut manager, engine, _tasks, record0, closing) = closed_epoch0(&temp).await?;
+        manager.consensus_bus.epoch_record_watch().send_replace(None);
+        execute_header(&manager, closing);
+        manager.last_consensus_header = Some(boundary_header());
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            // the test runtime polls the close on this thread, where the recorder is installed
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            manager.write_epoch_record(0, &engine).await?;
+        }
+        let counts: std::collections::BTreeMap<String, u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| {
+                key.key().name() == "tn_epoch.epoch_record_closing_block_check_total"
+            })
+            .filter_map(|(key, _, _, value)| {
+                let result = key.key().labels().find(|l| l.key() == "result")?.value().to_string();
+                match value {
+                    DebugValue::Counter(n) => Some((result, n)),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(counts, std::collections::BTreeMap::from([("ok".to_string(), 2)]));
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), Some(record0));
+        Ok(())
+    }
+
+    /// Every run of the check is counted with its result, and only a failed one is refused.
+    #[test]
+    fn the_closing_block_check_is_counted_with_its_result() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let final_consensus = ConsensusNumHash::new(9, B256::repeat_byte(0x09).into());
+        let closing = closing_header(block(42, 0x42), CHECKED_EPOCH, final_consensus, CLOSING_SEED);
+        let other_epoch = altered(&closing, |h| h.nonce = 0_u64.into());
+        metrics::with_local_recorder(&recorder, || {
+            for _ in 0..2 {
+                require_closing_block(
+                    Some(&closing),
+                    CHECKED_EPOCH,
+                    final_consensus,
+                    Some(CLOSING_SEED),
+                    RecordCheckPath::Built,
+                    false,
+                )
+                .expect("the closing block passes");
+            }
+            let refused = require_closing_block(
+                Some(&other_epoch),
+                CHECKED_EPOCH,
+                final_consensus,
+                None,
+                RecordCheckPath::Entry,
+                true,
+            )
+            .expect_err("another epoch's block is refused");
+            assert_eq!(refused.check, ClosingBlockCheck::NonceEpoch);
+            let refused = require_closing_block(
+                None,
+                CHECKED_EPOCH,
+                final_consensus,
+                Some(CLOSING_SEED),
+                RecordCheckPath::Built,
+                false,
+            )
+            .expect_err("no block is refused");
+            assert_eq!(refused.check, ClosingBlockCheck::NoBlock);
+            assert_eq!(
+                refused.block,
+                SealedHeader::<ExecHeader>::default().num_hash(),
+                "the default header's"
+            );
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = |result: &str| {
+            snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    key.key().name() == "tn_epoch.epoch_record_closing_block_check_total"
+                        && key.key().labels().any(|l| l.key() == "result" && l.value() == result)
+                })
+                .and_then(|(_, _, _, value)| match value {
+                    DebugValue::Counter(n) => Some(*n),
+                    _ => None,
+                })
+        };
+        assert_eq!(count("ok"), Some(2));
+        assert_eq!(count("nonce_epoch"), Some(1));
+        assert_eq!(count("no_block"), Some(1));
+        assert_eq!(count("beacon_root"), None);
+    }
+
+    /// The refusal names its path, and its text says what the stop prevents there: a record being
+    /// built (at a close, or re-derived at an entry) is not saved yet, a stored one is, so the
+    /// stop keeps the node from running on a chain no epoch record attests. The log message's
+    /// leading text is the same on every path.
+    #[test]
+    fn the_refusal_names_its_path_and_what_the_stop_prevents() {
+        let final_consensus = ConsensusNumHash::new(9, B256::repeat_byte(0x09).into());
+        let closing = closing_header(block(42, 0x42), CHECKED_EPOCH, final_consensus, CLOSING_SEED);
+        let other_epoch = altered(&closing, |h| h.nonce = 0_u64.into());
+        for (path, name, prevents) in [
+            (
+                RecordCheckPath::Built,
+                "built",
+                "save, vote on or publish a record that commits another block",
+            ),
+            (
+                RecordCheckPath::Rederived,
+                "rederived",
+                "save, vote on or publish a record that commits another block",
+            ),
+            (RecordCheckPath::Stored, "stored", "run on a chain no epoch record attests"),
+            (RecordCheckPath::Entry, "entry", "run on a chain no epoch record attests"),
+        ] {
+            assert_eq!((path.as_str(), path.halt_reason()), (name, prevents));
+            let refused = require_closing_block(
+                Some(&other_epoch),
+                CHECKED_EPOCH,
+                final_consensus,
+                None,
+                path,
+                false,
+            )
+            .expect_err("another epoch's block is refused");
+            let message = refused.to_string();
+            for part in
+                [format!("({name} path)"), format!("stopping the node rather than {prevents}")]
+            {
+                assert!(message.contains(&part), "{name}: {part} missing from: {message}");
+            }
+        }
+    }
+
+    /// With nothing executed the build path has no closing block: the close is refused as
+    /// `no_block` before any committee read, and nothing is saved or published.
+    #[tokio::test]
+    async fn an_empty_ring_stops_the_build_as_no_block() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("closing_check_no_block")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        assert!(manager.consensus_bus.recent_blocks().borrow().is_empty(), "fixture: empty ring");
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            final_state: block(10, 0x10),
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save(record0.clone(), certificate_for(&record0)).await?;
+        let boundary = boundary_header();
+        manager.last_consensus_header = Some(boundary.clone());
+
+        let refused = expect_refusal(manager.write_epoch_record(1, &engine).await);
+        assert_eq!(
+            refused,
+            ClosingBlockMismatch {
+                epoch: 1,
+                path: RecordCheckPath::Built,
+                check: ClosingBlockCheck::NoBlock,
+                certified: false,
+                block: SealedHeader::<ExecHeader>::default().num_hash(),
+                final_consensus: num_hash_of(&boundary),
+            }
+        );
+        assert!(refused.to_string().contains("this node has executed no block yet"));
+        assert!(manager.consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
+        assert_eq!(*manager.consensus_bus.epoch_record_watch().borrow(), None);
+        Ok(())
+    }
+
+    /// A record re-derived at an entry is built through the same check, and a refusal there is
+    /// named `rederived`, not `built`.
+    #[tokio::test]
+    async fn a_rederived_record_is_refused_as_rederived() -> eyre::Result<()> {
+        let temp = tempfile::TempDir::with_prefix("closing_check_rederived")?;
+        let (mut manager, engine, _tasks, keys) = guard_manager(&temp, None).await?;
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            final_state: block(10, 0x10),
+            ..Default::default()
+        };
+        manager.consensus_chain.epochs().save(record0.clone(), certificate_for(&record0)).await?;
+        let boundary = boundary_header();
+        let closing = closing_header(block(20, 0x20), 1, num_hash_of(&boundary), CLOSING_SEED);
+        execute_header(&manager, altered(&closing, |h| h.nonce = (2_u64 << 32).into()));
+        manager.last_consensus_header = Some(boundary);
+
+        let refused = expect_refusal(
+            manager.write_epoch_record_on(1, &engine, RecordCheckPath::Rederived).await,
+        );
+        assert_eq!(
+            (refused.path, refused.check),
+            (RecordCheckPath::Rederived, ClosingBlockCheck::NonceEpoch)
+        );
+        assert!(manager.consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
+        Ok(())
+    }
+
+    /// One temporary chain with two worker pools and three senders: `funded` has a balance,
+    /// `unfunded` has none, and `executed` starts at nonce 1, as if its nonce 0 had executed.
+    struct OrphanPools {
+        /// Keeps the chain's datadir alive.
+        _tmp: tempfile::TempDir,
+        /// Runs the pools' validation tasks.
+        _task_manager: TaskManager,
+        /// Keeps the chain's provider alive.
+        _env: RethEnv,
+        /// The chain the transactions are signed for.
+        chain: std::sync::Arc<RethChainSpec>,
+        /// Worker 0's and worker 1's pools.
+        pools: Vec<tn_reth::WorkerTxPool>,
+        /// A sender with a balance.
+        funded: TransactionFactory,
+        /// A sender without a balance.
+        unfunded: TransactionFactory,
+        /// A funded sender whose executed nonce is 1.
+        executed: TransactionFactory,
+    }
+
+    impl OrphanPools {
+        /// Build the chain, its pools and the three senders.
+        fn new() -> eyre::Result<Self> {
+            let tmp = tempfile::tempdir()?;
+            let task_manager = TaskManager::default();
+            let sender = |seed: u8| {
+                TransactionFactory::new_random_from_seed(&mut StdRng::from_seed([seed; 32]))
+            };
+            let (funded, unfunded, executed) = (sender(41), sender(42), sender(43));
+            let genesis = test_genesis().extend_accounts([
+                (funded.address(), GenesisAccount::default().with_balance(U256::MAX)),
+                (
+                    executed.address(),
+                    GenesisAccount::default().with_balance(U256::MAX).with_nonce(Some(1)),
+                ),
+            ]);
+            let chain: std::sync::Arc<RethChainSpec> = std::sync::Arc::new(genesis.into());
+            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &task_manager, None)?;
+            let pools = (0..2)
+                .map(|_| env.init_txn_pool(BaseFeeContainer::default()))
+                .collect::<eyre::Result<Vec<_>>>()?;
+            Ok(Self {
+                _tmp: tmp,
+                _task_manager: task_manager,
+                _env: env,
+                chain,
+                pools,
+                funded,
+                unfunded,
+                executed,
+            })
+        }
+    }
+
+    /// The next transaction of `sender`, encoded as a batch carries it.
+    fn orphan_tx(
+        chain: &std::sync::Arc<RethChainSpec>,
+        sender: &mut TransactionFactory,
+    ) -> Vec<u8> {
+        sender.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            u128::from(MIN_PROTOCOL_BASE_FEE),
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        )
+    }
+
+    /// A worker's batch of `transactions`.
+    fn orphan_batch(worker_id: WorkerId, transactions: Vec<Vec<u8>>) -> Batch {
+        Batch { worker_id, transactions, ..Default::default() }
+    }
+
+    /// A finished batch with these per-result counts.
+    fn finished(counts: OrphanTxCounts) -> OrphanBatchRecovery {
+        OrphanBatchRecovery::Complete(counts)
+    }
+
+    /// Every counter of `snapshotter`'s recorder, keyed by `name{key=value}`. A snapshot drains
+    /// the recorder's counters, so a test takes one and reads every count from it.
+    fn orphan_counters(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+    ) -> std::collections::BTreeMap<String, u64> {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(series, _, _, value)| match value {
+                DebugValue::Counter(n) => {
+                    let labels = series
+                        .key()
+                        .labels()
+                        .map(|l| format!("{}={}", l.key(), l.value()))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    Some((format!("{}{{{labels}}}", series.key().name()), n))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each transaction of a re-pooled batch is counted once by its result and each batch once
+    /// by its path: all re-pooled, an undecodable transaction, a refused executed nonce, a refusal
+    /// for another reason (a sender without funds), and a batch handled twice (already pooled).
+    #[tokio::test]
+    async fn orphan_repool_counts_each_transaction_by_result() -> eyre::Result<()> {
+        // the re-pool runs on this thread (current-thread runtime), so the local recorder sees it
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let mut fixture = OrphanPools::new()?;
+        let chain = fixture.chain.clone();
+        let all_valid = orphan_batch(
+            0,
+            vec![orphan_tx(&chain, &mut fixture.funded), orphan_tx(&chain, &mut fixture.funded)],
+        );
+        let undecodable = orphan_batch(
+            0,
+            vec![b"invalid transaction".to_vec(), orphan_tx(&chain, &mut fixture.funded)],
+        );
+        let executed_nonce = orphan_batch(0, vec![orphan_tx(&chain, &mut fixture.executed)]);
+        let unfunded = orphan_batch(0, vec![orphan_tx(&chain, &mut fixture.unfunded)]);
+        let pools = &fixture.pools;
+
+        assert_eq!(
+            repool_batch_txns(pools, 1, &all_valid).await,
+            finished(OrphanTxCounts { repooled: 2, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &undecodable).await,
+            finished(OrphanTxCounts { repooled: 1, invalid: 1, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &executed_nonce).await,
+            finished(OrphanTxCounts { refused_nonce_too_low: 1, ..Default::default() })
+        );
+        assert_eq!(
+            repool_batch_txns(pools, 1, &unfunded).await,
+            finished(OrphanTxCounts { refused_other: 1, ..Default::default() })
+        );
+        // a pass cancelled after the re-pool and retried finds the transactions already pooled
+        assert_eq!(
+            repool_batch_txns(pools, 1, &all_valid).await,
+            finished(OrphanTxCounts { already_pooled: 2, ..Default::default() })
+        );
+
+        let counters = orphan_counters(&snapshotter);
+        let count = |series: &str| counters.get(series).copied();
+        assert_eq!(count("tn_node.orphan_txs_total{result=repooled}"), Some(3));
+        assert_eq!(count("tn_node.orphan_txs_total{result=invalid}"), Some(1));
+        assert_eq!(count("tn_node.orphan_txs_total{result=already_pooled}"), Some(2));
+        assert_eq!(count("tn_node.orphan_txs_total{result=refused_nonce_too_low}"), Some(1));
+        assert_eq!(count("tn_node.orphan_txs_total{result=refused_other}"), Some(1));
+        assert_eq!(count("tn_node.orphan_batches_total{path=own_worker}"), Some(5));
+        assert_eq!(count("tn_node.orphan_batches_total{path=worker0_fallback}"), None);
+        assert_eq!(count("tn_node.orphan_batches_total{path=non_validator}"), None);
+        Ok(())
+    }
+
+    /// A batch of a worker that is no longer active counts on the worker-0 fallback path, and a
+    /// batch retained for lack of any active pool counts nothing.
+    #[tokio::test]
+    async fn orphan_repool_counts_the_worker_zero_fallback() -> eyre::Result<()> {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let mut fixture = OrphanPools::new()?;
+        let chain = fixture.chain.clone();
+        let batch = orphan_batch(1, vec![orphan_tx(&chain, &mut fixture.funded)]);
+
+        assert_eq!(
+            repool_batch_txns(&fixture.pools, 1, &batch).await,
+            finished(OrphanTxCounts { repooled: 1, ..Default::default() })
+        );
+        assert_eq!(repool_batch_txns(&fixture.pools, 0, &batch).await, OrphanBatchRecovery::Retry);
+
+        let counters = orphan_counters(&snapshotter);
+        let count = |series: &str| counters.get(series).copied();
+        assert_eq!(count("tn_node.orphan_batches_total{path=worker0_fallback}"), Some(1));
+        assert_eq!(count("tn_node.orphan_batches_total{path=own_worker}"), None);
+        assert_eq!(count("tn_node.orphan_txs_total{result=repooled}"), Some(1));
+        // every result series is touched by a finished batch, at 0 when it had none
+        ["invalid", "already_pooled", "refused_nonce_too_low", "refused_other"].iter().for_each(
+            |result| {
+                assert_eq!(count(&format!("tn_node.orphan_txs_total{{result={result}}}")), Some(0));
+            },
+        );
+        Ok(())
+    }
+
+    /// Every pool error kind lands in exactly one refusal result. The nonce-too-low arm needs the
+    /// validator's own error, so the pool test above covers it with an executed nonce.
+    #[test]
+    fn orphan_refusal_classified_by_every_pool_error_kind() {
+        let refused =
+            |kind: PoolErrorKind| OrphanTxResult::refused(&PoolError::new(B256::ZERO, kind));
+        assert_eq!(refused(PoolErrorKind::AlreadyImported), OrphanTxResult::AlreadyPooled);
+        [
+            PoolErrorKind::ReplacementUnderpriced,
+            PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(1),
+            PoolErrorKind::SpammerExceededCapacity(Address::ZERO),
+            PoolErrorKind::DiscardedOnInsert,
+            PoolErrorKind::InvalidTransaction(
+                tn_reth::InvalidPoolTransactionError::ExceedsGasLimit(2, 1),
+            ),
+            PoolErrorKind::ExistingConflictingTransactionType(Address::ZERO, 3),
+            PoolErrorKind::Other("state read failed".into()),
+        ]
+        .into_iter()
+        .for_each(|kind| assert_eq!(refused(kind), OrphanTxResult::RefusedOther));
+    }
+
+    /// Captures the fields of every event, so a test can read a log line without a log backend.
+    #[derive(Default)]
+    struct LineCapture(std::sync::Mutex<Vec<std::collections::BTreeMap<&'static str, String>>>);
+
+    impl LineCapture {
+        /// The fields of the first captured event whose message is `message`.
+        fn line(&self, message: &str) -> Option<std::collections::BTreeMap<&'static str, String>> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .find(|fields| fields.get("message").is_some_and(|logged| logged == message))
+                .cloned()
+        }
+    }
+
+    impl tracing::Subscriber for LineCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = FieldCapture::default();
+            event.record(&mut fields);
+            self.0.lock().expect("capture lock").push(fields.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// One event's fields, by name, as their `Debug` text.
+    #[derive(Default)]
+    struct FieldCapture(std::collections::BTreeMap<&'static str, String>);
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name(), format!("{value:?}"));
+        }
+    }
+
+    /// The summary line keeps its message and fields and adds the pass's transaction counts; a
+    /// retained batch adds nothing to them.
+    #[tokio::test]
+    async fn orphan_recovery_summary_line_carries_the_counts() -> eyre::Result<()> {
+        let capture = std::sync::Arc::new(LineCapture::default());
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let mut fixture = OrphanPools::new()?;
+        let chain = fixture.chain.clone();
+        let tmp = tempfile::tempdir()?;
+        let db = tn_storage::open_db(tmp.path());
+        let mixed = orphan_batch(
+            0,
+            vec![
+                b"invalid transaction".to_vec(),
+                orphan_tx(&chain, &mut fixture.funded),
+                orphan_tx(&chain, &mut fixture.unfunded),
+            ],
+        );
+        let retained = orphan_batch(0, vec![orphan_tx(&chain, &mut fixture.funded)]);
+        let (mixed_digest, retained_digest) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        db.insert::<OurNodeBatchesCache>(&mixed_digest, &mixed)?;
+        db.insert::<OurNodeBatchesCache>(&retained_digest, &retained)?;
+        let pools = &fixture.pools;
+
+        recover_orphan_batches(
+            &db,
+            vec![(mixed_digest, mixed), (retained_digest, retained)],
+            |digest, batch| async move {
+                if digest == retained_digest {
+                    OrphanBatchRecovery::Retry
+                } else {
+                    repool_batch_txns(pools, 1, &batch).await
+                }
+            },
+        )
+        .await?;
+
+        let expected: std::collections::BTreeMap<&'static str, String> = [
+            ("message", "Finished processing orphaned batches"),
+            ("batches", "2"),
+            ("processed_batches", "1"),
+            ("processed_transactions", "3"),
+            ("txs_repooled", "1"),
+            ("txs_invalid", "1"),
+            ("txs_already_pooled", "0"),
+            ("txs_refused_nonce_too_low", "0"),
+            ("txs_refused_other", "1"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name, value.to_string()))
+        .collect();
+        assert_eq!(capture.line("Finished processing orphaned batches"), Some(expected));
+        assert!(!db.contains_key::<OurNodeBatchesCache>(&mixed_digest)?);
+        assert!(db.contains_key::<OurNodeBatchesCache>(&retained_digest)?);
+        Ok(())
+    }
+
+    /// Run the leftover drain on `queued` with `last_forwarded` as the last output the engine
+    /// got, an engine channel with room for all of them and no boundary in reach. Returns the
+    /// drain's result, the numbers the engine received and the last forwarded number after it.
+    async fn drain_after(
+        last_forwarded: u64,
+        queued: &[u64],
+    ) -> eyre::Result<(eyre::Result<Option<ConsensusHeaderDigest>>, Vec<u64>, u64)> {
+        let temp = tempfile::TempDir::with_prefix("leftover_continuity")?;
+        let (mut manager, _engine, _reth_env, _tasks, committee) =
+            super::super::run_epoch::tests::manager_with_engine_and_floor(&temp, None).await?;
+        manager.epoch_boundary = u64::MAX;
+        manager.last_forwarded_consensus_number = last_forwarded;
+        let (queue_tx, mut queue) = mpsc::channel(8);
+        for &number in queued {
+            queue_tx
+                .send(super::super::run_epoch::tests::member_output_at(&committee, number))
+                .await?;
+        }
+        let (to_engine, mut engine_rx) = mpsc::channel(8);
+        let drained =
+            manager.send_leftover_consensus_output_to_engine(&mut queue, &to_engine).await;
+        drop(to_engine);
+        let mut received = Vec::new();
+        while let Some(output) = engine_rx.recv().await {
+            received.push(output.number());
+        }
+        Ok((drained, received, manager.last_forwarded_consensus_number))
+    }
+
+    /// The queue phase refuses an output that does not follow the last one the engine got: the
+    /// node stops with both numbers named and the gap counted, and the engine gets nothing, so
+    /// it never executes past the gap. The output after the gap is not forwarded either.
+    #[test]
+    fn the_leftover_drain_stops_on_a_gap_before_the_engine_gets_past_it() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (drained, received, last_forwarded) =
+            metrics::with_local_recorder(&recorder, || rt.block_on(drain_after(1, &[3, 4])))
+                .expect("the drain runs");
+
+        let err = drained.expect_err("a gap stops the node");
+        assert!(format!("{err:#}").contains("expected 2 but received 3"), "{err:#}");
+        assert!(received.is_empty(), "the engine gets nothing past the gap: {received:?}");
+        assert_eq!(last_forwarded, 1);
+        let gaps = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.leftover_output_gaps_total")
+            .and_then(|(_, _, _, value)| match value {
+                DebugValue::Counter(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(gaps, Some(1));
+    }
+
+    /// The queue phase skips an output the engine already got, as the live forward does, and
+    /// forwards the one after it.
+    #[tokio::test]
+    async fn the_leftover_drain_skips_an_output_already_forwarded() -> eyre::Result<()> {
+        let (drained, received, last_forwarded) = drain_after(2, &[2, 3]).await?;
+        assert!(drained?.is_none(), "no boundary in reach");
+        assert_eq!(received, [3], "forwarded once, in order");
+        assert_eq!(last_forwarded, 3);
+        Ok(())
+    }
+
+    /// The queue phase's skip names the output it skips (number and digest) and the phase that
+    /// skipped it, and counts once in `tn_node.leftover_outputs_skipped_total`.
+    #[test]
+    fn the_leftover_drain_logs_and_counts_an_output_it_skips() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let capture = std::sync::Arc::new(LineCapture::default());
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let drain = async {
+            let temp = tempfile::TempDir::with_prefix("leftover_skip")?;
+            let (mut manager, _engine, _reth_env, _tasks, committee) =
+                super::super::run_epoch::tests::manager_with_engine_and_floor(&temp, None).await?;
+            manager.epoch_boundary = u64::MAX;
+            manager.last_forwarded_consensus_number = 2;
+            let stale = super::super::run_epoch::tests::member_output_at(&committee, 2);
+            let next = super::super::run_epoch::tests::member_output_at(&committee, 3);
+            let (queue_tx, mut queue) = mpsc::channel(8);
+            queue_tx.send(stale.clone()).await?;
+            queue_tx.send(next).await?;
+            let (to_engine, mut engine_rx) = mpsc::channel(8);
+            let drained =
+                manager.send_leftover_consensus_output_to_engine(&mut queue, &to_engine).await?;
+            assert!(drained.is_none(), "no boundary in reach");
+            assert_eq!(engine_rx.try_recv()?.number(), 3, "the next output is forwarded");
+            assert!(engine_rx.try_recv().is_err(), "the skipped one is not");
+            eyre::Ok(stale.consensus_header_hash())
+        };
+        let digest =
+            metrics::with_local_recorder(&recorder, || rt.block_on(drain)).expect("the drain runs");
+
+        let line = capture
+            .line("skipping already-forwarded consensus output")
+            .expect("the skip is logged");
+        let field = |name: &str| line.get(name).map(|value| value.trim_matches('"').to_string());
+        assert_eq!(field("number").as_deref(), Some("2"));
+        assert_eq!(field("last_forwarded").as_deref(), Some("2"));
+        assert_eq!(field("digest"), Some(format!("{digest:?}")));
+        assert_eq!(field("path").as_deref(), Some("leftover_queue"));
+        let skipped = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.leftover_outputs_skipped_total")
+            .and_then(|(_, _, _, value)| match value {
+                DebugValue::Counter(n) => Some(n),
+                _ => None,
+            });
+        assert_eq!(skipped, Some(1));
     }
 }

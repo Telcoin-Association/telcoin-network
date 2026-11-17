@@ -460,6 +460,8 @@ async fn a_lost_or_damaged_pack_refuses_the_start_or_fails_the_read() -> eyre::R
         "lacks epoch(s) 1.",
         "Put back each missing `epoch-N` directory from a backup taken after that epoch closed",
         "`telcoin-network db import-epoch --epoch N --from <copy>` verifies a copy",
+        "and `consensus-db` aside (a validator then stays stopped until the network has closed \
+         the last epoch it took part in)",
         "db load-state` from epoch 1 or a later one",
     ] {
         assert!(message.contains(says), "{message}");

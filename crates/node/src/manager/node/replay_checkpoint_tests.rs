@@ -102,7 +102,7 @@ async fn imported_manager(
     let (stream, len) = source.get_epoch_stream(0).await?;
     manager
         .consensus_chain
-        .stream_import(stream.take(len), &record, &previous, Duration::from_secs(5))
+        .stream_import(stream.take(len), &record, &previous, Duration::from_secs(5), None)
         .await?;
     for output in outputs.iter().take(saved) {
         manager.consensus_chain.save_consensus_output(output.clone()).await?;

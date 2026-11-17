@@ -563,6 +563,25 @@ pub(crate) const PUBLIC_OPENING_HOLD_WINDOW: Duration = Duration::from_secs(300)
 /// up instead of holding a responder opening permit.
 const SYNC_REQUEST_WRITE_TIMEOUT: Duration = PUBLIC_SYNC_REQUEST_READ_TIMEOUT;
 
+/// How long a peer's epoch-pack transfer into this node's import may run, from the transfer's
+/// start, on every exchange in which this node is a public-tier requester or the serving peer is
+/// not staked (`PrimaryNetworkHandle::epoch_pack_transfer_deadline`). A transfer that outlives it
+/// stops as `PackError::ImportDeadline`, charged Mild, and the walk moves on to the next peer.
+///
+/// It is [`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`] (200 s), the longest an honest responder lets a
+/// public-tier serve run, plus one `SYNC_RATE_WINDOW` (30 s, in `sync_codec`) of slack for the
+/// stream's latency and the import's work on its last records. The reader bounds a transfer's rate
+/// and the import its progress, neither its length, and the import authenticates only the final
+/// output: without this, a peer that keeps those bounds holds the epoch's only import for as long
+/// as it keeps sending, and execution stops at the first missing output.
+///
+/// A committee-tier requester served by a staked peer gets no deadline: honest responders bound
+/// that serve by pack length only (`sync_codec::pack_serve_deadline`), so a fixed cut would fail
+/// an honest large pack. An honest unstaked peer's serve to a committee-tier requester that would
+/// take longer than this is cut, and the walk tries the next peer.
+const EPOCH_PACK_TRANSFER_DEADLINE: Duration =
+    PUBLIC_EPOCH_PACK_SERVE_TIMEOUT.saturating_add(Duration::from_secs(30));
+
 /// Bound on the opening `Req` frame of an inbound sync stream (and on the tiny
 /// best-effort control writes that follow). The `EpochPack` request is a few bytes,
 /// but a `MissingCertificates` request carries one skip-round bitmap per committee
@@ -1853,6 +1872,15 @@ impl PrimaryNetworkHandle {
         self.staked_peers.lock().contains(peer)
     }
 
+    /// The deadline of an epoch-pack transfer from `peer` into this node's import:
+    /// [`EPOCH_PACK_TRANSFER_DEADLINE`] when this node is a public-tier requester
+    /// (`requester_tier`) or `peer` is not staked (`staked_peers`), and `None` for a
+    /// committee-tier requester served by a staked peer, which keeps no length bound.
+    fn epoch_pack_transfer_deadline(&self, peer: &BlsPublicKey) -> Option<Duration> {
+        let trusted = self.requester_tier() == PeerTier::Committee && self.is_staked(peer);
+        (!trusted).then_some(EPOCH_PACK_TRANSFER_DEADLINE)
+    }
+
     /// Whether the floor-only verdict holds now (`link_speed`), so the walks read every peer at
     /// the floor.
     fn floor_only(&self) -> bool {
@@ -2758,6 +2786,10 @@ impl PrimaryNetworkHandle {
     /// Request an epoch record and its certificate from a random peer, up to three times from
     /// three different peers.
     ///
+    /// On success it returns the record, its certificate and the BLS key of the peer that served
+    /// them: the identity the network resolved for the responding connection, used for logs only.
+    /// The caller validates the pair before it uses either.
+    ///
     /// The error tells a definitive answer apart from a failed exchange:
     /// - [`NetworkError::RPCError`]: at least one peer answered that it holds no certified record
     ///   for the request ([`PrimaryResponse::unavailable_epoch_record`]) and no peer returned one;
@@ -2771,7 +2803,7 @@ impl PrimaryNetworkHandle {
         &self,
         epoch: Option<Epoch>,
         hash: Option<EpochDigest>,
-    ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
+    ) -> NetworkResult<(EpochRecord, EpochCertificate, BlsPublicKey)> {
         let request = PrimaryRequest::EpochRecord { epoch, hash };
         let unavailable = PrimaryResponse::unavailable_epoch_record(epoch, hash);
         let mut answered = false;
@@ -2781,9 +2813,9 @@ impl PrimaryNetworkHandle {
             let res = self.handle.send_request_any(request.clone()).await?;
             match res.await {
                 Ok(Ok(NetworkResponseMessage {
-                    peer: _,
+                    peer,
                     result: PrimaryResponse::EpochRecord { record, certificate },
-                })) => return Ok((record, certificate)),
+                })) => return Ok((record, certificate, peer)),
                 Ok(Ok(NetworkResponseMessage { peer: _, result })) => {
                     answered |= result == unavailable;
                 }
@@ -3240,6 +3272,9 @@ impl PrimaryNetworkHandle {
                 // The reader's own per-frame timeout and throughput floor cut a stalled or
                 // dribbling peer; the per-record timeout must not cut a transfer the floor admits.
                 let record_timeout = record_timeout.max(sync_codec::SYNC_RECORD_TIMEOUT);
+                // Decided here, from this node's tier and the peer's stake: the storage crate
+                // knows neither.
+                let deadline = self.epoch_pack_transfer_deadline(&peer);
                 // Pick the import target on `last_consensus_number.is_some()`; both resolve to
                 // `Result<(), ConsensusChainError>`, so box to unify the future types while keeping
                 // the TYPED error (a peer-caused stream fault must be penalised before it is
@@ -3254,19 +3289,26 @@ impl PrimaryNetworkHandle {
                                 epoch_record,
                                 previous_epoch,
                                 record_timeout,
+                                deadline,
                             )
                             .boxed()
                     } else {
                         consensus_chain
-                            .stream_import(reader, epoch_record, previous_epoch, record_timeout)
+                            .stream_import(
+                                reader,
+                                epoch_record,
+                                previous_epoch,
+                                record_timeout,
+                                deadline,
+                            )
                             .boxed()
                     };
-                // No fixed overall wall-clock cap: the reader (`sync_pack_reader`) enforces a
-                // rate bound over a rolling window plus a per-frame timeout. A fresh peer must
-                // sustain `SYNC_TARGET_MIN_BYTES` per window and a de-prioritised peer the floor,
-                // both prorated over the real window length, and the `End` frame is checked too,
-                // so one slow probe costs about one window; the probe-first preference needs a
-                // target-rate serve. On such an error the
+                // The reader (`sync_pack_reader`) bounds the transfer's rate, not its length: it
+                // enforces a rate bound over a rolling window plus a per-frame timeout. A fresh
+                // peer must sustain `SYNC_TARGET_MIN_BYTES` per window and a de-prioritised peer
+                // the floor, both prorated over the real window length, and the `End` frame is
+                // checked too, so one slow probe costs about one window; the probe-first
+                // preference needs a target-rate serve. On such an error the
                 // future resolves `Err`, which unwinds `stream_import` so its
                 // `ImportPath` guard removes the import dir, releases the epoch's claim, and the
                 // epoch is retryable against another peer. The responder applies
@@ -3276,6 +3318,13 @@ impl PrimaryNetworkHandle {
                 // itself is bounded by what it writes, not by the bytes the reader counts: it must
                 // write at least its progress bound per window (`ImportStalled`, charged Mild
                 // below) and re-checks the free-space floor on a clock (`StorageFull`, local).
+                // None of these bounds how long a peer that keeps them streams. `deadline` does,
+                // on every exchange in which this node is a public-tier requester or the peer is
+                // not staked: the transfer stops `EPOCH_PACK_TRANSFER_DEADLINE` after it started
+                // (`ImportDeadline`, charged Mild below), never during the install that follows.
+                // A committee-tier requester served by a staked peer gets none, as honest
+                // responders bound that serve by pack length only, so nothing but the pack's end
+                // or the free-space floor ends that import.
                 match import.await {
                     Ok(()) => Ok(()),
                     Err(e) => {
@@ -3354,7 +3403,10 @@ impl PrimaryNetworkHandle {
                 // A stream that stores far less than its progress bound while the reader holds the
                 // peer to its throughput bound: its records store to almost nothing, which an
                 // honest pack's do not. Mild: the cut also marks the peer for the epoch.
-                PackError::ImportStalled { .. } => Some(Penalty::Mild),
+                PackError::ImportStalled { .. }
+                // A transfer that outlived `EPOCH_PACK_TRANSFER_DEADLINE`. Mild, like a stall: an
+                // honest unstaked peer's long serve to a committee-tier requester is cut too.
+                | PackError::ImportDeadline { .. } => Some(Penalty::Mild),
                 PackError::IO(_)
                 | PackError::BatchLoad(_)
                 | PackError::EpochLoad(_)
@@ -3425,7 +3477,8 @@ impl PrimaryNetworkHandle {
                 | PackError::OutputTooLarge { .. }
                 | PackError::InvalidConsensusNumber(_, _)
                 | PackError::InvalidEpoch(_, _)
-                | PackError::ImportStalled { .. } => true,
+                | PackError::ImportStalled { .. }
+                | PackError::ImportDeadline { .. } => true,
                 // Local storage / IO / decode-of-our-own-state, or ambiguous: never charge the
                 // peer. `CorruptPack` is excluded deliberately — it is also
                 // produced by local recovery, so on the import path it is treated
@@ -3785,7 +3838,8 @@ where
         // The default budget is unbounded, so this only observes until an operator sets
         // `serve_budget.vote`. An enforcing vote class also caps each peer at
         // `MAX_PERMITS_PER_PEER`, so one committee peer cannot hold the whole pool while its
-        // requests wait on its author lock in `RequestHandler::vote`.
+        // requests wait in `RequestHandler::vote`: on its author lock, and in the bounded wait for
+        // execution before that lock.
         if let Some(serve_permit) =
             self.network_handle.handle.serve_permits().try_acquire(ServiceClass::Vote, peer)
         {
@@ -6852,5 +6906,33 @@ mod sync_server_preference_tests {
                 (b, SyncRateBound::Floor),
             ]
         );
+    }
+
+    /// An epoch-pack transfer gets the whole-transfer deadline on every exchange in which this
+    /// node is a public-tier requester or the serving peer is not staked; a committee-tier
+    /// requester served by a staked peer gets none. The deadline is the public-tier serve cut plus
+    /// one rate window (the serve deadline of an empty pack).
+    #[test]
+    fn epoch_pack_transfer_deadline_follows_tier_and_stake() {
+        use super::{
+            sync_codec::pack_serve_deadline, EPOCH_PACK_TRANSFER_DEADLINE,
+            PUBLIC_EPOCH_PACK_SERVE_TIMEOUT,
+        };
+
+        assert_eq!(
+            EPOCH_PACK_TRANSFER_DEADLINE,
+            PUBLIC_EPOCH_PACK_SERVE_TIMEOUT + pack_serve_deadline(0)
+        );
+        assert_eq!(EPOCH_PACK_TRANSFER_DEADLINE, std::time::Duration::from_secs(230));
+        let handle = handle();
+        let (staked, unstaked) = (key(1), key(2));
+        stake(&handle, &[staked]);
+        let deadline = Some(EPOCH_PACK_TRANSFER_DEADLINE);
+        // A committee-tier requester (the default).
+        assert_eq!(handle.epoch_pack_transfer_deadline(&staked), None, "staked: no length bound");
+        assert_eq!(handle.epoch_pack_transfer_deadline(&unstaked), deadline, "unstaked peer");
+        handle.set_requester_tier(PeerTier::Public);
+        assert_eq!(handle.epoch_pack_transfer_deadline(&staked), deadline, "public requester");
+        assert_eq!(handle.epoch_pack_transfer_deadline(&unstaked), deadline, "public, unstaked");
     }
 }

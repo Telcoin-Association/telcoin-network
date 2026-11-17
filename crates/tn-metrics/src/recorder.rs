@@ -25,11 +25,40 @@ const SECONDS_BUCKETS: &[f64] =
 /// voter's fast vote stages (`tn_primary_vote_stage_seconds`), the engine's queue wait
 /// (`tn_engine_queue_wait_seconds`) and the worker's in-process batch report to its primary
 /// (`tn_worker_batch_report_seconds`, `tn_executor_consensus_pack_persist_seconds`) normally finish
-/// in that range. This layout adds sub-ms bounds below [`SECONDS_BUCKETS`] and keeps all of its
-/// bounds, so a query that pins one of them (for example `le="0.005"`) still finds its series.
+/// in that range. So do the execution stage histograms at light load
+/// ([`EXECUTION_STAGE_HISTOGRAMS`]). This layout adds sub-ms bounds below [`SECONDS_BUCKETS`] and
+/// keeps all of its bounds, so a query that pins one of them (for example `le="0.005"`) still
+/// finds its series.
 const SUB_MS_SECONDS_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
     5.0, 10.0, 30.0,
+];
+
+/// The execution stage histograms, by rendered name, that take [`SUB_MS_SECONDS_BUCKETS`].
+///
+/// The engine's per-output stages: signer recovery (`tn_engine_recover_seconds`, which runs
+/// beside execution) and the evm, state-root and finish laps summed over the output's blocks.
+/// The execution environment's per-block stages: execute, signer recovery (per batch), finish,
+/// the hashed state and the state root inside finish, and the overlay extend. Bench 5 measured
+/// these stages at tens of microseconds per transaction and single milliseconds per output, so
+/// on [`SECONDS_BUCKETS`] every lap at light load sat in the first bucket. Under load they reach
+/// hundreds of milliseconds, which the bounds above 5 ms still resolve.
+///
+/// Full names rather than a `tn_engine_` or `tn_reth_` prefix, so the per-output totals
+/// (`tn_engine_execution_duration_seconds`, `tn_engine_persist_duration_seconds`) and the
+/// per-persist laps (`tn_reth_persist_save_blocks_seconds`, `tn_reth_persist_commit_seconds`)
+/// keep [`SECONDS_BUCKETS`].
+const EXECUTION_STAGE_HISTOGRAMS: &[&str] = &[
+    "tn_engine_recover_seconds",
+    "tn_engine_evm_seconds",
+    "tn_engine_root_seconds",
+    "tn_engine_finish_seconds",
+    "tn_reth_block_execute_seconds",
+    "tn_reth_block_signer_recovery_seconds",
+    "tn_reth_block_finish_seconds",
+    "tn_reth_block_hashed_state_seconds",
+    "tn_reth_block_state_root_seconds",
+    "tn_reth_block_overlay_extend_seconds",
 ];
 
 /// Buckets for histograms ending in `_bytes` (payload sizes), 1KiB..4MiB.
@@ -202,6 +231,9 @@ fn build_prometheus_recorder() -> eyre::Result<PrometheusRecorder> {
             Matcher::Full("tn_executor_output_batches".to_string()),
             OUTPUT_BATCHES_BUCKETS,
         )?;
+    let builder = EXECUTION_STAGE_HISTOGRAMS.iter().try_fold(builder, |builder, name| {
+        builder.set_buckets_for_metric(Matcher::Full(name.to_string()), SUB_MS_SECONDS_BUCKETS)
+    })?;
 
     Ok(builder.build_recorder())
 }
@@ -281,6 +313,7 @@ impl Recorder for TnPrefixRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tn_types::{max_batch_gas, Epoch, MAX_HEADER_NUM_OF_BATCHES};
 
     /// Minimum gas of a transaction (the intrinsic cost of a plain transfer).
@@ -530,5 +563,78 @@ mod tests {
         ]
         .into_iter()
         .for_each(|line| assert!(rendered.contains(line), "missing {line:?} in {rendered}"));
+    }
+
+    /// The execution stage histograms take the sub-ms layout through their `Full` matchers,
+    /// recorded under the names the engine's and the execution environment's metric structs
+    /// register. A 100 us lap sits on the first bound, which `le` includes; a 2 ms lap lands
+    /// between 1 ms and 2.5 ms; a loaded output's 300 ms lap lands between 250 ms and 500 ms. The
+    /// per-output totals and the per-persist laps, which a `tn_engine_` or `tn_reth_` prefix
+    /// matcher would also catch, keep [`SECONDS_BUCKETS`].
+    #[test]
+    fn test_engine_stage_histograms_render_sub_ms_buckets() {
+        let inner = build_prometheus_recorder().expect("recorder builds");
+        let handle = inner.handle();
+        let recorder = TnPrefixRecorder { inner };
+        let stages = [
+            "tn_engine.recover_seconds",
+            "tn_engine.evm_seconds",
+            "tn_engine.root_seconds",
+            "tn_engine.finish_seconds",
+            "tn_reth.block_execute_seconds",
+            "tn_reth.block_signer_recovery_seconds",
+            "tn_reth.block_finish_seconds",
+            "tn_reth.block_hashed_state_seconds",
+            "tn_reth.block_state_root_seconds",
+            "tn_reth.block_overlay_extend_seconds",
+        ];
+        let unchanged = [
+            "tn_engine.execution_duration_seconds",
+            "tn_engine.persist_duration_seconds",
+            "tn_reth.persist_save_blocks_seconds",
+            "tn_reth.persist_commit_seconds",
+        ];
+        let rendered_name = |name: &str| name.replace('.', "_");
+        assert_eq!(
+            stages.map(rendered_name).to_vec(),
+            EXECUTION_STAGE_HISTOGRAMS,
+            "every listed stage is recorded below"
+        );
+        let fast = Duration::from_micros(100);
+        let laps = [fast, Duration::from_millis(2), Duration::from_millis(300)];
+
+        metrics::with_local_recorder(&recorder, || {
+            stages.into_iter().for_each(|stage| {
+                let histogram = metrics::histogram!(stage);
+                laps.into_iter().for_each(|lap| histogram.record(lap));
+            });
+            unchanged.into_iter().for_each(|name| metrics::histogram!(name).record(fast));
+        });
+
+        let rendered = handle.render();
+        stages
+            .into_iter()
+            .map(rendered_name)
+            .flat_map(|stage| {
+                [
+                    ("le=\"0.0001\"", 1),
+                    ("le=\"0.001\"", 1),
+                    ("le=\"0.0025\"", 2),
+                    ("le=\"0.25\"", 2),
+                    ("le=\"0.5\"", 3),
+                    ("le=\"30\"", 3),
+                ]
+                .map(|(le, count)| format!("{stage}_bucket{{{le}}} {count}\n"))
+                .into_iter()
+                .chain([format!("{stage}_count 3\n")])
+            })
+            .chain(
+                unchanged.map(|name| format!("{}_bucket{{le=\"0.005\"}} 1\n", rendered_name(name))),
+            )
+            .for_each(|line| assert!(rendered.contains(&line), "missing {line:?} in {rendered}"));
+        unchanged.into_iter().map(rendered_name).for_each(|name| {
+            let first = format!("{name}_bucket{{le=\"0.0001\"}}");
+            assert!(!rendered.contains(&first), "{name} took the sub-ms layout: {rendered}");
+        });
     }
 }

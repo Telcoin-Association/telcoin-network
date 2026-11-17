@@ -772,9 +772,15 @@ where
 
     /// Handler for `debug_getRawBlock`
     async fn raw_block(&self, block_id: BlockId) -> RpcResult<Bytes> {
+        // TN(TN-0210): the read can block (a datadir that stores transactions by batch position
+        // reads them from a consensus pack), so it runs on the blocking pool, as
+        // `debug_getRawTransaction`'s does. The provider's result comes back unconverted, so
+        // every answer and error is as before.
         let block = self
-            .provider()
-            .block_by_id(block_id)
+            .eth_api()
+            .spawn_blocking_io(move |this| Ok(this.provider().block_by_id(block_id)))
+            .await
+            .map_err(Into::into)?
             .to_rpc_result()?
             .ok_or(EthApiError::HeaderNotFound(block_id))?;
         let mut res = Vec::new();
@@ -794,9 +800,14 @@ where
     /// Handler for `debug_getRawTransactions`
     /// Returns the bytes of the transaction for the given hash.
     async fn raw_transactions(&self, block_id: BlockId) -> RpcResult<Vec<Bytes>> {
+        // TN(TN-0210): on the blocking pool, as in `raw_block`.
         let block: RecoveredBlock<BlockTy<Eth::Primitives>> = self
-            .provider()
-            .block_with_senders_by_id(block_id, TransactionVariant::NoHash)
+            .eth_api()
+            .spawn_blocking_io(move |this| {
+                Ok(this.provider().block_with_senders_by_id(block_id, TransactionVariant::NoHash))
+            })
+            .await
+            .map_err(Into::into)?
             .to_rpc_result()?
             .unwrap_or_default();
         Ok(block.into_transactions_recovered().map(|tx| tx.encoded_2718().into()).collect())
@@ -1963,5 +1974,104 @@ mod trace_permit_tests {
             assert_abandoned_trace_keeps_its_permit(method, tracing.clone(), Abandon::Timeout)
                 .await;
         }
+    }
+}
+
+/// TN(TN-0210): `debug_getRawBlock` and `debug_getRawTransactions` read the provider on the
+/// blocking pool, not on the runtime's threads, and answer as they did when they read it inline.
+#[cfg(test)]
+mod raw_read_tests {
+    use super::*;
+    use crate::permit_test_utils::{MockChain, TestEthApi};
+    use reth_errors::ProviderError;
+    use reth_tasks::TokioTaskExecutor;
+    use std::{future::Future, sync::mpsc, time::Duration};
+
+    fn api(chain: &MockChain) -> DebugApi<TestEthApi> {
+        DebugApi::new(
+            chain.eth_api(),
+            BlockingTaskGuard::new(1),
+            TokioTaskExecutor::default(),
+            futures::stream::empty(),
+        )
+    }
+
+    /// Runs `request` on the test's one-thread runtime while another thread holds the mock's
+    /// block store, until released or for 10 s, and returns its answer. A request that read the
+    /// store inline would block the runtime's thread until the holder gave up.
+    async fn answer_with_the_blocks_held<T: Send + 'static>(
+        chain: &MockChain,
+        request: impl Future<Output = T> + Send + 'static,
+    ) -> T {
+        let blocks = Arc::clone(&chain.provider.blocks);
+        let (locked_tx, locked) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = blocks.lock();
+            locked_tx.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(10)).is_ok()
+        });
+        locked.recv().unwrap();
+
+        let request = tokio::spawn(request);
+        // the runtime polls the request while this task sleeps
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let waited = !request.is_finished();
+        let _ = release.send(());
+        assert!(holder.join().unwrap(), "the request read the provider on the runtime's thread");
+        assert!(waited, "the request answered without waiting for the held block store");
+        request.await.unwrap()
+    }
+
+    /// The block by hash while another thread holds the block store, then by number, for a
+    /// block the node does not have and for the `finalized` tag, which the mock answers with a
+    /// provider error: each answer is the one the inline read gave.
+    #[tokio::test]
+    async fn raw_block_reads_the_provider_off_the_runtime() {
+        let chain = MockChain::new();
+        let api = api(&chain);
+        let raw_block = |block_id: BlockId| {
+            let api = api.clone();
+            async move { DebugApiServer::raw_block(&api, block_id).await }
+        };
+        let block: Bytes = alloy_rlp::encode(chain.block.clone().into_block()).into();
+
+        let by_hash = BlockId::hash(chain.block.hash());
+        let held = answer_with_the_blocks_held(&chain, raw_block(by_hash)).await;
+        assert_eq!(held.unwrap(), block);
+        assert_eq!(raw_block(BlockId::number(1)).await.unwrap(), block);
+
+        let missing = BlockId::hash(B256::with_last_byte(1));
+        let not_found: RpcResult<Bytes> = Err(EthApiError::HeaderNotFound(missing).into());
+        assert_eq!(raw_block(missing).await, not_found);
+
+        let provider_error = Err::<Bytes, _>(ProviderError::FinalizedBlockNotFound).to_rpc_result();
+        assert_eq!(raw_block(BlockNumberOrTag::Finalized.into()).await, provider_error);
+    }
+
+    /// As `raw_block_reads_the_provider_off_the_runtime`; a block the node does not have is
+    /// answered with no transactions.
+    #[tokio::test]
+    async fn raw_transactions_read_the_provider_off_the_runtime() {
+        let chain = MockChain::new();
+        let api = api(&chain);
+        let raw_transactions = |block_id: BlockId| {
+            let api = api.clone();
+            async move { DebugApiServer::raw_transactions(&api, block_id).await }
+        };
+        let transactions: Vec<Bytes> =
+            vec![chain.block.body().transactions[0].encoded_2718().into()];
+
+        let by_hash = BlockId::hash(chain.block.hash());
+        let held = answer_with_the_blocks_held(&chain, raw_transactions(by_hash)).await;
+        assert_eq!(held.unwrap(), transactions);
+        assert_eq!(raw_transactions(BlockId::number(1)).await.unwrap(), transactions);
+
+        let missing = BlockId::hash(B256::with_last_byte(1));
+        assert_eq!(raw_transactions(missing).await.unwrap(), Vec::<Bytes>::new());
+
+        let provider_error =
+            Err::<Vec<Bytes>, _>(ProviderError::FinalizedBlockNotFound).to_rpc_result();
+        assert_eq!(raw_transactions(BlockNumberOrTag::Finalized.into()).await, provider_error);
     }
 }

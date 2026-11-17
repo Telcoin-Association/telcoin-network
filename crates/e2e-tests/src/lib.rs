@@ -1,13 +1,45 @@
 //! End-to-end tests for Telcoin Network
 //!
 //! Utilities for it tests.
+//!
+//! # Fleet-wide parameters: `TN_E2E_PARAMETERS`
+//!
+//! `TN_E2E_PARAMETERS` holds top-level `parameters.yaml` entries that every start helper merges
+//! into the `parameters.yaml` of every node it starts, restarts included, so a lane can run an
+//! existing test set with a node parameter changed without editing a test:
+//!
+//! ```text
+//! TN_E2E_PARAMETERS='example_parameter: true; other_parameter: 4' cargo nextest run ...
+//! ```
+//!
+//! The value is a list of `key: value` entries separated by `;`. A key is a plain top-level name
+//! (ASCII letters, digits and `_`) and a value is one line of YAML written into the file as given,
+//! so it cannot itself hold a `;`. Whitespace around an entry, its key and its value is trimmed,
+//! an empty entry (a trailing `;`) is skipped, and an unset or blank variable means no entries.
+//!
+//! The entries go in before the test's own [`NodeOverrides`] for that node, so a test that sets
+//! the same key keeps its value (see [`NodeOverrides::layered_over`]). The variable is read once
+//! per test process, and the first start that applies it prints what it applies. A value that is
+//! not a list of entries, or that the node's loader cannot read as `Parameters`, fails the start
+//! with an error naming the variable. As with any [`NodeOverrides`] entry, a key the node does not
+//! know is ignored by the node, so check the setting in the node itself, not the merge.
+//!
+//! The merge is checked with the `Parameters` this crate is built with (the tree under test), not
+//! by the binary that will read the file. The entries also reach the `TN_BIN_PATH_PREV` nodes that
+//! `upgrade.rs`, `reth_db_migration.rs` and `resync.rs` start through the same helpers (see
+//! [`get_previous_telcoin_network_binary`]). When that binary was built at another commit, as
+//! `upgrade.rs` requires, it ignores a key its `Parameters` lacks without a word, so a lane that
+//! sets the variable runs the test as a mixed fleet with the setting on the current nodes only;
+//! the migration lane's previous binary is this tree's MDBX build, which reads the same keys.
 
 // ignore for IT test
 #![allow(unused_crate_dependencies)]
 
 use clap::Parser;
 use escargot::{CargoBuild, CargoRun};
+use eyre::WrapErr as _;
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -16,7 +48,7 @@ use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig, Parameters};
 use tn_node::launch_node;
 use tn_reth::init_reth_defaults;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 // unused deps warnings
 
 /// A telcoin-network binary for the e2e tests.
@@ -389,6 +421,499 @@ pub fn config_observer(
     Ok(())
 }
 
+/// Settings a test layers onto one node of a local fleet, on top of the harness's own setup.
+///
+/// Both lists are empty by default, and an empty [`NodeOverrides`] starts the node exactly as the
+/// harness does without one: on a datadir no earlier start gave entries to, its `parameters.yaml`
+/// is neither read nor rewritten, and its process gets no extra variable. The one exception is
+/// `TN_E2E_PARAMETERS` (see the crate docs), whose entries every start helper puts in before the
+/// node's own (see [`NodeOverrides::apply_with_e2e_parameters`]).
+///
+/// - `parameters` holds top-level `parameters.yaml` entries as `(key, raw YAML value)` pairs. The
+///   start helpers merge them into the node's own `parameters.yaml`, the file the `config_*`
+///   genesis helpers wrote, right before they spawn the node (see
+///   [`NodeOverrides::apply_parameters`] and [`merge_parameters_yaml`]). Every start rewrites the
+///   file as the harness wrote it plus that start's entries, so a node restarted with other
+///   entries, or with none, does not keep an earlier start's. Once a start has merged entries, the
+///   harness's file is kept as `parameters.yaml.harness-base` and every later start rebuilds from
+///   it, so a test that edits a node's `parameters.yaml` directly between starts loses the edit;
+///   change a node's parameters between starts through its overrides instead. The harness knows
+///   none of the keys: the node's `Parameters` ignores a top-level key it does not know, so a test
+///   can name a parameter whether or not the node under test reads it. The same holds for a
+///   misspelled key, or one the node reads from another file, so a test should check the setting
+///   took effect in the node itself (a log line or metric that reports it) rather than trust the
+///   merge.
+/// - `env` holds environment variables for the node's process only, set after the variables
+///   [`TestBinary::command`] forwards, so an entry overrides a forwarded variable of the same name.
+///   This is how a test arms the hooks in `tn_types::test_hooks` (for example
+///   `TN_TEST_EXECUTION_DELAY_MS`) on chosen nodes. Never export such a variable from the harness
+///   process instead: every node spawned afterwards would inherit it.
+///
+/// A setting that changes what the chain computes, such as a `TN_*_FORK_EPOCH` variable or the
+/// `basefee_address` or `gc_depth` parameter, forks the fleet when only some nodes carry it. Give
+/// those to every node or to none, unless the divergence is what the test is about; a fork pin for
+/// the whole fleet belongs in the harness environment, which [`TestBinary::command`] forwards to
+/// every node. A node restarted through a start helper that takes no overrides gets neither its
+/// entries nor its variables back, so a node that carries such a setting is restarted with the
+/// same overrides.
+///
+/// [`FleetOverrides`] assigns these per node across a fleet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeOverrides {
+    /// Top-level `parameters.yaml` entries, `(key, raw YAML value)`, merged in order, so a later
+    /// entry for the same key wins.
+    pub parameters: Vec<(String, String)>,
+    /// Environment variables for the node's process, `(name, value)`, set in order, so a later
+    /// entry for the same name wins.
+    pub env: Vec<(String, String)>,
+}
+
+impl NodeOverrides {
+    /// Add the top-level `parameters.yaml` entry `key: value`.
+    ///
+    /// `value` is raw one-line YAML, written into the file as given: `true`, `400`, `750ms`, or a
+    /// flow collection such as `[1, 2]`.
+    pub fn parameter(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.parameters.push((key.into(), value.into()));
+        self
+    }
+
+    /// Add the environment variable `name=value` for the node's process.
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// Whether this overrides nothing.
+    pub fn is_empty(&self) -> bool {
+        self.parameters.is_empty() && self.env.is_empty()
+    }
+
+    /// These overrides with the `parameters.yaml` entries of `fleet_wide` placed before their own.
+    ///
+    /// Entries merge in order and a later entry for a key wins (see [`merge_parameters_yaml`]), so
+    /// a key this node sets keeps this node's value and every other `fleet_wide` entry is added.
+    /// The environment variables are kept as they are.
+    pub fn layered_over(&self, fleet_wide: &[(String, String)]) -> NodeOverrides {
+        let parameters = fleet_wide.iter().chain(&self.parameters).cloned().collect();
+        NodeOverrides { parameters, env: self.env.clone() }
+    }
+
+    /// [`NodeOverrides::apply_parameters`] with the entries of `TN_E2E_PARAMETERS` placed before
+    /// this node's own (see [`NodeOverrides::layered_over`]); the start helpers call this before
+    /// every start of a node, restarts included.
+    ///
+    /// With the variable unset or blank this is [`NodeOverrides::apply_parameters`]. The first call
+    /// in a test process that applies entries prints them once.
+    ///
+    /// # Errors
+    ///
+    /// A variable that is not a list of `key: value` entries, or a merged file the node's loader
+    /// cannot read, fails with an error naming `TN_E2E_PARAMETERS`; the node's file is then left
+    /// as it was.
+    pub fn apply_with_e2e_parameters(&self, node_dir: &Path) -> eyre::Result<()> {
+        self.apply_layered(node_dir, e2e_parameters()?)
+    }
+
+    /// [`NodeOverrides::apply_parameters`] of these overrides layered over `fleet_wide`, the
+    /// entries of `TN_E2E_PARAMETERS`, with an error that names the variable when it set any.
+    fn apply_layered(&self, node_dir: &Path, fleet_wide: &[(String, String)]) -> eyre::Result<()> {
+        if fleet_wide.is_empty() {
+            return self.apply_parameters(node_dir);
+        }
+        self.layered_over(fleet_wide).apply_parameters(node_dir).wrap_err_with(|| {
+            format!(
+                "{E2E_PARAMETERS_VAR} entries {fleet_wide:?} (merged first) and the test's own \
+                 entries {:?} do not apply to {}",
+                self.parameters,
+                node_dir.display()
+            )
+        })
+    }
+
+    /// Write `<node_dir>/parameters.yaml` as the harness wrote it plus
+    /// [`NodeOverrides::parameters`] (see [`merge_parameters_yaml`]).
+    ///
+    /// The first application with entries keeps the harness's file beside it as
+    /// `parameters.yaml.harness-base`, and every later one merges into that copy, so applying the
+    /// same entries again leaves the file as it was and applying other entries does not keep the
+    /// earlier ones. Applying no entries puts the harness's file back if an earlier application
+    /// changed it, and otherwise neither reads nor rewrites anything. The start helpers call this
+    /// before every start of a node, restarts included.
+    ///
+    /// The merged text is written to `parameters.yaml.merging` first and moved into place only
+    /// once the node's own loader reads it as `Parameters`, so a malformed value fails here and
+    /// leaves the node's file as it was (and the refused merge in place for inspection). That
+    /// proves the file deserializes, not that the node accepts every value: the epoch timing
+    /// checks, for one, run when the node enters an epoch it can vote in, so a duration of the
+    /// right type that those checks refuse still fails there.
+    ///
+    /// A start that drops or changes entries the previous start of the same datadir merged (a
+    /// restart through a helper without overrides, or with other ones) says so in one line on
+    /// stderr and in the test's tracing, naming the datadir and the keys; it still writes the
+    /// file as described above.
+    ///
+    /// The start helpers reach this through [`NodeOverrides::apply_with_e2e_parameters`].
+    pub fn apply_parameters(&self, node_dir: &Path) -> eyre::Result<()> {
+        let path = node_dir.join("parameters.yaml");
+        let harness_base = node_dir.join("parameters.yaml.harness-base");
+        let had_base = harness_base.exists();
+        if self.parameters.is_empty() {
+            if had_base {
+                if let Ok(base) = std::fs::read_to_string(&harness_base) {
+                    report_dropped_entries(node_dir, &base);
+                }
+                std::fs::rename(&harness_base, &path).wrap_err_with(|| {
+                    format!("restoring {} from {}", path.display(), harness_base.display())
+                })?;
+            }
+            return Ok(());
+        }
+        if !had_base {
+            std::fs::copy(&path, &harness_base).wrap_err_with(|| {
+                format!("keeping {} as {}", path.display(), harness_base.display())
+            })?;
+        }
+        let base = std::fs::read_to_string(&harness_base)
+            .wrap_err_with(|| format!("reading {} to merge overrides", harness_base.display()))?;
+        let merged = merge_parameters_yaml(&base, &self.parameters)?;
+        let staged = node_dir.join("parameters.yaml.merging");
+        std::fs::write(&staged, &merged)
+            .wrap_err_with(|| format!("writing merged overrides to {}", staged.display()))?;
+        Config::load_from_path::<Parameters>(&staged, ConfigFmt::YAML).wrap_err_with(|| {
+            format!(
+                "{} does not load as node parameters after merging {:?}",
+                staged.display(),
+                self.parameters
+            )
+        })?;
+        if had_base {
+            report_dropped_entries(node_dir, &merged);
+        }
+        std::fs::rename(&staged, &path)
+            .wrap_err_with(|| format!("moving {} to {}", staged.display(), path.display()))?;
+        Ok(())
+    }
+}
+
+/// Per-node [`NodeOverrides`] for a local fleet, keyed by the name of each node's datadir under
+/// the test's temp dir.
+///
+/// The start helpers look a node up by that name, so a fleet means the same nodes to every helper
+/// and to a restart of a subset: `validator-<instance + 1>` for the helpers that take an
+/// `instance` (the `config_local_testnet*` layout), the name in the `validators` slice for those
+/// that take one. A node with no entry starts as the harness starts it. The builders add one
+/// setting to every node they name, so a mixed fleet reads as one chain:
+///
+/// ```
+/// use e2e_tests::FleetOverrides;
+///
+/// // validators 1 and 2 (instances 0 and 1) run with the parameter, 3 and 4 without it
+/// let overrides = FleetOverrides::default().parameter(
+///     ["validator-1", "validator-2"],
+///     "example_parameter",
+///     "true",
+/// );
+/// assert!(overrides.node("validator-3").is_empty());
+///
+/// // three of four validators execute each output 400 ms later
+/// let overrides = FleetOverrides::default().env(
+///     ["validator-2", "validator-3", "validator-4"],
+///     "TN_TEST_EXECUTION_DELAY_MS",
+///     "400",
+/// );
+/// assert!(overrides.node("validator-1").is_empty());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FleetOverrides {
+    /// The overrides of each node that has any, by datadir name.
+    nodes: BTreeMap<String, NodeOverrides>,
+}
+
+impl FleetOverrides {
+    /// Add the top-level `parameters.yaml` entry `key: value` (see [`NodeOverrides::parameter`])
+    /// to every node in `nodes`, named by datadir.
+    pub fn parameter(
+        mut self,
+        nodes: impl IntoIterator<Item = impl Into<String>>,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let (key, value) = (key.into(), value.into());
+        for node in nodes {
+            self.nodes
+                .entry(node.into())
+                .or_default()
+                .parameters
+                .push((key.clone(), value.clone()));
+        }
+        self
+    }
+
+    /// Add the environment variable `name=value` (see [`NodeOverrides::env`]) to every node in
+    /// `nodes`, named by datadir.
+    pub fn env(
+        mut self,
+        nodes: impl IntoIterator<Item = impl Into<String>>,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let (name, value) = (name.into(), value.into());
+        for node in nodes {
+            self.nodes.entry(node.into()).or_default().env.push((name.clone(), value.clone()));
+        }
+        self
+    }
+
+    /// Replace the overrides of the node whose datadir is `node` with `overrides`.
+    pub fn set_node(mut self, node: impl Into<String>, overrides: NodeOverrides) -> Self {
+        self.nodes.insert(node.into(), overrides);
+        self
+    }
+
+    /// The overrides of the node whose datadir is `node`, empty when the fleet sets none for it.
+    pub fn node(&self, node: &str) -> &NodeOverrides {
+        /// The overrides of a node the fleet sets nothing for.
+        static NONE: NodeOverrides = NodeOverrides { parameters: Vec::new(), env: Vec::new() };
+        self.nodes.get(node).unwrap_or(&NONE)
+    }
+
+    /// Apply each named node's overrides to its datadir `base_dir/<node>`, with the entries of
+    /// `TN_E2E_PARAMETERS` beneath them (see [`NodeOverrides::apply_with_e2e_parameters`]), in
+    /// order, stopping at the first node that cannot take them.
+    ///
+    /// A start helper that spawns several nodes calls this before it spawns any of them, so an
+    /// override that one node cannot take fails the start while no process exists yet that the
+    /// caller would have to stop.
+    ///
+    /// # Errors
+    ///
+    /// The first failure, naming the node; the nodes before it keep their merged files, which
+    /// their next start rebuilds anyway.
+    pub fn apply_with_e2e_parameters<'a>(
+        &self,
+        base_dir: &Path,
+        nodes: impl IntoIterator<Item = &'a str>,
+    ) -> eyre::Result<()> {
+        self.apply_layered(base_dir, nodes, e2e_parameters()?)
+    }
+
+    /// [`FleetOverrides::apply_with_e2e_parameters`] with `fleet_wide` in place of the entries of
+    /// `TN_E2E_PARAMETERS`.
+    fn apply_layered<'a>(
+        &self,
+        base_dir: &Path,
+        nodes: impl IntoIterator<Item = &'a str>,
+        fleet_wide: &[(String, String)],
+    ) -> eyre::Result<()> {
+        for node in nodes {
+            self.node(node)
+                .apply_layered(&base_dir.join(node), fleet_wide)
+                .wrap_err_with(|| format!("the overrides of {node} do not apply"))?;
+        }
+        Ok(())
+    }
+}
+
+/// `base`, the text of a `parameters.yaml`, with each `(key, value)` of `overrides` as a top-level
+/// `key: value` entry.
+///
+/// A pure text merge, so it needs no knowledge of the keys and leaves every other line of `base`
+/// byte for byte. Each entry, in order, first removes the top-level entry `key` already has in the
+/// text (its `key:` line at column 0 and the indented or `- ` lines of a block value below it),
+/// then appends `key: value` as the last line. A later entry for a key therefore replaces an
+/// earlier one, and merging the same overrides twice gives the text the first merge gave. With no
+/// overrides `base` comes back unchanged.
+///
+/// `base` must be one YAML document whose top level is a block mapping, the shape `serde_yaml`
+/// writes. A key must be a plain top-level name (ASCII letters, digits and `_`), and a value one
+/// non-empty line of YAML; anything else is an error. The value is not parsed here:
+/// [`NodeOverrides::apply_parameters`] checks the merged file against the node's loader.
+pub fn merge_parameters_yaml(base: &str, overrides: &[(String, String)]) -> eyre::Result<String> {
+    if overrides.is_empty() {
+        return Ok(base.to_owned());
+    }
+    let mut lines: Vec<String> = base.lines().map(str::to_owned).collect();
+    for (key, value) in overrides {
+        eyre::ensure!(
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "parameters override key {key:?} is not a plain top-level key"
+        );
+        eyre::ensure!(
+            !value.trim().is_empty() && !value.contains(['\n', '\r']),
+            "parameters override `{key}` needs a one-line YAML value, got {value:?}"
+        );
+        if let Some(start) = lines.iter().position(|line| starts_top_level_entry(line, key)) {
+            let end = lines[start + 1..]
+                .iter()
+                .position(|line| !continues_block_value(line))
+                .map_or(lines.len(), |offset| start + 1 + offset);
+            lines.drain(start..end);
+        }
+        lines.push(format!("{key}: {value}"));
+    }
+    let mut merged = lines.join("\n");
+    merged.push('\n');
+    Ok(merged)
+}
+
+/// Whether `line` opens the top-level mapping entry `key`: `key:` at column 0, followed by the
+/// end of the line or whitespace.
+fn starts_top_level_entry(line: &str, key: &str) -> bool {
+    line.strip_prefix(key)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+}
+
+/// Whether `line` still belongs to the block value of the top-level entry above it: a blank
+/// line, an indented line, or a sequence item at column 0 (`serde_yaml` may write a top-level
+/// key's sequence unindented). The next top-level key or a document marker ends the value.
+fn continues_block_value(line: &str) -> bool {
+    line.trim().is_empty() || line.starts_with([' ', '\t']) || line == "-" || line.starts_with("- ")
+}
+
+/// Print [`dropped_entries_notice`] for the start about to write `next` as
+/// `<node_dir>/parameters.yaml`, on stderr and to the test's tracing, when it drops or changes an
+/// entry of the file there now. Nothing is printed when it keeps every entry or the current file
+/// cannot be read: the notice is a diagnostic and never fails a start.
+fn report_dropped_entries(node_dir: &Path, next: &str) {
+    let Ok(current) = std::fs::read_to_string(node_dir.join("parameters.yaml")) else {
+        return;
+    };
+    if let Some(notice) = dropped_entries_notice(node_dir, &current, next) {
+        eprintln!("{notice}");
+        warn!("{notice}");
+    }
+}
+
+/// The line a start prints when `next`, the `parameters.yaml` it is about to write in `node_dir`,
+/// drops or changes top-level entries of `current`, the file the previous start left there:
+/// it names the datadir and the keys, in `current`'s order. `None` when `next` holds every entry
+/// of `current` as it was (it may add entries).
+fn dropped_entries_notice(node_dir: &Path, current: &str, next: &str) -> Option<String> {
+    let next = top_level_entries(next);
+    let dropped: Vec<&str> = top_level_entries(current)
+        .into_iter()
+        .filter(|entry| !next.contains(entry))
+        .map(|(key, _)| key)
+        .collect();
+    (!dropped.is_empty()).then(|| {
+        format!(
+            "e2e: {} starts without the parameters.yaml entries {dropped:?} of its previous start: \
+             each start writes the harness's file plus its own entries, so restart it with the same \
+             overrides to keep them",
+            node_dir.display()
+        )
+    })
+}
+
+/// The top-level entries of a `parameters.yaml` text, in order, as `(key, entry)`: the entry is
+/// the `key:` line and the lines of its block value (see [`continues_block_value`]), without
+/// trailing whitespace. Lines outside any entry, such as a document marker, are skipped.
+fn top_level_entries(text: &str) -> Vec<(&str, String)> {
+    let mut entries: Vec<(&str, String)> = Vec::new();
+    let mut in_entry = false;
+    for line in text.lines() {
+        if let Some(key) = top_level_key(line) {
+            entries.push((key, line.to_owned()));
+            in_entry = true;
+        } else if in_entry && continues_block_value(line) {
+            if let Some((_, entry)) = entries.last_mut() {
+                entry.push('\n');
+                entry.push_str(line);
+            }
+        } else {
+            in_entry = false;
+        }
+    }
+    for (_, entry) in &mut entries {
+        entry.truncate(entry.trim_end().len());
+    }
+    entries
+}
+
+/// The key of the top-level mapping entry `line` opens, if it opens one: a plain key (ASCII
+/// letters, digits and `_`) at column 0, then `:` and the end of the line or whitespace.
+fn top_level_key(line: &str) -> Option<&str> {
+    let (key, rest) = line.split_once(':')?;
+    let plain = !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (plain && (rest.is_empty() || rest.starts_with([' ', '\t']))).then_some(key)
+}
+
+/// The environment variable whose `parameters.yaml` entries every start helper merges into every
+/// node it starts (see the crate docs).
+pub const E2E_PARAMETERS_VAR: &str = "TN_E2E_PARAMETERS";
+
+/// The entries of [`E2E_PARAMETERS_VAR`], read and parsed once per test process (see
+/// [`parse_e2e_parameters`]); empty when the variable is unset or blank.
+///
+/// The first call prints the entries it read, once, on stderr and to the test's tracing, so a
+/// lane's output shows what every node of the test was given.
+///
+/// # Errors
+///
+/// A value that is not valid unicode, or one [`parse_e2e_parameters`] refuses, on this and every
+/// later call.
+pub fn e2e_parameters() -> eyre::Result<&'static [(String, String)]> {
+    /// The parsed variable, or the parse error as text (a report is not `Sync`).
+    static PARSED: OnceLock<Result<Vec<(String, String)>, String>> = OnceLock::new();
+    let parsed = PARSED.get_or_init(|| {
+        // a non-unicode value is refused: read lossily, a bad byte in a value would be applied
+        let raw = match std::env::var(E2E_PARAMETERS_VAR) {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(std::env::VarError::NotUnicode(raw)) => {
+                return Err(format!("{E2E_PARAMETERS_VAR} is not valid unicode: {raw:?}"));
+            }
+        };
+        let parsed = parse_e2e_parameters(&raw).map_err(|e| format!("{e:#}"))?;
+        if !parsed.is_empty() {
+            let applied =
+                parsed.iter().map(|(key, value)| format!("{key}: {value}")).collect::<Vec<_>>();
+            eprintln!(
+                "e2e: {E2E_PARAMETERS_VAR} applies {applied:?} to every node this test starts \
+                 (a test's own entry for a key wins)"
+            );
+            info!(?applied, "e2e: {E2E_PARAMETERS_VAR} applies to every node this test starts");
+        }
+        Ok(parsed)
+    });
+    parsed.as_deref().map_err(|e| eyre::eyre!("{e}"))
+}
+
+/// Parse a value of [`E2E_PARAMETERS_VAR`] into `(key, value)` entries, in order.
+///
+/// The value is `key: value` entries separated by `;`. Each entry is split at its first `:`, and
+/// its key and value are trimmed; an entry that is empty after trimming is skipped, so a blank
+/// value yields no entries. A key must be a plain top-level name (ASCII letters, digits and `_`)
+/// and a value one non-empty line. The value is not read as YAML here: the start helpers check the
+/// merged file against the node's loader.
+///
+/// # Errors
+///
+/// An entry without a `:`, with a key that is not a plain name, or with an empty or multi-line
+/// value; the error names [`E2E_PARAMETERS_VAR`] and the entry.
+pub fn parse_e2e_parameters(raw: &str) -> eyre::Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+    for entry in raw.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+        let (key, value) = entry.split_once(':').ok_or_else(|| {
+            eyre::eyre!("{E2E_PARAMETERS_VAR} entry {entry:?} is not `key: value` (in {raw:?})")
+        })?;
+        let (key, value) = (key.trim(), value.trim());
+        eyre::ensure!(
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "{E2E_PARAMETERS_VAR} entry {entry:?} needs a plain top-level key (ASCII letters, \
+             digits and `_`), got {key:?} (in {raw:?})"
+        );
+        eyre::ensure!(
+            !value.is_empty() && !value.contains(['\n', '\r']),
+            "{E2E_PARAMETERS_VAR} entry {entry:?} needs a one-line value (in {raw:?})"
+        );
+        entries.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(entries)
+}
+
 /// Create validator info, genesis ceremony, and spawn node command.
 pub fn spawn_local_testnet(
     temp_path: &Path,
@@ -402,6 +927,7 @@ pub fn spawn_local_testnet(
 
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
+        NodeOverrides::default().apply_with_e2e_parameters(&dir)?;
         let rpc_port = tn_types::get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port");
 
@@ -670,4 +1196,349 @@ pub async fn ensure_account_balance_infinite_loop(
     }
 
     Ok(U256::ZERO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        dropped_entries_notice, merge_parameters_yaml, parse_e2e_parameters, FleetOverrides,
+        NodeOverrides, E2E_PARAMETERS_VAR,
+    };
+    use std::time::Duration;
+    use tn_config::{Config, ConfigFmt, ConfigTrait as _, Parameters};
+
+    /// `(key, value)` pairs as owned strings, the shape [`NodeOverrides::parameters`] holds.
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect()
+    }
+
+    /// A file shaped like `serde_yaml`'s output: scalars, a nested block mapping holding an
+    /// indented sequence, and a sequence written at column 0.
+    const BASE: &str = "---\nfirst: 1\nnested:\n  inner: 2\n  list:\n    - a\n    - b\nlast: x\n\
+                        seq:\n- 1\n- 2\ntail: true\n";
+
+    #[test]
+    fn merge_without_overrides_returns_base_unchanged() {
+        let base = "---\nfirst: 1"; // no final newline, which a rewrite would add
+        assert_eq!(merge_parameters_yaml(base, &[]).unwrap(), base);
+    }
+
+    #[test]
+    fn merge_appends_a_new_key_and_keeps_every_other_line() {
+        let merged = merge_parameters_yaml(BASE, &pairs(&[("example_parameter", "true")])).unwrap();
+        assert_eq!(merged, format!("{BASE}example_parameter: true\n"));
+    }
+
+    #[test]
+    fn merge_replaces_an_existing_scalar_entry() {
+        let merged = merge_parameters_yaml(BASE, &pairs(&[("first", "9")])).unwrap();
+        assert_eq!(
+            merged,
+            "---\nnested:\n  inner: 2\n  list:\n    - a\n    - b\nlast: x\nseq:\n- 1\n- 2\n\
+             tail: true\nfirst: 9\n"
+        );
+    }
+
+    #[test]
+    fn merge_replaces_a_whole_block_value() {
+        let merged =
+            merge_parameters_yaml(BASE, &pairs(&[("nested", "{}"), ("seq", "[3]")])).unwrap();
+        assert_eq!(merged, "---\nfirst: 1\nlast: x\ntail: true\nnested: {}\nseq: [3]\n");
+    }
+
+    #[test]
+    fn merge_matches_whole_keys_only() {
+        // `last` must not match `last_round`, and an indented `first:` is not top level
+        let base = "---\nlast_round: 1\nnested:\n  first: 2\n";
+        let merged = merge_parameters_yaml(base, &pairs(&[("last", "x"), ("first", "y")])).unwrap();
+        assert_eq!(merged, format!("{base}last: x\nfirst: y\n"));
+    }
+
+    #[test]
+    fn merge_later_entry_wins_and_is_idempotent() {
+        let overrides = pairs(&[("switch", "false"), ("first", "2"), ("switch", "true")]);
+        let once = merge_parameters_yaml(BASE, &overrides).unwrap();
+        assert_eq!(once.matches("switch:").count(), 1, "{once}");
+        assert!(once.ends_with("first: 2\nswitch: true\n"), "{once}");
+        assert_eq!(merge_parameters_yaml(&once, &overrides).unwrap(), once);
+    }
+
+    #[test]
+    fn merge_rejects_keys_and_values_it_cannot_write_as_one_entry() {
+        for (key, value) in [
+            ("", "true"),
+            ("nested.inner", "3"),
+            (" indented", "true"),
+            ("key: x", "true"),
+            ("switch", ""),
+            ("switch", "  "),
+            ("switch", "a\nb: c"),
+        ] {
+            assert!(
+                merge_parameters_yaml(BASE, &pairs(&[(key, value)])).is_err(),
+                "merged {key:?}: {value:?}"
+            );
+        }
+    }
+
+    /// The harness's own `parameters.yaml` (as `config_local_testnet` writes it) takes an unknown
+    /// parameter and a typed override, and the node's loader reads the typed value back.
+    #[test]
+    fn apply_parameters_reaches_the_node_loader() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("parameters.yaml");
+        Config::write_to_path(&path, Parameters::default(), ConfigFmt::YAML).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        // nothing to apply: the file is left as written
+        NodeOverrides::default()
+            .env("TN_TEST_EXECUTION_DELAY_MS", "400")
+            .apply_parameters(dir.path())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "a no-op left files behind");
+
+        let overrides = NodeOverrides::default()
+            .parameter("unknown_switch", "true")
+            .parameter("max_header_delay", "750ms")
+            .parameter("allow_private_forward_targets", "true");
+        overrides.apply_parameters(dir.path()).unwrap();
+        let merged = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(merged.matches("max_header_delay:").count(), 1, "{merged}");
+        assert!(merged.contains("\nunknown_switch: true\n"), "{merged}");
+        let loaded: Parameters = Config::load_from_path(&path, ConfigFmt::YAML).unwrap();
+        assert_eq!(loaded.max_header_delay, Duration::from_millis(750));
+        assert!(loaded.allow_private_forward_targets);
+
+        // a restart applies the same overrides again and changes nothing
+        overrides.apply_parameters(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), merged);
+
+        // a value the node cannot read fails the merge and leaves the node's file alone
+        let bad = NodeOverrides::default().parameter("max_header_delay", "soon");
+        assert!(bad.apply_parameters(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), merged);
+    }
+
+    /// Each start gets the harness's file plus its own entries: a restart with other entries
+    /// drops the earlier ones, and a restart with none puts the harness's file back.
+    #[test]
+    fn apply_parameters_starts_each_run_from_the_harness_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("parameters.yaml");
+        Config::write_to_path(&path, Parameters::default(), ConfigFmt::YAML).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        NodeOverrides::default()
+            .parameter("switch_a", "true")
+            .apply_parameters(dir.path())
+            .unwrap();
+        NodeOverrides::default()
+            .parameter("switch_b", "true")
+            .apply_parameters(dir.path())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{written}switch_b: true\n"));
+
+        NodeOverrides::default().apply_parameters(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "the restore left files");
+    }
+
+    #[test]
+    fn fleet_overrides_assign_each_setting_to_the_named_nodes() {
+        let fleet = FleetOverrides::default()
+            .parameter(["validator-1", "validator-2"], "example_parameter", "true")
+            .env(
+                ["validator-2", "validator-3", "validator-4"],
+                "TN_TEST_EXECUTION_DELAY_MS",
+                "400",
+            );
+        assert_eq!(
+            fleet.node("validator-1"),
+            &NodeOverrides::default().parameter("example_parameter", "true")
+        );
+        assert_eq!(
+            fleet.node("validator-2"),
+            &NodeOverrides::default()
+                .parameter("example_parameter", "true")
+                .env("TN_TEST_EXECUTION_DELAY_MS", "400")
+        );
+        assert_eq!(
+            fleet.node("validator-4"),
+            &NodeOverrides::default().env("TN_TEST_EXECUTION_DELAY_MS", "400")
+        );
+        assert!(fleet.node("new-validator").is_empty());
+        assert!(FleetOverrides::default().node("validator-1").is_empty());
+
+        let replaced = fleet.set_node("validator-2", NodeOverrides::default());
+        assert!(replaced.node("validator-2").is_empty());
+    }
+
+    #[test]
+    fn parse_e2e_parameters_reads_entries_in_order() {
+        assert_eq!(
+            parse_e2e_parameters("example_parameter: true; other_parameter: 4").unwrap(),
+            pairs(&[("example_parameter", "true"), ("other_parameter", "4")])
+        );
+        // whitespace is trimmed, empty entries are skipped, a value keeps its own colons and
+        // spaces, and a repeated key stays repeated (the merge lets the later one win)
+        assert_eq!(
+            parse_e2e_parameters(" a:1 ;; nested : {x: 1, y: [2]} ;a: two words; ").unwrap(),
+            pairs(&[("a", "1"), ("nested", "{x: 1, y: [2]}"), ("a", "two words")])
+        );
+        for blank in ["", "  ", ";", " ; ;"] {
+            assert!(parse_e2e_parameters(blank).unwrap().is_empty(), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn parse_e2e_parameters_rejects_malformed_entries_naming_the_variable() {
+        for raw in [
+            "example_parameter",
+            "example_parameter true",
+            "example_parameter=true",
+            ": true",
+            "two words: true",
+            "nested.inner: 3",
+            "example_parameter:",
+            "example_parameter:   ; other_parameter: 4",
+            "a: 1\nb: 2",
+            "ok: 1; broken",
+        ] {
+            let err = parse_e2e_parameters(raw).expect_err(raw);
+            assert!(err.to_string().contains(E2E_PARAMETERS_VAR), "{raw:?}: {err}");
+        }
+    }
+
+    /// The fleet-wide entries go in first, so the test's own entry for a key wins and every
+    /// other fleet-wide entry is still merged; the node's environment is kept.
+    #[test]
+    fn layered_over_puts_the_test_entries_last() {
+        let fleet_wide = pairs(&[("example_parameter", "true"), ("other_parameter", "4")]);
+        let node = NodeOverrides::default()
+            .parameter("example_parameter", "false")
+            .env("TN_TEST_EXECUTION_DELAY_MS", "400");
+        let layered = node.layered_over(&fleet_wide);
+        assert_eq!(
+            layered.parameters,
+            pairs(&[
+                ("example_parameter", "true"),
+                ("other_parameter", "4"),
+                ("example_parameter", "false")
+            ])
+        );
+        assert_eq!(layered.env, node.env);
+        let merged = merge_parameters_yaml(BASE, &layered.parameters).unwrap();
+        assert!(merged.ends_with("other_parameter: 4\nexample_parameter: false\n"), "{merged}");
+        assert_eq!(merged.matches("example_parameter:").count(), 1, "{merged}");
+
+        // nothing fleet-wide leaves the node's overrides as they are
+        assert_eq!(node.layered_over(&[]), node);
+    }
+
+    /// Applied to a datadir, the fleet-wide entries reach the node's loader beneath the test's
+    /// own; a fleet-wide value the loader cannot read fails with the variable's name and leaves
+    /// the file alone; with no fleet-wide entries the apply is the plain one.
+    #[test]
+    fn apply_layered_merges_fleet_wide_entries_under_the_test_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("parameters.yaml");
+        Config::write_to_path(&path, Parameters::default(), ConfigFmt::YAML).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        let fleet_wide = pairs(&[("max_header_delay", "750ms"), ("unknown_switch", "true")]);
+        let node = NodeOverrides::default().parameter("max_header_delay", "900ms");
+        node.apply_layered(dir.path(), &fleet_wide).unwrap();
+        let merged = std::fs::read_to_string(&path).unwrap();
+        assert!(merged.contains("\nunknown_switch: true\n"), "{merged}");
+        let loaded: Parameters = Config::load_from_path(&path, ConfigFmt::YAML).unwrap();
+        assert_eq!(loaded.max_header_delay, Duration::from_millis(900));
+
+        // a node with no entries of its own still gets the fleet-wide ones
+        NodeOverrides::default().apply_layered(dir.path(), &fleet_wide).unwrap();
+        let loaded: Parameters = Config::load_from_path(&path, ConfigFmt::YAML).unwrap();
+        assert_eq!(loaded.max_header_delay, Duration::from_millis(750));
+        let applied = std::fs::read_to_string(&path).unwrap();
+
+        let bad = pairs(&[("max_header_delay", "soon")]);
+        let err = NodeOverrides::default().apply_layered(dir.path(), &bad).unwrap_err();
+        assert!(format!("{err:#}").contains(E2E_PARAMETERS_VAR), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), applied);
+
+        // no fleet-wide entries and none of its own: the harness's file comes back
+        NodeOverrides::default().apply_layered(dir.path(), &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    }
+
+    /// The pass a multi-node start helper runs before it spawns anything fails at the first node
+    /// that cannot take its overrides, naming it and leaving its file alone, so the helper returns
+    /// before any process exists; a fleet every node can take reaches every datadir.
+    #[test]
+    fn fleet_apply_fails_on_the_node_that_cannot_take_its_overrides() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nodes = ["validator-1", "validator-2", "validator-3", "validator-4"];
+        for node in nodes {
+            std::fs::create_dir(dir.path().join(node)).unwrap();
+            let path = dir.path().join(node).join("parameters.yaml");
+            Config::write_to_path(&path, Parameters::default(), ConfigFmt::YAML).unwrap();
+        }
+        let fourth = dir.path().join("validator-4").join("parameters.yaml");
+        let written = std::fs::read_to_string(&fourth).unwrap();
+
+        let bad = FleetOverrides::default().parameter(nodes, "unknown_switch", "true").parameter(
+            ["validator-4"],
+            "max_header_delay",
+            "soon",
+        );
+        let err = bad.apply_layered(dir.path(), nodes, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("validator-4"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&fourth).unwrap(), written);
+
+        let good = FleetOverrides::default().parameter(nodes, "unknown_switch", "true");
+        good.apply_layered(dir.path(), nodes, &[]).unwrap();
+        for node in nodes {
+            let merged =
+                std::fs::read_to_string(dir.path().join(node).join("parameters.yaml")).unwrap();
+            assert!(merged.ends_with("\nunknown_switch: true\n"), "{node}: {merged}");
+        }
+    }
+
+    /// A start that drops or changes entries the previous start merged names the datadir and the
+    /// keys; one that writes the same file, or only adds entries, says nothing.
+    #[test]
+    fn dropped_entries_notice_names_the_datadir_and_the_dropped_keys() {
+        let node_dir = std::path::Path::new("/tmp/e2e-test/validator-2");
+        let previous =
+            merge_parameters_yaml(BASE, &pairs(&[("example_parameter", "true"), ("first", "9")]))
+                .unwrap();
+
+        // a restart without overrides: the harness's file comes back
+        assert_eq!(
+            dropped_entries_notice(node_dir, &previous, BASE).as_deref(),
+            Some(
+                "e2e: /tmp/e2e-test/validator-2 starts without the parameters.yaml entries \
+                 [\"example_parameter\", \"first\"] of its previous start: each start writes the \
+                 harness's file plus its own entries, so restart it with the same overrides to \
+                 keep them"
+            )
+        );
+
+        // a restart with other overrides: a changed value counts, a kept entry does not
+        let other =
+            merge_parameters_yaml(BASE, &pairs(&[("first", "9"), ("example_parameter", "false")]))
+                .unwrap();
+        let notice = dropped_entries_notice(node_dir, &previous, &other).unwrap();
+        assert!(notice.contains(" [\"example_parameter\"] "), "{notice}");
+
+        // a block value replaced by the harness's is a change too
+        let flat = merge_parameters_yaml(BASE, &pairs(&[("nested", "{}")])).unwrap();
+        let notice = dropped_entries_notice(node_dir, &flat, BASE).unwrap();
+        assert!(notice.contains(" [\"nested\"] "), "{notice}");
+
+        // the same file, or one that only adds entries, says nothing
+        assert_eq!(dropped_entries_notice(node_dir, &previous, &previous), None);
+        let more = merge_parameters_yaml(&previous, &pairs(&[("other_parameter", "4")])).unwrap();
+        assert_eq!(dropped_entries_notice(node_dir, &previous, &more), None);
+        assert_eq!(dropped_entries_notice(node_dir, BASE, BASE), None);
+    }
 }

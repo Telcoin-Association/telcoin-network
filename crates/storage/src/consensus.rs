@@ -469,7 +469,10 @@ pub struct ConsensusChain {
     heal_failures: Arc<Mutex<HashMap<Epoch, (std::time::Instant, PackError)>>>,
     /// Serializes [`Self::import_partial_to_staging`], so two downloads of a staging prefix never
     /// run side by side (there is a single staging slot). Chain-wide and held across the whole
-    /// transfer, which the sync reader's per-frame timeout and throughput floor bound. Each import
+    /// transfer. The sync reader's per-frame timeout and throughput floor, and the import's
+    /// progress bound, limit the transfer's rate, not its length; the caller's deadline limits
+    /// its length. The primary gives one unless the node is a committee-tier requester served
+    /// by a staked peer, whose transfer nothing else limits in length. Each import
     /// also stages into a directory of its own, so clearing the installed pack never touches an
     /// import still streaming.
     staging_import: Arc<tokio::sync::Mutex<()>>,
@@ -908,12 +911,18 @@ impl ConsensusChain {
     /// chain of its own stored record: any other record for it, such as a prefix's partial final,
     /// is refused with [`ConsensusChainError::LiveEpochImport`] (a prefix of the live epoch goes
     /// to [`Self::import_partial_to_staging`]).
+    ///
+    /// A `deadline` bounds the download: once that long has passed since it started, it stops as
+    /// [`PackError::ImportDeadline`] and leaves nothing behind. It never covers the install that
+    /// follows, which a cancel between its rename and the swap of the live handle would leave on
+    /// replaced files.
     pub async fn stream_import<R: AsyncRead + Unpin>(
         &self,
         stream: R,
         epoch_record: &EpochRecord,
         previous_epoch: &EpochRecord,
         timeout: Duration,
+        deadline: Option<Duration>,
     ) -> Result<(), ConsensusChainError> {
         let epoch = epoch_record.epoch;
         let epoch_final_hash = epoch_record.final_consensus.hash;
@@ -968,6 +977,7 @@ impl ConsensusChain {
             epoch_record,
             previous_epoch,
             timeout,
+            deadline,
             self.import_min_free,
         )
         .await?
@@ -1023,13 +1033,15 @@ impl ConsensusChain {
     /// directory under the returned path is what an install may put in place
     /// ([`Self::install_imported_epoch_dir`]). The guard comes back with the path: dropping it
     /// removes the directory with whatever is left in it. `None` if this process is already
-    /// importing the epoch. Any failure leaves nothing behind.
+    /// importing the epoch. Any failure leaves nothing behind. A `deadline` bounds the transfer
+    /// only, not the seal and its check after it.
     async fn import_sealed<R: AsyncRead + Unpin>(
         base_path: &Path,
         stream: R,
         epoch_record: &EpochRecord,
         previous_epoch: &EpochRecord,
         timeout: Duration,
+        deadline: Option<Duration>,
         min_free: u64,
     ) -> Result<Option<(ImportPath, PathBuf)>, ConsensusChainError> {
         let epoch = epoch_record.epoch;
@@ -1052,6 +1064,7 @@ impl ConsensusChain {
             previous_epoch,
             epoch_record.final_consensus,
             timeout,
+            deadline,
             min_free,
             import_path,
         )
@@ -1438,12 +1451,16 @@ impl ConsensusChain {
     /// [`Self::save_consensus_output`]) cannot race it. Verifies the streamed prefix ends
     /// exactly at `epoch_record.final_consensus`. Concurrent calls run one after another (each
     /// replaces what the previous one staged), never interleaved in the staging directory.
+    ///
+    /// A `deadline` bounds the download: once that long has passed since it started (after this
+    /// call's turn came), it stops as [`PackError::ImportDeadline`] and leaves nothing staged.
     pub async fn import_partial_to_staging<R: AsyncRead + Unpin>(
         &self,
         stream: R,
         epoch_record: &EpochRecord,
         previous_epoch: &EpochRecord,
         timeout: Duration,
+        deadline: Option<Duration>,
     ) -> Result<(), ConsensusChainError> {
         let _serial = self.staging_import.lock().await;
         let epoch = epoch_record.epoch;
@@ -1456,18 +1473,20 @@ impl ConsensusChain {
         std::fs::create_dir_all(&staging_base)?;
         // The import authenticates the prefix's final output against `epoch_record`, and every
         // earlier one through the parent links back from it, so the staged data is trustworthy.
-        let pack = match ConsensusPack::stream_import_with_floor(
+        let pack = match ConsensusPack::stream_import_leased(
             &staging_base,
             stream,
             epoch,
             previous_epoch,
             epoch_record.final_consensus,
             timeout,
+            deadline,
             self.import_min_free,
+            (),
         )
         .await
         {
-            Ok(pack) => pack,
+            Ok((pack, ())) => pack,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&staging_base);
                 return Err(e.into());
@@ -2935,7 +2954,8 @@ impl ConsensusChainWriter for ConsensusChain {
         previous_epoch: &EpochRecord,
         timeout: Duration,
     ) -> eyre::Result<()> {
-        ConsensusChain::stream_import(self, stream, epoch_record, previous_epoch, timeout)
+        // The trait carries no whole-transfer deadline.
+        ConsensusChain::stream_import(self, stream, epoch_record, previous_epoch, timeout, None)
             .await
             .map_err(Into::into)
     }
@@ -4088,7 +4108,13 @@ mod test {
         let (stream, len) = consensus_chain.get_epoch_stream(0).await.unwrap();
         consensus_chain2.epochs().save_record(epoch_record.clone()).await.expect("save record");
         consensus_chain2
-            .stream_import(stream.take(len), &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .stream_import(
+                stream.take(len),
+                &epoch_record,
+                &previous_epoch,
+                Duration::from_secs(5),
+                None,
+            )
             .await
             .unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
@@ -5191,7 +5217,13 @@ mod test {
         let generation = target.install_generation();
         let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
         target
-            .stream_import(stream.take(len), &record0, &previous_epoch, Duration::from_secs(5))
+            .stream_import(
+                stream.take(len),
+                &record0,
+                &previous_epoch,
+                Duration::from_secs(5),
+                None,
+            )
             .await
             .expect("the whole epoch installs over the partial copy");
         assert_ne!(target.install_generation(), generation, "an install moves the generation");
@@ -5673,6 +5705,7 @@ mod test {
                         &record0,
                         &previous_epoch,
                         Duration::from_secs(5),
+                        None,
                     )
                     .await
             }
@@ -5800,6 +5833,7 @@ mod test {
                         &record0,
                         &previous_epoch,
                         Duration::from_secs(5),
+                        None,
                     )
                     .await
             }
@@ -6000,8 +6034,13 @@ mod test {
         target.new_epoch(record0.clone(), committee.advance_epoch_for_test(1)).await.unwrap();
         let (mut writer, reader) = tokio::io::duplex(1 << 20);
         let first_import = target.clone();
-        let first =
-            first_import.stream_import(reader, &record0, &previous_epoch, Duration::from_secs(30));
+        let first = first_import.stream_import(
+            reader,
+            &record0,
+            &previous_epoch,
+            Duration::from_secs(30),
+            None,
+        );
         tokio::pin!(first);
         // Drive the first import until it has claimed the epoch and waits on the stream.
         tokio::select! {
@@ -6015,7 +6054,13 @@ mod test {
         let import_dir = target_dir.path().join("import-0");
         assert!(import_dir.is_dir(), "the first import downloads into its directory");
         target
-            .stream_import(tokio::io::empty(), &record0, &previous_epoch, Duration::from_secs(5))
+            .stream_import(
+                tokio::io::empty(),
+                &record0,
+                &previous_epoch,
+                Duration::from_secs(5),
+                None,
+            )
             .await
             .expect("a second import of the epoch is a no-op");
         assert!(import_dir.is_dir(), "the second import left the first's directory alone");
@@ -6057,7 +6102,13 @@ mod test {
         target.epochs().save_record(record0.clone()).await.expect("save epoch record");
         let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
         target
-            .stream_import(stream.take(len), &record0, &previous_epoch, Duration::from_secs(5))
+            .stream_import(
+                stream.take(len),
+                &record0,
+                &previous_epoch,
+                Duration::from_secs(5),
+                None,
+            )
             .await
             .expect("import epoch 0");
         // Served from the cached handle on its own file.
@@ -6118,6 +6169,7 @@ mod test {
                         &record0,
                         &previous_epoch,
                         Duration::from_secs(5),
+                        None,
                     )
                     .await
             }
@@ -6225,7 +6277,13 @@ mod test {
                 let (stream, len) =
                     source.get_epoch_stream(epoch).await.expect("source epoch stream");
                 target
-                    .stream_import(stream.take(len), &record, &previous, Duration::from_secs(5))
+                    .stream_import(
+                        stream.take(len),
+                        &record,
+                        &previous,
+                        Duration::from_secs(5),
+                        None,
+                    )
                     .await
             }
         };
@@ -6333,6 +6391,7 @@ mod test {
             &partial_record,
             &previous_epoch,
             Duration::from_secs(5),
+            None,
         )
         .await
         .expect("staging import of verified prefix");
@@ -6425,6 +6484,7 @@ mod test {
                     &record,
                     &previous_epoch,
                     Duration::from_secs(30),
+                    None,
                 )
                 .await
             })
@@ -6452,6 +6512,7 @@ mod test {
                     &record,
                     &previous_epoch,
                     Duration::from_secs(30),
+                    None,
                 )
                 .await
             })
@@ -6654,6 +6715,7 @@ mod test {
             &record,
             &previous_epoch,
             Duration::from_secs(30),
+            None,
         )
         .await
         .expect("first import");
@@ -6680,6 +6742,7 @@ mod test {
                     &record,
                     &previous_epoch,
                     Duration::from_secs(30),
+                    None,
                 )
                 .await
             })
@@ -6746,6 +6809,7 @@ mod test {
                 &bad_record,
                 &previous_epoch,
                 Duration::from_secs(5),
+                None,
             )
             .await
             .expect_err("mismatched final hash must be rejected");
@@ -6806,6 +6870,7 @@ mod test {
                     &record,
                     &previous_epoch,
                     Duration::from_secs(3600),
+                    None,
                 )
                 .await
         });
@@ -6826,6 +6891,101 @@ mod test {
             staging_dirs(dst_dir.path(), 0).is_empty(),
             "a stopped import must remove its staging dir"
         );
+    }
+
+    /// A transfer given a deadline stops at it as `ImportDeadline` (charged to the peer by the
+    /// fetcher), however well its stream keeps the rate and progress bounds, through both
+    /// `stream_import` and `import_partial_to_staging`, and releases what it held before the error
+    /// returns: the epoch's claim and its import directory, or its staging directory. The same
+    /// stream with no deadline imports.
+    #[tokio::test(start_paused = true)]
+    async fn test_import_deadline_stops_the_transfer() {
+        use crate::consensus_pack::test::{
+            drip_into, fabricated_chain, incompressible, peer_stream_bytes, test_previous_epoch,
+        };
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        // About 21 MB of incompressible batches, streamed 256 KiB every 7.5 s: about 1 MiB per
+        // 30 s, ten times the import's progress bound, for about 600 s.
+        let (records, last) = fabricated_chain(&committee, 3, 7, |number, i| {
+            incompressible(number * 100 + u64::from(i), 999_000)
+        });
+        let src_dir = TempDir::with_prefix("test_import_deadline_src").expect("temp dir");
+        let bytes = peer_stream_bytes(src_dir.path(), &committee, &previous_epoch, &records);
+        let mut record = previous_epoch.clone();
+        record.final_consensus = last;
+        let (chunk, step) = (256 << 10, Duration::from_millis(7_500));
+        let stream_time = step * u32::try_from(bytes.len().div_ceil(chunk)).expect("chunks");
+        // Past the first progress window (300 s), which the stream passes.
+        let deadline = Duration::from_secs(360);
+        assert!(stream_time > deadline + 2 * step, "the stream takes {stream_time:?}");
+
+        let dst_dir = TempDir::with_prefix("test_import_deadline_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned(), committee.clone()).unwrap();
+        // Epoch 0 is then a past epoch, so a whole pack of it installs in place.
+        dest.new_epoch(record.clone(), committee.advance_epoch_for_test(1)).await.unwrap();
+        let is_deadline = |err: &ConsensusChainError| {
+            matches!(
+                err,
+                ConsensusChainError::PackError(PackError::ImportDeadline { deadline: d })
+                    if *d == deadline
+            )
+        };
+
+        let (peer, stream) = tokio::io::duplex(64 << 10);
+        let (importer, r, p) = (dest.clone(), record.clone(), previous_epoch.clone());
+        let started = tokio::time::Instant::now();
+        let import = tokio::spawn(async move {
+            importer.stream_import(stream, &r, &p, Duration::from_secs(3600), Some(deadline)).await
+        });
+        let err = drip_into(peer, &bytes, chunk, step, import)
+            .await
+            .expect_err("the deadline stops the import");
+        let elapsed = started.elapsed();
+        assert!(is_deadline(&err), "got {err:?}");
+        assert!(elapsed >= deadline && elapsed < stream_time, "stopped after {elapsed:?}");
+        assert!(!dest.already_streaming_epoch(0), "the claim is released before the error");
+        assert!(!dst_dir.path().join("import-0").exists(), "the import dir is removed");
+        assert!(!dest.is_epoch_complete(&record).await, "nothing was installed");
+
+        let (peer, stream) = tokio::io::duplex(64 << 10);
+        let (importer, r, p) = (dest.clone(), record.clone(), previous_epoch.clone());
+        let import = tokio::spawn(async move {
+            importer
+                .import_partial_to_staging(
+                    stream,
+                    &r,
+                    &p,
+                    Duration::from_secs(3600),
+                    Some(deadline),
+                )
+                .await
+        });
+        let err = drip_into(peer, &bytes, chunk, step, import)
+            .await
+            .expect_err("the deadline stops the staging import");
+        assert!(is_deadline(&err), "got {err:?}");
+        assert_eq!(dest.staging_final(), None, "a stopped import must not leave a staged pack");
+        assert!(
+            staging_dirs(dst_dir.path(), 0).is_empty(),
+            "a stopped import must remove its staging dir"
+        );
+
+        // With no deadline, the same stream imports and runs past the deadline.
+        let (peer, stream) = tokio::io::duplex(64 << 10);
+        let (importer, r, p) = (dest.clone(), record.clone(), previous_epoch.clone());
+        let started = tokio::time::Instant::now();
+        let import = tokio::spawn(async move {
+            importer.stream_import(stream, &r, &p, Duration::from_secs(3600), None).await
+        });
+        drip_into(peer, &bytes, chunk, step, import)
+            .await
+            .expect("with no deadline the stream imports");
+        assert!(started.elapsed() > deadline, "the import outlasted the deadline");
+        assert!(dest.is_epoch_complete(&record).await, "the epoch is installed");
+        dest.close().await;
     }
 
     /// With the in-progress epoch open as `current_pack` but only built up to `k`, reads for
@@ -6882,6 +7042,7 @@ mod test {
             &partial_record,
             &previous_epoch,
             Duration::from_secs(5),
+            None,
         )
         .await
         .expect("staging import of verified prefix");
@@ -6985,6 +7146,7 @@ mod test {
                 &partial_record,
                 &previous_epoch,
                 Duration::from_secs(5),
+                None,
             )
             .await
             .expect("partial import of data we already hold must be Ok");
@@ -7007,6 +7169,7 @@ mod test {
                 &full_record,
                 &previous_epoch,
                 Duration::from_secs(5),
+                None,
             )
             .await
             .expect("exact full import of data we already hold must be Ok");
@@ -7063,6 +7226,7 @@ mod test {
                 &prefix_record,
                 &previous_epoch,
                 Duration::from_secs(5),
+                None,
             )
             .await
             .expect_err("a prefix of the live epoch must not be installed in its place");
@@ -7080,6 +7244,7 @@ mod test {
             &epoch_record,
             &previous_epoch,
             Duration::from_secs(5),
+            None,
         )
         .await
         .expect("the epoch's own record installs");
@@ -7139,7 +7304,13 @@ mod test {
         use tokio::io::AsyncReadExt as _;
         let (stream, len) = source.get_epoch_stream(0).await.expect("epoch stream");
         target
-            .stream_import(stream.take(len), &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .stream_import(
+                stream.take(len),
+                &epoch_record,
+                &previous_epoch,
+                Duration::from_secs(5),
+                None,
+            )
             .await
             .expect("import");
         assert!(target.is_epoch_complete(&epoch_record).await, "the import must install the pack");
@@ -7377,6 +7548,7 @@ mod test {
                     &epoch_record,
                     &previous_epoch,
                     Duration::from_secs(5),
+                    None,
                 )
                 .await;
             done.store(true, Ordering::Relaxed);
@@ -7456,6 +7628,7 @@ mod test {
                     &epoch_record,
                     &previous_epoch,
                     Duration::from_secs(5),
+                    None,
                 )
                 .await
                 .expect("stream import");
@@ -7577,7 +7750,7 @@ mod test {
         use tokio::io::AsyncReadExt as _;
         let (stream, len) = source.get_epoch_stream(1).await.expect("source epoch-1 stream");
         target
-            .stream_import(stream.take(len), &record1, &record0, Duration::from_secs(5))
+            .stream_import(stream.take(len), &record1, &record0, Duration::from_secs(5), None)
             .await
             .expect("import future epoch 1");
 
@@ -7626,7 +7799,13 @@ mod test {
         let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
         target.epochs().save_record(record0.clone()).await.expect("save record");
         target
-            .stream_import(stream.take(len), &record0, &previous_epoch, Duration::from_secs(5))
+            .stream_import(
+                stream.take(len),
+                &record0,
+                &previous_epoch,
+                Duration::from_secs(5),
+                None,
+            )
             .await
             .expect("import current epoch 0");
         assert!(
@@ -7684,7 +7863,13 @@ mod test {
             let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
             target.epochs().save_record(record0.clone()).await.expect("save record");
             target
-                .stream_import(stream.take(len), &record0, &previous_epoch, Duration::from_secs(5))
+                .stream_import(
+                    stream.take(len),
+                    &record0,
+                    &previous_epoch,
+                    Duration::from_secs(5),
+                    None,
+                )
                 .await
                 .expect("import epoch 0");
             // no replay: latest_consensus stays at 0/0, so the restart takes the epoch-0 branch

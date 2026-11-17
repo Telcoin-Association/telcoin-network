@@ -24,6 +24,7 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{
     logs_utils::{self, append_matching_block_logs, ProviderOrBlock},
+    tx_read_scope::TxReadScope,
     EthApiError, EthFilterConfig, EthStateCache, EthSubscriptionIdProvider,
 };
 use reth_rpc_server_types::{result::rpc_error_with_code, ToRpcResult};
@@ -114,8 +115,23 @@ pub(crate) fn check_filter_size(filter: &Filter) -> Result<(), EthFilterError> {
 /// range's work was bounded only by its block count. A scan that passes this bound ends with
 /// [`EthFilterError::QueryExceedsMaxReads`] and a retry range that fits, as the response limit
 /// does. 50 reads per returnable log leaves room for the blocks whose blooms match a filter by
-/// chance, and an operator who raises the response limit raises this bound with it.
+/// chance, and an operator who raises the response limit raises this bound with it. A block whose
+/// transactions the scan resolves counts [`SCAN_READS_PER_RESOLVED_BLOCK`] more.
 const SCAN_READS_PER_RESPONSE_LOG: usize = 50;
+
+/// TN(TN-0209): the reads a range scan counts, beyond its receipts and logs, for a block whose
+/// transactions it resolved from their consensus batch: 1,000, so a scan under the default bound
+/// of 1,000,000 resolves at most 1,000 blocks.
+///
+/// A datadir that stores transactions by their position in a consensus batch resolves a block's
+/// transactions through the provider's resolver, from its cache or by reading, decoding and
+/// checking the whole batch from a consensus pack, once per block (TN-0204). A block with one
+/// matching log counts two reads but can cost a pack read, so without this weight one scan could
+/// read a batch for each of up to 20,000 blocks. A block counts it only if its log matching kept a
+/// batch in the thread's read scope ([`TxReadScope::kept`]), so a datadir that stores transactions
+/// inline, and a block the RPC cache holds, count as before. A batch from the resolver's cache
+/// counts as one from a pack: the scan cannot tell them apart.
+const SCAN_READS_PER_RESOLVED_BLOCK: usize = 1_000;
 
 /// Minimum number of bloom matching blocks in a header window for fetching their receipts in
 /// parallel
@@ -532,37 +548,32 @@ where
                     return Err(ProviderError::HeaderNotFound(block_hash.into()).into())
                 };
 
-                // Get header - from cached block if available, otherwise from provider
-                let header = if let Some(block) = &maybe_block {
-                    block.header().clone()
-                } else {
-                    self.provider()
-                        .header_by_hash_or_number(block_hash.into())?
-                        .ok_or_else(|| ProviderError::HeaderNotFound(block_hash.into()))?
-                };
-
-                // Check if the block has been pruned (EIP-4444)
-                let earliest_block = self.provider().earliest_block_number()?;
-                if header.number() < earliest_block {
-                    return Err(EthApiError::PrunedHistoryUnavailable.into());
+                if maybe_block.is_some() {
+                    return self.logs_at_block_hash(&filter, block_hash, &receipts, maybe_block)
                 }
 
-                let block_num_hash = BlockNumHash::new(header.number(), block_hash);
+                // TN(TN-0208): without the cached block the header and each matching transaction
+                // are provider reads, which can block (a datadir that stores transactions by batch
+                // position reads them from a consensus pack), so they run on the blocking pool
+                // under a blocking IO permit, as the range scan does.
+                let permit = self
+                    .eth_api
+                    .acquire_owned_blocking_io()
+                    .await
+                    .map_err(|_| EthFilterError::InternalError)?;
 
-                let mut all_logs = Vec::new();
-                append_matching_block_logs(
-                    &mut all_logs,
-                    maybe_block
-                        .map(ProviderOrBlock::Block)
-                        .unwrap_or_else(|| ProviderOrBlock::Provider(self.provider())),
-                    &filter,
-                    block_num_hash,
-                    &receipts,
-                    false,
-                    header.timestamp(),
-                )?;
+                let (tx, rx) = oneshot::channel();
+                let this = self.clone();
+                self.task_spawner.spawn_blocking_task(Box::pin(async move {
+                    let _permit = permit;
+                    // a request dropped before its task started needs no reads
+                    if !tx.is_closed() {
+                        let _ =
+                            tx.send(this.logs_at_block_hash(&filter, block_hash, &receipts, None));
+                    }
+                }));
 
-                Ok(all_logs)
+                rx.await.map_err(|_| EthFilterError::InternalError)?
             }
             FilterBlockOption::Range { from_block, to_block } => {
                 // Handle special case where from block is pending
@@ -639,6 +650,53 @@ where
                     .await
             }
         }
+    }
+
+    /// TN(TN-0208): returns the logs of the block with `block_hash` that match `filter`, from its
+    /// `receipts` and, when the RPC cache holds it, the block.
+    ///
+    /// Without the block, the header and the transaction of each matching receipt are read from
+    /// the provider, which blocks: call it on a blocking thread then.
+    fn logs_at_block_hash(
+        &self,
+        filter: &Filter,
+        block_hash: alloy_primitives::BlockHash,
+        receipts: &[ProviderReceipt<Eth::Provider>],
+        maybe_block: Option<
+            Arc<reth_primitives_traits::RecoveredBlock<ProviderBlock<Eth::Provider>>>,
+        >,
+    ) -> Result<Vec<Log>, EthFilterError> {
+        // Get header - from cached block if available, otherwise from provider
+        let header = if let Some(block) = &maybe_block {
+            block.header().clone()
+        } else {
+            self.provider()
+                .header_by_hash_or_number(block_hash.into())?
+                .ok_or_else(|| ProviderError::HeaderNotFound(block_hash.into()))?
+        };
+
+        // Check if the block has been pruned (EIP-4444)
+        let earliest_block = self.provider().earliest_block_number()?;
+        if header.number() < earliest_block {
+            return Err(EthApiError::PrunedHistoryUnavailable.into());
+        }
+
+        let block_num_hash = BlockNumHash::new(header.number(), block_hash);
+
+        let mut all_logs = Vec::new();
+        append_matching_block_logs(
+            &mut all_logs,
+            maybe_block
+                .map(ProviderOrBlock::Block)
+                .unwrap_or_else(|| ProviderOrBlock::Provider(self.provider())),
+            filter,
+            block_num_hash,
+            receipts,
+            false,
+            header.timestamp(),
+        )?;
+
+        Ok(all_logs)
     }
 
     /// Installs a new filter and returns the new identifier.
@@ -740,7 +798,8 @@ where
     ) -> Result<Vec<Log>, EthFilterError> {
         let mut all_logs = Vec::new();
 
-        // TN(TN-0193): the receipts and logs this scan may read, and has read.
+        // TN(TN-0193, TN-0209): the reads this scan may count, and has counted: its receipts and
+        // logs, and the weight of each block whose transactions it resolved.
         let max_reads =
             limits.max_logs_per_response.map(|max| max.saturating_mul(SCAN_READS_PER_RESPONSE_LOG));
         let mut reads = 0usize;
@@ -799,6 +858,9 @@ where
                 range_mode.next().await?
             {
                 let num_hash = header.num_hash();
+                // TN(TN-0209): the matching runs on this thread with no await in it, so a value
+                // kept in this thread's read scope meanwhile is a batch resolved for this block
+                let kept_before = TxReadScope::kept();
                 append_matching_block_logs(
                     &mut all_logs,
                     recovered_block
@@ -810,6 +872,7 @@ where
                     false,
                     header.timestamp(),
                 )?;
+                let resolved_batch = TxReadScope::kept() != kept_before;
 
                 // size check but only if range is multiple blocks, so we always return all
                 // logs of a single block
@@ -850,6 +913,10 @@ where
                         .map(|receipt| alloy_consensus::TxReceipt::logs(receipt).len())
                         .sum::<usize>();
                 reads = reads.saturating_add(block_reads);
+                // TN(TN-0209): resolving the block's transactions from their batch counts too
+                if resolved_batch {
+                    reads = reads.saturating_add(SCAN_READS_PER_RESOLVED_BLOCK);
+                }
                 if let Some(max_reads) = max_reads &&
                     is_multi_block_range &&
                     reads > max_reads
@@ -861,7 +928,7 @@ where
                         max_reads,
                         from_block,
                         to_block = retry_to_block,
-                        "Query exceeded max receipts and logs read"
+                        "Query exceeded max reads"
                     );
                     return Err(EthFilterError::QueryExceedsMaxReads {
                         max_reads,
@@ -1075,12 +1142,12 @@ pub enum EthFilterError {
     /// position.
     #[error("too many addresses or topics in one filter position, the limit is {0}")]
     TooManyFilterValues(usize),
-    /// TN(TN-0193): a range scan read more receipts and logs than it may.
-    #[error(
-        "query reads more than {max_reads} receipts and logs, retry with the range {from_block}-{to_block}"
-    )]
+    /// TN(TN-0193, TN-0209): a range scan counted more reads than it may: its receipts and logs,
+    /// and `SCAN_READS_PER_RESOLVED_BLOCK` for each block whose transactions it resolved. The
+    /// text has the shape of the response limit's, which a client may already retry on.
+    #[error("query exceeds max reads {max_reads}, retry with the range {from_block}-{to_block}")]
     QueryExceedsMaxReads {
-        /// Most receipts and logs one range scan may read
+        /// Most reads one range scan may count
         max_reads: usize,
         /// Start block of the suggested retry range
         from_block: u64,
@@ -2215,6 +2282,145 @@ mod tests {
         assert!(scan.await.unwrap().is_empty());
     }
 
+    /// TN(TN-0208): logs by block hash, for a block the RPC cache does not hold, read the
+    /// provider on the blocking pool under a blocking IO permit, not on the runtime's threads.
+    /// The test runtime has one thread, and another thread holds the provider's header,
+    /// body-index and block stores until the request holds its permit: a request that read them
+    /// inline would block the runtime's thread until the holder gave up. The logs, a provider
+    /// error and the cached path (no permit) are answered as before.
+    #[tokio::test]
+    async fn logs_by_hash_read_the_provider_off_the_runtime() {
+        use alloy_consensus::TxLegacy;
+        use alloy_eips::eip2718::Encodable2718;
+        use reth_db_api::models::StoredBlockBodyIndices;
+        use reth_ethereum_primitives::TransactionSigned;
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+        use std::sync::mpsc;
+
+        let tx = TransactionSigned::new_unhashed(
+            TxLegacy {
+                chain_id: Some(1),
+                nonce: 0,
+                gas_price: 21_000,
+                gas_limit: 21_000,
+                to: alloy_primitives::TxKind::Call(alloy_primitives::Address::ZERO),
+                value: alloy_primitives::U256::ZERO,
+                input: alloy_primitives::Bytes::new(),
+            }
+            .into(),
+            alloy_primitives::Signature::test_signature(),
+        );
+        let header = alloy_consensus::Header { number: 100, ..Default::default() };
+        let hash = header.hash_slow();
+        let provider = MockEthProvider::default();
+        provider.add_block(
+            hash,
+            reth_ethereum_primitives::Block {
+                header,
+                body: reth_ethereum_primitives::BlockBody {
+                    transactions: vec![tx.clone()],
+                    ..Default::default()
+                },
+            },
+        );
+        provider.add_receipts(
+            100,
+            vec![reth_ethereum_primitives::Receipt {
+                tx_type: TxType::Legacy,
+                cumulative_gas_used: 21_000,
+                logs: vec![alloy_primitives::Log {
+                    address: alloy_primitives::Address::ZERO,
+                    data: alloy_primitives::LogData::new_unchecked(
+                        vec![],
+                        alloy_primitives::Bytes::new(),
+                    ),
+                }],
+                success: true,
+            }],
+        );
+        provider
+            .add_block_body_indices(100, StoredBlockBodyIndices { first_tx_num: 0, tx_count: 1 });
+        let indices = provider.block_body_indices.clone();
+        let stores = (
+            provider.headers.clone(),
+            provider.block_body_indices.clone(),
+            provider.blocks.clone(),
+        );
+
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Box::new(TokioTaskExecutor::default()),
+        );
+        let inner = eth_filter.inner.clone();
+        let guard = inner.eth_api.blocking_io_task_guard().clone();
+        let permits = guard.available_permits();
+        let by_hash = || {
+            inner.clone().logs_for_filter(Filter::new().at_block_hash(hash), QueryLimits::default())
+        };
+
+        // the receipts are cached and the block is not, so the request reads the stores only
+        // after the cache
+        inner.eth_cache().get_receipts(hash).await.unwrap().expect("receipts");
+
+        // another thread holds the stores until released, or for 10 s
+        let (locked_tx, locked) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let (headers, indices, blocks) = &stores;
+            let _held = (headers.lock(), indices.lock(), blocks.lock());
+            locked_tx.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(10)).is_ok()
+        });
+        locked.recv().unwrap();
+
+        let request = tokio::spawn(by_hash());
+        let start = Instant::now();
+        while guard.available_permits() == permits &&
+            !request.is_finished() &&
+            start.elapsed() < Duration::from_secs(5)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let taken = permits - guard.available_permits();
+        let _ = release.send(());
+        assert!(holder.join().unwrap(), "the request read the provider on the runtime's thread");
+        assert_eq!(taken, 1, "the request reads under one blocking IO permit");
+
+        let logs = request.await.unwrap().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_hash, Some(hash));
+        assert_eq!(logs[0].block_number, Some(100));
+        assert_eq!(logs[0].transaction_hash, Some(tx.trie_hash()));
+        // the blocking task frees its permit just after it answers
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while guard.available_permits() != permits {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the permit comes back");
+
+        // a provider error on the blocking pool is answered as itself, not as an internal error
+        indices.lock().clear();
+        let err = by_hash().await.unwrap_err();
+        assert!(matches!(err, EthFilterError::EthAPIError(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            EthFilterError::from(ProviderError::BlockBodyIndicesNotFound(100)).to_string()
+        );
+
+        // with the block cached the request reads its transactions from it and takes no permit
+        inner.eth_cache().get_recovered_block(hash).await.unwrap().expect("block");
+        let all = guard.clone().acquire_many_owned(permits as u32).await.unwrap();
+        let cached = tokio::time::timeout(Duration::from_secs(10), by_hash())
+            .await
+            .expect("the cached path waits for no permit")
+            .unwrap();
+        assert_eq!(cached, logs);
+        drop(all);
+    }
+
     /// A range mode over `count` consecutive blocks starting at 100, each with one receipt.
     // TN(TN-0035): tests for the ported chunk permits.
     #[expect(clippy::type_complexity)]
@@ -2456,6 +2662,198 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(logs.len(), 60);
+    }
+
+    /// TN(TN-0209): resolves position rows as TN's resolver does, keeping each batch it resolves
+    /// in the thread's read scope, and counts its calls. A block's batch is its transactions.
+    #[derive(Debug, Default)]
+    struct KeepingResolver {
+        batches: HashMap<alloy_primitives::B256, Vec<reth_ethereum_primitives::TransactionSigned>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl reth_provider::TxBodyResolver<reth_ethereum_primitives::EthPrimitives> for KeepingResolver {
+        fn resolve(
+            &self,
+            number: u64,
+            header: &alloy_consensus::Header,
+            positions: &[u32],
+        ) -> Result<Vec<reth_ethereum_primitives::TransactionSigned>, ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let hash = header.hash_slow();
+            let batch =
+                self.batches.get(&hash).ok_or(ProviderError::HeaderNotFound(number.into()))?;
+            TxReadScope::keep(hash, Arc::new(batch.clone()));
+            Ok(positions.iter().map(|position| batch[*position as usize].clone()).collect())
+        }
+    }
+
+    /// TN(TN-0209): genesis and `count` blocks in storage v2, each block with one transaction
+    /// whose receipt has one log from address 1, under a logs bloom every filter matches. The
+    /// transactions are stored by their position in their block's batch if `by_position`, else
+    /// inline; a [`KeepingResolver`] over the batches is installed either way.
+    fn chain_with_logs(
+        count: u64,
+        by_position: bool,
+    ) -> (
+        reth_provider::providers::BlockchainProvider<
+            reth_provider::test_utils::MockNodeTypesWithDB,
+        >,
+        Arc<KeepingResolver>,
+    ) {
+        use alloy_consensus::{Header, TxLegacy};
+        use alloy_evm::block::BlockExecutionResult;
+        use alloy_primitives::{Address, Bloom, Bytes, Log, LogData, Signature, B256};
+        use reth_chain_state::{ComputedTrieData, ExecutedBlock};
+        use reth_db_api::models::StorageSettings;
+        use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned};
+        use reth_evm::execute::BlockExecutionOutput;
+        use reth_primitives_traits::{RecoveredBlock, SealedBlock};
+        use reth_provider::{
+            providers::BlockchainProvider, test_utils::create_test_provider_factory,
+            SaveBlocksMode, StaticFileProviderFactory,
+        };
+        use reth_storage_api::StorageSettingsCache;
+
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+        let static_files = factory.static_file_provider();
+        static_files.set_tx_pointer_jars(by_position);
+
+        let mut blocks = Vec::new();
+        let mut positions = Vec::new();
+        let mut batches = HashMap::new();
+        let mut parent_hash = B256::ZERO;
+        for number in 0..=count {
+            let transactions = if number == 0 {
+                Vec::new()
+            } else {
+                vec![TransactionSigned::new_unhashed(
+                    TxLegacy {
+                        chain_id: Some(1),
+                        nonce: number,
+                        gas_price: 21_000,
+                        gas_limit: 21_000,
+                        ..Default::default()
+                    }
+                    .into(),
+                    Signature::test_signature(),
+                )]
+            };
+            let receipts = transactions
+                .iter()
+                .map(|_| Receipt {
+                    tx_type: TxType::Legacy,
+                    cumulative_gas_used: 21_000,
+                    logs: vec![Log {
+                        address: Address::with_last_byte(1),
+                        data: LogData::new_unchecked(vec![], Bytes::new()),
+                    }],
+                    success: true,
+                })
+                .collect();
+            let header = Header {
+                number,
+                parent_hash,
+                logs_bloom: if number == 0 { Bloom::default() } else { Bloom::repeat_byte(0xff) },
+                ..Default::default()
+            };
+            let senders = vec![Address::ZERO; transactions.len()];
+            positions.push(Some((0..transactions.len() as u32).collect::<Arc<[u32]>>()));
+            let block = SealedBlock::seal_slow(Block {
+                header,
+                body: BlockBody { transactions: transactions.clone(), ..Default::default() },
+            });
+            parent_hash = block.hash();
+            batches.insert(block.hash(), transactions);
+            blocks.push(ExecutedBlock::new(
+                Arc::new(RecoveredBlock::new_sealed(block, senders)),
+                Arc::new(BlockExecutionOutput {
+                    result: BlockExecutionResult {
+                        receipts,
+                        requests: Default::default(),
+                        gas_used: 0,
+                        blob_gas_used: 0,
+                    },
+                    state: Default::default(),
+                }),
+                ComputedTrieData::default(),
+            ));
+        }
+
+        let resolver = Arc::new(KeepingResolver { batches, ..Default::default() });
+        static_files.set_tx_body_resolver(resolver.clone()).unwrap();
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .save_blocks_with_tx_positions(blocks, SaveBlocksMode::Full, &positions)
+            .unwrap();
+        provider_rw.commit().unwrap();
+        (BlockchainProvider::new(factory).unwrap(), resolver)
+    }
+
+    /// TN(TN-0209): on a datadir that stores transactions by position, a range scan counts
+    /// [`SCAN_READS_PER_RESOLVED_BLOCK`] reads more for each block whose transactions it resolved,
+    /// and ends at the read bound with a retry range that fits; the same blocks stored inline
+    /// resolve nothing and scan to the end as before. 300 blocks are past the cached mode's 250,
+    /// so the scan takes the range mode, and every block's transaction is read through the
+    /// provider, the RPC cache holding none.
+    #[tokio::test]
+    async fn range_scan_counts_resolved_blocks() {
+        use alloy_primitives::Address;
+        use std::sync::atomic::Ordering;
+
+        const BLOCKS: u64 = 300;
+        // one log per block, so the response limit fits every log; it allows 15,000 reads
+        let limits = QueryLimits {
+            max_blocks_per_filter: None,
+            max_logs_per_response: Some(BLOCKS as usize),
+        };
+        let scan = |provider: reth_provider::providers::BlockchainProvider<_>, to: u64| {
+            let eth_api = EthApiBuilder::new(
+                provider.clone(),
+                testing_pool(),
+                NoopNetwork::default(),
+                EthEvmConfig::new(provider.chain_spec()),
+            )
+            .build();
+            let eth_filter = EthFilter::new(
+                eth_api,
+                EthFilterConfig::default(),
+                Box::new(TokioTaskExecutor::default()),
+            );
+            eth_filter.inner.clone().get_logs_in_block_range(
+                Filter::new().address(Address::with_last_byte(1)),
+                1,
+                to,
+                limits,
+            )
+        };
+
+        // by position each block counts a receipt, a log and 1,000: block 15 passes 15,000
+        let (provider, resolver) = chain_with_logs(BLOCKS, true);
+        let err = scan(provider.clone(), BLOCKS).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EthFilterError::QueryExceedsMaxReads {
+                    max_reads: 15_000,
+                    from_block: 1,
+                    to_block: 14
+                }
+            ),
+            "{err:?}"
+        );
+        // the text names the reads, which here are mostly the blocks' weight, not receipts and logs
+        assert_eq!(err.to_string(), "query exceeds max reads 15000, retry with the range 1-14");
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 15, "one batch per block scanned");
+        // the retry range fits
+        assert_eq!(scan(provider, 14).await.unwrap().len(), 14);
+
+        // inline the scan reads 600 and returns every log, and no batch is resolved
+        let (provider, resolver) = chain_with_logs(BLOCKS, false);
+        let logs = scan(provider, BLOCKS).await.unwrap();
+        assert_eq!(logs.len(), BLOCKS as usize);
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
     }
 
     /// TN(TN-0056): the third filter is refused at a limit of two, and uninstalling frees a slot.

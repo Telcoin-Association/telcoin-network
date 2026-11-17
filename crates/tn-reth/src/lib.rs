@@ -111,7 +111,7 @@ pub use reth_rpc_builder::RpcServerHandle;
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::Layers;
 pub use reth_transaction_pool::{
-    error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
+    error::{InvalidPoolTransactionError, PoolError, PoolErrorKind, PoolTransactionError},
     identifier::{SenderId, SenderIdentifiers},
     BestTransactions, EthPooledTransaction,
 };
