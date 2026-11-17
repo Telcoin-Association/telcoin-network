@@ -891,8 +891,10 @@ impl ConsensusPack {
             // An all-zero `data` file (a first write that sized the file but crashed before the
             // header was durable) is unwritten, not repairable: there is nothing to rebuild.
             // Report it with an actionable message rather than letting the classifier surface a
-            // bare open error. The newest epoch's is harmless: the writable open that creates the
-            // epoch re-initializes it (`Pack::init_header`). A past epoch held outputs, now lost.
+            // bare open error. A past epoch held outputs, now lost. The newest epoch's is
+            // re-initialized by the writable open that creates the epoch (`Pack::init_header`),
+            // but the epoch the node resumes is opened by `open_append_exists`, which needs its
+            // meta, so the start refuses it there.
             Err(e) if e.is_unwritten_data_file() => {
                 return Ok(EpochRepair::Unrepairable(if has_later_epoch(epochs_dir, epoch)? {
                     format!(
@@ -900,12 +902,23 @@ impl ConsensusPack {
                          this past epoch's outputs are lost. {}",
                         lost_pack_remedy(format!("epoch-{epoch}"))
                     )
+                } else if crate::consensus::ConsensusChain::start_resumes(epochs_dir, epoch) {
+                    format!(
+                        "epoch {epoch}: the data file is all zeros, and this is the epoch the node \
+                         resumes from: its start opens the epoch to resume it and refuses a pack \
+                         with no epoch meta, and with `epoch-{epoch}/` removed it finds no pack \
+                         to resume, so do not remove it. The outputs it had saved in this epoch \
+                         are lost on this node. With the node stopped, restore a whole restore \
+                         point or start the node over as a new one; a validator restored or \
+                         started over either way stays stopped until the network has closed the \
+                         last epoch it took part in."
+                    )
                 } else {
                     format!(
                         "epoch {epoch}: the data file is all zeros (an interrupted first write \
                          when the node created this epoch); it holds no output. It is the newest \
-                         epoch: the node re-initializes the file in place when it enters the \
-                         epoch at its next start, so nothing needs to be done."
+                         epoch, which the node has not resumed: leave it, the node re-initializes \
+                         the file in place when it enters the epoch."
                     )
                 }));
             }
@@ -1943,6 +1956,16 @@ pub(crate) fn legacy_migration_refusal(data_path: &Path, epoch: Epoch) -> Option
 /// refused. This is the only check a legacy v0 pack gets, since it is only ever read by its
 /// migration.
 pub fn legacy_migration_dry_run(data_path: &Path, epoch: Epoch) -> Result<u64, String> {
+    legacy_migration_dry_run_last(data_path, epoch).map(|(outputs, _)| outputs)
+}
+
+/// [`legacy_migration_dry_run`], also returning the number and digest of the last output the
+/// migration would copy (`None` for a pack with no output), so a caller can compare it with the
+/// epoch's certified final output.
+pub fn legacy_migration_dry_run_last(
+    data_path: &Path,
+    epoch: Epoch,
+) -> Result<(u64, Option<ConsensusNumHash>), String> {
     let base_dir = data_path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", data_path.display()))?;
@@ -3116,7 +3139,7 @@ impl Inner {
                     epoch,
                     expect_complete,
                 ) {
-                    Ok(n) => EpochMigrate::WouldMigrate(format!(
+                    Ok((n, _)) => EpochMigrate::WouldMigrate(format!(
                         "v{version} -> v{PACK_VERSION}, {n} output(s)"
                     )),
                     Err(MigrateAbort::Corrupt(why)) => EpochMigrate::Corrupt(why),
@@ -3338,7 +3361,7 @@ impl Inner {
             PACK_VERSION,
         )
         .map_err(|e| MigrateAbort::Fatal(e.into()))?;
-        let copied = Self::migrate_copy(
+        let (copied, _) = Self::migrate_copy(
             src,
             Some(&mut dst),
             version,
@@ -3418,8 +3441,8 @@ impl Inner {
     /// Walk the legacy `src` data log record-by-record, validating as it reads. When `dst` is
     /// `Some`, each record is re-appended to the fresh v2 log in header-first order (reordering a
     /// v0 batches-first log). When `dst` is `None` this only validates and counts (the dry-run
-    /// path). Returns the number of outputs. See [`Self::migrate_consistent_end`] for
-    /// `expect_complete`.
+    /// path). Returns the number of outputs and the number and digest of the last one. See
+    /// [`Self::migrate_consistent_end`] for `expect_complete`.
     fn migrate_copy(
         src: &Pack<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
@@ -3428,7 +3451,7 @@ impl Inner {
         data_file: &Path,
         epoch: Epoch,
         expect_complete: bool,
-    ) -> Result<u64, MigrateAbort> {
+    ) -> Result<(u64, Option<ConsensusNumHash>), MigrateAbort> {
         // For a header-first (v1) log, compute the safe consistent end with the same WAL replay +
         // committed-data guards recovery uses: an unacked crash tail past `end` is dropped, but a
         // committed output is never silently lost. A v0 (batches-first) log cannot be replayed; it
@@ -3486,11 +3509,20 @@ impl Inner {
                 )))
             }
         }
-        if version == 0 {
-            Self::migrate_copy_v0(&mut iter, dst, base_dir, epoch)
+        let mut last = None;
+        let count = if version == 0 {
+            Self::migrate_copy_v0(&mut iter, dst, base_dir, epoch, &mut last)
         } else {
-            Self::migrate_copy_v1(&mut iter, dst, base_dir, end, epoch)
-        }
+            Self::migrate_copy_v1(&mut iter, dst, base_dir, end, epoch, &mut last)
+        }?;
+        // one digest per migration, of the last header only
+        let last = match last {
+            Some(PackRecord::Consensus(header)) => {
+                Some(ConsensusNumHash::new(header.number, header.digest()))
+            }
+            _ => None,
+        };
+        Ok((count, last))
     }
 
     /// Compute the recoverable end of a header-first legacy log and reject any damage below the
@@ -3566,13 +3598,14 @@ impl Inner {
 
     /// Copy a header-first (v1) log up to `end`, output by output (`Consensus` header followed by
     /// the exact number of `Batch` records its sub-dag names). Records at/after `end` are the
-    /// discarded unacked tail.
+    /// discarded unacked tail. `last` is set to each output's header record as it is copied.
     fn migrate_copy_v1(
         iter: &mut crate::archive::pack::RawIter<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
         base_dir: &Path,
         end: u64,
         epoch: Epoch,
+        last: &mut Option<PackRecord>,
     ) -> Result<u64, MigrateAbort> {
         let mut count = 0u64;
         loop {
@@ -3584,10 +3617,12 @@ impl Inner {
                 None => break,
                 Some(Ok(PackRecord::Consensus(header))) => {
                     let expected = Self::expected_batch_count(&header);
+                    let record = PackRecord::Consensus(header);
                     if let Some(d) = dst.as_deref_mut() {
-                        d.append(&PackRecord::Consensus(header))
+                        d.append(&record)
                             .map_err(|e| MigrateAbort::Fatal(PackError::append_failed(e)))?;
                     }
+                    *last = Some(record);
                     for _ in 0..expected {
                         let batch_pos = iter.logical_position();
                         match iter.next() {
@@ -3643,12 +3678,14 @@ impl Inner {
     /// Copy a v0 batches-first log, reordering each output into header-first form: batches are
     /// buffered until their `Consensus` header appears, then the header and its batches are
     /// appended. Any decode failure or a batch count that disagrees with the header is
-    /// corruption; a read the disk failed is a [`PackError::ReadError`] (nothing is cut).
+    /// corruption; a read the disk failed is a [`PackError::ReadError`] (nothing is cut). `last`
+    /// is set to each output's header record as it is copied.
     fn migrate_copy_v0(
         iter: &mut crate::archive::pack::RawIter<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
         base_dir: &Path,
         epoch: Epoch,
+        last: &mut Option<PackRecord>,
     ) -> Result<u64, MigrateAbort> {
         let mut count = 0u64;
         let mut pending: Vec<Batch> = Vec::new();
@@ -3674,8 +3711,9 @@ impl Inner {
                             pending.len()
                         )));
                     }
+                    let record = PackRecord::Consensus(header);
                     if let Some(d) = dst.as_deref_mut() {
-                        d.append(&PackRecord::Consensus(header))
+                        d.append(&record)
                             .map_err(|e| MigrateAbort::Fatal(PackError::append_failed(e)))?;
                         for batch in pending.drain(..) {
                             d.append(&PackRecord::Batch(batch))
@@ -3684,6 +3722,7 @@ impl Inner {
                     } else {
                         pending.clear();
                     }
+                    *last = Some(record);
                     count += 1;
                 }
                 Some(Ok(PackRecord::EpochMeta(_))) => {
@@ -5757,9 +5796,10 @@ impl Drop for ImportSlot {
 ///
 /// The floor holds the import's slot in an imports-in-flight counter (the process-wide
 /// [`IMPORTS_IN_FLIGHT`] in production) from its creation until it drops, when the import's
-/// blocking half returns, whatever its outcome. A floor of `0` takes no slot: it never checks, and
-/// its only user is `db load-state`'s restore, which runs offline in its own process, where no
-/// floored import runs beside it.
+/// blocking half returns, whatever its outcome. A floor of `0` takes no slot: it never checks. It
+/// is `db load-state`'s restore's alone, which runs offline in its own process, where no floored
+/// import runs beside it; `db load-state --verify-only`, which may run beside a node, keeps the
+/// node's floor.
 ///
 /// The import's blocking half checks the floor as its data log grows; the reader's task checks it
 /// again on a clock ([`ImportClock`], from [`Self::clock`]), with the data length the blocking half
@@ -12394,9 +12434,10 @@ pub(crate) mod test {
                     );
                     // The newest epoch's is re-initialized when the node enters the epoch.
                     assert!(
-                        msg.contains("nothing needs to be done"),
-                        "the newest epoch needs no action: {msg}"
+                        msg.contains("leave it, the node re-initializes the file"),
+                        "the newest epoch is left to the node: {msg}"
                     );
+                    assert!(!msg.contains("nothing needs to be done"), "{msg}");
                 }
                 other => {
                     panic!("an unwritten file must be Unrepairable (apply={apply}), got {other:?}")
@@ -12407,6 +12448,31 @@ pub(crate) mod test {
             std::fs::metadata(&data_path).expect("stat").len(),
             1 << 20,
             "repair must not mutate the unwritten data file"
+        );
+
+        // The epoch the node resumes is opened to resume, not created: the start refuses its
+        // all-zero file
+        // (test_start_reinitializes_an_all_zero_data_file_only_above_the_resume_epoch),
+        // so it is never "left to the node", nor removed.
+        crate::consensus::ConsensusChain::write_latest_consensus_hint(temp_dir.path(), 0, 5)
+            .expect("hint");
+        for apply in [false, true] {
+            let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, apply).await.expect("repair");
+            let EpochRepair::Unrepairable(msg) = res else {
+                panic!("the resume epoch's unwritten file must be Unrepairable, got {res:?}")
+            };
+            assert!(msg.contains("the epoch the node resumes from"), "{msg}");
+            assert!(msg.contains("do not remove it"), "{msg}");
+            assert!(msg.contains("restore a whole restore point"), "{msg}");
+            assert!(!msg.contains("re-initializes"), "{msg}");
+        }
+        // at the hint's (0, 0) the start creates epoch 0, re-initializing the file
+        crate::consensus::ConsensusChain::write_latest_consensus_hint(temp_dir.path(), 0, 0)
+            .expect("hint");
+        let res = ConsensusPack::repair_epoch(temp_dir.path(), 0, false).await.expect("repair");
+        assert!(
+            matches!(&res, EpochRepair::Unrepairable(msg) if msg.contains("re-initializes")),
+            "{res:?}"
         );
 
         // A past epoch's all-zero data file lost its outputs: nothing recreates it, and removing
@@ -12425,6 +12491,64 @@ pub(crate) mod test {
             1 << 20,
             "repair must not mutate the unwritten data file"
         );
+    }
+
+    /// Where the node's start meets a newest epoch whose data file is all zeros. Above the epoch it
+    /// resumes from, it enters the epoch with `new_epoch`, whose `open_append` re-initializes the
+    /// file in place. At the resume epoch, `ConsensusChain::new` opens it with
+    /// `open_append_exists`, which finds no epoch meta to resume and refuses the start.
+    #[tokio::test]
+    async fn test_start_reinitializes_an_all_zero_data_file_only_above_the_resume_epoch() {
+        use crate::consensus::ConsensusChain;
+        let temp_dir = TempDir::with_prefix("test_unwritten_start").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let epoch0 = test_previous_epoch(&committee);
+        let base = temp_dir.path().to_path_buf();
+        let data1 = base.join("epoch-1").join(Inner::DATA_NAME);
+        let zero_epoch_1 = || {
+            std::fs::create_dir_all(data1.parent().expect("epoch dir")).expect("mkdir");
+            std::fs::write(&data1, vec![0_u8; 1 << 20]).expect("write zeros");
+        };
+
+        // epoch 0 holds outputs 1..=3 and the node resumes it; epoch 1's file is all zeros
+        let consensus_chain = ConsensusChain::new(base.clone(), committee.clone()).expect("open");
+        consensus_chain.new_epoch(epoch0.clone(), committee.clone()).await.expect("epoch 0");
+        let mut parent = ConsensusHeader::default().digest();
+        for n in 1..=3u64 {
+            let output = make_test_output(&committee, (n as usize) % 4, chain.clone(), n, parent);
+            parent = output.digest();
+            consensus_chain.save_consensus_output(output).await.expect("save");
+        }
+        consensus_chain.persist_current().await.expect("persist");
+        let record0 = EpochRecord {
+            parent_hash: epoch0.digest(),
+            final_consensus: ConsensusNumHash { number: 3, hash: parent },
+            ..epoch0.clone()
+        };
+        zero_epoch_1();
+        assert_eq!(ConsensusChain::resume_epoch(&base), Some(0));
+        consensus_chain
+            .new_epoch(record0, committee.advance_epoch_for_test(1))
+            .await
+            .expect("entering the epoch above the resume epoch re-initializes its all-zero file");
+        consensus_chain.persist_current().await.expect("persist");
+        let pack = Pack::<PackRecord>::open(&data1, 1, true, PackCompression::ZStd, PACK_VERSION)
+            .expect("the re-initialized file has a header");
+        let meta = pack.fetch(DATA_HEADER_BYTES as u64).expect("and an epoch meta");
+        assert_eq!(meta.into_epoch().expect("an epoch meta").epoch, 1);
+        drop(pack);
+        drop(consensus_chain);
+
+        // the node resumes epoch 1, whose file is all zeros: the start refuses it
+        ConsensusChain::write_latest_consensus_hint(&base, 1, 4).expect("hint");
+        zero_epoch_1();
+        assert_eq!(ConsensusChain::resume_epoch(&base), Some(1));
+        let started = ConsensusChain::new(base.clone(), committee.clone());
+        assert!(started.is_err(), "the resume epoch's all-zero file is not re-initialized");
+        let restarted = ConsensusChain::new(base.clone(), committee.clone());
+        assert!(restarted.is_err(), "and every later start refuses it too");
     }
 
     /// A later epoch left only as an interrupted install (`epoch-1.replaced` with no `epoch-1`,

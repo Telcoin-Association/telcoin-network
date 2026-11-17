@@ -263,7 +263,9 @@ start the node over (crates/tn-reth/README.md, "Transactions stored by position"
 stopped until the network has closed the last epoch it took part in), and never delete the
 `epoch-N` directory, which a datadir storing transactions by position needs at every start. Only the
 newest epoch's torn-empty meta or all-zero data file holds no output: the node creates (or
-re-initializes) that epoch again when it enters it. Its read-only recovery checks
+re-initializes) that epoch again when it enters it. The epoch the node resumes from is not entered
+but opened to resume (`open_append_exists`), and the start refuses its all-zero data file, so `db
+repair` gives it a whole restore point or a start over instead (`ConsensusChain::start_resumes`). Its read-only recovery checks
 (shared with `db repair`'s dry run) read the position index's entries straight from the file, so an
 index a crash left unsealed attests the same output boundaries it does to the writable open.
 
@@ -299,7 +301,8 @@ The progress bound and the sync reader's rate bounds set how fast an import must
 The length is bounded by a deadline the caller gives the transfer (`stream_import`, `import_partial_to_staging`), checked by the same clock: past it the import stops as `ImportDeadline`, which the fetcher charges to the peer like a stall, and it never covers the seal or the install that follow.
 The fetcher gives 230 s (the 200 s public-tier serve cut plus one 30 s rate window) to every exchange in which the node is a public-tier requester or the serving peer is not staked, and no deadline to a committee-tier requester served by a staked peer, whose import nothing else bounds in length.
 A stopped import's files are removed only after its
-blocking half stopped writing them. `db load-state`'s restore of a local bundle has no floor and no clock;
+blocking half stopped writing them. `db load-state`'s restore of a local bundle has no floor and no clock
+(its `--verify-only`, which may run beside a node, keeps the node's floor);
 the imported pack is sealed before `pack_install` is taken, and the live (writable) epoch is replaced
 only with its stored record's chain, anything else, such as a prefix's partial final, being refused as
 `LiveEpochImport`), and drives epoch handoff.
@@ -317,8 +320,10 @@ the epoch ran meanwhile and the file is the handle's (same device and inode); ot
 `consensus_slot{1,2}` files — a non-authoritative hint; the pack files are ground truth.
 
 **Pack retention (invariant).** Packs are never pruned: no code deletes an `epoch-{N}` pack that
-holds outputs. The only removal of a data log, `remove_header_only_legacy`, removes a legacy pack
-holding nothing but its header. An install replaces an epoch's files only with the epoch's whole
+holds outputs, but for one its own failed import just created (`db load-state` refuses a datadir
+that holds the bundle epoch's pack, and removes only the `epoch-N` its failed import made). The only
+other removal of a data log, `remove_header_only_legacy`, removes a legacy pack holding nothing but
+its header. An install replaces an epoch's files only with the epoch's whole
 certified chain (`stream_import`, over a pack lacking that chain's final output) or with the same
 log re-indexed or migrated (a read-side heal). The checked batch reads above serve readers that
 record where a batch is (its leader epoch and digest) and treat a missing pack as damage, so
@@ -503,7 +508,12 @@ or `--all` for every epoch there, in turn) walks a pack's `data` stream read-onl
 issues. A check it could not run is an error, never a verdict: a data log it cannot open or read
 (in the validation walk, the index cross-check's walk, the incomplete-output check) fails the
 command, and the recovery check reports an unopenable log as "recoverability unknown", so a
-transient failure never reads as a truncatable tail or a skipped index check. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
+transient failure never reads as a truncatable tail or a skipped index check. The datadir forms
+(`--epoch N`, `--all`) then judge a past epoch's pack (one before the epoch the latest-consensus
+hint resumes) against the local epoch records, as `db import-epoch` judges a pack in place
+(`ConsensusChain::past_pack_check`): one that does not end with the final output of its epoch's
+record fails; one the records cannot judge (no record of the epoch yet, say) is reported unchecked,
+and the epoch the node resumes from, still being written, is never judged. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported with
 its recovery (above), never "fixed". A read the disk failed (opening the data log included, for the validation
@@ -512,8 +522,8 @@ too), any other OS failure (a sync, a rename, an unlink), a failure the environm
 sync or seal (recovery seals its rebuilt indexes before it cuts the log), is no verdict on the epoch:
 it is reported as an error to rerun once the cause is fixed, never as unrepairable. A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
 drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. Only the newest
-epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory) was
-complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
+epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory, or
+an interrupted install of one, `epoch-N.replaced` with no `epoch-N`) was complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
 read-side heal, `db migrate`, `db repair` and `db validate`, even when its indexes cannot attest its
 length. A legacy v0
 (batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. An
@@ -523,17 +533,21 @@ never read as "not found" or healthy; the node's next start puts it back
 (`ConsensusChain::recover_incomplete_installs`), and `db repair --force` runs that same step first,
 then checks the restored epoch with the others. `telcoin-network db import-epoch --epoch N --from
 <copy> [--force]` puts back one past epoch's pack from a copy at rest
-(`ConsensusChain::import_epoch_at_rest`, `consensus/at_rest_import.rs`): the copy's data log up to
-its last complete output (`wal_consistent_end`; a sealed log ends with its sentinel, which no peer
-serves) goes through the peer import's own staged path (`ConsensusChain::import_sealed`, the
+(`ConsensusChain::import_epoch_at_rest`, `consensus/at_rest_import.rs`; a legacy v0 copy is refused
+by its format, naming its conversion by `db migrate --force` in a scratch datadir): the copy's data
+log up to its last complete output (`wal_consistent_end`; a sealed log ends with its sentinel, which
+no peer serves) goes through the peer import's own staged path (`ConsensusChain::import_sealed`, the
 `import-N` directory, the checked seal and its read-back) against the local records of epochs N-1
-and N, read from their logs without opening the records DB (N certified, N chaining to N-1), and
+and N, read from their logs without opening the records DB (N certified, N chaining to N-1; a log
+an unclean stop left unsealed is read up to its torn tail, as the node's open recovers it; for epoch
+0, record 0, naming no parent, and the stand-in record the node opens epoch 0 with,
+`ConsensusChain::epoch_zero_previous`, from the genesis committee the command loads), and
 only a verified copy is installed (`install_imported_epoch_dir`, rename-aside, which also puts back
 an interrupted install's aside first). It opens no `ConsensusChain`: an open writes (the live
 epoch's append open, `recover_incomplete_installs`, the sweep), and `stream_import`'s idempotency
 guard keeps a pack that still serves its final output, however damaged the rest of its log. It
-refuses epoch 0, the epoch the latest-consensus hint resumes and later ones, a copy inside the
-epochs directory (whose directories the import and the node's start remove or replace), and a pack
+refuses the epoch the latest-consensus hint resumes and later ones (and, with no hint, every epoch:
+the epoch the start resumes is then unknown), a copy inside the epochs directory (whose directories the import and the node's start remove or replace), and a pack
 in place (or an interrupted install's aside) that validates and ends with the epoch's certified
 final output (`pack_damage`: a v2 pack must also be sealed; a legacy v0 or v1 pack, which predates
 the sentinel, is judged by the dry run of its migration to v2, as the node reads it); a dry run (no

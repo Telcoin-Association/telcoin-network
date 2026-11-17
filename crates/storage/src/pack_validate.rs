@@ -162,7 +162,10 @@ pub enum PackIssue {
 /// Overall verdict for a pack file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// No issues found — the pack would import cleanly.
+    /// No issues found: the pack is whole as far as it goes. Its records are not judged against
+    /// the epoch records, so a prefix of the epoch, a pack holding only its meta, or (validated
+    /// with no previous record) another chain's pack is `Valid`; `db validate --epoch N` judges a
+    /// past epoch's pack against them (`ConsensusChain::past_pack_check`).
     Valid,
     /// One or more issues found — the pack would be rejected by `stream_import`.
     Invalid,
@@ -183,11 +186,12 @@ impl Display for Verdict {
 /// truncatable (an unacked tail / an empty pack) or a data-losing corruption of committed records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorruptionKind {
-    /// The epoch meta (record 0) is incomplete and nothing readable is behind it: the pack holds
-    /// no outputs. No committed data is at risk, but it is not healed by truncation: both open
-    /// doors REFUSE torn meta bytes (they cannot read the committee), and only a header followed
-    /// by nothing but zeros is re-initialized, by the open that creates the epoch. Remove this
-    /// `epoch-N` directory to rebuild.
+    /// The epoch meta (record 0) is incomplete and nothing readable is behind it (no record
+    /// decodes at any offset past it): the pack holds no outputs. No committed data is at risk,
+    /// but it is not healed by truncation: both open doors REFUSE torn meta bytes (they cannot
+    /// read the committee), and only a header followed by nothing but zeros is re-initialized,
+    /// by the open that creates the epoch. The newest epoch's `epoch-N` directory can be
+    /// removed to rebuild it; a past epoch's outputs are lost.
     TornMetaEmpty,
     /// The epoch meta (record 0) is unreadable but complete records follow it: those outputs are
     /// unreachable without the meta. Data loss for this epoch.
@@ -261,9 +265,34 @@ pub struct PhysicalCorruption {
     pub detail: String,
 }
 
+impl PhysicalCorruption {
+    /// The report of this damage for an epoch the caller has placed: `past` is whether it is a past
+    /// epoch (before the epoch the node resumes from, or before a later epoch beside it), `None`
+    /// when that is not known. A torn epoch meta's recommended action then gives only the branch
+    /// that applies; the plain [`Display`] gives both, each with its condition.
+    pub fn report(&self, past: Option<bool>) -> impl Display + '_ {
+        CorruptionReport { corruption: self, past }
+    }
+}
+
 impl Display for PhysicalCorruption {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let summary = match self.kind {
+        self.report(None).fmt(f)
+    }
+}
+
+/// [`PhysicalCorruption::report`]: the damage and the recommended action for an epoch that is past
+/// (`Some(true)`), the newest (`Some(false)`) or not placed (`None`).
+struct CorruptionReport<'a> {
+    corruption: &'a PhysicalCorruption,
+    past: Option<bool>,
+}
+
+impl Display for CorruptionReport<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let past = self.past;
+        let corruption = self.corruption;
+        let summary = match corruption.kind {
             CorruptionKind::TornMetaEmpty => "torn epoch-meta record, nothing behind it",
             CorruptionKind::CorruptMetaWithData => {
                 "unreadable epoch-meta record with outputs behind it"
@@ -277,27 +306,39 @@ impl Display for PhysicalCorruption {
             }
         };
         writeln!(f, "PHYSICAL CORRUPTION: {summary}")?;
-        writeln!(f, "  first bad record offset:        {} bytes", self.offset)?;
-        writeln!(f, "  complete records before damage: {}", self.records_ok_before)?;
+        writeln!(f, "  first bad record offset:        {} bytes", corruption.offset)?;
+        writeln!(f, "  complete records before damage: {}", corruption.records_ok_before)?;
         writeln!(
             f,
             "  readable records after damage:  {}",
-            if self.decodable_after { "yes" } else { "no" }
+            if corruption.decodable_after { "yes" } else { "no" }
         )?;
-        writeln!(f, "  read error:                     {}", self.detail)?;
+        writeln!(f, "  read error:                     {}", corruption.detail)?;
         write!(f, "  recommended action:             ")?;
-        match self.kind {
-            CorruptionKind::TornMetaEmpty => writeln!(
-                f,
-                "ACTION NEEDED — both open doors refuse torn epoch-meta bytes (only a header \
-                 followed by nothing but zeros is re-initialized, and only when the node creates \
-                 the epoch). If this is the node's newest epoch (no later `epoch-M` directory \
-                 beside it), it holds no output and no committed data is at risk: with the node \
-                 stopped, remove this `epoch-N` directory, and the node creates it again when it \
-                 enters the epoch. If a later epoch exists, this is a past epoch and its outputs \
-                 are lost: do not remove it. {}",
-                lost_pack_remedy("epoch-N")
-            ),
+        match corruption.kind {
+            CorruptionKind::TornMetaEmpty => {
+                const REFUSED: &str = "ACTION NEEDED — both open doors refuse torn epoch-meta \
+                     bytes (only a header followed by nothing but zeros is re-initialized, and \
+                     only when the node creates the epoch).";
+                const NEWEST: &str = "it holds no output and no committed data is at risk: with \
+                     the node stopped, remove this `epoch-N` directory, and the node creates it \
+                     again when it enters the epoch.";
+                const PAST: &str = "its outputs are lost: do not remove it.";
+                let remedy = lost_pack_remedy("epoch-N");
+                match past {
+                    Some(false) => {
+                        writeln!(f, "{REFUSED} This is the node's newest epoch: {NEWEST}")
+                    }
+                    Some(true) => writeln!(f, "{REFUSED} This is a past epoch: {PAST} {remedy}"),
+                    None => writeln!(
+                        f,
+                        "{REFUSED} If this is the node's newest epoch (no later `epoch-M` \
+                         directory beside it, nor an interrupted install of one, \
+                         `epoch-M.replaced`), {NEWEST} If a later epoch exists, this is a past \
+                         epoch and {PAST} {remedy}"
+                    ),
+                }
+            }
             CorruptionKind::TornTrailingTail => writeln!(
                 f,
                 "truncatable unacked tail. If this is the CURRENT/latest epoch, the node heals it \
@@ -901,7 +942,10 @@ pub fn classify_physical_corruption(
                     // walk cannot see past it. The position index attests each output's exact
                     // start, so re-frame from there (desync-immune) to tell a
                     // torn tail from mid-log corruption with survivors.
-                    let decodable_after = attested_output_survives_past(path, epoch, offset)?;
+                    let mut decodable_after = attested_output_survives_past(path, epoch, offset)?;
+                    if records_ok_before == 0 && !decodable_after {
+                        decodable_after = record_decodes_after(path, epoch, offset)?;
+                    }
                     let kind = match (records_ok_before == 0, decodable_after, sealed) {
                         (true, false, _) => CorruptionKind::TornMetaEmpty,
                         (true, true, _) => CorruptionKind::CorruptMetaWithData,
@@ -932,8 +976,13 @@ pub fn classify_physical_corruption(
                 // The position index frames the later output from its recorded (desync-immune)
                 // boundary; fall back to the walk only when the index is absent (an index the disk
                 // fails to read is an error, not an absent one).
-                let decodable_after = attested_output_survives_past(path, epoch, offset)?
+                let mut decodable_after = attested_output_survives_past(path, epoch, offset)?
                     || probe_decodable_after(path, &mut iter)?;
+                // the walk cannot see past a meta whose size prefix is damaged: before calling the
+                // pack empty, look for a record at every offset past it
+                if records_ok_before == 0 && !decodable_after {
+                    decodable_after = record_decodes_after(path, epoch, offset)?;
+                }
                 let kind = match (records_ok_before == 0, decodable_after) {
                     // record 0 is the epoch meta
                     (true, false) => CorruptionKind::TornMetaEmpty,
@@ -962,6 +1011,21 @@ pub fn classify_physical_corruption(
             }
         }
     }
+}
+
+/// Whether a whole record passes its CRC and decodes at some byte offset after `from` in the data
+/// log at `path`: the test that a torn epoch meta at `from` has nothing behind it. The meta's own
+/// size prefix cannot say where the meta ends (it may be the damaged part), and with no position
+/// index nothing attests where the outputs start, so every offset is tried. A frame that passes its
+/// CRC is no leftover of a torn write. Offsets whose 4-byte length prefix is zero (unwritten
+/// padding, which never frames a record) are skipped without reading further, so an empty padded
+/// file costs one pass over its bytes, and an occupied one stops at its first output.
+fn record_decodes_after(path: &Path, epoch: Epoch, from: u64) -> Result<bool, PackError> {
+    let pack =
+        Pack::<PackRecord>::open(path, epoch as u64, true, PackCompression::ZStd, PACK_VERSION)?;
+    let end = pack.file_len();
+    Ok((from.saturating_add(1)..end)
+        .any(|pos| pack.record_present_at(pos) && pack.fetch(pos).is_ok()))
 }
 
 /// After the walk hit an unreadable record, scan the rest of the stream: `true` if any later record
@@ -1962,6 +2026,60 @@ mod test {
             torn_meta.contains("past epoch and its outputs are lost: do not remove it"),
             "must keep a past epoch's directory: {torn_meta}"
         );
+        assert!(
+            torn_meta.contains("`epoch-M.replaced`"),
+            "an install is a later epoch: {torn_meta}"
+        );
+
+        // placed, the report gives only the branch that applies
+        let torn = super::PhysicalCorruption {
+            kind: super::CorruptionKind::TornMetaEmpty,
+            offset: 28,
+            records_ok_before: 0,
+            decodable_after: false,
+            detail: "short read".to_string(),
+        };
+        let past = torn.report(Some(true)).to_string();
+        assert!(past.contains("This is a past epoch: its outputs are lost"), "{past}");
+        assert!(past.contains("db import-epoch"), "a past epoch gets the lost-pack remedy: {past}");
+        assert!(!past.contains("remove this `epoch-N` directory"), "{past}");
+        let newest = torn.report(Some(false)).to_string();
+        assert!(newest.contains("remove this `epoch-N` directory"), "{newest}");
+        assert!(!newest.contains("past epoch"), "{newest}");
+        assert_eq!(torn.report(None).to_string(), torn_meta, "unplaced, it names both");
+    }
+
+    /// A torn epoch meta is called empty (`TornMetaEmpty`, whose newest-epoch action is removal)
+    /// only when nothing follows it: a pack holding outputs whose meta size prefix is damaged, with
+    /// no position index to attest the outputs, is `CorruptMetaWithData`, whatever the damaged
+    /// prefix claims.
+    #[test]
+    fn test_torn_meta_with_outputs_behind_it_is_never_called_empty() {
+        let (temp_dir, committee, chain) = setup();
+        let outputs = make_outputs(&committee, chain, 3);
+        let (records, _) = build_records(epoch0_meta(&committee), &outputs, PACK_VERSION);
+        let path = temp_dir.path().join("data");
+        write_records(&path, &records, PACK_VERSION);
+        let clean = std::fs::read(&path).expect("read pack");
+        let prefix = crate::archive::pack::DATA_HEADER_BYTES;
+        for (name, claimed) in [
+            ("past the end of the file", clean.len() as u32),
+            ("past the record cap", u32::MAX),
+            ("zero", 0),
+            ("one byte", 1),
+        ] {
+            let mut bytes = clean.clone();
+            bytes[prefix..prefix + 4].copy_from_slice(&claimed.to_le_bytes());
+            std::fs::write(&path, &bytes).expect("write pack");
+            let corruption = classify_physical_corruption(&path, 0)
+                .expect("classify")
+                .expect("the meta is damaged");
+            assert_eq!(
+                corruption.kind,
+                super::CorruptionKind::CorruptMetaWithData,
+                "a meta size prefix claiming {name}, with outputs behind it: {corruption}"
+            );
+        }
     }
 
     /// The index-degraded remediation no longer tells operators to delete `hash`/`bhash` by

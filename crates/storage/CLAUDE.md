@@ -111,8 +111,9 @@ and remember that everything after `mod test` is tests (more than half of `conse
     rebuilds on every open.
 - **Packs a stored execution row points into are never removed** (README §6, "Pack retention"):
   tn-reth's pointer datadirs keep each transaction only as its position in a batch of its epoch's
-  pack. No code deletes a pack holding outputs; pruning must first move those rows off it, and an
-  install or repair must keep every batch's bytes and digest.
+  pack. No code deletes a pack holding outputs (a failed `db load-state` removes only the
+  `epoch-N` its own import created); pruning must first move those rows off it, and an install or
+  repair must keep every batch's bytes and digest.
 - **Persist on the hot path is the data log's msync, nothing more.**
   - Indexes are derived and rebuilt from the log.
   - Durable watermarks go in the commit marker (`stamp_commit_marker`, best effort), never as

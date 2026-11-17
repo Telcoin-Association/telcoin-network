@@ -557,6 +557,82 @@ pub struct SnapshotRestorer {
     reth_env: RethEnv,
 }
 
+/// Check that `window` is a header window `SnapshotRestorer::import_chain_scaffold` can scaffold up
+/// to `final_state` (block `B`): not empty, `B` above genesis, its tip block `B` with
+/// `final_state`'s hash, not including genesis, starting at or below the EVM `BLOCKHASH` lookback's
+/// floor, contiguous and parent-hash linked. The scaffold runs it first; `db load-state
+/// --verify-only` runs it on a bundle before the restore would.
+pub fn check_scaffold_window(
+    window: &[SealedHeader],
+    final_state: BlockNumHash,
+) -> eyre::Result<()> {
+    let header_b = window
+        .last()
+        .ok_or_else(|| eyre!("snapshot restore: cannot scaffold an empty header window"))?;
+    let b = final_state.number;
+
+    // cheap invariant checks. `scaffold_window` only normalizes, and the pack-vs-record check sees
+    // the tip alone, so the scaffold makes these itself: a mis-shaped window would silently
+    // corrupt it
+    if b == 0 {
+        return Err(eyre!("snapshot restore: cannot scaffold at genesis (block 0)"));
+    }
+    if header_b.number != b || header_b.hash() != final_state.hash {
+        return Err(eyre!(
+            "snapshot restore: window tip {}:{} does not match final_state {b}:{}",
+            header_b.number,
+            header_b.hash(),
+            final_state.hash
+        ));
+    }
+    let window_start = window[0].number;
+    if window_start == 0 {
+        return Err(eyre!("snapshot restore: window must not include genesis (block 0)"));
+    }
+    // defense-in-depth floor (issue #1174): every block below `window_start` is scaffolded
+    // with a zero hash, so a window that does not cover the EVM `BLOCKHASH` lookback below
+    // the tip (or reach block 1) would let the first post-restore block read a zero hash
+    // inside its lookback and fork this node's state root off the fleet. The honest
+    // exporter always ships this window (`gather_headers` in `tn-node`); only a truncated
+    // or corrupted pack fails here.
+    let floor = b.saturating_sub(BLOCKHASH_ANCESTORS - 1).max(1);
+    (window_start <= floor).then_some(()).ok_or_else(|| {
+        eyre!(
+            "snapshot restore: window start {window_start} does not cover the BLOCKHASH \
+             lookback (need <= {floor} for tip {b})"
+        )
+    })?;
+    for (i, header) in window.iter().enumerate() {
+        let expected = window_start + i as u64;
+        if header.number != expected {
+            return Err(eyre!(
+                "snapshot restore: window is not contiguous at index {i}: expected block \
+                 {expected}, got {}",
+                header.number
+            ));
+        }
+    }
+    // parent-hash linkage. `final_state.hash` is pinned upstream to the certificate-verified
+    // `EpochRecord.final_state`, and a header hash commits to every field of that header,
+    // including its `parent_hash`. Walking the links therefore carries the certificate's
+    // coverage from the tip down through every ancestor this scaffold writes, instead of
+    // trusting the bundle's producer for them. Number contiguity alone accepts a header that
+    // sits at the right height with arbitrary ancestry.
+    window.iter().zip(window.iter().skip(1)).try_for_each(|(parent, child)| {
+        (child.parent_hash == parent.hash()).then_some(()).ok_or_else(|| {
+            eyre!(
+                "snapshot restore: window is not hash-linked at block {}: parent_hash {} does \
+                 not match block {}'s hash {}",
+                child.number,
+                child.parent_hash,
+                parent.number,
+                parent.hash()
+            )
+        })
+    })?;
+    Ok(())
+}
+
 impl SnapshotRestorer {
     /// Open a restorer over an empty datadir, refusing any datadir that already holds chain data.
     ///
@@ -598,9 +674,10 @@ impl SnapshotRestorer {
     /// `window` is a contiguous, ascending, parent-hash-linked run of the real headers that end at
     /// `final_state` (block `B`); it must not include genesis, and it must cover the EVM
     /// `BLOCKHASH` lookback: its first block must be at or below
-    /// `max(1, B - ([`BLOCKHASH_ANCESTORS`] - 1))`. Those properties are re-checked
-    /// here rather than assumed, so every caller of this `pub` API gets them. This method, run
-    /// once before [`import_state`](Self::import_state):
+    /// `max(1, B - ([`BLOCKHASH_ANCESTORS`] - 1))`. Those properties are re-checked here
+    /// ([`check_scaffold_window`], before anything is written) rather than assumed, so every caller
+    /// of this `pub` API gets them. This method, run once before
+    /// [`import_state`](Self::import_state):
     ///
     /// - Clears the genesis alloc from `PlainAccountState`, `PlainStorageState`, `HashedAccounts`,
     ///   `HashedStorages`, `AccountsTrie`, and `StoragesTrie` (the plain tables are already empty
@@ -636,70 +713,11 @@ impl SnapshotRestorer {
         window: &[SealedHeader],
         final_state: BlockNumHash,
     ) -> eyre::Result<()> {
-        let header_b = window
-            .last()
-            .ok_or_else(|| eyre!("snapshot restore: cannot scaffold an empty header window"))?;
+        check_scaffold_window(window, final_state)?;
+        // the window is not empty (checked), and its tip is block B
         let b = final_state.number;
-
-        // cheap invariant checks. nothing upstream re-checks the window's shape or its linkage
-        // (`scaffold_window` only normalizes, and the pack-vs-record check sees the tip alone), so
-        // these run here or nowhere, and a mis-shaped window would silently corrupt the scaffold
-        if b == 0 {
-            return Err(eyre!("snapshot restore: cannot scaffold at genesis (block 0)"));
-        }
-        if header_b.number != b || header_b.hash() != final_state.hash {
-            return Err(eyre!(
-                "snapshot restore: window tip {}:{} does not match final_state {b}:{}",
-                header_b.number,
-                header_b.hash(),
-                final_state.hash
-            ));
-        }
         let window_start = window[0].number;
-        if window_start == 0 {
-            return Err(eyre!("snapshot restore: window must not include genesis (block 0)"));
-        }
-        // defense-in-depth floor (issue #1174): every block below `window_start` is scaffolded
-        // with a zero hash, so a window that does not cover the EVM `BLOCKHASH` lookback below
-        // the tip (or reach block 1) would let the first post-restore block read a zero hash
-        // inside its lookback and fork this node's state root off the fleet. The honest
-        // exporter always ships this window (`gather_headers` in `tn-node`); only a truncated
-        // or corrupted pack fails here.
-        let floor = b.saturating_sub(BLOCKHASH_ANCESTORS - 1).max(1);
-        (window_start <= floor).then_some(()).ok_or_else(|| {
-            eyre!(
-                "snapshot restore: window start {window_start} does not cover the BLOCKHASH \
-                 lookback (need <= {floor} for tip {b})"
-            )
-        })?;
-        for (i, header) in window.iter().enumerate() {
-            let expected = window_start + i as u64;
-            if header.number != expected {
-                return Err(eyre!(
-                    "snapshot restore: window is not contiguous at index {i}: expected block \
-                     {expected}, got {}",
-                    header.number
-                ));
-            }
-        }
-        // parent-hash linkage. `final_state.hash` is pinned upstream to the certificate-verified
-        // `EpochRecord.final_state`, and a header hash commits to every field of that header,
-        // including its `parent_hash`. Walking the links therefore carries the certificate's
-        // coverage from the tip down through every ancestor this scaffold writes, instead of
-        // trusting the bundle's producer for them. Number contiguity alone accepts a header that
-        // sits at the right height with arbitrary ancestry.
-        window.iter().zip(window.iter().skip(1)).try_for_each(|(parent, child)| {
-            (child.parent_hash == parent.hash()).then_some(()).ok_or_else(|| {
-                eyre!(
-                    "snapshot restore: window is not hash-linked at block {}: parent_hash {} does \
-                     not match block {}'s hash {}",
-                    child.number,
-                    child.parent_hash,
-                    parent.number,
-                    parent.hash()
-                )
-            })
-        })?;
+        let header_b = &window[window.len() - 1];
 
         // persist the restored-state floor (= block B, the ONLY block whose state the restore
         // imports) BEFORE any chain data commits: a crash cannot produce a restored datadir
@@ -1297,8 +1315,8 @@ pub use tn_types::gas_accumulator::worker_id_from_header;
 #[cfg(test)]
 mod tests {
     use super::{
-        export_plain_state, eyre, worker_id_from_header, PinnedStateView, SnapshotRestorer,
-        StateEntry, StatePackSink, BLOCKHASH_ANCESTORS, KECCAK_EMPTY,
+        check_scaffold_window, export_plain_state, eyre, worker_id_from_header, PinnedStateView,
+        SnapshotRestorer, StateEntry, StatePackSink, BLOCKHASH_ANCESTORS, KECCAK_EMPTY,
     };
     use crate::{
         error::{TnRethError, TnRethResult},
@@ -2142,6 +2160,39 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// `check_scaffold_window`, which the scaffold and `db load-state --verify-only` run, accepts a
+    /// contiguous, hash-linked window ending at the final state and refuses one with a gap, a
+    /// broken parent link or another tip, with the scaffold's own texts.
+    #[test]
+    fn check_scaffold_window_refuses_a_gap_and_a_broken_link() {
+        let state_root = B256::repeat_byte(0x11);
+        let h1 = synthetic_header(1, B256::repeat_byte(0xaa), state_root);
+        let h2 = synthetic_header(2, h1.hash(), state_root);
+        let h3 = synthetic_header(3, h2.hash(), state_root);
+        let final_state = BlockNumHash::new(3, h3.hash());
+        check_scaffold_window(&[h1.clone(), h2.clone(), h3.clone()], final_state)
+            .expect("a linked, contiguous window");
+
+        let err = check_scaffold_window(&[h1.clone(), h3.clone()], final_state)
+            .expect_err("a gap at block 2");
+        assert!(err.to_string().contains("not contiguous at index 1"), "{err}");
+
+        let stranger = synthetic_header(2, B256::repeat_byte(0xee), state_root);
+        let h3_on_stranger = synthetic_header(3, stranger.hash(), state_root);
+        let err = check_scaffold_window(
+            &[h1.clone(), stranger, h3_on_stranger.clone()],
+            BlockNumHash::new(3, h3_on_stranger.hash()),
+        )
+        .expect_err("block 2 does not descend from block 1");
+        assert!(err.to_string().contains("not hash-linked at block 2"), "{err}");
+
+        let err = check_scaffold_window(&[h1, h2, h3], BlockNumHash::new(3, B256::ZERO))
+            .expect_err("another final state");
+        assert!(err.to_string().contains("does not match final_state"), "{err}");
+        let err = check_scaffold_window(&[], final_state).expect_err("no window");
+        assert!(err.to_string().contains("empty header window"), "{err}");
     }
 
     /// The scaffold writes a zero-hash dummy for every block below the window, so a window that

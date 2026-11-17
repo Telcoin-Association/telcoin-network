@@ -13,13 +13,15 @@
 //! there ([`refuse_interrupted_reset`]): a start between two moves would open a datadir holding
 //! half an execution database. An empty one (a reset stopped before its first move, or undone by
 //! moving its entries back) holds none of it and blocks nothing. Running the command again finishes
-//! an interrupted reset into the same directory.
+//! an interrupted reset into the same directory. A move that fails (the rename of a bind mount,
+//! say) moves back what the run had moved, so a failed run leaves the datadir as it was.
 //!
 //! The rebuild re-executes every epoch from 0 from the node's own consensus packs, so the command
-//! refuses a datadir whose consensus database lacks the pack of an epoch below its latest one that
-//! the node cannot fetch again, at or below the epoch it resumes from ([`refuse_missing_packs`]): a
-//! datadir bootstrapped with `db load-state` (no pack below the restored epoch), or one that lost a
-//! past pack. The side-observer swap moves the execution database
+//! refuses a datadir whose consensus database lacks the pack of an epoch the node cannot fetch
+//! again, one at or below the epoch it resumes from, or holds a past one that is not the whole
+//! epoch ([`refuse_missing_packs`]): a datadir bootstrapped with `db load-state` (no pack below the
+//! restored epoch), or one that lost a past pack or the resume epoch's, or one a rebuild stalled
+//! in. The side-observer swap moves the execution database
 //! aside to copy in a synced observer's, which replays nothing below the copy's tip, so it skips
 //! that check ([`ResetMode::Swap`]). Both refuse a datadir an unfinished `db load-state` left, as
 //! the node does ([`refuse_interrupted_load_state`]): what they would move aside is half a restore,
@@ -33,7 +35,7 @@ use std::{
 };
 use tn_config::{PidLock, TelcoinDirs as _};
 use tn_storage::{
-    consensus::ConsensusChain,
+    consensus::{ConsensusChain, PastPackCheck},
     disk::{available_bytes, fsync_directory},
 };
 use tn_types::Epoch;
@@ -97,7 +99,8 @@ pub(crate) fn refuse_interrupted_reset(datadir: &Path) -> eyre::Result<()> {
         }
         bail!(
             "an execution reset of {} did not finish: {} holds part of the execution database. \
-             Run `telcoin-network db reset-execution --force` to finish it, or move its entries \
+             Run the `telcoin-network db reset-execution --force` that started it again, with \
+             `--for-swap` if it was the side-observer swap's, to finish it, or move its entries \
              back into the datadir to undo it (an empty one blocks nothing)",
             datadir.display(),
             partial.display(),
@@ -127,16 +130,20 @@ fn pack_epoch(name: &str) -> Option<Epoch> {
     name.strip_prefix("epoch-")?.parse().ok()
 }
 
-/// The epochs from 0 to the latest of `present` (ascending, deduplicated) that it lacks, as
-/// inclusive ranges `(first, last)`.
-fn missing_ranges(present: &[Epoch]) -> Vec<(Epoch, Epoch)> {
+/// The epochs from 0 to `end` that `present` (ascending, deduplicated) lacks, as inclusive ranges
+/// `(first, last)`.
+fn missing_ranges(present: &[Epoch], end: Epoch) -> Vec<(Epoch, Epoch)> {
     let mut ranges = Vec::new();
-    let mut next = 0;
-    for &epoch in present {
-        if epoch > next {
-            ranges.push((next, epoch - 1));
+    // the first epoch not yet accounted for; `None` past the last epoch there is
+    let mut next = Some(0);
+    for &epoch in present.iter().take_while(|&&epoch| epoch <= end) {
+        if let Some(first) = next.filter(|&first| epoch > first) {
+            ranges.push((first, epoch - 1));
         }
-        next = epoch.saturating_add(1);
+        next = epoch.checked_add(1);
+    }
+    if let Some(first) = next.filter(|&first| first <= end) {
+        ranges.push((first, end));
     }
     ranges
 }
@@ -183,25 +190,34 @@ fn runs(ranges: &[(Epoch, Epoch)]) -> String {
         .join(", ")
 }
 
-/// Refuse a datadir whose consensus database lacks the pack of an epoch below the latest one it
-/// holds that the node cannot fetch again: one at or below the epoch it resumes from
-/// ([`ConsensusChain::resume_epoch`], the latest-consensus hint; genesis without one, as the node's
-/// start does). After a reset the node re-executes every epoch from 0 from its own packs. Its start
-/// opens the resume epoch's pack, refusing to start without it, and state-sync fetches from peers
-/// only the packs of the recorded epochs after it (`request_missing_packs`), so a missing pack at
-/// or below it would stop every start. A datadir bootstrapped with `db load-state` is one (it holds
-/// consensus only from the restored epoch on, where its hint points), and so is one that lost a
-/// past pack. A missing pack above the resume epoch (a catch-up stopped while several imports ran)
-/// is fetched again by the next start, so it passes, and a refusal for the others names it apart.
-/// A pack is present as the node's start finds it ([`ConsensusChain::pack_data_at_start`]: the
-/// epoch's data log, the one an interrupted install moved aside included). A datadir with no pack
-/// at all starts as a new node does and syncs from genesis, so it passes.
-fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
+/// Refuse a datadir whose consensus database lacks the pack of an epoch the node cannot fetch
+/// again: one at or below the epoch it resumes from ([`ConsensusChain::resume_epoch`], the
+/// latest-consensus hint; genesis without one, as the node's start does). After a reset the node
+/// re-executes every epoch from 0 from its own packs. Its start opens the resume epoch's pack,
+/// refusing to start without it past epoch 0, and state-sync fetches from peers only the packs of
+/// the recorded epochs after it (`request_missing_packs`), so a missing pack at or below it would
+/// stop every start. A datadir bootstrapped with `db load-state` is one (it holds consensus only
+/// from the restored epoch on, where its hint points), and so is one that lost a past pack or the
+/// resume epoch's. A missing pack above the resume epoch (a catch-up stopped while several imports
+/// ran) is fetched again by the next start, so it passes, and a refusal for the others names it
+/// apart. A pack is present as the node's start finds it ([`ConsensusChain::pack_data_at_start`]:
+/// the epoch's data log, the one an interrupted install moved aside included), and a past one,
+/// below the resume epoch, only when it is the whole epoch ([`ConsensusChain::past_pack_check`]: it
+/// validates against this node's records of it and of the epoch before, and ends with the epoch's
+/// final output as its record names it). A header-and-meta stub a rebuild that stalled at a lost
+/// pack created, or a sealed prefix, is a gap of its own, since the next rebuild would stall there
+/// again. A past pack the check cannot judge (a record missing, as a stop at an epoch boundary
+/// before the record was written leaves it, or unreadable, or epoch 0 without the genesis
+/// committee) counts as present, as it did before the check: the check refuses only what it
+/// proves, and the reset names the unchecked packs as a warning, which this returns. The check
+/// reads each past pack once, small next to the re-execution it guards. A datadir with no pack and
+/// no hint past epoch 0 starts as a new node does and syncs from genesis, so it passes.
+fn refuse_missing_packs(datadir: &Path) -> eyre::Result<Vec<(Epoch, String)>> {
     let epochs = datadir.to_path_buf().epochs_db_path();
     if !exists(&epochs)? {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let mut present = Vec::new();
+    let mut present: Vec<Epoch> = Vec::new();
     for entry in fs::read_dir(&epochs)
         .wrap_err_with(|| format!("failed to list the epoch packs in {}", epochs.display()))?
     {
@@ -216,13 +232,45 @@ fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
     }
     present.sort_unstable();
     present.dedup();
-    let Some(latest) = present.last() else { return Ok(()) };
     let resume = ConsensusChain::resume_epoch(&epochs).unwrap_or(0);
-    let missing = split_ranges(&missing_ranges(&present), resume);
-    if missing.at_or_below.is_empty() {
-        return Ok(());
+    // the start opens the resume epoch's pack past epoch 0, so a missing one counts even above
+    // every pack the datadir holds
+    let end = match present.last() {
+        Some(&latest) => latest.max(resume),
+        None if resume > 0 => resume,
+        None => return Ok(Vec::new()),
+    };
+    let missing = split_ranges(&missing_ranges(&present, end), resume);
+    // A past pack the node holds is judged against its records of the epoch and of the one
+    // before: a rebuild stops at one that is not the whole epoch (the header-and-meta stub a
+    // rebuild that stalled at a lost pack leaves, a sealed prefix). One the check cannot judge
+    // counts as present and is returned for the reset to warn about.
+    let mut incomplete = Vec::new();
+    let mut unchecked = Vec::new();
+    let mut genesis = None;
+    for &epoch in present.iter().take_while(|&&epoch| epoch < resume) {
+        if epoch == 0 {
+            match super::load_genesis_committee(&datadir.to_path_buf()) {
+                Ok(committee) => genesis = Some(committee),
+                Err(e) => {
+                    unchecked.push((epoch, format!("{e:#}")));
+                    continue;
+                }
+            }
+        }
+        match ConsensusChain::past_pack_check(&epochs, epoch, genesis.as_ref()) {
+            PastPackCheck::Complete => {}
+            PastPackCheck::Incomplete(why) => incomplete.push((epoch, why)),
+            PastPackCheck::Unchecked(why) => unchecked.push((epoch, why)),
+        }
     }
-    let lost = runs(&missing.at_or_below);
+    if missing.at_or_below.is_empty() && incomplete.is_empty() {
+        return Ok(unchecked);
+    }
+    let held = match present.last() {
+        Some(latest) => format!("packs up to epoch {latest}"),
+        None => "no pack".to_string(),
+    };
     let fetched = if missing.above.is_empty() {
         String::new()
     } else {
@@ -232,20 +280,94 @@ fn refuse_missing_packs(datadir: &Path) -> eyre::Result<()> {
             runs(&missing.above)
         )
     };
+    let incomplete_epochs =
+        runs(&incomplete.iter().map(|&(epoch, _)| (epoch, epoch)).collect::<Vec<_>>());
+    let incomplete_why =
+        incomplete.iter().map(|(_, why)| why.as_str()).collect::<Vec<_>>().join("; ");
+    let reason = if missing.at_or_below.is_empty() {
+        format!(
+            "its consensus database holds an incomplete pack of epoch(s) {incomplete_epochs} \
+             ({incomplete_why}), so every start would stop at the first one: the node resumes \
+             from epoch {resume} and fetches only the packs of the epochs after it.{fetched}"
+        )
+    } else {
+        format!(
+            "its consensus database ({held}) lacks the pack of epoch(s) {}, so every start would \
+             stop at the first missing one: the node resumes from epoch {resume}, its start opens \
+             that epoch's pack, and it fetches only the packs of the epochs after it.{fetched}",
+            runs(&missing.at_or_below),
+        )
+    };
+    // the resume epoch is the one the node writes: no copy of a closed epoch puts it back
+    let resume_lost = missing.at_or_below.last().is_some_and(|&(_, last)| last == resume);
+    let past = match resume.checked_sub(1) {
+        Some(below) => split_ranges(&missing.at_or_below, below).at_or_below,
+        None => Vec::new(),
+    };
+    let mut ways = String::new();
+    // another node's sealed copy, checked against this node's records, puts back any past epoch
+    let import = "another node's sealed copy (`db import-epoch --epoch N --from <copy>` verifies \
+                  and installs one)";
+    match past.as_slice() {
+        [] => {}
+        // every epoch below a point lost, the shape `db load-state` leaves: it never held them
+        &[(0, last)] => ways.push_str(&format!(
+            " A datadir bootstrapped with `db load-state` holds packs only from the restored epoch \
+             on, and this one holds none below epoch {}. To get a new execution database, run \
+             `db load-state` again instead, with `db`, `static_files`, `restored-state-floor` and \
+             `consensus-db` moved aside (its import creates the restored epoch's pack and refuses \
+             a datadir that holds one; a validator then stays stopped until the network has closed \
+             the last epoch it took part in). To rebuild it, put back each missing pack (epoch(s) \
+             {}) from {import}.",
+            last + 1,
+            runs(&past),
+        )),
+        _ => ways.push_str(&format!(
+            " To rebuild it, put back each missing `epoch-N` directory from a backup taken after \
+             that epoch closed (epoch(s) {}; a sealed epoch's pack never changes) or {import}.",
+            runs(&past),
+        )),
+    }
+    if !incomplete.is_empty() {
+        if !missing.at_or_below.is_empty() {
+            ways.push_str(&format!(
+                " It also holds an incomplete pack of epoch(s) {incomplete_epochs} \
+                 ({incomplete_why}), where a rebuild stops too."
+            ));
+        }
+        ways.push_str(
+            " Replace each incomplete pack with another node's sealed copy (`db import-epoch \
+             --epoch N --from <copy> --force` verifies it and puts it in place) or with its \
+             `epoch-N` directory from a backup taken after that epoch closed.",
+        );
+    }
+    for (epoch, why) in &unchecked {
+        ways.push_str(&format!(
+            " The pack of epoch {epoch} could not be checked against this node's epoch records \
+             ({why})."
+        ));
+    }
+    if resume_lost {
+        ways.push_str(&format!(
+            " Epoch {resume} is the epoch the node resumes, whose pack it writes: neither a backup \
+             taken after an epoch closed nor `db import-epoch` (which refuses that epoch) puts its \
+             pack back. Restore the whole `consensus-db` from a backup taken with the node stopped \
+             (a validator whose whole `consensus-db/` is restored stays stopped until the network \
+             has closed the epoch it was last in)."
+        ));
+    }
+    let swap_too = if resume_lost && resume > 0 {
+        format!(" (its start opens the pack of epoch {resume} too)")
+    } else {
+        String::new()
+    };
     bail!(
         "{} cannot rebuild its execution database from genesis: the rebuild re-executes every \
-         epoch from 0 from this datadir's own consensus packs, and its consensus database (packs \
-         up to epoch {latest}) lacks the pack of epoch(s) {lost}, so every start would stop at the \
-         first missing one: the node resumes from epoch {resume}, its start opens that epoch's \
-         pack, and it fetches only the packs of the epochs after it.{fetched} A datadir \
-         bootstrapped with `db load-state` holds packs only from the restored epoch on. To \
-         rebuild it, put back each missing `epoch-N` directory from a backup taken after that \
-         epoch closed (epoch(s) {lost}; a sealed epoch's pack never changes) or another node's \
-         sealed copy (`db import-epoch --epoch N --from <copy>` verifies and installs one), \
-         or move `consensus-db` aside as well, so the node syncs from genesis as a new one does (a \
+         epoch from 0 from this datadir's own consensus packs, and {reason}{ways} Or start over: \
+         move `consensus-db` aside as well, so the node syncs from genesis as a new one does (a \
          validator then stays stopped until the network has closed the last epoch it took part \
          in). For the side-observer swap, which copies a synced observer's execution database in \
-         instead of rebuilding, pass `--for-swap`",
+         instead of rebuilding, pass `--for-swap`{swap_too}",
         datadir.display(),
     )
 }
@@ -297,6 +419,10 @@ pub(crate) struct ResetPlan {
     /// Moved entries that are links: the reset moves the link, not what it points to, and the
     /// next start creates a new entry in the datadir, on the datadir's filesystem.
     pub(crate) links: Vec<(PathBuf, PathBuf)>,
+    /// Past packs the rebuild's check could not judge against this node's epoch records, with
+    /// why (a record missing or unreadable, or epoch 0 without the genesis committee). They count
+    /// as present; the rebuild re-executes them as they are.
+    pub(crate) unchecked: Vec<(Epoch, String)>,
 }
 
 /// The bytes the files under `path` hold (their lengths), not following links.
@@ -316,9 +442,11 @@ fn bytes_under(path: &Path) -> eyre::Result<u64> {
     Ok(total)
 }
 
-/// Refuse a move the reset's rename cannot make: an entry that is a mount point, or on another
-/// filesystem than the datadir (`rename(2)` fails there, `EBUSY` or `EXDEV`). Checked before
-/// anything moves.
+/// Refuse a move the reset's rename cannot make: an entry on another filesystem than the datadir
+/// (`rename(2)` fails there, `EXDEV` or, for the mount point of one, `EBUSY`). Checked before
+/// anything moves. It compares `st_dev`, so it catches another filesystem only: a bind mount from
+/// the datadir's own filesystem passes, its rename then fails with `EBUSY`, and the reset moves
+/// back what it had moved ([`move_back`]).
 #[cfg(unix)]
 fn refuse_other_filesystem(datadir: &Path, entry: &Path) -> eyre::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
@@ -376,12 +504,30 @@ pub(crate) fn reset_execution(
     let _pid_lock = PidLock::acquire(&datadir.to_path_buf())?;
     // the node refuses this datadir until `db load-state` is rerun, which redoes the restore
     refuse_interrupted_load_state(datadir)?;
-    if mode == ResetMode::Rebuild {
-        refuse_missing_packs(datadir)?;
-    }
+    let partials = partial_resets(datadir)?;
+    let unchecked = match mode {
+        ResetMode::Rebuild => match refuse_missing_packs(datadir) {
+            Ok(unchecked) => unchecked,
+            Err(refusal) => {
+                // a swap's reset stopped between its moves is finished by a swap's rerun, which
+                // skips this check: the node's refusal sends the operator here first
+                for partial in &partials {
+                    if !is_empty_dir(partial)? {
+                        bail!(
+                            "{refusal:#}. This datadir also holds the unfinished reset {}: if it \
+                             was started with `--for-swap`, `db reset-execution --for-swap \
+                             --force` finishes it",
+                            partial.display(),
+                        );
+                    }
+                }
+                return Err(refusal);
+            }
+        },
+        ResetMode::Swap => Vec::new(),
+    };
 
     let entries = execution_entries(datadir)?;
-    let partials = partial_resets(datadir)?;
     if partials.len() > 1 {
         bail!(
             "{} holds more than one unfinished execution reset ({}): resolve them by hand",
@@ -460,7 +606,7 @@ pub(crate) fn reset_execution(
             );
         }
     }
-    let plan = ResetPlan { moves, target, resumes, moved_bytes, available_bytes, links };
+    let plan = ResetPlan { moves, target, resumes, moved_bytes, available_bytes, links, unchecked };
     if !force {
         return Ok(plan);
     }
@@ -469,24 +615,111 @@ pub(crate) fn reset_execution(
         // a new reset's name is the current second's, so a rerun a second later gets another one
         bail!("{} already exists: run the reset again in a second", plan.target.display());
     }
-    if plan.resumes.is_none() {
+    let created = plan.resumes.is_none();
+    if created {
         fs::create_dir(&staging)
             .wrap_err_with(|| format!("failed to create {}", staging.display()))?;
         sync_dir(datadir)?;
     }
+    // a failed move (a bind mount's rename fails with `EBUSY` though the filesystem check passed
+    // it) moves back what this run moved, so it leaves no half-moved reset behind
+    let mut moved = Vec::new();
     for entry in &plan.moves {
         let from = datadir.join(entry);
         let to = staging.join(entry);
-        fs::rename(&from, &to)
-            .wrap_err_with(|| format!("failed to move {} to {}", from.display(), to.display()))?;
-        sync_dir(&staging)?;
-        sync_dir(datadir)?;
+        if let Err(e) = move_entry(&from, &to) {
+            let failure = eyre!("failed to move {} to {}: {e}", from.display(), to.display());
+            return Err(move_back(datadir, &staging, created, &moved, failure));
+        }
+        moved.push(entry);
+        if let Err(failure) = sync_dir(&staging).and_then(|()| sync_dir(datadir)) {
+            return Err(move_back(datadir, &staging, created, &moved, failure));
+        }
     }
     fs::rename(&staging, &plan.target).wrap_err_with(|| {
         format!("failed to rename {} to {}", staging.display(), plan.target.display())
     })?;
     sync_dir(datadir)?;
     Ok(plan)
+}
+
+/// Undo this run's moves after `failure`: move each entry of `moved` back from `staging` into
+/// `datadir`, the last first, sync both, and remove `staging` when this run `created` it and
+/// moved everything back. Returns the error to report: `failure`, then what was moved back, or
+/// what could not be and is left for the operator.
+fn move_back(
+    datadir: &Path,
+    staging: &Path,
+    created: bool,
+    moved: &[&PathBuf],
+    failure: eyre::Report,
+) -> eyre::Report {
+    let mut stuck = Vec::new();
+    for entry in moved.iter().rev() {
+        if let Err(e) = fs::rename(staging.join(entry), datadir.join(entry)) {
+            stuck.push(format!("{} ({e})", entry.display()));
+        }
+    }
+    let mut notes = Vec::new();
+    if let Err(e) = sync_dir(staging) {
+        notes.push(format!("{e:#}"));
+    }
+    if created && stuck.is_empty() {
+        if let Err(e) = fs::remove_dir(staging) {
+            notes.push(format!(
+                "failed to remove {} ({e}), which is empty and blocks nothing",
+                staging.display()
+            ));
+        }
+    }
+    if let Err(e) = sync_dir(datadir) {
+        notes.push(format!("{e:#}"));
+    }
+    let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) };
+    let names = |entries: &[&PathBuf]| {
+        entries.iter().map(|e| e.display().to_string()).collect::<Vec<_>>().join(", ")
+    };
+    if !stuck.is_empty() {
+        return eyre!(
+            "{failure:#}. Moving back what it had moved failed too: {} stay in {}, and the node \
+             refuses this datadir until they are moved back into it by hand{notes}",
+            stuck.join(", "),
+            staging.display(),
+        );
+    }
+    let back = if moved.is_empty() {
+        String::new()
+    } else {
+        format!(" The reset moved {} back into the datadir:", names(moved))
+    };
+    if created {
+        eyre!("{failure:#}.{back} nothing moved{notes}")
+    } else {
+        eyre!(
+            "{failure:#}.{back} nothing else moved, and the unfinished reset {} holds what it held \
+             before this run{notes}",
+            staging.display(),
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: once this many more of the reset's moves on this thread have run, the next one
+    /// fails, as the rename of a bind mount from the datadir's own filesystem does (`EBUSY`).
+    static FAIL_MOVE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Rename `from` to `to`, one of the reset's moves. Tests inject its failure.
+fn move_entry(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(left) = FAIL_MOVE_AFTER.with(std::cell::Cell::get) {
+        FAIL_MOVE_AFTER.with(|fail| fail.set(left.checked_sub(1)));
+        if left == 0 {
+            return Err(std::io::Error::other("injected move failure"));
+        }
+    }
+    fs::rename(from, to)
 }
 
 /// The final name of the reset directory `staging` (`...partial` without its suffix).
@@ -528,6 +761,120 @@ mod tests {
         pack(&root.join("consensus-db/epochs/epoch-1"));
         fs::create_dir_all(root.join("node-keys")).unwrap();
         dir
+    }
+
+    /// A closed epoch of [`synced_datadir`]: its record and committee.
+    struct Closed {
+        record: tn_types::EpochRecord,
+        committee: tn_types::Committee,
+    }
+
+    /// A datadir with every entry a reset moves, whose consensus database is the one a node that
+    /// synced from genesis to the live epoch `live` leaves: epochs 0 to `live - 1` sealed with
+    /// three outputs each and their records (each with a certificate) chained from record 0, the
+    /// live epoch's pack, the latest-consensus hint at it, and the genesis committee
+    /// (`committee.yaml`) epoch 0's pack chains to. Returns the closed epochs too.
+    fn synced_datadir(live: Epoch) -> (tempfile::TempDir, Vec<Closed>) {
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
+        use tn_types::{
+            Address, BlsKeypair, Certificate, CommittedSubDag, CommitteeBuilder,
+            ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, EpochCertificate,
+            EpochDigest, EpochRecord, EpochSeedChainValue, ReputationScores,
+        };
+        let dir = datadir();
+        let root = dir.path().to_path_buf();
+        let epochs = root.epochs_db_path();
+        fs::remove_dir_all(&epochs).unwrap();
+        fs::create_dir_all(&epochs).unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let keys: Vec<_> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let committee = |epoch| {
+            let mut committee = CommitteeBuilder::new(epoch);
+            for (i, key) in keys.iter().enumerate() {
+                committee.add_authority(*key.public(), Address::repeat_byte(i as u8));
+            }
+            committee.build()
+        };
+        Config::write_to_path(root.committee_path(), committee(0), ConfigFmt::YAML).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let (closed, number) = runtime.block_on(async {
+            let chain = ConsensusChain::new(epochs.clone(), committee(0)).unwrap();
+            let mut parent = ConsensusHeaderDigest::default();
+            let mut closed: Vec<Closed> = Vec::new();
+            let mut number = 0;
+            for epoch in 0..live {
+                for _ in 0..3 {
+                    number += 1;
+                    let mut leader = Certificate::default();
+                    leader.update_header_epoch_for_test(epoch);
+                    leader.update_header_round_for_test(number as u32);
+                    let sub_dag = CommittedSubDag::new(
+                        vec![leader.clone()],
+                        leader,
+                        number,
+                        ReputationScores::default(),
+                        None,
+                        EpochSeedChainValue::genesis_placeholder(),
+                    );
+                    let output = ConsensusOutput::new_with_subdag(sub_dag, parent, number);
+                    parent = output.consensus_header_hash();
+                    chain.save_consensus_output(output).await.unwrap();
+                }
+                chain.persist_current().await.unwrap();
+                let keys: Vec<_> = committee(epoch).bls_keys().into_iter().collect();
+                let record = EpochRecord {
+                    epoch,
+                    committee: keys.clone(),
+                    next_committee: keys,
+                    parent_hash: closed
+                        .last()
+                        .map_or(EpochDigest::default(), |previous| previous.record.digest()),
+                    final_consensus: ConsensusNumHash::new(number, parent),
+                    ..Default::default()
+                };
+                let cert = EpochCertificate {
+                    epoch_hash: record.digest(),
+                    signature: Default::default(),
+                    signed_authorities: Default::default(),
+                };
+                chain.epochs().save(record.clone(), cert).await.unwrap();
+                chain.new_epoch(record.clone(), committee(epoch + 1)).await.unwrap();
+                closed.push(Closed { record, committee: committee(epoch) });
+            }
+            chain.epochs().persist().await.unwrap();
+            chain.close().await;
+            (closed, number)
+        });
+        hint(&epochs, live, number);
+        (dir, closed)
+    }
+
+    /// Set the latest-consensus hint under `epochs` to (`epoch`, `number`), both slots, so the
+    /// epoch the node resumes from is `epoch` even below a hint already there.
+    fn hint(epochs: &Path, epoch: Epoch, number: u64) {
+        for slot in ["consensus_slot1", "consensus_slot2"] {
+            let _ = fs::remove_file(epochs.join(slot));
+        }
+        ConsensusChain::write_latest_consensus_hint(epochs, epoch, number).unwrap();
+    }
+
+    /// Replace the pack of `epoch` under `epochs` with the one a rebuild that stalled at a lost
+    /// pack creates when it enters the epoch: its header and meta, no output.
+    fn stub_pack(epochs: &Path, closed: &[Closed], epoch: Epoch) {
+        let dir = epochs.join(format!("epoch-{epoch}"));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        let previous = closed[epoch as usize - 1].record.clone();
+        let committee = closed[epoch as usize].committee.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            tn_storage::consensus_pack::ConsensusPack::open_append(epochs, previous, committee)
+                .unwrap()
+                .close()
+                .await;
+        });
     }
 
     /// The names of the entries directly in `dir`, sorted.
@@ -636,20 +983,21 @@ mod tests {
     /// every start. A pack counts only as the node's start finds it, its data log: an `epoch-N`
     /// directory without one is a gap, and an interrupted install's aside holding one fills it.
     /// The newest epoch's directory without a data log (its creation stopped first) is no gap: the
-    /// node creates it again when it enters the epoch.
+    /// node creates it again when it enters the epoch. Each lost epoch gets only the recoveries
+    /// that put it back: a backup or another node's copy for a gap between packs, and for the
+    /// shape `db load-state` leaves (no pack below the restored epoch, which it never held) a
+    /// rerun of `db load-state` or other nodes' copies, not a backup.
     #[test]
     fn a_reset_refuses_a_gap_in_the_packs() {
-        let dir = datadir();
+        use tn_storage::consensus_pack::DATA_NAME;
+        // the node resumes from epoch 6, so it fetches no pack below it again
+        let (dir, _) = synced_datadir(6);
         let root = dir.path();
         let epochs = root.join("consensus-db/epochs");
-        for epoch in [2, 3, 5, 6] {
-            pack(&epochs.join(format!("epoch-{epoch}")));
-        }
-        // the node resumes from epoch 6, so it fetches no pack below it again
-        ConsensusChain::write_latest_consensus_hint(&epochs, 6, 60).unwrap();
         // epoch 4 is lost; epoch 1's directory lost its data log
-        fs::remove_file(epochs.join("epoch-1").join(tn_storage::consensus_pack::DATA_NAME))
-            .unwrap();
+        let aside = tempfile::tempdir().unwrap();
+        fs::rename(epochs.join("epoch-4"), aside.path().join("epoch-4")).unwrap();
+        fs::rename(epochs.join("epoch-1").join(DATA_NAME), aside.path().join(DATA_NAME)).unwrap();
         for force in [false, true] {
             let err =
                 format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
@@ -658,46 +1006,165 @@ mod tests {
                 "{err}"
             );
             assert!(
-                err.contains("put back each missing `epoch-N` directory from a backup"),
+                err.contains(
+                    "each missing `epoch-N` directory from a backup taken after that epoch closed \
+                     (epoch(s) 1, 4;"
+                ),
                 "{err}"
             );
             assert!(err.contains("`db import-epoch --epoch N --from <copy>`"), "{err}");
+            assert!(!err.contains("`db load-state` again"), "{err}");
             assert!(err.contains("pass `--for-swap`"), "{err}");
-            assert_eq!(
-                names(root),
-                [
-                    "consensus-db",
-                    "db",
-                    "node-keys",
-                    "restored-state-floor",
-                    "static_files",
-                    "telcoin.pid"
-                ],
-                "nothing moved"
-            );
+            assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
         }
 
-        pack(&epochs.join("epoch-1"));
-        pack(&epochs.join("epoch-4.replaced"));
+        fs::rename(aside.path().join(DATA_NAME), epochs.join("epoch-1").join(DATA_NAME)).unwrap();
+        fs::rename(aside.path().join("epoch-4"), epochs.join("epoch-4.replaced")).unwrap();
         fs::create_dir(epochs.join("epoch-7")).unwrap();
         reset_execution(root, false, ResetMode::Rebuild).unwrap();
         // the swap replays nothing below the copy's tip, so a gap does not refuse it
         fs::remove_dir_all(epochs.join("epoch-4.replaced")).unwrap();
         reset_execution(root, false, ResetMode::Swap).unwrap();
+
+        // the shape `db load-state` leaves: only the restored epoch's pack, the hint at it
+        let dir = datadir();
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        fs::remove_dir_all(epochs.join("epoch-0")).unwrap();
+        fs::remove_dir_all(epochs.join("epoch-1")).unwrap();
+        pack(&epochs.join("epoch-3"));
+        ConsensusChain::write_latest_consensus_hint(&epochs, 3, 30).unwrap();
+        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("(packs up to epoch 3) lacks the pack of epoch(s) 0..=2,"), "{err}");
+        assert!(err.contains("run `db load-state` again"), "{err}");
+        assert!(
+            err.contains(
+                "with `db`, `static_files`, `restored-state-floor` and `consensus-db` moved aside \
+                 (its import creates the restored epoch's pack and refuses a datadir that holds \
+                 one; a validator then stays stopped until the network has closed the last epoch \
+                 it took part in)"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("`db import-epoch --epoch N --from <copy>`"), "{err}");
+        assert!(!err.contains("from a backup"), "it never held them: {err}");
+        assert!(err.contains("pass `--for-swap`"), "{err}");
+
+        // the lowest pack lost too, with a gap above it: no longer that shape
+        let (dir, _) = synced_datadir(3);
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        fs::remove_dir_all(epochs.join("epoch-0")).unwrap();
+        fs::remove_dir_all(epochs.join("epoch-2")).unwrap();
+        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("lacks the pack of epoch(s) 0, 2,"), "{err}");
+        assert!(
+            err.contains("from a backup taken after that epoch closed (epoch(s) 0, 2;"),
+            "{err}"
+        );
+        assert!(err.contains("`db import-epoch --epoch N --from <copy>`"), "{err}");
+        assert!(!err.contains("`db load-state` again"), "{err}");
+        assert!(!err.contains("could not be checked"), "epoch 1's pack is whole: {err}");
+
+        // a datadir restored at epoch 2 that ran on to epoch 4: its packs from the restored epoch
+        // on are whole, so only the shape `db load-state` leaves is named
+        let (dir, _) = synced_datadir(4);
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        fs::remove_dir_all(epochs.join("epoch-0")).unwrap();
+        fs::remove_dir_all(epochs.join("epoch-1")).unwrap();
+        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("(packs up to epoch 4) lacks the pack of epoch(s) 0..=1,"), "{err}");
+        assert!(err.contains("run `db load-state` again"), "{err}");
+        assert!(!err.contains("incomplete") && !err.contains("could not be checked"), "{err}");
+        reset_execution(root, false, ResetMode::Swap).expect("the swap");
+    }
+
+    /// A past pack counts as present only when it is the whole epoch, as this node's records of
+    /// it and of the epoch before name it: a header-and-meta-only stub (the pack a rebuild that
+    /// stalled at a lost pack opens for the epoch) is refused as a gap of its own, by the dry run
+    /// too, naming why and the import that replaces it, and nothing moves. The datadir a node that
+    /// synced from genesis leaves passes, and so does one whose node was killed (its records logs
+    /// left unsealed, read as the node's open recovers them).
+    #[test]
+    fn a_reset_refuses_a_stub_pack_below_the_resume_epoch() {
+        let (dir, closed) = synced_datadir(3);
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        reset_execution(root, false, ResetMode::Rebuild).expect("a synced datadir");
+
+        stub_pack(&epochs, &closed, 1);
+        for force in [false, true] {
+            let err =
+                format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
+            assert!(err.contains("holds an incomplete pack of epoch(s) 1 ("), "{err}");
+            assert!(err.contains("holds no output"), "{err}");
+            assert!(err.contains("`db import-epoch --epoch N --from <copy> --force`"), "{err}");
+            assert!(!err.contains("lacks the pack"), "no pack is missing: {err}");
+            assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
+        }
+
+        // a past pack the check cannot judge counts as present, as it did before the check, and
+        // `ResetPlan::unchecked` names it for a warning: epoch 0's without the genesis committee
+        // it chains to, any without this node's record (as a stop at an epoch boundary before the
+        // record was written leaves the last one)
+        let (dir, _) = synced_datadir(3);
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        let committee = root.to_path_buf().committee_path();
+        let yaml = fs::read(&committee).unwrap();
+        fs::remove_file(&committee).unwrap();
+        let plan = reset_execution(root, false, ResetMode::Rebuild).expect("no proven gap");
+        let unchecked: Vec<_> = plan.unchecked.iter().map(|(epoch, _)| *epoch).collect();
+        assert_eq!(unchecked, [0], "{:?}", plan.unchecked);
+        assert!(plan.unchecked[0].1.contains("failed to load genesis"), "{:?}", plan.unchecked);
+        fs::write(&committee, yaml).unwrap();
+        let records = epochs.join(tn_storage::epoch_records::RECORDS_NAME);
+        let aside = root.join("records-aside");
+        fs::rename(&records, &aside).unwrap();
+        let plan = reset_execution(root, false, ResetMode::Rebuild).expect("no proven gap");
+        let unchecked: Vec<_> = plan.unchecked.iter().map(|(epoch, _)| *epoch).collect();
+        assert_eq!(unchecked, [0, 1, 2], "every past pack, each named: {:?}", plan.unchecked);
+        // beside a lost pack, the refusal names both
+        fs::remove_dir_all(epochs.join("epoch-1")).unwrap();
+        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("(packs up to epoch 3) lacks the pack of epoch(s) 1,"), "{err}");
+        assert!(err.contains("The pack of epoch 0 could not be checked against"), "{err}");
+        assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
+        fs::rename(&aside, &records).unwrap();
+        reset_execution(root, false, ResetMode::Swap).expect("the swap checks no pack");
+
+        // a killed node: no clean-close sentinel (8 bytes) on its records logs, zeros past them
+        let (dir, _) = synced_datadir(3);
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        for name in [tn_storage::epoch_records::RECORDS_NAME, tn_storage::epoch_records::CERTS_NAME]
+        {
+            let path = epochs.join(name);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.truncate(bytes.len() - 8);
+            bytes.resize(bytes.len() + 4096, 0);
+            fs::write(&path, bytes).unwrap();
+        }
+        reset_execution(root, true, ResetMode::Rebuild).expect("a killed node's datadir");
     }
 
     #[test]
     fn missing_epochs_print_as_runs() {
-        assert!(missing_ranges(&[]).is_empty());
-        assert!(missing_ranges(&[0, 1, 2]).is_empty());
-        assert_eq!(runs(&missing_ranges(&[3])), "0..=2");
-        assert_eq!(runs(&missing_ranges(&[0, 2, 3, 7])), "1, 4..=6");
-        assert_eq!(runs(&missing_ranges(&[1])), "0");
+        assert!(missing_ranges(&[0, 1, 2], 2).is_empty());
+        assert_eq!(runs(&missing_ranges(&[3], 3)), "0..=2");
+        assert_eq!(runs(&missing_ranges(&[0, 2, 3, 7], 7)), "1, 4..=6");
+        assert_eq!(runs(&missing_ranges(&[1], 1)), "0");
+        // through an end past every pack held, and not past the end
+        assert_eq!(runs(&missing_ranges(&[], 5)), "0..=5");
+        assert_eq!(runs(&missing_ranges(&[0, 1], 3)), "2..=3");
+        assert_eq!(runs(&missing_ranges(&[0, 2, 9], 5)), "1, 3..=5");
+        assert_eq!(missing_ranges(&[Epoch::MAX], Epoch::MAX), [(0, Epoch::MAX - 1)]);
     }
 
     #[test]
     fn missing_epochs_split_at_the_resume_epoch() {
-        let ranges = missing_ranges(&[0, 2, 3, 7]);
+        let ranges = missing_ranges(&[0, 2, 3, 7], 7);
         let split = |epoch| split_ranges(&ranges, epoch);
         assert_eq!(split(0), SplitRanges { at_or_below: vec![], above: vec![(1, 1), (4, 6)] });
         assert_eq!(split(1), SplitRanges { at_or_below: vec![(1, 1)], above: vec![(4, 6)] });
@@ -715,27 +1182,31 @@ mod tests {
     /// names the ones the start fetches apart from the ones it cannot.
     #[test]
     fn a_reset_refuses_only_the_gaps_the_node_cannot_fetch_again() {
-        let dir = datadir();
+        let (dir, _) = synced_datadir(5);
         let root = dir.path();
         let epochs = root.join("consensus-db/epochs");
-        pack(&epochs.join("epoch-3"));
+        let aside = tempfile::tempdir().unwrap();
+        for epoch in [2, 4, 5] {
+            let name = format!("epoch-{epoch}");
+            fs::rename(epochs.join(&name), aside.path().join(&name)).unwrap();
+        }
         // packs 0, 1, 3: epoch 2 is missing
-        ConsensusChain::write_latest_consensus_hint(&epochs, 1, 10).unwrap();
+        hint(&epochs, 1, 4);
         // the dry run runs the same check `--force` does, and moves nothing
         let plan = reset_execution(root, false, ResetMode::Rebuild);
         assert!(plan.is_ok(), "the start fetches epoch 2: {plan:?}");
-        ConsensusChain::write_latest_consensus_hint(&epochs, 3, 30).unwrap();
+        hint(&epochs, 3, 10);
         for force in [false, true] {
             let err =
                 format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
             assert!(err.contains("(packs up to epoch 3) lacks the pack of epoch(s) 2,"), "{err}");
             assert!(err.contains("the node resumes from epoch 3"), "{err}");
             assert!(!err.contains("missing too"), "no gap after epoch 3: {err}");
-            assert_eq!(names(root).len(), 6, "nothing moved: {:?}", names(root));
+            assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
         }
 
         // packs 0, 1, 3, 5 resuming from epoch 3: epoch 2 cannot be fetched again, epoch 4 can
-        pack(&epochs.join("epoch-5"));
+        fs::rename(aside.path().join("epoch-5"), epochs.join("epoch-5")).unwrap();
         let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
         assert!(err.contains("(packs up to epoch 5) lacks the pack of epoch(s) 2,"), "{err}");
         assert!(
@@ -745,8 +1216,44 @@ mod tests {
             ),
             "{err}"
         );
-        pack(&epochs.join("epoch-2"));
+        fs::rename(aside.path().join("epoch-2"), epochs.join("epoch-2")).unwrap();
         reset_execution(root, false, ResetMode::Rebuild).expect("only epoch 4 is missing");
+    }
+
+    /// The pack of the epoch the node resumes from is one its start opens, so a missing one
+    /// refuses a rebuild even with no pack after it, by the dry run too, and nothing moves. The
+    /// refusal names it apart: the node writes that epoch, so neither a backup taken after an
+    /// epoch closed nor `db import-epoch` puts it back. With no pack at all, a hint past epoch 0
+    /// refuses every epoch up to it; with no slot files either the datadir starts as a new node
+    /// does and passes.
+    #[test]
+    fn a_reset_refuses_a_missing_resume_epoch_pack() {
+        let (dir, _) = synced_datadir(5);
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        fs::remove_dir_all(epochs.join("epoch-5")).unwrap();
+        for force in [false, true] {
+            let err =
+                format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
+            assert!(err.contains("(packs up to epoch 4) lacks the pack of epoch(s) 5,"), "{err}");
+            assert!(err.contains("Epoch 5 is the epoch the node resumes"), "{err}");
+            assert!(err.contains("Restore the whole `consensus-db`"), "{err}");
+            assert!(!err.contains("`db import-epoch --epoch N"), "no past epoch is lost: {err}");
+            assert!(!err.contains("could not be checked"), "every past pack is whole: {err}");
+            assert!(root.join("db/tn-lmdb.dat").exists(), "nothing moved");
+        }
+
+        for epoch in 0..=4 {
+            fs::remove_dir_all(epochs.join(format!("epoch-{epoch}"))).unwrap();
+        }
+        let err = format!("{:#}", reset_execution(root, false, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("(no pack) lacks the pack of epoch(s) 0..=5,"), "{err}");
+        assert!(err.contains("Epoch 5 is the epoch the node resumes"), "{err}");
+
+        for slot in ["consensus_slot1", "consensus_slot2"] {
+            let _ = fs::remove_file(epochs.join(slot));
+        }
+        reset_execution(root, false, ResetMode::Rebuild).expect("a new node's datadir");
     }
 
     /// The side-observer swap (`--for-swap`) moves the execution database of a datadir whose
@@ -860,6 +1367,50 @@ mod tests {
         drop(held);
     }
 
+    /// A move that fails after an earlier one moved (as the rename of a bind mount from the
+    /// datadir's own filesystem does, which the filesystem check passes) moves back what this run
+    /// moved and removes the staging directory it created: the datadir is as it was, no
+    /// unfinished reset blocks the node, and the error says so. A rerun finishing an unfinished
+    /// reset moves back only its own moves and keeps that reset's directory and what it held.
+    #[test]
+    fn a_failed_move_moves_the_entries_back() {
+        let dir = datadir();
+        let root = dir.path();
+        FAIL_MOVE_AFTER.with(|fail| fail.set(Some(1)));
+        let err = format!("{:#}", reset_execution(root, true, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("injected move failure"), "{err}");
+        assert!(err.contains("moved db back into the datadir"), "{err}");
+        assert!(err.contains("nothing moved"), "{err}");
+        assert_eq!(
+            names(root),
+            [
+                "consensus-db",
+                "db",
+                "node-keys",
+                "restored-state-floor",
+                "static_files",
+                "telcoin.pid"
+            ],
+            "db is back and no staging directory is left"
+        );
+        assert_eq!(fs::read(root.join("db/tn-lmdb.dat")).unwrap(), b"database");
+        refuse_interrupted_reset(root).unwrap();
+
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        fs::rename(root.join("db"), partial.join("db")).unwrap();
+        FAIL_MOVE_AFTER.with(|fail| fail.set(Some(1)));
+        let err = format!("{:#}", reset_execution(root, true, ResetMode::Rebuild).unwrap_err());
+        assert!(err.contains("moved static_files back into the datadir"), "{err}");
+        assert!(err.contains(&partial.display().to_string()), "{err}");
+        assert_eq!(names(&partial), ["db"], "the unfinished reset holds what it held");
+        assert!(root.join("static_files").exists());
+        assert!(root.join("restored-state-floor").exists());
+
+        let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+    }
+
     /// A reset stopped between two moves blocks a node's start, and a rerun finishes it into the
     /// same directory.
     #[test]
@@ -877,6 +1428,44 @@ mod tests {
         let plan = reset_execution(root, true, ResetMode::Rebuild).unwrap();
         assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
         assert_eq!(plan.target, root.join("execution-reset-20261109T163205Z"));
+        assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
+        refuse_interrupted_reset(root).unwrap();
+    }
+
+    /// An interrupted side-observer swap's reset on a datadir whose rebuild the pack check refuses:
+    /// the node's refusal names `--for-swap`, a rerun without it refuses naming the unfinished
+    /// reset and how to finish it, and a swap's rerun finishes it.
+    #[test]
+    fn an_interrupted_swap_reset_is_finished_by_a_swap_rerun() {
+        let dir = datadir();
+        let root = dir.path();
+        let epochs = root.join("consensus-db/epochs");
+        // the shape `db load-state` leaves, which only the swap resets
+        fs::remove_dir_all(epochs.join("epoch-0")).unwrap();
+        ConsensusChain::write_latest_consensus_hint(&epochs, 1, 10).unwrap();
+        let partial = root.join("execution-reset-20261109T163205Z.partial");
+        fs::create_dir(&partial).unwrap();
+        fs::rename(root.join("db"), partial.join("db")).unwrap();
+
+        let node = refuse_interrupted_reset(root).unwrap_err().to_string();
+        assert!(node.contains("with `--for-swap` if it was the side-observer swap's"), "{node}");
+        for force in [false, true] {
+            let err =
+                format!("{:#}", reset_execution(root, force, ResetMode::Rebuild).unwrap_err());
+            assert!(err.contains("lacks the pack of epoch(s) 0,"), "{err}");
+            assert!(
+                err.contains(&format!(
+                    "This datadir also holds the unfinished reset {}",
+                    partial.display()
+                )),
+                "{err}"
+            );
+            assert!(err.contains("`db reset-execution --for-swap --force` finishes it"), "{err}");
+            assert_eq!(names(&partial), ["db"], "nothing moved");
+        }
+
+        let plan = reset_execution(root, true, ResetMode::Swap).unwrap();
+        assert_eq!(plan.resumes.as_deref(), Some(partial.as_path()));
         assert_eq!(names(&plan.target), ["db", "restored-state-floor", "static_files"]);
         refuse_interrupted_reset(root).unwrap();
     }

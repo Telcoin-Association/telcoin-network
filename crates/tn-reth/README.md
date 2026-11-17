@@ -535,8 +535,9 @@ it so the beneficiary and base-fee accounts are never spuriously touched.
 transaction into a CRC32+zstd state pack; it records the caller-supplied state root **without
 recomputing it**. The restore side is the real integrity check (`SnapshotRestorer`):
 
-- refuses any datadir that already holds chain data; genesis (the trust root) always comes from
-  the local chain spec, never the snapshot;
+- refuses a datadir whose execution database holds blocks past genesis (and `db load-state` one
+  whose `consensus-db/epochs` already holds the bundle epoch's pack); genesis (the trust root)
+  always comes from the local chain spec, never the snapshot;
 - scaffolds a header-only chain (real hashes inside the shipped window, zero-hash dummies below);
 - **recomputes the state root from scratch** out of the imported accounts (`StateRoot::from_tx`)
   and hard-fails unless it equals both the pack's declared root and `header(B).state_root` from
@@ -955,8 +956,9 @@ as its index in the consensus batch its block executed ("Transactions stored by 
   **Operator response:** the file is damaged on this node only (disk or memory fault,
   or a bad copy), and no heal can rebuild it. Stop the node, keep the datadir for diagnosis if
   wanted, and rebuild the execution database: `telcoin-network db reset-execution`, then start
-  the node, which re-executes the chain from genesis (or restore a snapshot). Check the disk:
-  one damaged file usually means more. A v2 datadir written before these checksums does not open
+  the node, which re-executes the chain from genesis (or restore a snapshot into a fresh datadir:
+  move `consensus-db/` aside as well, and a validator then stays stopped until the network has
+  closed the last epoch it took part in). Check the disk: one damaged file usually means more. A v2 datadir written before these checksums does not open
   (`static file <path> has no checksums`): v2 datadirs must hold only checksummed files, since
   two flipped bits could otherwise pass a checksummed file off as an unchecked one. Recreate it,
   or `db reset-execution` and re-execute.
@@ -1063,9 +1065,9 @@ CHANGES.md TN-0200..0203.
     checked against this node's certified record of epoch N and every earlier output by its
     parent links, and only a verified, sealed copy is renamed into place; without `--force` it only
     verifies. The copy must lie outside `consensus-db/epochs/`. It needs the records of epochs N-1
-    and N (the second certified) and refuses the epoch the node resumes, and epoch 0, whose sealed
-    pack is put back from this node's backup as a plain copy (then `db validate --epoch 0`). A
-    whole `consensus-db/` from an older backup lacks the packs of the epochs since it was taken,
+    and N (the second certified; for epoch 0, certified record 0 and the genesis committee) and
+    refuses the epoch the node resumes. A whole `consensus-db/` from an older backup lacks the
+    packs of the epochs since it was taken,
     so it fixes the gap only with the execution database restored from the same stop or rebuilt,
     and a validator restored that way stays stopped until the network has closed the epoch it was
     last in (its later votes are not in the backup). The node cannot
@@ -1253,7 +1255,8 @@ restored from a snapshot, which would refuse the rebuilt chain's old blocks if i
 and config stay, and so does reth's transaction-pool blob store (`blobstore/`), which holds pool
 state, not chain data. It refuses while a node holds the datadir or a process holds
 `db/tn-lmdb.dat` open, and is a dry run without `--force`. It refuses a `db/` or `static_files/`
-that is a mount point or on another filesystem, which a rename cannot move, before anything moves.
+on another filesystem, which a rename cannot move, before anything moves; a move that fails anyway
+(a bind mount from the datadir's own filesystem) moves back what the run had moved.
 One that is a link moves as a link: the next start creates a new one in the datadir, on the
 datadir's filesystem, and the command prints a warning naming the link. It prints the size of what
 it moves and the space free on the datadir's filesystem: the moved-aside database keeps its space
@@ -1262,14 +1265,21 @@ again. The moves are staged in `execution-reset-<UTC time>.partial/`, renamed on
 refuses to start while a `.partial` directory holding an entry is there, and running the command
 again finishes it. An empty one (left when the entries are moved back to undo it) blocks nothing.
 It refuses, dry run included, and moves nothing, a datadir whose consensus database lacks the pack
-of an epoch below the latest one it holds, at or below the epoch the node resumes from (its
-latest-consensus hint; a pack counts as the node's start finds it, its `data` log, an interrupted
-install's aside included), as a datadir bootstrapped with `db load-state` does (it holds consensus
-only from the restored epoch on) and one that lost a past pack does. The rebuild re-executes every
-epoch from 0 from the node's own packs, and the node fetches only the packs of the epochs after the
-one it resumes from, so every start would stop at the gap. A pack missing after that epoch does not
-refuse: the next start fetches it from peers. Such a node puts back
-each missing `epoch-N/` from a backup taken after that epoch closed, or rebuilds as a new one: move
+of an epoch at or below the epoch the node resumes from (its latest-consensus hint; a pack counts as
+the node's start finds it, its `data` log, an interrupted install's aside included), as a datadir
+bootstrapped with `db load-state` does (it holds consensus only from the restored epoch on) and one
+that lost a past pack or the resume epoch's does. A past pack counts only when it is the whole
+epoch: it validates against this node's epoch records and ends with the epoch's final output, so a
+header-and-meta stub a stalled rebuild left, or a sealed prefix, refuses too (the check reads each
+past pack once). A past pack it cannot check against the records (a record missing, as a stop at
+an epoch boundary can leave it, or unreadable) counts as present, and the reset names it in a
+warning. The rebuild
+re-executes every epoch from 0 from the node's own packs, and the node fetches only the packs of the
+epochs after the one it resumes from, so every start would stop at the gap. A pack missing after
+that epoch does not refuse: the next start fetches it from peers. Such a node puts back each lost
+past `epoch-N/` from a backup taken after that epoch closed or another node's sealed copy (`db
+import-epoch`, with `--force` over an incomplete one; a `db load-state` datadir, which never held
+them, can also run `db load-state` again), or rebuilds as a new one: move
 `consensus-db/` aside as well, as for a forked record below, and it syncs from genesis.
 A validator rebuilt that way stays stopped until the network has closed the last epoch it took part
 in: its votes and proposals for that epoch leave with `consensus-db/`. A validator takes the
