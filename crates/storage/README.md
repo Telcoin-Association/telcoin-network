@@ -503,7 +503,12 @@ or `--all` for every epoch there, in turn) walks a pack's `data` stream read-onl
 issues. A check it could not run is an error, never a verdict: a data log it cannot open or read
 (in the validation walk, the index cross-check's walk, the incomplete-output check) fails the
 command, and the recovery check reports an unopenable log as "recoverability unknown", so a
-transient failure never reads as a truncatable tail or a skipped index check. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
+transient failure never reads as a truncatable tail or a skipped index check. The datadir forms
+(`--epoch N`, `--all`) then judge a past epoch's pack (one before the epoch the latest-consensus
+hint resumes) against the local epoch records, as `db import-epoch` judges a pack in place
+(`ConsensusChain::past_pack_check`): one that does not end with the final output of its epoch's
+record fails; one the records cannot judge (no record of the epoch yet, say) is reported unchecked,
+and the epoch the node resumes from, still being written, is never judged. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported with
 its recovery (above), never "fixed". A read the disk failed (opening the data log included, for the validation

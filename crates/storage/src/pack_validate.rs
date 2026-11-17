@@ -162,7 +162,10 @@ pub enum PackIssue {
 /// Overall verdict for a pack file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// No issues found — the pack would import cleanly.
+    /// No issues found: the pack is whole as far as it goes. Its records are not judged against
+    /// the epoch records, so a prefix of the epoch, a pack holding only its meta, or (validated
+    /// with no previous record) another chain's pack is `Valid`; `db validate --epoch N` judges a
+    /// past epoch's pack against them (`ConsensusChain::past_pack_check`).
     Valid,
     /// One or more issues found — the pack would be rejected by `stream_import`.
     Invalid,
