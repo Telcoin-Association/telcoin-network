@@ -122,16 +122,28 @@ That absorbs a transient kad miss without pinning a departed peer.
 GF_SECURITY_ADMIN_PASSWORD=change-me docker compose -f etc/compose.yaml --profile observability up -d
 ```
 
-All three services bind to loopback: Prometheus on 9090, Grafana on 3000 and node_exporter on 9100. Grafana has anonymous access off. The admin password comes from `GF_SECURITY_ADMIN_PASSWORD`; the default `telcoin-local` is for a local stack only. Each validator binds `--metrics` to its fixed bridge address `10.10.0.2N:9101` so the host Prometheus can scrape it. The port is not published.
+All three services bind to loopback: Prometheus on 9090, Grafana on 3000 and node_exporter on 9100.
+Grafana has anonymous access off.
+The admin password comes from `GF_SECURITY_ADMIN_PASSWORD`; the default `telcoin-local` is for a local stack only.
+Grafana provisions two dashboards: "Telcoin Node Metrics" (`etc/grafana/telcoin-node-metrics.json`) and "Telcoin Worker Gateway" (`bin/worker-gateway/grafana-worker-gateway.json`), whose `job` variable scopes every panel to the jobs that scrape gateways.
+Each validator, the observer, each worker gateway and `node-record-api` binds its metrics listener to its fixed bridge address (`10.10.0.x:9101`), so the host Prometheus can scrape it on a Linux host.
+The ports are not published.
+With every service healthy, Prometheus reports `up` at 1 for all eleven targets in the table below.
 
 ### Prometheus jobs
 
 | Job | Targets | Instance label | Series |
 | --- | --- | --- | --- |
-| `telcoin-node` | `10.10.0.21` to `10.10.0.24`, port 9101 | `validator1` to `validator4` | `tn_*` node series |
+| `telcoin-node` | `10.10.0.21` to `10.10.0.24` and `10.10.0.31`, port 9101 | `validator1` to `validator4`, `observer` | `tn_*` node series |
+| `worker-gateway` | `10.10.0.41` to `10.10.0.44`, port 9101 | `worker-gateway1` to `worker-gateway4` | `tn_worker_gateway_*`, `tn_info` and `reth_process_*` |
+| `node-record-api` | `10.10.0.51:9101` | `node-record-api` | `tn_node_record_api_*` |
 | `node` | `127.0.0.1:9100` | the host | `node_*`, `up` and the `tn_host_*` textfile series |
 
 Rules load from `etc/prometheus/rules/*.rules.yaml`. The scrape and evaluation interval is 15 seconds.
+
+The observer is not a committee member, so it reports `tn_network_committee_peers_expected` 0 and the committee alerts skip it; `TnNodeDown` and `TnNodeCommitteeSeriesAbsent` cover it like a validator.
+No rule matches the `worker-gateway` or `node-record-api` jobs.
+The gateway's own series are described in `bin/worker-gateway/README.md` ("Observability"), and those of `node-record-api` in `bin/node-record-api/README.md`.
 
 ## Series reference
 
@@ -238,6 +250,7 @@ The thresholds below are launch defaults. To re-derive one, record the matching 
 | `TnNodeCommitteeSeriesAbsent` | node up without `tn_network_committee_peers_expected` for 15 minutes | warning | Confirm that the node release exports the committee gauges and that the scrape target is the node metrics endpoint. |
 
 The committee alerts read the node gauges, so they cannot fire for a node that is down or does not export them. These two alerts cover that gap.
+They cover every target of the `telcoin-node` job, the compose profile's observer included.
 
 ### Firewall drops
 
@@ -299,6 +312,8 @@ The unit test file `etc/prometheus/rules/telcoin-host-network.test.yaml` covers 
 
 ## Related
 
-- Issue #1672 (gateway dashboards) and issue #930: the scoping and label policy on this page applies to the work tracked there.
+- Issue #930: the scoping and label policy on this page applies to the work tracked there.
+- `bin/worker-gateway/README.md` ("Observability"): the gateway's series and the "Telcoin Worker Gateway" dashboard, which the compose profile provisions.
+- `etc/README.md` ("Docker Compose"): the compose testnet's services, endpoints and the checks of its gateway path.
 - [Validator production operations](validator-operations.md): firewall configuration and capacity monitoring.
 - [tn\_admissionSnapshot](../rpc-methods/tn/tn_admissionsnapshot.md): the admission view that fills the `validators` set.

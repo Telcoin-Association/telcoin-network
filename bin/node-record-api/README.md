@@ -208,10 +208,12 @@ bind it to an internal interface.
 ## Deployment
 
 A container image is built by `bin/node-record-api/Dockerfile` (rust:1.94 builder, slim debian
-runtime, non-root user). Build it from the repository root:
+runtime, non-root user). Build it from the repository root, with the `tn-contracts` submodule
+checked out (`make init-submodules`), and pass the commit so that `--version` reports it:
 
 ```
-docker build -f bin/node-record-api/Dockerfile -t telcoin-node-record-api:latest .
+docker build -f bin/node-record-api/Dockerfile \
+  --build-arg GIT_SHA=$(git rev-parse HEAD) -t telcoin-node-record-api:latest .
 ```
 
 Run it against testnet with the chain-config files from the repository:
@@ -231,6 +233,10 @@ curl -s 127.0.0.1:8080/v1/rpcs
 
 Reference Kubernetes manifests live under `deploy/k8s/` (a single-replica Deployment with a
 mounted committee ConfigMap, a Service, and a ServiceMonitor); see `deploy/README.md`.
+
+The local compose testnet (`etc/compose.yaml`, started with `make up`) runs the service as `node-record-api`, published on `127.0.0.1:8090`.
+It reads the generated `committee.yaml` for keys and bootstrap servers, follows the committee through the testnet's observer (`--rpc-url`), and refreshes every 30 seconds.
+Once ready, `/v1/records` lists the four validators and `/v1/rpcs` the gateway URLs they advertise, `http://10.10.0.41:8545/` to `http://10.10.0.44:8545/`; `etc/README.md` ("Docker Compose") shows the checks.
 
 ## Dependencies
 

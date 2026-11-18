@@ -1032,6 +1032,10 @@ Build it from the repository root:
 docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:<tag> .
 ```
 
+The local compose testnet (`etc/compose.yaml`, started with `make up`) is a running example: `worker-gateway1` to `worker-gateway4` each front one validator, with `--redirect-queries` pointing at an observer node in the same network.
+Each gateway's probe listener (`127.0.0.1:8546`) serves the compose healthcheck, which reads `/ready/any`, and its metrics bind its bridge address for the stack's Prometheus.
+The testnet turns the rate limits and `--max-connections-per-ip` off, because every client on the test host reaches a gateway from one address; `etc/README.md` ("Docker Compose") shows how to restore them and how to check which upstream answers each call.
+
 Reference Kubernetes manifests live under `deploy/k8s/` (a Deployment, a
 client Service carrying only the `rpc` port, a cluster-internal
 `worker-gateway-metrics` Service for `/metrics`, a ServiceMonitor, a
