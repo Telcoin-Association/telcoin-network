@@ -48,6 +48,12 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.21/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x1111111111111111111111111111111111111111
       - TN_BLS_PASSPHRASE=local
+      # The URL this validator advertises in its node record, where the observer forwards the
+      # transactions it accepts: worker-gateway1's address on this network, as a validator
+      # advertises its public gateway on mainnet. Not 127.0.0.1, which the observer would take for
+      # its own loopback. setup_validator.sh applies it with new keys, so a change here takes
+      # effect after `make down`.
+      - RPC_HTTP=http://10.10.0.41:8545/
     user: "root"
     command:
       - "bash"
@@ -64,6 +70,7 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.22/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x2222222222222222222222222222222222222222
       - TN_BLS_PASSPHRASE=local
+      - RPC_HTTP=http://10.10.0.42:8545/
     user: "root"
     command:
       - "bash"
@@ -80,6 +87,7 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.23/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x3333333333333333333333333333333333333333
       - TN_BLS_PASSPHRASE=local
+      - RPC_HTTP=http://10.10.0.43:8545/
     user: "root"
     command:
       - "bash"
@@ -96,6 +104,7 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.24/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x4444444444444444444444444444444444444444
       - TN_BLS_PASSPHRASE=local
+      - RPC_HTTP=http://10.10.0.44:8545/
     user: "root"
     command:
       - "bash"
@@ -104,7 +113,7 @@ services:
       - ./setup_validator.sh:/setup_validator.sh
       - validator4-data:/home/nonroot/data
   # Observer keys. genesis.sh never reads this node-info, so the observer stays out of the
-  # committee.
+  # committee. No RPC_HTTP: observers forward only to committee members' URLs.
   setup-observer:
     image: local-telcoin-network:latest
     depends_on:
@@ -292,8 +301,10 @@ services:
       validators:
         ipv4_address: 10.10.0.24
   # Follows the chain without joining the committee, with the same listeners as a validator. The
-  # worker gateways send it every call that is not a submission. Its RPC is published on host
-  # loopback only.
+  # worker gateways send it every call that is not a submission. A transaction sent to it is
+  # forwarded to the gateway the sender's validator advertises, so it reaches the validator the
+  # same way as on mainnet (genesis.sh lets this observer dial those private addresses). Its RPC is
+  # published on host loopback only.
   observer:
     container_name: observer
     image: local-telcoin-network:latest

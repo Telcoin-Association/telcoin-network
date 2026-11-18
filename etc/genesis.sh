@@ -28,6 +28,24 @@ install_chain_config() {
     chown -R "$NODE_UID:$NODE_UID" "$node/genesis" "$node/parameters.yaml"
 }
 
+# Sets allow_private_forward_targets to true in one parameters.yaml. The genesis writes the key as
+# false, so the line is rewritten in place; a file without the key gets it appended. A file that
+# already says true is left untouched, so repeated runs change nothing.
+allow_private_forward_targets() {
+    local params=$1
+    if grep -qx 'allow_private_forward_targets: true' "$params"; then
+        return
+    fi
+    if grep -q '^allow_private_forward_targets:' "$params"; then
+        sed -i 's/^allow_private_forward_targets:.*/allow_private_forward_targets: true/' "$params"
+    else
+        # The file may not end in a newline.
+        [ -z "$(tail -c 1 "$params")" ] || echo >> "$params"
+        echo 'allow_private_forward_targets: true' >> "$params"
+    fi
+    chown "$NODE_UID:$NODE_UID" "$params"
+}
+
 if [ -f "$GENESIS/genesis.yaml" ]; then
     echo "keeping the genesis in $GENESIS (make down removes it; TN_DEV_FUNDED_ACCOUNT applies to a new genesis only)"
     if [ ! -f "$GENESIS/parameters.yaml" ]; then
@@ -62,8 +80,16 @@ done
 # The observer follows the chain from the same config. Its node-info never goes into
 # genesis/validators, so it is not in the committee and finds the validators through the
 # committee's bootstrap servers. Skipped when compose mounts no observer volume here.
+#
+# The observer forwards the transactions it accepts to the URL each validator advertises, here its
+# gateway's address on the compose bridge network. A node refuses to dial a private address unless
+# allow_private_forward_targets is set, which is safe only where one operator runs every node, as
+# on this local network: never copy it into a real node's parameters.yaml. The validators' copies
+# keep the default. Applied on every run, because the observer's copy is installed only once, so a
+# false set there by hand lasts until the next `up`.
 if [ -d "$DATA/observer" ]; then
     install_chain_config "$DATA/observer"
+    allow_private_forward_targets "$DATA/observer/parameters.yaml"
 fi
 
 echo "done"
