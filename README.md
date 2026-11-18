@@ -13,6 +13,8 @@ The Telcoin Network protocol client supports Linux and MacOS operating systems. 
 
 Releases are signed git tags with a Linux x86_64 tarball and a `linux/amd64` container image published as `ghcr.io/telcoin-association/tn-mainnet:<tag>` for mainnet tags and as `ghcr.io/telcoin-association/tn-testnet:<tag>` for tags ending in `-adiri`, which are built with the `adiri` feature for the adiri testnet.
 Each release lists the tarball and the image digest in `SHA256SUMS`, and `SHA256SUMS.asc` carries a detached signature over that file from a maintainer's OpenPGP key held on a YubiKey.
+A release that ships the edge services, `worker-gateway` and `node-record-api`, also carries a tarball for each and an image in `ghcr.io/telcoin-association/tn-worker-gateway` or `ghcr.io/telcoin-association/tn-node-record-api`, packages that mainnet and Adiri releases share.
+Their tarballs and image digests are listed in a second manifest, `SHA256SUMS-edge`, which the same maintainer keys sign in `SHA256SUMS-edge.asc`.
 Follow [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) to download a release and check its signature and checksums before you run it.
 The check takes the maintainer keys from [`tn-release-signing`](https://github.com/Telcoin-Association/tn-release-signing), the shared repository of maintainer keys that this repository carries as the `release` submodule, at the commit `main` records, never from the release's tag.
 It has you compare their fingerprints with the table in its `KEYS.md` and with the maintainers' keys on GitHub.

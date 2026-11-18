@@ -9,6 +9,15 @@ Each release is a signed git tag plus these files on the tag's [GitHub release](
 | `IMAGE_DIGEST` | The `linux/amd64` image, named by its content digest, in the network's package: `ghcr.io/telcoin-association/tn-mainnet` for a mainnet tag, `ghcr.io/telcoin-association/tn-testnet` for an Adiri tag |
 | `SHA256SUMS` | The SHA-256 of the tarball, of `IMAGE_DIGEST`, and of the network's three chain-config files |
 | `SHA256SUMS.asc` | A maintainer's detached OpenPGP signature over `SHA256SUMS` |
+| `worker-gateway-<TAG>-x86_64-unknown-linux-gnu.tar.gz` | Releases that ship the edge services: the `worker-gateway` binary, with `LICENSE-APACHE`, `LICENSE-MIT` and `NOTICE` |
+| `node-record-api-<TAG>-x86_64-unknown-linux-gnu.tar.gz` | Releases that ship the edge services: the `node-record-api` binary, with `LICENSE-APACHE`, `LICENSE-MIT` and `NOTICE` |
+| `IMAGE_DIGEST-worker-gateway`, `IMAGE_DIGEST-node-record-api` | Releases that ship the edge services: the service's `linux/amd64` image, named by its content digest, in the service's own package, `ghcr.io/telcoin-association/tn-worker-gateway` or `ghcr.io/telcoin-association/tn-node-record-api`, which mainnet and Adiri tags share |
+| `SHA256SUMS-edge` | Releases that ship the edge services: the SHA-256 of each edge tarball and each `IMAGE_DIGEST-<service>` file |
+| `SHA256SUMS-edge.asc` | Releases that ship the edge services: the maintainers' detached OpenPGP signatures over `SHA256SUMS-edge`, by the same keys as `SHA256SUMS.asc` |
+
+Every release ships the node.
+A release also ships `worker-gateway`, `node-record-api` or both when `etc/release-components` at the tagged commit names them; a tag without that file ships the node alone.
+[Edge services](#edge-services-worker-gateway-and-node-record-api) verifies their files.
 
 There are no release builds for other platforms.
 On those, build from source as the [README](https://github.com/Telcoin-Association/telcoin-network/blob/main/README.md#quick-start) describes.
@@ -26,6 +35,7 @@ The tag name sets the network, the build features, the image package and the ima
 
 Both packages are under `ghcr.io/telcoin-association/`.
 A mainnet release never has its image in `tn-testnet`, and an Adiri release never in `tn-mainnet`; the image check below refuses either.
+The edge services' images are in neither: each service has one package that both networks share, as [Edge services](#edge-services-worker-gateway-and-node-record-api) describes.
 
 Running with `--chain adiri` needs a build with the `adiri` feature, so Adiri nodes use the `-adiri` releases.
 Release candidates are for testing and do not belong in production.
@@ -37,6 +47,7 @@ GitHub marks every Adiri release and every release candidate as a pre-release, s
 
 `SHA256SUMS` has five lines: `IMAGE_DIGEST`, which names the image by its content digest, the tarball, and the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` by their path in the repository, under `chain-configs/testnet/` for an `-adiri` tag and `chain-configs/mainnet/` for any other.
 One signature over `SHA256SUMS` therefore covers the binary, the image and the chain configuration.
+The edge services' files are not in `SHA256SUMS`; a second signed manifest, `SHA256SUMS-edge`, covers them, as [Edge services](#edge-services-worker-gateway-and-node-record-api) describes.
 The blocks below extract the chain-config files from the tag, so Path A checks all five lines and Path B checks every line but the tarball's.
 `SHA256SUMS.asc` is made with a maintainer's OpenPGP signing key, held on a YubiKey, which it never leaves.
 The git tag carries a signature by a key on the same allowlist.
@@ -223,6 +234,158 @@ docker image inspect --format '{{index .RepoDigests 0}}' "ghcr.io/telcoin-associ
 cat IMAGE_DIGEST
 ```
 
+## Edge services: worker gateway and node-record API
+
+Some releases also ship the edge services, built from the same commit as the node:
+
+- `worker-gateway`: a mostly stateless reverse proxy in front of a worker's JSON-RPC endpoint, which forwards the calls its method policy allows to a ready worker.
+- `node-record-api`: a read-only HTTP/JSON directory of the JSON-RPC endpoints that validators advertise, which it reads from their signed node records in the worker DHT.
+
+The notes of such a release have an "Edge services" section with a row for each service it ships and the blocks below, with `TAG` set and only those services' files.
+
+Each service's images are in a package of its own, `ghcr.io/telcoin-association/tn-worker-gateway` and `ghcr.io/telcoin-association/tn-node-record-api`, which mainnet and Adiri releases share, so an image's tag, the release tag, says which release it belongs to.
+In each of these packages `:latest` and `:adiri` move to the newest mainnet and Adiri release when it is published, as the node's do, and a release candidate moves neither; pin the digest from `IMAGE_DIGEST-<service>` instead.
+
+The services' files are listed in a second manifest, `SHA256SUMS-edge`, which the same maintainer keys sign in `SHA256SUMS-edge.asc`, and a release needs as many signatures on it as on `SHA256SUMS`.
+`SHA256SUMS` lists none of these files, so Path A and Path B do not cover them.
+[What the signature proves](#what-the-signature-proves) holds for `SHA256SUMS-edge` as for `SHA256SUMS`: before a release is published, the maintainers' tooling checks that each service's binary in its tarball is byte-identical to the one in its image and that its `--version` names the tagged commit.
+
+The blocks below are for a release that ships both services.
+For a release that ships one of them, leave the other's files out of the `curl` line and the `printf` list of names, as that release's notes do; a file the release does not have stops the block at `curl` with `404`.
+
+Run each edge block in a new, empty directory of its own, not in the directory where Path A or Path B ran.
+Like the node's blocks, its first command stops on a directory that is not empty, and it clones `main` and its `release` submodule for the maintainer keys and fetches the tag itself, so it checks against the keys on `main` when it runs.
+
+### Edge tarballs
+
+This block downloads `SHA256SUMS-edge`, `SHA256SUMS-edge.asc`, each `IMAGE_DIGEST-<service>` and each tarball, stopping at the first download that fails, checks the signatures over `SHA256SUMS-edge` with the same rule as Path A, checks that `SHA256SUMS-edge` names exactly this release's edge files, and checks every hash in it:
+
+```sh
+TAG=v0.17.0-adiri
+REPO=Telcoin-Association/telcoin-network
+BASE="https://github.com/$REPO/releases/download/$TAG"
+if [ -n "$(ls -A)" ]; then echo "Run these commands in a new, empty directory" >&2; false; fi &&
+git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
+git -C tn-main submodule update --init --depth 1 -- release &&
+git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
+for k in tn-main/release/keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
+gpg --show-keys --with-fingerprint tn-main/release/keys/*.asc &&
+curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS-edge" "$BASE/SHA256SUMS-edge.asc" "$BASE/IMAGE_DIGEST-worker-gateway" "$BASE/worker-gateway-$TAG-x86_64-unknown-linux-gnu.tar.gz" "$BASE/IMAGE_DIGEST-node-record-api" "$BASE/node-record-api-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
+gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS-edge.asc SHA256SUMS-edge |
+awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
+if [ "$(awk 'length($1) == 64 && /^[0-9a-f]+  [^ ]+$/ { print $2; next } { print "malformed" }' SHA256SUMS-edge | LC_ALL=C sort)" != "$(printf '%s\n' "IMAGE_DIGEST-node-record-api" "IMAGE_DIGEST-worker-gateway" "node-record-api-$TAG-x86_64-unknown-linux-gnu.tar.gz" "worker-gateway-$TAG-x86_64-unknown-linux-gnu.tar.gz")" ]; then echo "SHA256SUMS-edge does not name exactly the edge files of $TAG" >&2; false; fi &&
+sha256sum --check SHA256SUMS-edge &&
+echo "Edge signature and hashes verified"
+```
+
+Expect:
+
+- `GOODSIG`, then `signed by primary key` followed by a fingerprint;
+- `sha256sum` to print `OK` after each `IMAGE_DIGEST-<service>` file and each tarball;
+- `Edge signature and hashes verified` as the last line.
+
+The same maintainer keys sign the node's `SHA256SUMS` and the `SHA256SUMS-edge` of every release, so a good signature alone does not show that the file is this release's edge manifest.
+The `if` line before `sha256sum` does: it reads the names in `SHA256SUMS-edge` and stops unless every line is `<64 hex>  <name>` and the names are exactly this release's `IMAGE_DIGEST-<service>` files and tarballs, each once.
+If the last line `Edge signature and hashes verified` is missing, the services' files are not verified; stop, do not extract or run any of them, and report it.
+Then check the key fingerprints as in [Path A](#check-the-key-fingerprints), with this directory's `tn-main`.
+
+### Check the edge binaries
+
+Run this only after the last line was `Edge signature and hashes verified` and the fingerprints matched:
+
+```sh
+tar -xzf "worker-gateway-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
+"./worker-gateway-$TAG-x86_64-unknown-linux-gnu/worker-gateway" --version &&
+tar -xzf "node-record-api-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
+"./node-record-api-$TAG-x86_64-unknown-linux-gnu/node-record-api" --version &&
+git -C tn-main rev-parse "refs/tags/$TAG^{commit}"
+```
+
+Each tarball holds one directory, `<service>-<TAG>-x86_64-unknown-linux-gnu/`, with the service's binary, `LICENSE-APACHE`, `LICENSE-MIT` and `NOTICE` in it.
+Each `--version` prints these two lines and nothing else, shown here for `v0.17.0-adiri`, where `<commit>` is the full commit that `git rev-parse` printed:
+
+```text
+tn-worker-gateway Version: 0.17.0
+Commit SHA: <commit>
+
+tn-node-record-api Version: 0.17.0
+Commit SHA: <commit>
+```
+
+The version is the tag without its leading `v` and without `-adiri` or `-rcN`, as for the node, and there is no `Build Features:` line.
+
+Install the binaries:
+
+```sh
+sudo install -m 0755 "worker-gateway-$TAG-x86_64-unknown-linux-gnu/worker-gateway" /usr/local/bin/worker-gateway &&
+sudo install -m 0755 "node-record-api-$TAG-x86_64-unknown-linux-gnu/node-record-api" /usr/local/bin/node-record-api
+```
+
+Record each tarball's SHA-256 from `SHA256SUMS-edge` and each `--version` output in your operator inventory, as for the node.
+
+### Edge images
+
+The images need only `SHA256SUMS-edge`, `SHA256SUMS-edge.asc` and the `IMAGE_DIGEST-<service>` files.
+Run the [Edge tarballs](#edge-tarballs) block without the tarballs, in a new, empty directory of its own.
+It checks the names in `SHA256SUMS-edge` as that block does, the tarballs' included.
+Its last check then drops only the tarballs' lines from `SHA256SUMS-edge` with `grep`, so `sha256sum` checks every `IMAGE_DIGEST-<service>` file and fails when one of them is missing:
+
+```sh
+TAG=v0.17.0-adiri
+REPO=Telcoin-Association/telcoin-network
+BASE="https://github.com/$REPO/releases/download/$TAG"
+if [ -n "$(ls -A)" ]; then echo "Run these commands in a new, empty directory" >&2; false; fi &&
+git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
+git -C tn-main submodule update --init --depth 1 -- release &&
+git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
+for k in tn-main/release/keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
+gpg --show-keys --with-fingerprint tn-main/release/keys/*.asc &&
+curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS-edge" "$BASE/SHA256SUMS-edge.asc" "$BASE/IMAGE_DIGEST-worker-gateway" "$BASE/IMAGE_DIGEST-node-record-api" &&
+gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS-edge.asc SHA256SUMS-edge |
+awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
+if [ "$(awk 'length($1) == 64 && /^[0-9a-f]+  [^ ]+$/ { print $2; next } { print "malformed" }' SHA256SUMS-edge | LC_ALL=C sort)" != "$(printf '%s\n' "IMAGE_DIGEST-node-record-api" "IMAGE_DIGEST-worker-gateway" "node-record-api-$TAG-x86_64-unknown-linux-gnu.tar.gz" "worker-gateway-$TAG-x86_64-unknown-linux-gnu.tar.gz")" ]; then echo "SHA256SUMS-edge does not name exactly the edge files of $TAG" >&2; false; fi &&
+grep -v -F -e "  worker-gateway-$TAG-x86_64-unknown-linux-gnu.tar.gz" -e "  node-record-api-$TAG-x86_64-unknown-linux-gnu.tar.gz" SHA256SUMS-edge | sha256sum --check &&
+echo "Edge signature and hashes verified"
+```
+
+Expect `GOODSIG`, then `signed by primary key` followed by a fingerprint, then `OK` after each `IMAGE_DIGEST-<service>` file, and `Edge signature and hashes verified` as the last line.
+If the last line `Edge signature and hashes verified` is missing, the files are not verified; stop, do not pull or run the images, and report it.
+Then check the key fingerprints as in [Path A](#check-the-key-fingerprints), with this directory's `tn-main`, and stop if one is missing, different or revoked.
+
+### Check the edge images
+
+Run this only after the signature, the hashes and the fingerprints have passed.
+It refuses an `IMAGE_DIGEST-<service>` that does not name an image in that service's package by digest; each service's images are published there and nowhere else:
+
+```sh
+IMAGE_REF=$(cat IMAGE_DIGEST-worker-gateway) &&
+case "$IMAGE_REF" in
+  ghcr.io/telcoin-association/tn-worker-gateway@sha256:*) docker pull "$IMAGE_REF" && docker run --rm --network none --entrypoint /usr/local/bin/worker-gateway "$IMAGE_REF" --version ;;
+  *) echo "IMAGE_DIGEST-worker-gateway does not name an image in ghcr.io/telcoin-association/tn-worker-gateway by digest: $IMAGE_REF" >&2; false ;;
+esac &&
+IMAGE_REF=$(cat IMAGE_DIGEST-node-record-api) &&
+case "$IMAGE_REF" in
+  ghcr.io/telcoin-association/tn-node-record-api@sha256:*) docker pull "$IMAGE_REF" && docker run --rm --network none --entrypoint /usr/local/bin/node-record-api "$IMAGE_REF" --version ;;
+  *) echo "IMAGE_DIGEST-node-record-api does not name an image in ghcr.io/telcoin-association/tn-node-record-api by digest: $IMAGE_REF" >&2; false ;;
+esac &&
+echo "Edge images pulled by digest"
+```
+
+In each image the binary is `/usr/local/bin/<service>`, and its `--version` output must be the same two lines as its tarball's in [Check the edge binaries](#check-the-edge-binaries), with the commit that `git -C tn-main rev-parse "refs/tags/$TAG^{commit}"` prints.
+If the last line is not `Edge images pulled by digest`, do not run the images; the lines above it say which check failed.
+Put the full content of each `IMAGE_DIGEST-<service>` (`ghcr.io/telcoin-association/tn-worker-gateway@sha256:...` or `ghcr.io/telcoin-association/tn-node-record-api@sha256:...`) in compose files and systemd units, not a tag.
+The images are `linux/amd64` only.
+
+### When an edge check fails
+
+Never extract, install or run any of the services' files when one of these checks failed.
+[When verification fails](#when-verification-fails) applies, with `SHA256SUMS-edge`, `SHA256SUMS-edge.asc`, `IMAGE_DIGEST-<service>` and `Edge signature and hashes verified` in place of `SHA256SUMS`, `SHA256SUMS.asc`, `IMAGE_DIGEST` and `Signature and hashes verified`.
+Its table also has rows for the edge blocks' digest-file refusal, `IMAGE_DIGEST-<service> does not name an image in ghcr.io/telcoin-association/tn-<service> by digest`, and for an edge service's `--version`.
+Two more failures belong to the edge blocks alone:
+
+- `SHA256SUMS-edge does not name exactly the edge files of <TAG>`: the signed manifest lacks one of this release's edge files, names another file or holds a malformed line, as the node's `SHA256SUMS` or another release's `SHA256SUMS-edge` would; it is not this release's edge manifest, so stop and report it.
+- `curl` fails with `404` for an edge file: besides a wrong `TAG`, the release may not ship that service; its notes and its files on the release page show which services it ships.
+
 ## Optional: check the tag signature
 
 The tag carries its own signature, by one key on the allowlist.
@@ -258,7 +421,9 @@ Never extract, install or run anything from a release that failed one of these c
 | `sha256sum` prints `FAILED open or read` for a `chain-configs/` file | `git archive` did not extract it from the tag | Check that the tag was fetched; if it was, stop and report it. |
 | A fingerprint is missing from, or differs from, `tn-main/release/KEYS.md` or GitHub, or its `KEYS.md` Status is `revoked` | The keys on `main` are not the current maintainer keys | Stop and report it. |
 | `IMAGE_DIGEST does not name an image in ghcr.io/telcoin-association/<package> by digest` | The signed `IMAGE_DIGEST` points outside the tag's package, for example at the other network's package | Stop and report it. |
+| `IMAGE_DIGEST-<service> does not name an image in ghcr.io/telcoin-association/tn-<service> by digest` | The signed digest file of an edge service points outside that service's package, for example at the node's package | Stop and report it. |
 | `Commit SHA` differs from the tag's commit, `Build Features` is not empty on a mainnet tag, or on an `-adiri` tag lacks `adiri` or lists anything but `adiri` and `faucet` | The binary does not match the release | Stop and report it. |
+| An edge service's `--version` prints anything but its two lines, `tn-<service> Version: X.Y.Z` and `Commit SHA:` with the tag's commit, such as another version, another commit or a `Build Features:` line | The service's binary does not match the release | Stop and report it. |
 | `exec format error`, or Docker warns that the image platform does not match the host | The release is built for Linux x86_64 only | Use an x86_64 host, or build from source. |
 | `docker pull` fails with `denied` or `unauthorized` | The image is not publicly readable | Tell the maintainers. |
 

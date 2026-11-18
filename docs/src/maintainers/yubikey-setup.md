@@ -30,12 +30,16 @@ The node deployment scripts carry maintainer keys of their own, so a release sig
 
 ## PIN and touch during signing
 
-`make release-tag` and `make release-sign` each make one signature, so each needs one touch of the YubiKey, and the PIN when it is the first signature since the YubiKey was plugged in.
+Each signature needs one touch of the YubiKey, and the PIN when it is the first signature since the YubiKey was plugged in.
+`make release-tag` makes one signature, over the tag.
+`make release-sign` makes one per manifest it signs: one, over `SHA256SUMS`, for a release that ships the node alone, and two, over `SHA256SUMS` and `SHA256SUMS-edge`, for a release that ships the edge services.
+It makes every signature before it uploads any, so when the second touch is missed, gpg fails and nothing is uploaded, the first signature included; run `make release-sign` again, and it asks for both touches again.
 [PIN and touch during signing](https://github.com/Telcoin-Association/tn-release-signing/blob/main/docs/yubikey-setup.md#pin-and-touch-during-signing) in the shared guide covers the prompts, the retries and a blocked PIN.
 
 ## Registry access on the build server
 
-`make release-build` and `make release-publish` push to the release packages, `ghcr.io/telcoin-association/tn-mainnet` for mainnet tags and `ghcr.io/telcoin-association/tn-testnet` for Adiri tags, which needs a classic personal access token with only the `write:packages` scope.
+`make release-build` and `make release-publish` push to the release packages, which needs a classic personal access token with only the `write:packages` scope.
+The release packages are the node's, `ghcr.io/telcoin-association/tn-mainnet` for mainnet tags and `ghcr.io/telcoin-association/tn-testnet` for Adiri tags, and the edge services', `ghcr.io/telcoin-association/tn-worker-gateway` and `ghcr.io/telcoin-association/tn-node-record-api`, which mainnet and Adiri tags share.
 The scope lets the token write only to packages its account can write, and the [one-time setup](releasing.md#one-time-setup) gives write access on the release packages to the release maintainer account alone, so create the token on that account.
 Create one at `https://github.com/settings/tokens/new?scopes=write:packages&description=tn-release-build-server` with a 90-day expiry.
 That link selects `write:packages` alone; ticking the scope by hand on the token page also selects `repo`, which this token must not have.
