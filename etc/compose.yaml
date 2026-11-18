@@ -1,9 +1,10 @@
 # Clients reach the chain through four worker gateways on host ports 8545-8542, one in front of
 # each validator: a gateway sends transaction submissions to its validator and every other call to
 # the observer. Each validator's own RPC is published on host loopback only (18545-18542), as a
-# debug port that bypasses its gateway. Health and metrics bind each node's compose-network address
-# and are not published to the host; see docs/src/getting-started/observability-listeners.md and
-# compose.observability.yaml.
+# debug port that bypasses its gateway. node-record-api, on host loopback 8090, lists the
+# validators' signed node records and the gateway URLs they advertise. Health and metrics bind each
+# node's compose-network address and are not published to the host; see
+# docs/src/getting-started/observability-listeners.md and compose.observability.yaml.
 
 # Edge limits shared by the four gateways, off (0) by default: a load generator on this host
 # reaches a gateway from one address, which the production per-client limits would throttle.
@@ -455,6 +456,61 @@ services:
     networks:
       validators:
         ipv4_address: 10.10.0.44
+
+  # Reads the validators' signed node records from the worker-0 DHT (QUIC to each validator's
+  # worker port, from an ephemeral identity that never listens) and serves them as JSON:
+  # /v1/records lists every record, /v1/rpcs the RPC URLs they advertise, here the gateways'.
+  # The genesis committee.yaml gives it the validators' keys and, through its bootstrap servers,
+  # the DHT addresses to dial; the observer's RPC gives it the live committee and epoch
+  # boundaries. It writes nothing to disk, so the root filesystem stays read-only.
+  node-record-api:
+    container_name: node-record-api
+    image: local-telcoin-node-record-api:latest
+    build:
+      context: ../
+      dockerfile: bin/node-record-api/Dockerfile
+    # The committee file must exist at startup; genesis.sh has written it once comittee exits 0.
+    # The observer need only be started: a failed RPC call leaves the committee file's keys, and
+    # the next cycle retries.
+    depends_on:
+      comittee:
+        condition: service_completed_successfully
+      observer:
+        condition: service_started
+    environment:
+      NODE_RECORD_API_LISTEN_ADDR: 0.0.0.0:8080
+      NODE_RECORD_API_METRICS_ADDR: 10.10.0.51:9101
+      # Decimal: the genesis's 0x1e7. A wrong id is no error, only an empty directory.
+      NODE_RECORD_API_CHAIN_ID: "487"
+      NODE_RECORD_API_COMMITTEE_FILE: /etc/node-record-api/genesis/committee.yaml
+      NODE_RECORD_API_RPC_URL: http://10.10.0.31:8545
+      # Above the 15s DHT query timeout, and short enough that the directory is ready within a
+      # cycle or two of the validators publishing their records.
+      NODE_RECORD_API_REFRESH_INTERVAL: 30s
+      # This binary reads its log filter here, not from RUST_LOG.
+      NODE_RECORD_API_LOG_FILTER: info
+    volumes:
+      - sharedgenesisdir:/etc/node-record-api/genesis:ro
+    ports:
+      - 127.0.0.1:8090:8080
+    # /readyz is 200 once a refresh cycle has finished and at least one cached record is fresh,
+    # so the service is healthy only while it serves the validators' records. The image has bash
+    # but no HTTP client.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    # Above the daemon's shutdown on SIGTERM: a 30s drain and a 1s margin, as the reference
+    # Kubernetes Deployment allows it.
+    stop_grace_period: 40s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.51
 
   # Observability profile: off by default, so `make up` is unchanged.
   # Start it with `docker compose --profile observability up -d`.
