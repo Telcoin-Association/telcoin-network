@@ -59,4 +59,11 @@ for i in 1 2 3 4; do
     install_chain_config "$DATA/validator-$i"
 done
 
+# The observer follows the chain from the same config. Its node-info never goes into
+# genesis/validators, so it is not in the committee and finds the validators through the
+# committee's bootstrap servers. Skipped when compose mounts no observer volume here.
+if [ -d "$DATA/observer" ]; then
+    install_chain_config "$DATA/observer"
+fi
+
 echo "done"

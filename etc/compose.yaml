@@ -1,4 +1,4 @@
-# Health and metrics bind each validator's compose-network address and are not published to
+# Health and metrics bind each node's compose-network address and are not published to
 # the host; see docs/src/getting-started/observability-listeners.md and compose.observability.yaml.
 services:
   # build image once
@@ -73,6 +73,25 @@ services:
     volumes:
       - ./setup_validator.sh:/setup_validator.sh
       - validator4-data:/home/nonroot/data
+  # Observer keys. genesis.sh never reads this node-info, so the observer stays out of the
+  # committee.
+  setup-observer:
+    image: local-telcoin-network:latest
+    depends_on:
+      - telcoin-base
+    environment:
+      - NODE_TYPE=observer
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/10.10.0.31/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.31/udp/49595/quic-v1
+      - EXECUTION_ADDRESS=0x5555555555555555555555555555555555555555
+      - TN_BLS_PASSPHRASE=local
+    user: "root"
+    command:
+      - "bash"
+      - "/setup_validator.sh"
+    volumes:
+      - ./setup_validator.sh:/setup_validator.sh
+      - observer-data:/home/nonroot/data
 
   # create and distribute genesis files
   comittee:
@@ -90,7 +109,8 @@ services:
       - "bash"
       - "/genesis.sh"
     # Genesis reads every validator's node-info, so it starts only once each setup has exited 0,
-    # and `up` fails when one of them fails.
+    # and `up` fails when one of them fails. It need not wait for setup-observer: the observer is
+    # not in the genesis, and the two write different files in the observer's volume.
     depends_on:
       setup1:
         condition: service_completed_successfully
@@ -107,6 +127,7 @@ services:
       - validator2-data:/home/nonroot/data/validator-2
       - validator3-data:/home/nonroot/data/validator-3
       - validator4-data:/home/nonroot/data/validator-4
+      - observer-data:/home/nonroot/data/observer
 
   # start nodes
 
@@ -240,6 +261,42 @@ services:
     networks:
       validators:
         ipv4_address: 10.10.0.24
+  # Follows the chain without joining the committee, with the same listeners as a validator. Its
+  # RPC is published on host loopback only.
+  observer:
+    container_name: observer
+    image: local-telcoin-network:latest
+    # Starts once its keys exist and genesis.sh has given it the chain config.
+    depends_on:
+      setup-observer:
+        condition: service_completed_successfully
+      comittee:
+        condition: service_completed_successfully
+    environment:
+      - RUST_LOG=info
+      - TN_BLS_PASSPHRASE=local # must match value used in setup-observer service
+    user: "1101:1101"
+    command: >
+      /usr/local/bin/telcoin node
+      --datadir /home/nonroot/data
+      --http
+      --http.addr 0.0.0.0
+      --http.port 8545
+      --healthcheck 10.10.0.31:8080
+      --metrics 10.10.0.31:9101
+    ports:
+      - 127.0.0.1:8541:8545
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.31/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    volumes:
+      - observer-data:/home/nonroot/data
+    networks:
+      validators:
+        ipv4_address: 10.10.0.31
 
   # Observability profile: off by default, so `make up` is unchanged.
   # Start it with `docker compose --profile observability up -d`.
@@ -289,6 +346,7 @@ volumes:
   validator2-data:
   validator3-data:
   validator4-data:
+  observer-data:
   sharedgenesisdir:
   prometheus-data:
   grafana-data:
