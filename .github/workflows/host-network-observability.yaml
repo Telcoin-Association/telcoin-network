@@ -1,6 +1,6 @@
 name: Host network observability
 
-# Validates the Prometheus rules, their unit tests, the Grafana dashboard and
+# Validates the Prometheus rules, their unit tests, the Grafana dashboards and
 # the observability compose profile, then runs the controlled host scenarios
 # of docs/src/getting-started/host-network-observability.md on a Linux runner.
 # Not a required check: the CI Success job in pr.yaml stays the single gate.
@@ -12,6 +12,7 @@ on:
       - etc/grafana/**
       - etc/host-metrics/**
       - etc/compose.yaml
+      - bin/worker-gateway/grafana-worker-gateway.json
       - .github/workflows/host-network-observability.yaml
   workflow_dispatch:
 
@@ -39,13 +40,14 @@ jobs:
         run: docker run --rm -v "$PWD/etc/prometheus:/p:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" test rules /p/rules/telcoin-host-network.test.yaml
       - name: Check the Prometheus configuration
         run: docker run --rm -v "$PWD/etc/prometheus:/p:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check config /p/prometheus.yaml
-      - name: Parse the dashboard and the provisioning files
+      - name: Parse the dashboards and the provisioning files
         run: |
           jq empty etc/grafana/telcoin-node-metrics.json
+          jq empty bin/worker-gateway/grafana-worker-gateway.json
           python3 -I -c 'import sys, yaml; [yaml.safe_load(open(p)) for p in sys.argv[1:]]' \
             etc/grafana/provisioning/datasources/prometheus.yaml \
             etc/grafana/provisioning/dashboards/telcoin.yaml
-      - name: Validate the observability compose profile
+      - name: Validate the compose file with the observability profile
         run: docker compose -f etc/compose.yaml --profile observability config -q
 
   host-scenarios:

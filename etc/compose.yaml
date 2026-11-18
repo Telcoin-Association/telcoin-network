@@ -3,8 +3,8 @@
 # the observer. Each validator's own RPC is published on host loopback only (18545-18542), as a
 # debug port that bypasses its gateway. node-record-api, on host loopback 8090, lists the
 # validators' signed node records and the gateway URLs they advertise. Health and metrics bind each
-# node's compose-network address and are not published to the host; see
-# docs/src/getting-started/observability-listeners.md and compose.observability.yaml.
+# node's compose-network address and are not published to the host; the observability profile of
+# this file scrapes them (see docs/src/getting-started/observability-listeners.md).
 
 # Edge limits shared by the four gateways, off (0) by default: a load generator on this host
 # reaches a gateway from one address, which the production per-client limits would throttle.
@@ -553,6 +553,7 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/telcoin-node-metrics.json:/var/lib/grafana/dashboards/telcoin-node-metrics.json:ro
+      - ../bin/worker-gateway/grafana-worker-gateway.json:/var/lib/grafana/dashboards/telcoin-worker-gateway.json:ro
       - grafana-data:/var/lib/grafana
 
 volumes:
