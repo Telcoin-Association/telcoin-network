@@ -129,7 +129,7 @@ help:
 	@echo "    :::> Bootstrap the docker builder for building telcoin-network binary container images." ;
 	@echo ;
 	@echo "make up" ;
-	@echo "    :::> Launch docker compose file with 4 local validators in detached state." ;
+	@echo "    :::> Launch the docker compose testnet in detached state: 4 local validators, each behind a worker gateway on host ports 8545-8542, and an observer (see etc/README.md)." ;
 	@echo ;
 	@echo "make down" ;
 	@echo "    :::> Bring the docker compose containers down and remove orphans and volumes." ;

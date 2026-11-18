@@ -1,5 +1,35 @@
-# Health and metrics bind each node's compose-network address and are not published to
-# the host; see docs/src/getting-started/observability-listeners.md and compose.observability.yaml.
+# Clients reach the chain through four worker gateways on host ports 8545-8542, one in front of
+# each validator: a gateway sends transaction submissions to its validator and every other call to
+# the observer. Each validator's own RPC is published on host loopback only (18545-18542), as a
+# debug port that bypasses its gateway. Health and metrics bind each node's compose-network address
+# and are not published to the host; see docs/src/getting-started/observability-listeners.md and
+# compose.observability.yaml.
+
+# Edge limits shared by the four gateways, off (0) by default: a load generator on this host
+# reaches a gateway from one address, which the production per-client limits would throttle.
+# The production values are the gateway's defaults. To restore them, set
+# WORKER_GATEWAY_RATE_LIMIT_PER_IP=100, WORKER_GATEWAY_RATE_LIMIT_GLOBAL=3000 and
+# WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP=32 in the shell or in etc/.env before `make up`; on a
+# running stack, recreate the gateways alone with
+#   docker compose -f etc/compose.yaml up -d --no-deps worker-gateway1 worker-gateway2 worker-gateway3 worker-gateway4
+# The capacity caps (connections, in-flight requests, request size, batch length) keep their
+# production defaults either way.
+x-worker-gateway-env: &worker-gateway-env
+  RUST_LOG: info
+  WORKER_GATEWAY_RATE_LIMIT_PER_IP: "${WORKER_GATEWAY_RATE_LIMIT_PER_IP:-0}"
+  WORKER_GATEWAY_RATE_LIMIT_GLOBAL: "${WORKER_GATEWAY_RATE_LIMIT_GLOBAL:-0}"
+  WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP: "${WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP:-0}"
+
+# /ready/any on the gateway's probe listener, as the reference Kubernetes readinessProbe checks
+# it: 200 while the gateway can serve a route, that is while its validator takes submissions or
+# the observer answers reads. The image has bash but no HTTP client.
+x-worker-gateway-healthcheck: &worker-gateway-healthcheck
+  test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8546 && printf 'GET /ready/any HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 60s
+
 services:
   # build image once
   telcoin-base:
@@ -130,10 +160,8 @@ services:
       - observer-data:/home/nonroot/data/observer
 
   # start nodes
-
-  # Each node binds --metrics to its fixed bridge address so the host-network
-
-  # Prometheus of the observability profile can scrape it. The port is not published.
+  # Each node binds --metrics to its fixed bridge address so the host-network Prometheus of the
+  # observability profile can scrape it. The port is not published.
   validator1:
     container_name: validator1
     image: local-telcoin-network:latest
@@ -155,8 +183,10 @@ services:
       --http.port 8545
       --healthcheck 10.10.0.21:8080
       --metrics 10.10.0.21:9101
+    # Debug port: this validator's RPC straight from host loopback, bypassing worker-gateway1.
+    # Clients use the gateway's port. 127.0.0.1, not localhost, which may resolve to ::1.
     ports:
-      - 8545:8545
+      - 127.0.0.1:18545:8545
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.21/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
       interval: 30s
@@ -187,7 +217,7 @@ services:
       --healthcheck 10.10.0.22:8080
       --metrics 10.10.0.22:9101
     ports:
-      - 8544:8545
+      - 127.0.0.1:18544:8545
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.22/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
       interval: 30s
@@ -218,7 +248,7 @@ services:
       --healthcheck 10.10.0.23:8080
       --metrics 10.10.0.23:9101
     ports:
-      - 8543:8545
+      - 127.0.0.1:18543:8545
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.23/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
       interval: 30s
@@ -249,7 +279,7 @@ services:
       --healthcheck 10.10.0.24:8080
       --metrics 10.10.0.24:9101
     ports:
-      - 8542:8545
+      - 127.0.0.1:18542:8545
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.24/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
       interval: 30s
@@ -261,8 +291,9 @@ services:
     networks:
       validators:
         ipv4_address: 10.10.0.24
-  # Follows the chain without joining the committee, with the same listeners as a validator. Its
-  # RPC is published on host loopback only.
+  # Follows the chain without joining the committee, with the same listeners as a validator. The
+  # worker gateways send it every call that is not a submission. Its RPC is published on host
+  # loopback only.
   observer:
     container_name: observer
     image: local-telcoin-network:latest
@@ -297,6 +328,122 @@ services:
     networks:
       validators:
         ipv4_address: 10.10.0.31
+
+  # A worker gateway in front of each validator, as on mainnet. It sends transaction submissions,
+  # and the nonce and receipt reads only the validator's pool can answer, to its validator, and
+  # every other call to the observer (--redirect-queries). The upstreams are IP literals: a
+  # private address passes the gateway's startup checks over plain http without a warning, where
+  # a service name such as validator1 would log one.
+  worker-gateway1:
+    container_name: worker-gateway1
+    image: local-telcoin-worker-gateway:latest
+    # Built once here; worker-gateway2..4 run the same image.
+    build:
+      context: ../
+      dockerfile: bin/worker-gateway/Dockerfile
+    # Started, not healthy: the gateway stays not-ready until its upstreams answer.
+    depends_on:
+      validator1:
+        condition: service_started
+      observer:
+        condition: service_started
+    environment: *worker-gateway-env
+    command: >
+      --listen-addr 0.0.0.0:8545
+      --probe-addr 127.0.0.1:8546
+      --metrics 10.10.0.41:9101
+      --upstream-rpc-url http://10.10.0.21:8545
+      --upstream-readiness-url http://10.10.0.21:8080/health/workers
+      --redirect-queries http://10.10.0.31:8545
+    ports:
+      - 8545:8545
+    healthcheck: *worker-gateway-healthcheck
+    # Above the gateway's shutdown on SIGTERM: a 45s in-flight drain and a 1s margin.
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.41
+  worker-gateway2:
+    container_name: worker-gateway2
+    image: local-telcoin-worker-gateway:latest
+    depends_on:
+      validator2:
+        condition: service_started
+      observer:
+        condition: service_started
+    environment: *worker-gateway-env
+    command: >
+      --listen-addr 0.0.0.0:8545
+      --probe-addr 127.0.0.1:8546
+      --metrics 10.10.0.42:9101
+      --upstream-rpc-url http://10.10.0.22:8545
+      --upstream-readiness-url http://10.10.0.22:8080/health/workers
+      --redirect-queries http://10.10.0.31:8545
+    ports:
+      - 8544:8545
+    healthcheck: *worker-gateway-healthcheck
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.42
+  worker-gateway3:
+    container_name: worker-gateway3
+    image: local-telcoin-worker-gateway:latest
+    depends_on:
+      validator3:
+        condition: service_started
+      observer:
+        condition: service_started
+    environment: *worker-gateway-env
+    command: >
+      --listen-addr 0.0.0.0:8545
+      --probe-addr 127.0.0.1:8546
+      --metrics 10.10.0.43:9101
+      --upstream-rpc-url http://10.10.0.23:8545
+      --upstream-readiness-url http://10.10.0.23:8080/health/workers
+      --redirect-queries http://10.10.0.31:8545
+    ports:
+      - 8543:8545
+    healthcheck: *worker-gateway-healthcheck
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.43
+  worker-gateway4:
+    container_name: worker-gateway4
+    image: local-telcoin-worker-gateway:latest
+    depends_on:
+      validator4:
+        condition: service_started
+      observer:
+        condition: service_started
+    environment: *worker-gateway-env
+    command: >
+      --listen-addr 0.0.0.0:8545
+      --probe-addr 127.0.0.1:8546
+      --metrics 10.10.0.44:9101
+      --upstream-rpc-url http://10.10.0.24:8545
+      --upstream-readiness-url http://10.10.0.24:8080/health/workers
+      --redirect-queries http://10.10.0.31:8545
+    ports:
+      - 8542:8545
+    healthcheck: *worker-gateway-healthcheck
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.44
 
   # Observability profile: off by default, so `make up` is unchanged.
   # Start it with `docker compose --profile observability up -d`.
