@@ -399,9 +399,35 @@ check_release_dockerfiles() {
     echo "release Dockerfiles keep the contract etc/release.sh relies on: $1 $2 $3"
 }
 
+# etc/release-components names the components a tag of this commit ships, and etc/release.sh
+# reads it only when a release is tagged. This runs the script's own reader, load_components,
+# on HEAD's copy, so a list the script would refuse fails on the pull request, with the
+# script's own refusal, instead of at release time. It reads the file as committed at HEAD,
+# which is what a tag carries: an uncommitted edit is not what it checks. The file must be
+# there: main ships the edge services, and a tag of a commit without it ships the node alone,
+# which the script accepts without a word.
+check_release_components() {
+    echo "+ load_components HEAD (etc/release.sh)"
+    (
+        # Sourcing defines the script's functions and constants and runs nothing; the subshell
+        # keeps them out of this script.
+        # shellcheck source=etc/release.sh
+        . etc/release.sh
+        local entry
+        entry=$(git ls-tree --full-tree HEAD -- "$COMPONENTS_FILE")
+        if [[ -z $entry ]]; then
+            echo "check_release_components: HEAD has no $COMPONENTS_FILE, so a tag of this" \
+                "commit would ship the node alone; commit the file, one component per line" >&2
+            exit 1
+        fi
+        load_components HEAD
+    )
+}
+
 lane_test_default() {
-    # Static and cheap, so it runs first.
+    # Static and cheap, so they run first.
     check_release_dockerfiles etc/Dockerfile bin/worker-gateway/Dockerfile bin/node-record-api/Dockerfile
+    check_release_components
     run python3 -B -I -m unittest discover -s tools/network-budget -p 'test_*.py'
     # This lane is the tn-lmdb lane, and the release is the tn-lmdb build, only while no crate
     # turns tn-reth's `mdbx` feature on: every backend test checks "this build's engine", so a
