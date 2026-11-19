@@ -23,30 +23,40 @@
 //! The router also budgets the request-body bytes held across all in-flight
 //! requests (see [`reserve_request_bytes`]), so the memory buffered bodies
 //! take is bounded by one number rather than by the connection count.
+//!
+//! An answer given before its request body was read to its end, the rate
+//! limiter's `429` first of all, carries `Connection: close`, and its
+//! connection closes without resetting a client still sending that body (see
+//! [`close_if_body_unread`]); an answer given after the body was read leaves
+//! the connection as it was.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    io::{self, IoSlice},
     net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
-    pin::pin,
+    pin::{pin, Pin},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard, PoisonError,
     },
+    task::{ready, Context, Poll, Waker},
     time::{Duration, Instant},
 };
 
 use axum::{
-    body::HttpBody as _,
+    body::{Body, Bytes, HttpBody},
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     handler::Handler as _,
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode, Version},
     middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
 };
 use futures::future::{self, Either};
+use hyper::body::{Frame, SizeHint};
 use hyper_util::{
     rt::{TokioIo, TokioTimer},
     server::graceful::GracefulShutdown,
@@ -56,8 +66,10 @@ use reqwest::Client;
 use serde::Serialize;
 use tn_types::{Noticer, TaskError, B256};
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{watch, OwnedSemaphorePermit, Semaphore},
+    time::Sleep,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, info, warn};
@@ -187,6 +199,23 @@ const CORS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// response (the client closed the connection, the connection lifetime cap,
 /// shutdown): nginx's "client closed request".
 const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// Longest a client connection's lingering close waits for the client to stop
+/// sending (see [`LingeringStream`]), never more than the header read timeout.
+/// A client that honours `Connection: close` stops within a round trip of
+/// reading the answer; one still sending after this is ignoring it.
+const LINGER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bytes a lingering close reads, and discards, per read: hyper's smallest
+/// read buffer ([`HTTP1_MIN_BUF_SIZE`]), here on the stack of one poll.
+const LINGER_READ_CHUNK: usize = HTTP1_MIN_BUF_SIZE;
+
+/// Most frames a [`WatchedBody`] dropped before its end takes from what its
+/// body already holds. hyper hands a request body over through a channel that
+/// holds one data frame at a time, so a body of hyper's yields at most a data
+/// frame and its trailers before it would have to wait; the bound only keeps a
+/// body that is always ready (one built in memory) from running the drop on.
+const WATCHED_BODY_HELD_FRAMES: usize = 4;
 
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
@@ -744,6 +773,251 @@ impl Drop for ClientSlot {
     }
 }
 
+/// One client connection's switch for a lingering close: armed by
+/// [`close_if_body_unread`] when an answer leaves before its request body was
+/// read to its end, and read by the connection's [`LingeringStream`] when
+/// hyper shuts the connection down. The accept loop hands a clone to the
+/// connection's service as a request extension.
+#[derive(Clone, Debug, Default)]
+struct LingerOnClose(Arc<AtomicBool>);
+
+impl LingerOnClose {
+    /// Make the connection's shutdown linger.
+    fn arm(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the connection's shutdown lingers.
+    fn is_armed(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A client connection's socket. Reads and writes pass straight through; once
+/// the connection's [`LingerOnClose`] is armed, shutting it down is a
+/// lingering close.
+///
+/// hyper ends a connection by shutting down its write side (the FIN after the
+/// last answer) and then dropping the socket. When the client is still sending
+/// the body of a request that was answered before the body was read, the
+/// kernel answers the bytes left unread at the close, and any that arrive
+/// after it, with a reset, and a reset can discard the answer before the
+/// client has read it (RFC 9112, section 9.6). Armed, the shutdown sends the
+/// FIN, then reads and discards what the client still sends until the client
+/// closes its side, `linger` passes or `max_discard` bytes are gone, whichever
+/// comes first, and only then lets hyper drop the socket.
+///
+/// Neither bound lets a client hold more than it already can. `linger` is at
+/// most [`LINGER_TIMEOUT`] and never more than the header read timeout, which
+/// is both the time any connection may spend sending each request head and
+/// the share of the request deadline a body gets (see
+/// `crate::cli::request_deadline`). `max_discard` is `--max-request-bytes`,
+/// what the gateway reads of any request it admits. The linger holds only the
+/// connection's own slots, no rate-limit token, byte-budget reservation or
+/// upstream slot, and it runs inside the connection's future, so the lifetime
+/// cap's and the drain's graces bound it like any exchange in flight.
+/// Unarmed, the shutdown is the plain one, so a connection whose answers all
+/// came after their bodies were read closes as it always has.
+struct LingeringStream<S = TcpStream> {
+    /// The accepted socket.
+    stream: S,
+    /// Whether this connection's shutdown lingers.
+    linger_on_close: LingerOnClose,
+    /// Longest the shutdown waits for the client to finish.
+    linger: Duration,
+    /// Most bytes the shutdown reads and discards.
+    max_discard: usize,
+    /// Bytes discarded so far.
+    discarded: usize,
+    /// Whether the write side is shut down (the FIN sent).
+    write_closed: bool,
+    /// The linger's deadline, started once the FIN is sent.
+    deadline: Option<Pin<Box<Sleep>>>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> LingeringStream<S> {
+    /// Wrap an accepted `stream`, whose shutdown lingers once
+    /// `linger_on_close` is armed.
+    fn new(
+        stream: S,
+        linger_on_close: LingerOnClose,
+        linger: Duration,
+        max_discard: usize,
+    ) -> Self {
+        Self {
+            stream,
+            linger_on_close,
+            linger,
+            max_discard,
+            discarded: 0,
+            write_closed: false,
+            deadline: None,
+        }
+    }
+
+    /// The armed shutdown: send the FIN, then read and discard until the
+    /// client closes its side, the linger runs out or `max_discard` bytes are
+    /// gone. A failed read ends it too: a reset has already ended the
+    /// connection, and there is no answer left to protect.
+    fn poll_linger(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.write_closed {
+            ready!(Pin::new(&mut self.stream).poll_shutdown(cx))?;
+            self.write_closed = true;
+        }
+        let linger = self.linger;
+        let deadline = self.deadline.get_or_insert_with(|| Box::pin(tokio::time::sleep(linger)));
+        let mut scratch = [0_u8; LINGER_READ_CHUNK];
+        while self.discarded < self.max_discard {
+            // the clock, read before every read, and not only the timer below:
+            // tokio polls the read and the timer under one cooperative budget,
+            // so once a client whose bytes are always ready has spent it the
+            // timer reports `Pending` as the read does, and by itself would
+            // never end the linger against such a client
+            if deadline.deadline() <= tokio::time::Instant::now() {
+                break;
+            }
+            let mut buf = ReadBuf::new(&mut scratch);
+            match Pin::new(&mut self.stream).poll_read(cx, &mut buf) {
+                Poll::Ready(Ok(())) if buf.filled().is_empty() => break,
+                Poll::Ready(Ok(())) => self.discarded += buf.filled().len(),
+                Poll::Ready(Err(_)) => break,
+                Poll::Pending => {
+                    ready!(deadline.as_mut().poll(cx));
+                    break;
+                }
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for LingeringStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.linger_on_close.is_armed() {
+            this.poll_linger(cx)
+        } else {
+            Pin::new(&mut this.stream).poll_shutdown(cx)
+        }
+    }
+}
+
+/// A request body that records, for [`close_if_body_unread`], whether it was
+/// read to its end: by the service, up to its last frame, or, when the service
+/// drops it first, from what hyper had already read of it.
+struct WatchedBody {
+    /// The request's own body.
+    body: Body,
+    /// Set once the body has reached its end.
+    read: Arc<AtomicBool>,
+    /// Set once a read of the body has failed.
+    failed: bool,
+}
+
+impl WatchedBody {
+    /// Whether `polled`, the result of polling the body, leaves it at its end:
+    /// the end itself, or a frame after which the body has nothing left.
+    ///
+    /// A body that failed never reaches its end: hyper follows the error of a
+    /// body it could not decode with an end of stream and closes the
+    /// connection, so that end must not pass for the body's.
+    fn reached_end(&mut self, polled: &Poll<Option<Result<Frame<Bytes>, axum::Error>>>) -> bool {
+        match polled {
+            Poll::Ready(Some(Err(_))) => {
+                self.failed = true;
+                false
+            }
+            Poll::Ready(None) => !self.failed,
+            Poll::Ready(Some(Ok(_))) => !self.failed && self.body.is_end_stream(),
+            Poll::Pending => false,
+        }
+    }
+}
+
+impl HttpBody for WatchedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.body).poll_frame(cx);
+        if this.reached_end(&polled) {
+            this.read.store(true, Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+impl Drop for WatchedBody {
+    fn drop(&mut self) {
+        if self.read.load(Ordering::Relaxed) {
+            return;
+        }
+        // hyper reads the start of every body itself, before the service runs,
+        // and keeps the connection once that read reaches the body's end,
+        // whether or not the service ever polls it: a small body that arrived
+        // with its head. take what hyper has already handed over, without
+        // waiting, so such a body counts as read and one still arriving does
+        // not
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..WATCHED_BODY_HELD_FRAMES {
+            let polled = Pin::new(&mut self.body).poll_frame(&mut cx);
+            if self.reached_end(&polled) {
+                self.read.store(true, Ordering::Relaxed);
+                return;
+            }
+            if !matches!(polled, Poll::Ready(Some(Ok(_)))) {
+                return;
+            }
+        }
+    }
+}
+
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
 ///
 /// `request_deadline` bounds each whole request, and an overrun is answered
@@ -806,6 +1080,10 @@ impl Drop for ClientSlot {
 /// `/health` and `/ready` sit inside the CORS layer, which answers an
 /// `OPTIONS` to them and adds `Access-Control-Allow-Origin` to their answers
 /// for an allowed `Origin`.
+///
+/// Outside all of them, [`close_if_body_unread`] marks an answer given before
+/// its request body was read to its end `Connection: close`, whichever layer
+/// or route gave it, so the connection hyper then closes is never reused.
 pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
@@ -875,6 +1153,10 @@ pub(crate) fn router(
         // Outermost, so every response the service produces carries it, the
         // identity, CORS and rate-limit layers' included.
         .layer(map_response(set_nosniff))
+        // outside every layer and route, `/ready/any`'s own rate limit
+        // included, so whatever answers before reading the body, now or later,
+        // announces the close that follows
+        .layer(from_fn(close_if_body_unread))
         .with_state(state)
 }
 
@@ -885,6 +1167,62 @@ async fn set_nosniff(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
+}
+
+/// Axum middleware: mark an answer that leaves before its request body was
+/// read to its end `Connection: close`, so a client that pools connections
+/// opens a new one for its next request instead of sending it on a connection
+/// that is closing.
+///
+/// hyper keeps an HTTP/1 connection only once the request body on it has been
+/// read to its end. It reads the first part of each body itself, before the
+/// service runs, so a body that fits in that read, a typical JSON-RPC request
+/// that arrived with its head, is consumed whether or not anything reads it,
+/// and that connection stays open. A body with more to come when the answer
+/// leaves is not: hyper tries one more read after the answer and closes the
+/// connection unless that read ends the body, and since it decides that only
+/// after writing the answer's head, the answer does not say so. This layer
+/// wraps the body in a [`WatchedBody`] and, on the way out, adds the header
+/// when that body had not reached its end in what hyper had read of it,
+/// whichever layer or handler answered: the rate limiter's `429`, the byte
+/// budget's `413` and `503`, the deadline's `408`, a `405`, a CORS preflight,
+/// or any answer added later. A request without a body, or whose body was
+/// read, keeps its connection. A larger body that had arrived in full by then
+/// is announced as closing too, though hyper's last read might have kept its
+/// connection: the layer cannot see what is still in the socket, and an
+/// announced close that could have been avoided costs the client a reconnect,
+/// while an unannounced one costs it its next request. Such an answer also
+/// arms the connection's lingering close ([`LingerOnClose`]), so the close
+/// does not reset the connection under a client that is still sending the
+/// body.
+///
+/// The listener serves HTTP/1 only. HTTP/2 forbids the header, so a request of
+/// any version but HTTP/1.0 and HTTP/1.1 passes through untouched.
+async fn close_if_body_unread(request: Request, next: Next) -> Response {
+    let version = request.version();
+    if !matches!(version, Version::HTTP_10 | Version::HTTP_11) || request.body().is_end_stream() {
+        return next.run(request).await;
+    }
+    let linger_on_close = request.extensions().get::<LingerOnClose>().cloned();
+    let read = Arc::new(AtomicBool::new(false));
+    let watched = Arc::clone(&read);
+    let request = request.map(|body| Body::new(WatchedBody { body, read: watched, failed: false }));
+    let mut response = next.run(request).await;
+    // every layer and handler inside has returned, so the body has been read
+    // or dropped by now; one still held somewhere counts as unread
+    if !read.load(Ordering::Relaxed) {
+        response.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
+        // for an HTTP/1.0 keep-alive request hyper replaces the `Connection`
+        // header of a 1.1 answer with `keep-alive`; a 1.0 answer keeps `close`
+        // and has hyper close the connection
+        if version == Version::HTTP_10 {
+            *response.version_mut() = Version::HTTP_10;
+        }
+        if let Some(linger_on_close) = linger_on_close {
+            linger_on_close.arm();
+        }
+    }
     response
 }
 
@@ -1212,6 +1550,11 @@ pub(crate) async fn serve(
 /// exchange in flight (if any) finishes, and only drops it if that takes
 /// longer than a grace of `request_deadline` after the cap or
 /// `graceful_timeout` at shutdown.
+///
+/// A connection whose answer left before its request body was read (see
+/// [`close_if_body_unread`]) ends with a bounded lingering close
+/// ([`LingeringStream`]) instead of a plain one, so a client still sending
+/// that body reads the answer rather than a reset.
 async fn accept_loop(
     listener: TcpListener,
     app: Router,
@@ -1238,6 +1581,8 @@ async fn accept_loop(
     // sender's `closed()` resolves once every connection has finished.
     let (drain, _) = watch::channel(());
     let request_deadline = limits.request_deadline;
+    let linger = LINGER_TIMEOUT.min(limits.header_read_timeout);
+    let max_discard = limits.max_request_bytes;
     let limiter =
         Arc::new(Semaphore::new(limits.max_connections.get().min(Semaphore::MAX_PERMITS)));
     let client_connections = limits
@@ -1395,6 +1740,11 @@ async fn accept_loop(
             // believes no forwarding header on a `LOCAL` connection.
             let app = app.layer(Extension(ConnectInfo(client_addr)));
             let app = if local { app.layer(Extension(LocalConnection)) } else { app };
+            // the router arms it when an answer leaves before its request body
+            // was read, and the socket then lingers on close
+            let linger_on_close = LingerOnClose::default();
+            let app = app.layer(Extension(linger_on_close.clone()));
+            let stream = LingeringStream::new(stream, linger_on_close, linger, max_discard);
             let service = TowerToHyperService::new(app);
             let mut connection =
                 pin!(connection_builder.serve_connection(TokioIo::new(stream), service));
@@ -10744,5 +11094,962 @@ mod tests {
         assert_eq!(response.text().await.expect("text"), "query");
         assert_eq!(query_seen.hits(), 1);
         assert_eq!(worker_seen.hits(), 1);
+    }
+
+    /// Answers the gateway gives before it has read a request's body, on a
+    /// kept-alive HTTP/1.1 connection driven by hand: the request head is
+    /// written alone, the answer read whole, and only then the body.
+    ///
+    /// A client that pools connections, a reverse proxy in particular, sends
+    /// its next request on any connection whose last answer did not announce
+    /// a close. So an answer must either carry `Connection: close` and be
+    /// followed by a clean end of stream, or leave its connection usable.
+    /// hyper consumes a small body that arrives with its head before the
+    /// service runs, which leaves that connection usable whatever the
+    /// service does, so these tests send the body apart from the head.
+    ///
+    /// Rate limits run on a clock that never moves, so no bucket refills
+    /// within a test however slowly it runs, and every read and write is
+    /// bounded, so a lost answer fails a test instead of hanging it. Timing
+    /// assertions are lower bounds the gateway's own timers guarantee, and
+    /// upper bounds with a second or more of room.
+    mod early_answers {
+        use super::*;
+        use futures::{stream, StreamExt as _};
+        use std::{
+            io,
+            task::{Context, Poll, Waker},
+        };
+
+        /// Bound on each read and write of a [`RawConnection`].
+        const IO_BOUND: Duration = Duration::from_secs(5);
+
+        /// Pause between a request's head and its body when the two go in
+        /// separate writes, so the gateway has the head, and can answer it,
+        /// before the body arrives.
+        const SPLIT_GAP: Duration = Duration::from_millis(20);
+
+        /// Pause between the pieces of a body sent in pieces: a piece sent to
+        /// a socket the gateway has closed draws a reset, which the next piece
+        /// then fails on, where one large write could pass it unseen.
+        const PIECE_GAP: Duration = Duration::from_millis(1);
+
+        /// A request the gateway answers itself with a `200`, carrying no body
+        /// and spending no rate-limit token: the check that a connection is
+        /// still usable.
+        const HEALTH: &[u8] = b"GET /health HTTP/1.1\r\nHost: gateway\r\n\r\n";
+
+        /// A response read whole off a [`RawConnection`].
+        #[derive(Debug)]
+        struct RawResponse {
+            /// The status line's protocol, such as `HTTP/1.1`.
+            version: String,
+            status: u16,
+            /// Header names lowercased, in the order sent.
+            headers: Vec<(String, String)>,
+            body: String,
+        }
+
+        impl RawResponse {
+            /// The tokens of every `Connection` header.
+            fn connection_tokens(&self) -> impl Iterator<Item = &str> {
+                self.headers
+                    .iter()
+                    .filter(|(name, _)| name == "connection")
+                    .flat_map(|(_, value)| value.split(','))
+                    .map(str::trim)
+            }
+
+            /// Whether the response says the server closes the connection
+            /// after it.
+            fn announces_close(&self) -> bool {
+                self.connection_tokens().any(|token| token.eq_ignore_ascii_case("close"))
+            }
+        }
+
+        /// One client connection to the gateway, written and read by hand, so
+        /// connection reuse shows exactly as a pooling client meets it.
+        struct RawConnection {
+            stream: TcpStream,
+            /// Bytes read but not yet taken as part of a response.
+            unread: Vec<u8>,
+        }
+
+        impl RawConnection {
+            async fn open(gateway: SocketAddr) -> Self {
+                let stream = TcpStream::connect(gateway).await.expect("connect");
+                Self { stream, unread: Vec::new() }
+            }
+
+            /// Write `bytes` whole: `Err` on a reset or a closed connection.
+            async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+                tokio::time::timeout(IO_BOUND, self.stream.write_all(bytes)).await.unwrap_or_else(
+                    |_| Err(io::Error::new(io::ErrorKind::TimedOut, "write stalled")),
+                )
+            }
+
+            /// Write `bytes` in pieces of `piece` bytes, [`PIECE_GAP`] apart, as
+            /// a client streaming a body does. Returns how many bytes were
+            /// written before the first failure, and that failure.
+            async fn send_in_pieces(
+                &mut self,
+                bytes: &[u8],
+                piece: usize,
+            ) -> (usize, io::Result<()>) {
+                let mut sent = 0;
+                for chunk in bytes.chunks(piece) {
+                    if let Err(err) = self.send(chunk).await {
+                        return (sent, Err(err));
+                    }
+                    sent += chunk.len();
+                    tokio::time::sleep(PIECE_GAP).await;
+                }
+                (sent, Ok(()))
+            }
+
+            /// Send `request` in one write and read its answer.
+            async fn exchange(&mut self, request: &[u8]) -> io::Result<RawResponse> {
+                self.send(request).await?;
+                self.read_response().await
+            }
+
+            /// Send `head`, then `body` in a second write [`SPLIT_GAP`] later,
+            /// and read the answer.
+            async fn exchange_split(&mut self, head: &str, body: &[u8]) -> io::Result<RawResponse> {
+                self.send(head.as_bytes()).await?;
+                tokio::time::sleep(SPLIT_GAP).await;
+                self.send(body).await?;
+                self.read_response().await
+            }
+
+            /// Read one complete response: its head, then as many body bytes
+            /// as its `Content-Length` gives. `Err` when the connection ends,
+            /// or is reset, before the response is complete.
+            async fn read_response(&mut self) -> io::Result<RawResponse> {
+                let head_len = loop {
+                    if let Some(at) =
+                        self.unread.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break at + 4;
+                    }
+                    self.fill().await?;
+                };
+                let head = String::from_utf8_lossy(&self.unread[..head_len]).into_owned();
+                let mut lines = head.split("\r\n");
+                let mut status_line = lines.next().unwrap_or_default().splitn(3, ' ');
+                let version = status_line.next().unwrap_or_default().to_string();
+                let status = status_line
+                    .next()
+                    .and_then(|status| status.parse().ok())
+                    .ok_or_else(|| io::Error::other(format!("no status line in {head:?}")))?;
+                let headers: Vec<(String, String)> = lines
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(name, value)| {
+                        (name.trim().to_ascii_lowercase(), value.trim().to_string())
+                    })
+                    .collect();
+                let body_len = headers
+                    .iter()
+                    .find(|(name, _)| name == "content-length")
+                    .and_then(|(_, value)| value.parse::<usize>().ok())
+                    .ok_or_else(|| io::Error::other(format!("no Content-Length in {head:?}")))?;
+                let end = head_len + body_len;
+                while self.unread.len() < end {
+                    self.fill().await?;
+                }
+                let body = String::from_utf8_lossy(&self.unread[head_len..end]).into_owned();
+                self.unread.drain(..end);
+                Ok(RawResponse { version, status, headers, body })
+            }
+
+            /// Expect the clean end of the stream: no further byte, no reset.
+            async fn read_eof(&mut self) -> io::Result<()> {
+                if self.unread.is_empty() {
+                    match self.fill().await {
+                        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                        Err(err) => return Err(err),
+                        Ok(()) => {}
+                    }
+                }
+                let after = String::from_utf8_lossy(&self.unread);
+                Err(io::Error::other(format!("bytes after the last response: {after:?}")))
+            }
+
+            /// Read what arrives next into `unread`. `Err` on a reset, at the
+            /// end of the stream (`UnexpectedEof`), or when nothing arrives
+            /// within [`IO_BOUND`].
+            async fn fill(&mut self) -> io::Result<()> {
+                let mut buf = [0_u8; 4096];
+                let read = tokio::time::timeout(IO_BOUND, self.stream.read(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "no byte")))?;
+                if read == 0 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                self.unread.extend_from_slice(&buf[..read]);
+                Ok(())
+            }
+
+            /// Wait until the gateway's answer has begun to arrive, without
+            /// reading it.
+            async fn await_answer(&mut self) {
+                let mut byte = [0_u8; 1];
+                let peeked = tokio::time::timeout(IO_BOUND, self.stream.peek(&mut byte))
+                    .await
+                    .expect("the gateway should answer from the head")
+                    .expect("peek");
+                assert_eq!(peeked, 1, "the gateway closed the connection unanswered");
+            }
+        }
+
+        /// A request head announcing a `len`-byte body, which the request
+        /// sends apart from it.
+        fn head(method: &str, path: &str, len: usize) -> String {
+            format!("{method} {path} HTTP/1.1\r\nHost: gateway\r\nContent-Length: {len}\r\n\r\n")
+        }
+
+        /// A request whose small body goes with its head, in one write.
+        fn whole(method: &str, path: &str, body: &str) -> String {
+            format!("{}{body}", head(method, path, body.len()))
+        }
+
+        /// `len` bytes of body nobody parses.
+        fn filler(len: usize) -> Vec<u8> {
+            vec![b' '; len]
+        }
+
+        /// Rate limits of `tokens` requests in all, per IP or global, on a
+        /// clock that never moves.
+        fn rate_limited(tokens: u32, per_ip: bool) -> RouterLayers {
+            let limit = Some(RateLimit::new(nz(1), nz(tokens)));
+            let (per_ip, global) = if per_ip { (limit, None) } else { (None, limit) };
+            let limiters = RateLimiters::with_clock(
+                SharedClock::from(ManualClock::new()),
+                per_ip,
+                global,
+                None,
+                16,
+                PrefixPolicy::default(),
+            )
+            .expect("limiters");
+            RouterLayers { rate_limiters: Some(Arc::new(limiters)), ..RouterLayers::default() }
+        }
+
+        /// A gateway in front of a ready worker mock, built from these fields
+        /// and served through the real accept loop. The defaults trip nothing.
+        struct TestGateway {
+            layers: RouterLayers,
+            request_deadline: Duration,
+            /// The router's body cap; the accept loop's own copy, which bounds
+            /// a lingering close, is `limits.max_request_bytes`.
+            max_request_bytes: usize,
+            budget: Option<NonZeroU32>,
+            max_batch_len: Option<NonZeroUsize>,
+            limits: ServerLimits,
+        }
+
+        impl Default for TestGateway {
+            fn default() -> Self {
+                Self {
+                    layers: RouterLayers::default(),
+                    request_deadline: Duration::from_secs(5),
+                    max_request_bytes: MAX_REQUEST_BYTES,
+                    budget: None,
+                    max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
+                    limits: test_limits(),
+                }
+            }
+        }
+
+        impl TestGateway {
+            /// Serve it. Returns its address, the worker's readiness (to take
+            /// it out of service) and the `Notifier`s that keep both servers
+            /// alive.
+            async fn spawn(self) -> (SocketAddr, Arc<GatewayReadiness>, [Notifier; 2]) {
+                let (worker, _seen, worker_server) = named_mock("worker").await;
+                let mut state = redirect_state(worker, None);
+                state.max_batch_len = self.max_batch_len;
+                state.readiness.set_ready(0, true);
+                let readiness = Arc::clone(&state.readiness);
+                let app = router(
+                    state,
+                    self.request_deadline,
+                    self.max_request_bytes,
+                    self.budget,
+                    self.layers,
+                    Arc::default(),
+                );
+                let (gateway, gateway_server) = spawn_with_limits(app, self.limits).await;
+                (gateway, readiness, [worker_server, gateway_server])
+            }
+        }
+
+        /// Hold `answer`, just read off `connection`, to the rule a pooling
+        /// client relies on, once the client has sent `rest`, the part of the
+        /// announced body it had not sent: an answer that announces
+        /// `Connection: close` is followed by a clean end of stream, and any
+        /// other leaves the connection usable for the next request.
+        async fn assert_closed_or_reusable(
+            connection: &mut RawConnection,
+            answer: &RawResponse,
+            rest: &[u8],
+            what: &str,
+        ) {
+            // a client that wrote its head before the answer came goes on
+            // sending the body it announced
+            connection
+                .send(rest)
+                .await
+                .unwrap_or_else(|err| panic!("{what}: sending the rest of the body failed: {err}"));
+            if answer.announces_close() {
+                connection.read_eof().await.unwrap_or_else(|err| {
+                    panic!(
+                        "{what}: announced a close, but the connection did not end cleanly: {err}"
+                    )
+                });
+            } else {
+                let next = connection.exchange(HEALTH).await.unwrap_or_else(|err| {
+                    panic!(
+                        "{what}: the answer did not announce a close, yet the next request on \
+                         its connection was lost: {err}"
+                    )
+                });
+                assert_eq!(
+                    next.status, 200,
+                    "{what}: the next request on the connection: {next:?}"
+                );
+            }
+        }
+
+        /// Write `head` alone on `connection`, read the answer the gateway
+        /// gives before the body, which must have `status`, then send `rest`,
+        /// the body the head announced, and hold the connection to
+        /// [`assert_closed_or_reusable`].
+        async fn assert_early_answer(
+            connection: &mut RawConnection,
+            head: &str,
+            rest: &[u8],
+            status: u16,
+            what: &str,
+        ) {
+            connection
+                .send(head.as_bytes())
+                .await
+                .unwrap_or_else(|err| panic!("{what}: sending the head failed: {err}"));
+            let answer = connection
+                .read_response()
+                .await
+                .unwrap_or_else(|err| panic!("{what}: no complete answer: {err}"));
+            assert_eq!(answer.status, status, "{what}: {answer:?}");
+            assert_closed_or_reusable(connection, &answer, rest, what).await;
+        }
+
+        /// Spend a rate-limit token on `connection` with a `GET /`, which
+        /// carries no body and is refused with a `405` once admitted.
+        async fn spend_token(connection: &mut RawConnection) {
+            let answer = connection
+                .exchange(b"GET / HTTP/1.1\r\nHost: gateway\r\n\r\n")
+                .await
+                .expect("the GET is answered");
+            assert_eq!(answer.status, 405, "{answer:?}");
+            assert!(!answer.announces_close(), "a request without a body keeps its connection");
+        }
+
+        /// The measured case: a client over its per-IP limit, on a connection
+        /// it keeps alive as a pooling proxy does.
+        #[tokio::test]
+        async fn per_ip_429_closes_honestly_or_stays_usable() {
+            let gateway = TestGateway { layers: rate_limited(1, true), ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+            let body = call("eth_chainId", 1);
+
+            // the client's one token, on a request that is served
+            let served = connection.exchange(whole("POST", "/", &body).as_bytes()).await;
+            let served = served.expect("the first request is served");
+            assert_eq!((served.status, served.body.as_str()), (200, "worker"), "{served:?}");
+            // the next one, on the same connection, is over the limit
+            let head = head("POST", "/", body.len());
+            assert_early_answer(&mut connection, &head, body.as_bytes(), 429, "per-IP 429").await;
+        }
+
+        #[tokio::test]
+        async fn global_429_closes_honestly_or_stays_usable() {
+            let gateway = TestGateway { layers: rate_limited(1, false), ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+            spend_token(&mut connection).await;
+
+            let body = call("eth_chainId", 1);
+            let head = head("POST", "/", body.len());
+            assert_early_answer(&mut connection, &head, body.as_bytes(), 429, "global 429").await;
+        }
+
+        /// `/ready/any` refuses other methods behind its own rate limit,
+        /// outside the layers the other routes share.
+        #[tokio::test]
+        async fn ready_any_429_closes_honestly_or_stays_usable() {
+            let gateway = TestGateway { layers: rate_limited(1, true), ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+            spend_token(&mut connection).await;
+
+            let head = head("POST", "/ready/any", 64);
+            assert_early_answer(&mut connection, &head, &filler(64), 429, "/ready/any 429").await;
+        }
+
+        #[tokio::test]
+        async fn declared_413_closes_honestly_or_stays_usable() {
+            let gateway = TestGateway { max_request_bytes: 1024, ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let head = head("POST", "/", 4096);
+            assert_early_answer(&mut connection, &head, &filler(4096), 413, "declared 413").await;
+        }
+
+        #[tokio::test]
+        async fn byte_budget_503_closes_honestly_or_stays_usable() {
+            // a declared length the 4 KiB budget cannot cover
+            let gateway = TestGateway { budget: NonZeroU32::new(4096), ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let head = head("POST", "/", 8192);
+            assert_early_answer(&mut connection, &head, &filler(8192), 503, "byte budget 503")
+                .await;
+        }
+
+        /// The deadline passes while the proxy waits for a body that has not
+        /// arrived.
+        #[tokio::test]
+        async fn deadline_408_closes_honestly_or_stays_usable() {
+            let request_deadline = Duration::from_millis(200);
+            let gateway = TestGateway { request_deadline, ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let body = call("eth_chainId", 1);
+            let head = head("POST", "/", body.len());
+            assert_early_answer(&mut connection, &head, body.as_bytes(), 408, "deadline 408").await;
+        }
+
+        #[tokio::test]
+        async fn probe_405_closes_honestly_or_stays_usable() {
+            let (gateway, _, _servers) = TestGateway::default().spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let head = head("POST", "/health", 64);
+            assert_early_answer(&mut connection, &head, &filler(64), 405, "probe 405").await;
+        }
+
+        #[tokio::test]
+        async fn ready_any_405_closes_honestly_or_stays_usable() {
+            let (gateway, _, _servers) = TestGateway::default().spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let head = head("POST", "/ready/any", 64);
+            assert_early_answer(&mut connection, &head, &filler(64), 405, "/ready/any 405").await;
+        }
+
+        #[tokio::test]
+        async fn post_only_405_closes_honestly_or_stays_usable() {
+            let (gateway, _, _servers) = TestGateway::default().spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let head = head("PUT", "/", 64);
+            assert_early_answer(&mut connection, &head, &filler(64), 405, "POST-only 405").await;
+        }
+
+        /// A chunked body whose first chunk is already over the cap is refused
+        /// while it is read, before its last chunk arrives.
+        #[tokio::test]
+        async fn chunked_413_closes_honestly_or_stays_usable() {
+            let gateway = TestGateway { max_request_bytes: 8, ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            // a 16-byte first chunk, with the last chunk to follow
+            let head = "POST / HTTP/1.1\r\nHost: gateway\r\nTransfer-Encoding: chunked\r\n\r\n\
+                        10\r\n{\"jsonrpc\":\"2.0\"\r\n";
+            assert_early_answer(&mut connection, head, b"0\r\n\r\n", 413, "chunked 413").await;
+        }
+
+        #[tokio::test]
+        async fn cors_preflight_closes_honestly_or_stays_usable() {
+            let cors = cors_list(&["https://app.example"]);
+            let layers = RouterLayers { cors, ..RouterLayers::default() };
+            let (gateway, _, _servers) =
+                TestGateway { layers, ..TestGateway::default() }.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let head = "OPTIONS / HTTP/1.1\r\nHost: gateway\r\nOrigin: https://app.example\r\n\
+                        Access-Control-Request-Method: POST\r\nContent-Length: 64\r\n\r\n";
+            assert_early_answer(&mut connection, head, &filler(64), 200, "CORS preflight").await;
+        }
+
+        /// A body larger than a segment, which the client goes on sending
+        /// while the gateway's early answer waits unread, as a client that
+        /// reads only once its body is sent does: every piece is accepted, and
+        /// the answer is then read whole.
+        #[tokio::test]
+        async fn early_answer_survives_a_large_body_sent_after_it() {
+            // under the 1 MiB cap the accept loop's linger discards up to
+            const LEN: usize = 256 * 1024;
+            let gateway = TestGateway { layers: rate_limited(1, true), ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+            spend_token(&mut connection).await;
+
+            let body = padded_call(1, LEN);
+            let (first, rest) = body.as_bytes().split_at(1024);
+            let start = [head("POST", "/", LEN).as_bytes(), first].concat();
+            connection.send(&start).await.expect("send the head and the first KiB");
+            connection.await_answer().await;
+            let (sent, result) = connection.send_in_pieces(rest, 16 * 1024).await;
+            result.unwrap_or_else(|err| panic!("reset after {sent} bytes of the body: {err}"));
+
+            let answer = connection.read_response().await.expect("the early answer is read whole");
+            assert_eq!(answer.status, 429, "{answer:?}");
+            assert_closed_or_reusable(&mut connection, &answer, b"", "429 to a large body").await;
+        }
+
+        /// The negative control: answers given once the body was read, a
+        /// refusal included, keep the connection and announce no close, even
+        /// with the body sent in a second write.
+        #[tokio::test]
+        async fn answers_after_the_body_keep_the_connection() {
+            let max_batch_len = NonZeroUsize::new(3);
+            let (gateway, readiness, _servers) =
+                TestGateway { max_batch_len, ..TestGateway::default() }.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let unreadable = format!("[1e400,{}]", call("eth_getBalance", 1));
+            let cases = [
+                (true, call("eth_chainId", 1), 200, "a served call"),
+                (true, unreadable, 400, "an unreadable batch"),
+                (true, batch("eth_getBalance", 4), 413, "a batch over the cap"),
+                (false, call("eth_chainId", 2), 503, "a call with no upstream ready"),
+            ];
+            for (worker_ready, body, status, what) in cases {
+                readiness.set_ready(0, worker_ready);
+                let head = head("POST", "/", body.len());
+                let answer = connection.exchange_split(&head, body.as_bytes()).await;
+                let answer = answer.unwrap_or_else(|err| panic!("{what}: {err}"));
+                assert_eq!(answer.status, status, "{what}: {answer:?}");
+                assert!(!answer.announces_close(), "{what}: {answer:?}");
+            }
+            let answer = connection.exchange(HEALTH).await.expect("the connection stays usable");
+            assert_eq!(answer.status, 200, "{answer:?}");
+        }
+
+        /// A small body sent with its head is consumed by hyper before the
+        /// service runs, so an answer given without reading it leaves the
+        /// connection usable, and must not announce a close: a pooling client
+        /// would otherwise reconnect after every refusal.
+        #[tokio::test]
+        async fn early_answers_to_a_body_sent_with_its_head_keep_the_connection() {
+            let gateway = TestGateway { layers: rate_limited(1, true), ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let body = call("eth_chainId", 1);
+            // the first spends the only token and is refused by the POST-only
+            // rule, the second is over the limit
+            for (method, status) in [("PUT", 405), ("POST", 429)] {
+                let answer = connection.exchange(whole(method, "/", &body).as_bytes()).await;
+                let answer = answer.unwrap_or_else(|err| panic!("{method}: {err}"));
+                assert_eq!(answer.status, status, "{method}: {answer:?}");
+                assert!(!answer.announces_close(), "{method}: {answer:?}");
+            }
+            let answer = connection.exchange(HEALTH).await.expect("the connection stays usable");
+            assert_eq!(answer.status, 200, "{answer:?}");
+        }
+
+        /// The probes on a kept-alive connection: each is answered and the
+        /// connection kept, a refused method with its body sent alongside
+        /// included.
+        #[tokio::test]
+        async fn probes_on_a_kept_alive_connection_keep_their_behaviour() {
+            let (gateway, _, _servers) = TestGateway::default().spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            for path in ["/health", "/ready", "/ready/any"] {
+                let request = format!("GET {path} HTTP/1.1\r\nHost: gateway\r\n\r\n");
+                let answer = connection.exchange(request.as_bytes()).await;
+                let answer = answer.unwrap_or_else(|err| panic!("{path}: {err}"));
+                assert_eq!(answer.status, 200, "{path}: {answer:?}");
+                assert!(!answer.announces_close(), "{path}: {answer:?}");
+            }
+            let request = whole("POST", "/health", &call("eth_chainId", 1));
+            let refused = connection.exchange(request.as_bytes()).await.expect("POST /health");
+            assert_eq!(refused.status, 405, "{refused:?}");
+            assert!(!refused.announces_close(), "{refused:?}");
+            let answer = connection.exchange(HEALTH).await.expect("the connection stays usable");
+            assert_eq!(answer.status, 200, "{answer:?}");
+        }
+
+        /// A client that goes on sending its body after reading the early
+        /// answer meets a clean end of stream and no reset, and the gateway
+        /// ends the connection as soon as the client closes its side.
+        #[tokio::test]
+        async fn lingering_close_reads_the_body_until_the_client_closes() {
+            const LEN: usize = 64 * 1024;
+            // one connection slot, so the next connection is served only once
+            // this one has ended; the header read timeout leaves the linger at
+            // its 2 s bound
+            let max_connections = NonZeroUsize::new(1).expect("nonzero");
+            let limits = ServerLimits { max_connections, ..test_limits() };
+            let gateway = TestGateway { max_request_bytes: 1024, limits, ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            connection.send(head("POST", "/", LEN).as_bytes()).await.expect("send the head");
+            let answer = connection.read_response().await.expect("the answer is read whole");
+            assert_eq!(answer.status, 413, "{answer:?}");
+            assert!(answer.announces_close(), "{answer:?}");
+            connection.read_eof().await.expect("a clean end of stream after the answer");
+            let (sent, result) = connection.send_in_pieces(&filler(LEN), 4 * 1024).await;
+            result.unwrap_or_else(|err| panic!("reset after {sent} bytes of the body: {err}"));
+            connection.stream.shutdown().await.expect("close the client's side");
+
+            let closed = Instant::now();
+            let mut next = RawConnection::open(gateway).await;
+            let health = next.exchange(HEALTH).await.expect("the next connection is served");
+            assert_eq!(health.status, 200, "{health:?}");
+            let waited = closed.elapsed();
+            let prompt = LINGER_TIMEOUT.mul_f32(0.75);
+            assert!(waited < prompt, "the linger outlived the client: {waited:?}");
+        }
+
+        /// The linger's time bound, the smaller of 2 s and the header read
+        /// timeout: a client that keeps trickling bytes is cut off then, and
+        /// only after it has read the whole answer.
+        #[tokio::test]
+        async fn lingering_close_ends_at_the_header_read_timeout() {
+            let header_read_timeout = Duration::from_millis(250);
+            let limits = ServerLimits { header_read_timeout, ..test_limits() };
+            let gateway = TestGateway { max_request_bytes: 1024, limits, ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            // the linger starts after the head arrives, so it cannot end
+            // before `header_read_timeout` has passed from here
+            let sent_head = Instant::now();
+            let head = head("POST", "/", MAX_REQUEST_BYTES);
+            connection.send(head.as_bytes()).await.expect("send the head");
+            let answer = connection.read_response().await.expect("the answer is read whole");
+            assert_eq!(answer.status, 413, "{answer:?}");
+            assert!(answer.announces_close(), "{answer:?}");
+            connection.read_eof().await.expect("a clean end of stream after the answer");
+
+            // 64 bytes a millisecond: the 1 MiB byte bound is never reached
+            let body = filler(MAX_REQUEST_BYTES);
+            let trickle = connection.send_in_pieces(&body, 64);
+            let (sent, result) = tokio::time::timeout(Duration::from_secs(3), trickle)
+                .await
+                .expect("the gateway must cut off a client still trickling its body");
+            let cut_off = sent_head.elapsed();
+            assert!(result.is_err(), "the whole body went through");
+            assert!(
+                cut_off >= header_read_timeout,
+                "cut off after {cut_off:?} and {sent} bytes, before the linger ran out"
+            );
+            assert!(
+                cut_off < LINGER_TIMEOUT,
+                "cut off after {cut_off:?}, not at the header timeout"
+            );
+        }
+
+        /// The linger's byte bound, `--max-request-bytes`: a client flooding
+        /// past it after the early answer is cut off once that much is
+        /// discarded, not before, and long before the time bound.
+        #[tokio::test]
+        async fn lingering_close_ends_at_the_body_cap() {
+            const CAP: usize = 16 * 1024;
+            // the header read timeout leaves the time bound at 2 s
+            let limits = ServerLimits { max_request_bytes: CAP, ..test_limits() };
+            let gateway = TestGateway { max_request_bytes: CAP, limits, ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let head = head("POST", "/", MAX_REQUEST_BYTES);
+            connection.send(head.as_bytes()).await.expect("send the head");
+            let answer = connection.read_response().await.expect("the answer is read whole");
+            assert_eq!(answer.status, 413, "{answer:?}");
+            assert!(answer.announces_close(), "{answer:?}");
+
+            let answered = Instant::now();
+            let body = filler(MAX_REQUEST_BYTES);
+            let flood = connection.send_in_pieces(&body, 1024);
+            let (sent, result) = tokio::time::timeout(Duration::from_secs(5), flood)
+                .await
+                .expect("the gateway must cut off a client flooding past the cap");
+            let cut_off = answered.elapsed();
+            assert!(result.is_err(), "the whole body went through");
+            assert!(sent >= CAP, "cut off after {sent} bytes, before the cap was discarded");
+            assert!(cut_off < LINGER_TIMEOUT, "cut off after {cut_off:?}, not at the byte bound");
+        }
+
+        /// A connection whose answers all came after their bodies were read
+        /// closes as it always has, at once: nothing lingers.
+        #[tokio::test]
+        async fn connection_without_an_early_answer_closes_at_once() {
+            // one connection slot, so the next connection is served only once
+            // this one has ended; a linger would last its 2 s bound here, since
+            // this client neither sends nor closes
+            let max_connections = NonZeroUsize::new(1).expect("nonzero");
+            let limits = ServerLimits { max_connections, ..test_limits() };
+            let (gateway, _, _servers) =
+                TestGateway { limits, ..TestGateway::default() }.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let body = call("eth_chainId", 1);
+            let head = format!(
+                "POST / HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let answer = connection.exchange_split(&head, body.as_bytes()).await.expect("served");
+            assert_eq!((answer.status, answer.body.as_str()), (200, "worker"), "{answer:?}");
+            connection.read_eof().await.expect("the gateway closes after the answer, as asked");
+
+            let closed = Instant::now();
+            let mut next = RawConnection::open(gateway).await;
+            let health = next.exchange(HEALTH).await.expect("the next connection is served");
+            assert_eq!(health.status, 200, "{health:?}");
+            let waited = closed.elapsed();
+            let prompt = LINGER_TIMEOUT.mul_f32(0.75);
+            assert!(waited < prompt, "the plain close lingered: {waited:?}");
+            drop(connection);
+        }
+
+        /// hyper answers an HTTP/1.0 keep-alive request with
+        /// `Connection: keep-alive` unless the answer is itself HTTP/1.0, so an
+        /// early answer to one is an HTTP/1.0 answer that announces the close,
+        /// and the connection then ends.
+        #[tokio::test]
+        async fn http10_keep_alive_request_answered_early_is_told_of_the_close() {
+            let gateway = TestGateway { max_request_bytes: 1024, ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let head = "POST / HTTP/1.0\r\nHost: gateway\r\nConnection: keep-alive\r\n\
+                        Content-Length: 4096\r\n\r\n";
+            connection.send(head.as_bytes()).await.expect("send the head");
+            let answer = connection.read_response().await.expect("the answer is read whole");
+            assert_eq!((answer.version.as_str(), answer.status), ("HTTP/1.0", 413), "{answer:?}");
+            assert!(answer.announces_close(), "{answer:?}");
+            connection.send(&filler(4096)).await.expect("the client finishes its body");
+            connection.read_eof().await.expect("the connection ends cleanly after the answer");
+        }
+
+        /// A kept-alive connection that stays idle after its last answer is
+        /// closed once the header read timeout passes, with no response
+        /// written: hyper's header read timer also runs while it waits for the
+        /// next head. A front that pools connections must keep its own idle
+        /// timeout below it.
+        #[tokio::test]
+        async fn idle_kept_alive_connection_closes_at_the_header_read_timeout() {
+            let header_read_timeout = Duration::from_millis(500);
+            let limits = ServerLimits { header_read_timeout, ..test_limits() };
+            let (gateway, _, _servers) =
+                TestGateway { limits, ..TestGateway::default() }.spawn().await;
+            let mut connection = RawConnection::open(gateway).await;
+
+            let answer = connection.exchange(HEALTH).await.expect("the first request is served");
+            assert_eq!(answer.status, 200, "{answer:?}");
+            // an idle spell shorter than the timeout leaves the connection
+            // open, and the timer counts from the last request, not from the
+            // connection's start
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let last_request = Instant::now();
+            let answer = connection.exchange(HEALTH).await.expect("the second request is served");
+            assert_eq!(answer.status, 200, "{answer:?}");
+            assert!(!answer.announces_close(), "{answer:?}");
+
+            connection.read_eof().await.expect("closed with no response written");
+            let idle = last_request.elapsed();
+            assert!(idle >= header_read_timeout, "closed after {idle:?}, before the timeout");
+            let margin = header_read_timeout + Duration::from_secs(3);
+            assert!(idle < margin, "closed after {idle:?}, long after the timeout");
+        }
+
+        /// A body sent with its head, in one write, counts as read only when
+        /// hyper's first read of the request took all of it: that read is
+        /// 8 KiB, head included, and the service is handed what it holds, so
+        /// the close is announced from a request of 8 KiB and one byte on (a
+        /// 56-byte head and an 8137-byte body). A larger body may
+        /// have arrived in full, but the gateway cannot see what is still in
+        /// the socket, so a `429` to it announces a close: a reconnect the
+        /// client could have been spared, never a lost request.
+        #[tokio::test]
+        async fn early_answer_to_a_body_sent_with_its_head_closes_past_the_first_read() {
+            let gateway = TestGateway { layers: rate_limited(1, true), ..TestGateway::default() };
+            let (gateway, _, _servers) = gateway.spawn().await;
+            spend_token(&mut RawConnection::open(gateway).await).await;
+
+            for (len, closes) in [(300, false), (12_000, true), (20_000, true)] {
+                let what = format!("429 to a {len}-byte body sent with its head");
+                let mut connection = RawConnection::open(gateway).await;
+                let request = whole("POST", "/", &padded_call(1, len));
+                let answer = connection.exchange(request.as_bytes()).await;
+                let answer = answer.unwrap_or_else(|err| panic!("{what}: {err}"));
+                assert_eq!(answer.status, 429, "{what}: {answer:?}");
+                assert_eq!(answer.announces_close(), closes, "{what}: {answer:?}");
+                assert_closed_or_reusable(&mut connection, &answer, b"", &what).await;
+            }
+        }
+
+        /// A client whose bytes are always ready the moment they are asked
+        /// for, and which accepts every write and the shutdown.
+        struct AlwaysReady;
+
+        impl AsyncRead for AlwaysReady {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let len = buf.initialize_unfilled().len();
+                buf.advance(len);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for AlwaysReady {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        /// The linger's time bound holds against a client whose bytes are
+        /// always ready, whose reads never return `Pending`: the time bound
+        /// ends the linger, not the byte bound.
+        #[tokio::test]
+        async fn linger_ends_at_its_time_bound_against_bytes_always_ready() {
+            const LINGER: Duration = Duration::from_millis(50);
+            // far more than can be read in the test's time (1 TiB), and
+            // finite, so a linger without the time bound fails the test
+            // rather than hanging it
+            let max_discard = usize::try_from(1_u64 << 40).unwrap_or(usize::MAX);
+            let armed = LingerOnClose::default();
+            armed.arm();
+            let mut stream = LingeringStream::new(AlwaysReady, armed, LINGER, max_discard);
+
+            let started = Instant::now();
+            stream.shutdown().await.expect("the shutdown completes");
+            let took = started.elapsed();
+            assert!(
+                stream.discarded < max_discard,
+                "ended at its byte bound after {took:?}, not at its time bound"
+            );
+            assert!(took >= LINGER, "ended after {took:?}, before the linger ran out");
+            let margin = LINGER + Duration::from_secs(4);
+            assert!(took < margin, "ended after {took:?}, long after the linger ran out");
+        }
+
+        /// A [`WatchedBody`] over `body`, and the flag it sets once `body` is
+        /// read to its end.
+        fn watched(body: Body) -> (WatchedBody, Arc<AtomicBool>) {
+            let read = Arc::new(AtomicBool::new(false));
+            (WatchedBody { body, read: Arc::clone(&read), failed: false }, read)
+        }
+
+        /// Poll `body` once without waiting, as hyper's own read of it does.
+        fn poll_once(body: &mut WatchedBody) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+            Pin::new(body).poll_frame(&mut Context::from_waker(Waker::noop()))
+        }
+
+        /// A streamed body of `chunks`, whose end shows only once they are
+        /// taken, and which is then still pending when `then_pending` is set.
+        fn streamed(chunks: &[&'static str], then_pending: bool) -> Body {
+            let chunks: Vec<Result<Bytes, io::Error>> =
+                chunks.iter().map(|chunk| Ok(Bytes::from_static(chunk.as_bytes()))).collect();
+            let chunks = stream::iter(chunks);
+            if then_pending {
+                Body::from_stream(chunks.chain(stream::pending()))
+            } else {
+                Body::from_stream(chunks)
+            }
+        }
+
+        #[test]
+        fn watched_body_read_to_its_end_counts_as_read() {
+            let (mut body, read) = watched(streamed(&["{", "}"], false));
+            for _ in 0..2 {
+                assert!(matches!(poll_once(&mut body), Poll::Ready(Some(Ok(_)))));
+                assert!(!read.load(Ordering::Relaxed), "a frame short of the end is not the end");
+            }
+            assert!(matches!(poll_once(&mut body), Poll::Ready(None)));
+            assert!(read.load(Ordering::Relaxed), "the end marks the body read while it is held");
+
+            // a body that knows its length ends with its last frame
+            let (mut body, read) = watched(Body::from("{}"));
+            assert!(matches!(poll_once(&mut body), Poll::Ready(Some(Ok(_)))));
+            assert!(read.load(Ordering::Relaxed), "a frame that leaves nothing to read is the end");
+        }
+
+        /// What hyper does with a small body that came with its head: the
+        /// whole body waits, unpolled, when the service drops it.
+        #[test]
+        fn watched_body_dropped_holding_its_frames_counts_as_read() {
+            let (body, read) = watched(Body::from("{}"));
+            drop(body);
+            assert!(read.load(Ordering::Relaxed), "a body held whole counts as read");
+
+            let (body, read) = watched(streamed(&["{", "}"], false));
+            drop(body);
+            assert!(read.load(Ordering::Relaxed), "frames held up to the end count as read");
+        }
+
+        /// What hyper does with a body it cannot decode: an error, then an
+        /// end of stream, and the connection closes.
+        #[test]
+        fn watched_body_that_failed_is_unread() {
+            let failing = || {
+                let frames: Vec<Result<Bytes, io::Error>> =
+                    vec![Ok(Bytes::from_static(b"{")), Err(io::Error::other("bad chunk"))];
+                Body::from_stream(stream::iter(frames))
+            };
+
+            let (mut body, read) = watched(failing());
+            assert!(matches!(poll_once(&mut body), Poll::Ready(Some(Ok(_)))));
+            assert!(matches!(poll_once(&mut body), Poll::Ready(Some(Err(_)))));
+            assert!(matches!(poll_once(&mut body), Poll::Ready(None)));
+            assert!(
+                !read.load(Ordering::Relaxed),
+                "the end that follows a failed read is not the body's"
+            );
+
+            let (body, read) = watched(failing());
+            drop(body);
+            assert!(
+                !read.load(Ordering::Relaxed),
+                "a body dropped holding a failed read is unread"
+            );
+        }
+
+        #[test]
+        fn watched_body_dropped_while_pending_is_unread() {
+            let (body, read) = watched(streamed(&[], true));
+            drop(body);
+            assert!(!read.load(Ordering::Relaxed), "a body nothing of which arrived is unread");
+
+            let (body, read) = watched(streamed(&["{"], true));
+            drop(body);
+            assert!(!read.load(Ordering::Relaxed), "a body whose rest has not arrived is unread");
+        }
     }
 }
