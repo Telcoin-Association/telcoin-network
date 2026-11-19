@@ -207,22 +207,30 @@ bind it to an internal interface.
 
 ## Deployment
 
-A container image is built by `bin/node-record-api/Dockerfile` (rust:1.94 builder, slim debian
-runtime, non-root user). Build it from the repository root, with the `tn-contracts` submodule
-checked out (`make init-submodules`), and pass the commit so that `--version` reports it:
+Every signed release that ships node-record-api publishes its image, built from the release's commit, as `ghcr.io/telcoin-association/tn-node-record-api`.
+Run that image pinned by digest: once `SHA256SUMS-edge` and its signatures have verified, take the image reference from the release's `IMAGE_DIGEST-node-record-api` file, as the "Edge images" and "Check the edge images" steps of [Installing a release](../../docs/src/getting-started/installing-a-release.md#edge-services-worker-gateway-and-node-record-api) show.
+The file holds the full reference, `ghcr.io/telcoin-association/tn-node-record-api@sha256:<64 hex>`; put that, not a tag, in compose files, systemd units and manifests.
+A tag can be moved to another image (`:latest` moves to each final mainnet release and `:adiri` to each final Adiri release), while a digest names exactly one image; the signed `SHA256SUMS-edge` covers it through the hash of `IMAGE_DIGEST-node-record-api`, and Docker checks an image pulled by digest against it.
+The release images are `linux/amd64` only.
+
+To build an image yourself instead, use `bin/node-record-api/Dockerfile` (rust:1.94 builder, slim debian runtime, non-root user).
+Build it from the repository root, with the `tn-contracts` submodule checked out (`make init-submodules`), and pass the commit so that `--version` reports it (without `GIT_SHA` it reports `Commit SHA: unknown`):
 
 ```
 docker build -f bin/node-record-api/Dockerfile \
-  --build-arg GIT_SHA=$(git rev-parse HEAD) -t telcoin-node-record-api:latest .
+  --build-arg GIT_SHA=$(git rev-parse HEAD) -t telcoin-node-record-api:<tag> .
 ```
 
-Run it against testnet with the chain-config files from the repository:
+Such an image is not signed; to deploy it, push it to your own registry and pin it by digest there too.
+
+Run it against testnet with the chain-config files from the repository, with `IMAGE` set to the content of `IMAGE_DIGEST-node-record-api` (or to your own build's tag):
 
 ```
+IMAGE="ghcr.io/telcoin-association/tn-node-record-api@sha256:<64 hex>"
 docker run --rm -p 8080:8080 \
   -v "$PWD/chain-configs/testnet/committee.yaml:/etc/node-record-api/committee.yaml:ro" \
   -v "$PWD/chain-configs/testnet/bootstrap_servers.yaml:/etc/node-record-api/bootstrap_servers.yaml:ro" \
-  telcoin-node-record-api:latest \
+  "$IMAGE" \
   --chain-id 2017 \
   --committee-file /etc/node-record-api/committee.yaml \
   --bootstrap-servers-file /etc/node-record-api/bootstrap_servers.yaml

@@ -148,7 +148,7 @@ Every flag has an environment-variable fallback.
 | `--upstream-client-key` | `WORKER_GATEWAY_UPSTREAM_CLIENT_KEY` | (none) | Unencrypted PEM private key for `--upstream-client-cert`; requires `--upstream-client-cert`. |
 | `--dns-cache-ttl` | `WORKER_GATEWAY_DNS_CACHE_TTL` | `30s` | How long an upstream host's resolved addresses are reused (`0` disables the cache); see [DNS and the DDoS front](#dns-and-the-ddos-front). |
 | `--max-concurrent-dns-lookups` | `WORKER_GATEWAY_MAX_CONCURRENT_DNS_LOOKUPS` | `8` | Upstream DNS lookups that may run at once, for the proxy and the readiness poller each (at least `1`); a lookup over the cap fails at once and does not count toward `--upstream-failure-threshold`. |
-| `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard); a `--proxy-protocol` connection from a listed front gets one more for its PROXY header. |
+| `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard), for every request on a connection, so a kept-alive connection idle that long is closed (see [Connection handling](#connection-handling)); a `--proxy-protocol` connection from a listed front gets one more for its PROXY header. |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. Each connection needs a file descriptor: the gateway raises its soft `RLIMIT_NOFILE` to the hard limit at startup and warns when this cap plus the upstream caps exceed it. |
 | `--max-connections-per-ip` | `WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP` | `32` | Concurrent inbound connections per client prefix, keyed on the resolved client (the PROXY header's source, else the peer); connections from `--trusted-proxies` are not counted (`0` disables; see [Connection handling](#connection-handling)); keep it at or below `--rate-limit-per-ip-burst`, so that with `--rate-limit-submissions` the first requests of every connection a client opens at once are charged against its bucket. |
 | `--max-inflight-submissions` | `WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS` | `256` | In-flight cap for requests made only of submissions; over it the gateway answers `503` at once (`0` = unlimited). |
@@ -290,6 +290,12 @@ It must be at least the gateway's single-request bound
 first request on a connection can never be cut off.
 With the default timeouts that bound is 55 s (10 s + 35 s + 10 s), or 65 s with `--proxy-protocol`, and an explicit `--max-connection-duration` below it fails startup.
 
+An answer the gateway gives before it has read the request body to its end, such as the rate limiter's `429`, the `413` for a declared `Content-Length` over `--max-request-bytes` or a `405`, carries `Connection: close`, and the connection ends after it, so a client that pools connections opens a new one for its next request instead of sending it on a connection that is closing.
+A request without a body, one whose body was read, and one whose short body arrived with its head (hyper, the HTTP library underneath, has read it already) keep their connection.
+After such an answer the gateway sends its FIN and then reads and discards what the client still sends, until the client closes its side, for at most 2 s (`--header-read-timeout` if that is shorter) and at most `--max-request-bytes`, so a client still sending the body reads the answer rather than a reset.
+Between requests, a kept-alive connection has `--header-read-timeout` (10 s by default) for its next request head, as a new connection has for its first, so one left idle that long after its last answer is closed without a response; `--max-connection-duration` closes an idle one at once (see above).
+What a front that pools its connections to the gateway has to set for these closes is in [Behind a reverse proxy](#behind-a-reverse-proxy).
+
 Every request forwarded to a worker carries the `X-TN-Gateway` hop marker (calls
 sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, see
 [Query redirect](#query-redirect)), and an inbound
@@ -330,7 +336,7 @@ Once the request is read and classified, its first call is charged to the global
 A refusal there is a `429` that spends no other shared bucket, so a refused submission spends no global token and a refused query no submission token, but the per-IP token stays spent: the body has been read and screened by then, and that token pays for the work.
 A first-seen client gets its per-IP entry at that charge, whether its class bucket admits or refuses the request, or, for a request answered before it is classified (a `405`, an unreadable or over-length body, a denied method, a loop), at its settlement, whatever the global bucket says; so an entry costs the per-IP token that paid for reading the request, and a flood the shared buckets refuse can add entries up to `--rate-limit-per-ip-max-entries`, each of which then holds its client to the per-IP limit at the edge.
 While the table is full, the requests of further first-seen clients are metered on the overflow bucket, and every charge metered there (a request's first call, a batch's calls beyond the first) is counted by `tn_worker_gateway_rate_limit_overflow_total`.
-Such a `429` comes after the body has been read (up to `--max-request-bytes`) and parsed, where without the flag the global `429` leaves before the body is read; that work is bounded by `--max-connections`, the per-client connection cap (`--max-connections-per-ip`) and the per-IP limit, which refuses a client at the edge, before its body is read, once its refused requests have spent its burst.
+Such a `429` comes after the body has been read (up to `--max-request-bytes`) and parsed, where without the flag the global `429` leaves before the body is read; that work is bounded by `--max-connections`, the per-client connection cap (`--max-connections-per-ip`, which does not count a front listed in `--trusted-proxies`; see [Behind a reverse proxy](#behind-a-reverse-proxy)) and the per-IP limit, which refuses a client at the edge, before its body is read, once its refused requests have spent its burst.
 A first-seen client's concurrent first requests all pass the edge before its entry exists, and their tokens are recorded against the entry as debt (down to minus one burst), so its sustained rate stays the per-IP rate but its first burst can reach the number of requests it has in flight; keep `--max-connections-per-ip` at or below `--rate-limit-per-ip-burst` (32 and 200 at the defaults), and note that a client named by a trusted `X-Forwarded-For` front is not under the per-client connection cap.
 A submission over its own budget is refused even while the global bucket has tokens, since letting it spend them would hand the read budget back to a submission flood.
 A batch then pays for its calls beyond the first from the per-IP and global buckets whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not; that refusal gives the first call's class token back; its per-IP token stays spent.
@@ -518,7 +524,7 @@ A request made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync`
 
 A class slot is held from classification until the response body has been sent to the client, or until the request fails, so a query upstream that sends its head and then stalls still holds only query slots.
 A client that reads its response slowly holds its query slot for the whole transfer too: with the defaults, 80 slow readers (256 with `--redirect-queries`) put every other read on `503`, while submissions keep their own slots.
-On Linux `TCP_USER_TIMEOUT` (`--tcp-user-timeout`, 30 s) ends a read whose client stops acknowledging, and `--max-connection-duration` (10 m) ends one that trickles; on other hosts only `--max-connection-duration` does (see [Connection handling](#connection-handling)), and the per-IP limit and `--max-connections-per-ip` bound how many such reads one client starts.
+On Linux `TCP_USER_TIMEOUT` (`--tcp-user-timeout`, 30 s) ends a read whose client stops acknowledging, and `--max-connection-duration` (10 m) ends one that trickles; on other hosts only `--max-connection-duration` does (see [Connection handling](#connection-handling)), and the per-IP limit and `--max-connections-per-ip` bound how many such reads one client starts (behind a front listed in `--trusted-proxies`, the per-IP limit alone; see [Behind a reverse proxy](#behind-a-reverse-proxy)).
 An upstream that keeps sending, however slowly, holds its slot the same way, so the query URL can hold every query slot for up to `--max-connection-duration` plus the request deadline.
 With `--max-connection-duration 0`, neither a trickling read nor a trickling upstream has a time bound, and startup warns.
 A worker slot is released when the worker's response head arrives: by then the worker has built the whole response and freed its own connection permit.
@@ -566,7 +572,7 @@ Size it from both ends:
   Each extra connection adds at most `--http1-max-buf-size`.
   Raising `--max-request-bytes` does not raise the memory bound, but it makes the budget cheaper to exhaust: a request reserves its declared length (or the whole cap when chunked) from its head and holds it until the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 45 s by default) even if no body byte arrives.
   About `--max-inflight-request-bytes` / `--max-request-bytes` such idle requests (512 at the defaults, 35 at a 15 MiB cap) make every other body-carrying request fail with `-32010`.
-  On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); the per-client connection cap (`--max-connections-per-ip`) bounds how many of them one client can hold.
+  On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); the per-client connection cap (`--max-connections-per-ip`) bounds how many of them one client can hold, except behind a front listed in `--trusted-proxies`, whose connections it does not count, so there the front has to bound how long a request may take to arrive (see [Behind a reverse proxy](#behind-a-reverse-proxy)).
   The budget is shared by every client and no client prefix's share of it is capped, so below that point a few clients together, or one client when the quotient is at or below `--max-connections-per-ip`, can hold all of it with idle requests; startup warns in that case too.
   If the limit has to stay lower, lower the budget, for example `--max-inflight-request-bytes 268435456` (256 MiB) for about 352 MiB.
   A 256 MiB budget is exhausted by 256 idle requests, so on an internet-facing gateway lower `--max-connections` to 256 with it, which brings the figure to about 336 MiB.
@@ -645,6 +651,8 @@ The URL may be `http` or `https`, as worker URLs may.
 An `https` URL needs the system CA certificates, which the image installs; `--upstream-ca-cert` and the client certificate apply to it as well (see [TLS to workers](#tls-to-workers)).
 The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names, `localhost` as both `127.0.0.1` and `[::1]`, and an unspecified host (`0.0.0.0`, `[::]`) as any loopback or unspecified address, since a node bound to one answers on the loopback addresses.
 A URL elsewhere on a worker's machine, at another port or on another loopback address at its port (such as `[::1]` or `127.0.0.2` beside a worker on `127.0.0.1`, which a separate node can bind), logs a warning at startup, and so does plain `http` to a host that is not a loopback, private, carrier-grade NAT (`100.64.0.0/10`) or link-local (`169.254.0.0/16`, `fe80::/10`) address.
+A host name other than `localhost` counts as public for the second warning, because the gateway does not resolve it.
+Neither warning stops the gateway, and each repeats at every start for as long as the configuration stands: use `https` or a private address literal to clear the second, and accept the first when the URL serves a separate node.
 A value that is not a valid URL stops startup with an error that says what is wrong without repeating the value, which can carry an API key.
 
 A batch goes to the worker only when every element is a submission.
@@ -759,7 +767,7 @@ The three probes answer on `--listen-addr`, exempt from rate limiting but inside
 With `--probe-addr <addr>` set, they also answer on a listener of their own that serves nothing else (a request for any other path gets `404`), with no connection cap, no rate limit and no body limit.
 Each connection to it serves one request, whose head must arrive within the header read deadline and be at most 8 KiB; a larger head gets `431`.
 A flood that holds every client connection then cannot make the probes time out, as it can on the client port, where a timed-out liveness probe gets a healthy pod restarted.
-Point orchestrator probes at it, and keep it reachable from the orchestrator only, since it has no connection cap.
+Point orchestrator probes at it, and keep it reachable from the orchestrator only, since it has no connection cap; a front on the same host may relay probe requests to it (see [Behind a reverse proxy](#behind-a-reverse-proxy)).
 It keeps answering through the shutdown delay, so probes aimed at it see the draining `503`, and stops accepting when the client listener does (see [Graceful shutdown](#graceful-shutdown)).
 `--probe-addr` must not collide with `--listen-addr`; the gateway refuses to start if it does.
 
@@ -939,7 +947,7 @@ A line never carries the request URL, a header value, the body, the params, or a
 Under `--log-format json` a line is one object with `target` `gateway::access` and the same fields under `fields`, next to `message` `request`.
 With the default `--log-filter info` the lines join the gateway's normal output; a filter such as `warn,gateway::access=info` keeps them while quieting the rest.
 The line rate follows the raw request rate, ahead of the rate limiter: it is `rate` times whatever clients send, `429`s included, capped at `--access-log-max-lines-per-second` (default 1000; lines over it are dropped and counted in `tn_worker_gateway_access_log_suppressed_total`; the cap counts whole seconds, so a burst across one second's edge can write about twice it), so size the rate for the request rate a flood can reach at the listener, not for `--rate-limit-global`.
-One client is no exception: its `429`s are logged too, so its lines are bounded by how fast it can send on its `--max-connections-per-ip` connections, not by its rate limit.
+One client is no exception: its `429`s are logged too, so its lines are bounded by how fast it can send on its `--max-connections-per-ip` connections, or behind a front listed in `--trusted-proxies`, whose connections that cap does not count, on the front's, not by its rate limit.
 The ceiling is one window shared by every client: a client sending a flood of `429`s can take every line of a second, and the other clients' sampled lines in that second, proxied ones included, are dropped and counted, so a rising `tn_worker_gateway_access_log_suppressed_total` means lines of any client were lost.
 This is deliberate: the ceiling protects the log consumer, and a per-client share would need per-client state on the hot path.
 Lines are written synchronously to standard output, so a log consumer that stops reading stalls request handling, `/health` and `/ready` included, once the pipe fills; keep the rate low on a public edge and send standard output to a consumer that keeps up.
@@ -1013,6 +1021,84 @@ Without one, a `--redirect-queries` host that resolved slowly under steady reads
 - A steady rate of `tn_worker_gateway_dns_lookups_total{result="rejected"}` means more upstream names are resolving slowly at once than the cap allows.
   Fix the resolver before raising the cap: every slot is a thread blocked in the system resolver.
 
+### Behind a reverse proxy
+
+These rules are for an HTTP front between clients and the gateway: Caddy, which the [tn-node-deployment](https://github.com/Telcoin-Association/tn-node-deployment) scripts install in front of a gateway, nginx, HAProxy in HTTP mode, or a cloud HTTP load balancer.
+For a Caddy on the gateway's host, with the gateway started with `--listen-addr 127.0.0.1:8545 --probe-addr 127.0.0.1:8546 --trusted-proxies 127.0.0.1/32`, the rules below come to this Caddyfile, where `rpc.example.com` stands for the gateway's public name:
+
+```caddyfile
+{
+	servers {
+		timeouts {
+			read_header 2s
+			read_body 2s
+		}
+	}
+}
+
+rpc.example.com {
+	# optional: the probes, answered by the gateway's probe listener
+	@probes {
+		method GET HEAD
+		path /health /ready /ready/any
+	}
+	handle @probes {
+		reverse_proxy 127.0.0.1:8546
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8545 {
+			transport http {
+				keepalive 5s
+			}
+		}
+	}
+}
+```
+
+**Early answers.**
+An answer the gateway gives before it has read the request body carries `Connection: close`, and the gateway then closes the connection (see [Connection handling](#connection-handling)).
+A front that pools connections drops that connection after the answer and opens a new one for its next request, so it needs no setting for this; each such answer costs it one new connection to the gateway.
+
+**Idle connections.**
+The gateway closes a kept-alive connection that stays idle for `--header-read-timeout` (10 s by default) after its last answer, and closes any connection when it reaches `--max-connection-duration` (10 min after accept by default), at once if it is idle (see [Connection handling](#connection-handling)).
+A front that keeps an idle upstream connection longer can send a request on it just as the gateway closes it; Caddy does not resend a `POST` that failed that way, so the client gets a `502` from Caddy.
+Have the front drop idle upstream connections well before the gateway does: in Caddy, `keepalive 5s` in the `reverse_proxy` block's `transport http`, as above (Caddy's default is 2 minutes); elsewhere, the front's idle timeout for upstream connections, such as `keepalive_timeout` in an nginx `upstream` block (60 s by default).
+Raising `--header-read-timeout` past the front's idle timeout instead would also give every client that long to send each request head and lengthen the whole-request deadline (`--upstream-request-timeout` + `--header-read-timeout`), the gateway's bounds on a slow client; lower the front's timeout instead.
+The lifetime cap can still close an idle connection just as the front picks it, at most once per connection lifetime; no idle setting avoids that.
+
+**Client address.**
+List the front's own addresses in `--trusted-proxies`, so the gateway attributes each request to the right-most `X-Forwarded-For` entry that is not listed, and have the front end that header with the address it received the connection from, appended or in place of what the client sent, never passing the client's own value on unchanged (see [Client identity behind a front](#client-identity-behind-a-front)).
+Caddy's `reverse_proxy` does this by default: unless the client's address is in Caddy's own `trusted_proxies` server option, it discards the `X-Forwarded-For` the client sent, sends the client's address instead and sets `X-Forwarded-Proto`, so leave `trusted_proxies` unset, or limited to fronts ahead of Caddy.
+On one host, give Caddy the address literal the gateway listens on and lists, as above (`127.0.0.1`, not `localhost`, which can resolve to `::1`), so the peer the gateway sees is the one it trusts.
+
+**Per-client bounds behind a listed front.**
+The per-client connection cap does not count a front listed in `--trusted-proxies` (see [Connection handling](#connection-handling)), so behind such a front one client's share of the gateway's connections is bounded only by its per-IP rate (`--rate-limit-per-ip`, 100 a second, with a burst of 200 by default) and by how long its requests take to arrive.
+One client can then have about burst + rate × T requests open at once, where T is that time: with the gateway's whole-request deadline alone (45 s by default), 200 + 100 × 45 = 4,700, far more than `--max-connections` (500) and than the 512 idle 1 MiB requests that use up `--max-inflight-request-bytes` (see [Request size](#request-size)).
+The front has to bound T: Caddy's `read_body` server timeout bounds how long Caddy reads a request, its body included, and Caddy applies none unless it is set; nginx instead reads the whole body before it connects upstream (`proxy_request_buffering on`, its default).
+Keep burst + rate × `read_body` below both figures, which at the defaults means a `read_body` of at most 2 s (200 + 100 × 2 = 400), still enough for a 1 MiB body at about 4 Mbit/s, or lower the per-IP rate and burst.
+`read_header` protects the front itself: an HTTP front reads a request's whole head before it connects upstream, so a slow head never reaches the gateway.
+Behind an L4 front that sends PROXY protocol headers, each client is under the per-client cap on its own (see [Client identity behind a front](#client-identity-behind-a-front)).
+
+**Health checks.**
+A front that balances over several gateways checks each on `/ready/any`, which answers `200` while the gateway can serve any route, and on `/ready` only when it can send submissions to another validator's gateways instead (see [Gateway endpoints](#gateway-endpoints) and [DNS and the DDoS front](#dns-and-the-ddos-front)); in Caddy, `health_uri /ready/any` in the `reverse_proxy` block.
+A front with a single gateway behind it gains nothing from the check: with its only upstream marked down, it answers every request itself, without the gateway's JSON-RPC errors.
+A monitor should alert on each route on its own, from `/ready` for submissions or from the `submissions` and `queries` fields of `/ready/any`: `/ready/any` itself stays `200` while one of the two works.
+A front on the gateway's host may relay clients' `GET` and `HEAD` on `/health`, `/ready` and `/ready/any` to `--probe-addr`, as the `@probes` route above does, and run its own checks there (Caddy: `health_port`), so a connection flood on the client listener cannot make them time out.
+The probe listener has no connection cap or rate limit, which is why clients must not reach it directly, but behind an HTTP front a client that sends slowly holds a connection to the front, not to the probe listener, which sees one short connection per relayed request, answered from memory.
+
+**Caps along the path.**
+Through a gateway the smallest limits are the gateway's own, on either route: 50 calls in a batch (`--max-batch-len`, or the smallest per-IP or global burst when that is lower; see [Batches](#batches)) and a 1 MiB body (`--max-request-bytes`; see [Request size](#request-size)).
+The read node at the `--redirect-queries` URL takes up to 100 calls in a batch at its default `--rpc.max-batch-requests`, and a larger body, so a client can batch at most 50 calls through a gateway, and a client that reaches a read node directly meets that node's limits instead.
+
+**A forwarding RPC node is one client.**
+An RPC node that forwards its users' transactions to the endpoints validators advertise reaches the gateway from its own address, so everything it forwards counts as one client: one `--rate-limit-per-ip` bucket (100 a second, burst 200, by default) and, unless it comes through a listed front, one `--max-connections-per-ip` count (32).
+It sends no `X-Forwarded-For`, so listing it in `--trusted-proxies` does not lift that limit, and the gateway has no per-client override.
+To let such a node forward more, raise `--rate-limit-per-ip` and its burst, which applies to every client, or spread the forwarding over more nodes, each at an address of its own (for IPv6, in another `/64` at the default `--rate-limit-per-ip-v6-prefix`).
+
+**One query URL.**
+`--redirect-queries` takes one URL, and the query route has no fallback (see [Query redirect](#query-redirect)): while the URL is unreachable, every call the gateways send there gets `502` / `-32001` or `504` / `-32002`, while submissions still reach the worker and `/ready/any` stays `200` as long as the worker is ready.
+Point it at an address that survives one read node's restart, such as a front over two or more read nodes, rather than at a single node.
+
 ### Firewalling
 
 - The worker's RPC port: reachable from the gateway hosts only.
@@ -1024,13 +1110,21 @@ Without one, a `--redirect-queries` host that resolved slowly under steady reads
 
 ## Deployment
 
-A container image is built by `bin/worker-gateway/Dockerfile`, which mirrors the
-node's `etc/Dockerfile` (rust:1.94 builder, slim debian runtime, non-root user).
-Build it from the repository root:
+Every signed release that ships the gateway publishes its image, built from the release's commit, as `ghcr.io/telcoin-association/tn-worker-gateway`.
+Run that image pinned by digest: once `SHA256SUMS-edge` and its signatures have verified, take the image reference from the release's `IMAGE_DIGEST-worker-gateway` file, as the "Edge images" and "Check the edge images" steps of [Installing a release](../../docs/src/getting-started/installing-a-release.md#edge-services-worker-gateway-and-node-record-api) show.
+The file holds the full reference, `ghcr.io/telcoin-association/tn-worker-gateway@sha256:<64 hex>`; put that, not a tag, in compose files, systemd units and manifests.
+A tag can be moved to another image (`:latest` moves to each final mainnet release and `:adiri` to each final Adiri release), while a digest names exactly one image; the signed `SHA256SUMS-edge` covers it through the hash of `IMAGE_DIGEST-worker-gateway`, and Docker checks an image pulled by digest against it.
+The release images are `linux/amd64` only.
+
+To build an image yourself instead, use `bin/worker-gateway/Dockerfile`, which mirrors the node's `etc/Dockerfile` (rust:1.94 builder, slim debian runtime, non-root user).
+Build it from the repository root, and pass the commit so that `--version` reports it (without `GIT_SHA` it reports `Commit SHA: unknown`):
 
 ```
-docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:<tag> .
+docker build -f bin/worker-gateway/Dockerfile \
+  --build-arg GIT_SHA=$(git rev-parse HEAD) -t telcoin-worker-gateway:<tag> .
 ```
+
+Such an image is not signed; to deploy it, push it to your own registry and pin it by digest there too.
 
 The local compose testnet (`etc/compose.yaml`, started with `make up`) is a running example: `worker-gateway1` to `worker-gateway4` each front one validator, with `--redirect-queries` pointing at an observer node in the same network.
 Each gateway's probe listener (`127.0.0.1:8546`) serves the compose healthcheck, which reads `/ready/any`, and its metrics bind its bridge address for the stack's Prometheus.
