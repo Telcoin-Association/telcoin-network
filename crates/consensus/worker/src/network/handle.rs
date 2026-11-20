@@ -69,9 +69,20 @@ const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// inside this bound. Pairs with [`SYNC_ACK_TIMEOUT`] for the reply.
 pub(crate) const SYNC_REQUEST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Headroom added to `max_batch_size` for the sync-frame envelope (the `SyncFrame`
-/// enum tag and the `Data` length prefix) when bounding a decoded frame.
-const SYNC_FRAME_OVERHEAD: usize = 1024;
+/// Headroom added to `max_batch_size` when bounding a decoded sync frame.
+///
+/// `max_batch_size` counts transaction bytes only. An encoded batch also carries a
+/// length prefix for each transaction, the transaction count and the batch header
+/// fields, and the frame adds the `SyncFrame` enum tag and the `Data` length
+/// prefix. The headroom covers all of these for any batch within `max_batch_size`.
+///
+/// The smallest transaction that decodes is 10 bytes (a legacy RLP list of nine
+/// fields), so a batch holds at most `max_batch_size / 10` transactions and at
+/// most 100,000 prefix bytes at the 1,000,000-byte limit. A longer transaction
+/// has a longer prefix at a lower rate (2 bytes for 128 bytes or more). The rest
+/// is under 64 bytes. A fork that raises `max_batch_size` must raise this value
+/// with it.
+const SYNC_FRAME_OVERHEAD: usize = 128 * 1024;
 
 /// Maximum number of retries through the full peer list in `request_batches()`.
 const MAX_BATCH_REQUEST_RETRIES: usize = 3;
