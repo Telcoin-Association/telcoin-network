@@ -10,6 +10,10 @@ target
 .gitignore
 .gitmodules
 
+# Release signing tooling and maintainer keys (the tn-release-signing submodule): the
+# node image's `COPY . .` does not need them.
+release
+
 # Secrets / local / dev / runtime state
 .env
 .env.example

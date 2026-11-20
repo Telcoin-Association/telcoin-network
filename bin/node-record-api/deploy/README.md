@@ -20,8 +20,12 @@ load grows.
 
 ## Placeholders to replace
 
-- **Image ref** (`deployment.yaml`): `telcoin-node-record-api:latest` is a local build tag.
-  Point it at your registry, e.g. `registry.example.com/telcoin/node-record-api:<tag>`.
+- **Image ref** (`deployment.yaml`): `telcoin-node-record-api:latest` is a placeholder.
+  Replace it with the signed release image pinned by digest: the full content of the release's `IMAGE_DIGEST-node-record-api`, `ghcr.io/telcoin-association/tn-node-record-api@sha256:<64 hex>`, taken once `SHA256SUMS-edge` and its signatures have verified, as the "Edge images" and "Check the edge images" steps of [Installing a release](../../../docs/src/getting-started/installing-a-release.md#edge-services-worker-gateway-and-node-record-api) show.
+  The digest pins the pod to the one image the release's signed manifest covers; a tag, `:latest` and `:adiri` above all, can move to another image, so do not deploy one.
+  At a new release, run the same steps for its tag, put the new file's content in `image:` and apply the Deployment, which rolls the pod over to it.
+  The release images are `linux/amd64` only, so on a cluster with nodes of other architectures add a `nodeSelector` on `kubernetes.io/arch: amd64`.
+  For an image you build yourself (see the README's "Deployment" section), push it to your registry and pin it by digest the same way (`<ref>@sha256:<digest>`); `docker buildx imagetools inspect <ref>:<tag>` prints the digest after a push.
 - **Chain-config files** (`deployment.yaml`): the `node-record-api-committee` ConfigMap is
   created from the repository's `chain-configs/testnet/committee.yaml` and
   `chain-configs/testnet/bootstrap_servers.yaml` in the manifest's comment; create it for the

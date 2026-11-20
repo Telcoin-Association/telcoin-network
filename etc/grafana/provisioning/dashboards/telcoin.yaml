@@ -1,5 +1,6 @@
 # Grafana dashboard provisioning for the observability compose profile.
-# compose.yaml mounts etc/grafana/telcoin-node-metrics.json under this path.
+# compose.yaml mounts etc/grafana/telcoin-node-metrics.json and the gateway's own dashboard,
+# bin/worker-gateway/grafana-worker-gateway.json, under this path.
 apiVersion: 1
 
 providers:

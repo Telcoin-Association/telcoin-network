@@ -140,7 +140,9 @@ In order of importance:
    configuration the lanes read (`.cargo/`, `.config/`, the toolchain pins, and every
    `rustfmt.toml` and `clippy.toml`) to the four accounts in `MAINTAINERS` (the `ci-scope`
    job in `pr.yaml`), so a PR that touches any of them needs one of those four to approve
-   it. GitHub reads CODEOWNERS from the PR's base branch, so a PR cannot change who has to
+   it. `/release` and `/.gitmodules`, which decide which maintainer keys may sign a release,
+   are assigned to the two release key holders instead, so a PR that moves the submodule
+   pointer needs one of them. GitHub reads CODEOWNERS from the PR's base branch, so a PR cannot change who has to
    review it. Other paths need the one approval, but not a code owner's. Recommended, and
    still off: *Require approval of the most recent reviewable push*, so the author of that
    push cannot approve it themselves.
@@ -405,15 +407,17 @@ One thing a pin does newly fix: `taiki-e/install-action` resolves a tool request
 `.github/workflows/release.yaml` checks a release tag, opens a draft GitHub release for it, and checks the release again once a maintainer has published it.
 It builds, signs and publishes nothing: a maintainer does those on their own machines with the `make release-*` targets, which run `etc/release.sh`.
 The procedure is in the [maintainer guide](https://docs.telcoin.network/maintainers/releasing.html), and the checks an operator runs on a release are in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html).
+A release always ships the node, and also the edge services `worker-gateway` and `node-record-api` when `etc/release-components` at the tagged commit lists them; a tag without that file ships the node alone.
+The node's files are in `SHA256SUMS`, signed in `SHA256SUMS.asc`, and the edge services' tarballs and `IMAGE_DIGEST-<service>` files in a second manifest, `SHA256SUMS-edge`, signed in `SHA256SUMS-edge.asc` by the same maintainer keys under the same threshold.
 The release signatures and the on-chain attestation answer different questions: the attestation says a maintainer ran the full suite on a commit, and the signatures say which files the maintainers vouch for as that commit's release.
 
 | Job | Event | Runs | Token | Timeout |
 |---|---|---|---|---|
 | `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `Install Foundry`, `etc/release.sh check-tag`, then `etc/release.sh notes` into the step summary | `contents: read`, `actions: read` | 15 min |
 | `draft-release` | a pushed `v*` tag, once `validate-tag` has passed | `etc/release.sh draft` | `contents: write` | 5 min |
-| `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `Install Foundry`, `etc/release.sh verify` | `contents: read` | 20 min |
+| `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `Install Foundry`, `etc/release.sh verify` | `contents: read` | 30 min |
 
-`validate-tag` checks that the tag is an annotated tag signed by a key in the allowlist (`.github/maintainer-gpg-keys/` on `main`), that it points at a commit on `main` whose Cargo version and `CHANGELOG.md` section match it, and that the commit was attested on-chain, which is what `cast` is installed for.
+`validate-tag` checks that the tag is an annotated tag signed by a key in the allowlist (`release/keys/` at the commit `main` records for the `release` submodule), that it points at a commit on `main` whose Cargo version and `CHANGELOG.md` section match it, and that the commit was attested on-chain, which is what `cast` is installed for.
 A tag is validated against every release tag that exists when it is pushed: on the push, the first run of `validate-tag` compares it with every `v*` tag in its checkout, and a re-run with the tags created before GitHub created the run, which `actions: read` lets it look up; the date in the tag plays no part there.
 The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly there instead of being ignored, and `etc/release.sh` decides what a release tag is.
 `draft-release` creates the draft with the same notes, or refreshes the notes of a draft it created before; the draft carries no assets until the maintainer's `make release-build` uploads them.
@@ -428,12 +432,14 @@ No job in `release.yaml` may be named `CI Success`: item 1 of "Repository settin
 
 ### Scripts and keys come from `main`
 
-Every job checks out `refs/heads/main`, never the tagged tree, with `fetch-depth: 0` (every tag, and the `refs/remotes/origin/main` that the ancestry and version checks read) and `persist-credentials: false`.
+Every job checks out `refs/heads/main`, never the tagged tree, with `fetch-depth: 0` (every tag, and the `refs/remotes/origin/main` that the ancestry and version checks read), `submodules: true` and `persist-credentials: false`.
 The checkout step still receives the job's token and fetches with it; `persist-credentials: false` only keeps the token out of `.git/config` for the steps after it.
 `etc/release.sh`, `.github/scripts/verify_commit_hash.sh` and the allowlist all come from that checkout.
+The allowlist is `keys/` of `tn-release-signing`, the repository of maintainer keys that every signed Telcoin project shares, which `main` carries as the `release` submodule; `etc/release.sh` reads the keys and the signature threshold in `KEYS.md` from the submodule's object store at the commit `main` records, never from its checked-out files, which is why every checkout takes the submodule.
 The reason is the one the `attest` job in `pr.yaml` gives for its `trusted/` checkout: a tag on a commit that edits a script or adds a key would otherwise be judged by its own edit.
-The local `make release-*` targets read the allowlist from `origin/main` as well, and `make release-build` and `make release-publish` refuse to run when `etc/release.sh` or `verify_commit_hash.sh` differs from it.
-The operator check in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) also builds its keyring from a checkout of `main`, and fetches the tag into it by its full name, `refs/tags/<TAG>`, because `git clone --branch <TAG>` prefers a branch of the same name.
+A key reaches the allowlist only through a pull request that moves the `release` pointer on `main`, and `.github/CODEOWNERS` assigns `/release` and `/.gitmodules` to the maintainers who hold release keys, so that move needs one of them to approve it.
+The local `make release-*` targets read the allowlist at the commit `origin/main` records for `release` as well, and `make release-build` and `make release-publish` refuse to run when `etc/release.sh` or `verify_commit_hash.sh` differs from it.
+The operator check in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) also builds its keyring from a checkout of `main` and its `release` submodule, and fetches the tag into it by its full name, `refs/tags/<TAG>`, because `git clone --branch <TAG>` prefers a branch of the same name.
 
 The job definitions are the exception.
 GitHub reads `release.yaml` itself from the tagged commit (for a dispatch, from the branch it runs on), so a tag on a commit that edits the workflow runs the edited workflow under that tag's name.
@@ -444,17 +450,19 @@ What protects a release is the maintainer signatures, which `make release-publis
 ### Why CI never builds
 
 CI cannot run the full suite (the top of this file says why).
-What vouches for a released commit is the attested local run, e2e included, and the release binary and image are built from that commit on the maintainer's host by `make release-build`.
+What vouches for a released commit is the attested local run, e2e included, and the release binaries and images are built from that commit on the maintainer's host by `make release-build`.
 A `GITHUB_TOKEN` must also never be able to publish an artifact.
 A CI build would compile every dependency, build scripts and procedural macros included, in a job holding a token that can upload release assets or push the image.
 In `release.yaml` no job has `packages: write`, and the one job with any write, `draft-release`, runs only the pinned `actions/checkout`, which fetches `main` with the token and does not leave it in the checkout, and `etc/release.sh draft`, which calls `gh`.
 Its `contents: write` lets the token create, edit, publish and delete releases and their assets, and push any branch or tag that no ruleset protects, but it holds no artifact and cannot sign one.
-Anyone with write access can get the same permission from a workflow on their own branch, so what protects an operator is the check in Installing a release: the signature over `SHA256SUMS` against the allowlist on `main`, and the fingerprint comparison with `SECURITY.md` on `main`.
+Anyone with write access can get the same permission from a workflow on their own branch, so what protects an operator is the check in Installing a release: the signature over `SHA256SUMS`, and over `SHA256SUMS-edge` for the edge services, against the allowlist on `main`, and the fingerprint comparison with `KEYS.md` in `main`'s `release` submodule.
 The release text is not protected: anyone with write access can edit a draft's notes, so the install page, built from `main`, is the reference.
 
 ### The post-publish check is detective only
 
-`verify-release` repeats the checks `make release-publish` runs before it publishes: the tag checks, the asset set and `SHA256SUMS`, the signatures on `SHA256SUMS` against the allowlist on `main`, the image digest against the registry, and that the binary in the image is the one in the tarball and reports the tagged commit.
+`verify-release` repeats the checks `make release-publish` runs before it publishes: the tag checks, the asset set that the components of the tag call for, `SHA256SUMS` and, when the tag ships an edge service, `SHA256SUMS-edge`, each with enough maintainer signatures from the allowlist on `main`, each image digest against the registry, and that the binary in each image is the one in its tarball and reports the tagged commit.
+Its log shows one `verified` line for the node, then one for each edge service.
+A tag that ships both edge services has three images to pull and run instead of one, which is why the job's timeout is 30 minutes.
 By the time it runs the release is public, so a failure is an alarm for a maintainer, not a gate.
 It runs only for a publish that was not made with a `GITHUB_TOKEN`: GitHub starts no workflow for an event a `GITHUB_TOKEN` caused, so a draft that anyone with write access publishes from a workflow on their own branch is never checked here and raises no alarm.
 After every publish, check that a `verify-release` run exists for the tag, and if none does, start one with a `verify` dispatch.
@@ -473,16 +481,18 @@ None of these is visible to the workflow, and each closes a gap the workflow lea
    The rule limits who can create, move or delete a `v*` tag and nothing else; it does not limit who can create, edit, publish or delete releases, which write access alone allows.
 2. **Immutable releases** (Settings -> General -> Releases).
    Once a release is published its assets and its tag cannot change, so the files `verify-release` checked are the files operators download.
-3. **The release packages `ghcr.io/telcoin-association/tn-mainnet` (mainnet tags) and `ghcr.io/telcoin-association/tn-testnet` (Adiri tags) are public, linked to this repository, and writable only by the release maintainer account, by account and by workflow.**
+3. **The release packages `ghcr.io/telcoin-association/tn-mainnet` (the node, mainnet tags), `ghcr.io/telcoin-association/tn-testnet` (the node, Adiri tags), `ghcr.io/telcoin-association/tn-worker-gateway` and `ghcr.io/telcoin-association/tn-node-record-api` (the edge services, both shared by mainnet and Adiri tags) are public, linked to this repository, and writable only by the release maintainer account, by account and by workflow.**
    Operators, `verify-release` and `etc/release.sh` read them anonymously, and the script stops with "package is not public" on a 401 or 403 from the registry.
-   A package exists only after its first push, which `make release-build` makes for a network's first release only with `RELEASE_FIRST_PUSH` set to the package, so these settings are made right after it, as the maintainer guide's one-time setup describes; until then ghcr answers 403 for the package as it does for a private one.
-   The `org.opencontainers.image.source` label in `etc/Dockerfile` links the package to the repository when an image is pushed, and GitHub gives the workflows of a linked repository access to the package.
+   A package exists only after its first push, which `make release-build` makes for a network's first release only when `RELEASE_FIRST_PUSH` names the package, so these settings are made right after it, as the maintainer guide's one-time setup describes; until then ghcr answers 403 for the package as it does for a private one.
+   The first release that ships the edge services pushes their two packages the same way, with `RELEASE_FIRST_PUSH=tn-worker-gateway,tn-node-record-api`, the network's package added when it is also the network's first release, and each of them needs these settings.
+   The `org.opencontainers.image.source` label in `etc/Dockerfile`, `bin/worker-gateway/Dockerfile` and `bin/node-record-api/Dockerfile` links the package to the repository when an image is pushed, and GitHub gives the workflows of a linked repository access to the package.
    Two lists in each package's settings decide who can push: under "Manage access", remove the access inherited from this repository and give write only to the release maintainer account; under "Manage Actions access", this repository must be absent or have the Read role.
    Otherwise anyone with write access here can push to the package, directly or from a workflow on any branch that asks for `packages: write`, and overwrite `:vX.Y.Z`, `:latest` or `:adiri`.
    No workflow here asks for `packages: write`, but anyone with write access can add one on a branch, so that is not a control.
-   A digest cannot be overwritten, which is why operators and `verify-release` pull by the digest in `IMAGE_DIGEST`.
-   `etc/release.sh` takes the package from the tag's channel and refuses an `IMAGE_DIGEST` that names an image in any other package, so an Adiri image cannot be released under a mainnet tag, nor the reverse.
-   A third package, `ghcr.io/telcoin-association/tn-dev`, takes the ad-hoc `dev-<flavor>-<TAG>` images of `make docker-adiri` and `make docker-devnet`; it holds no release, and nothing in the release process reads it.
+   A digest cannot be overwritten, which is why operators and `verify-release` pull by the digest in `IMAGE_DIGEST` and `IMAGE_DIGEST-<service>`.
+   `etc/release.sh` takes the node's package from the tag's channel and refuses an `IMAGE_DIGEST` that names an image in any other package, so an Adiri image cannot be released under a mainnet tag, nor the reverse.
+   It takes each edge service's package from the service, for both channels, and refuses an `IMAGE_DIGEST-<service>` that names an image in any other package.
+   Another package, `ghcr.io/telcoin-association/tn-dev`, takes the unsigned ad-hoc images of `make docker-adiri` and `make docker-devnet` (`dev-<flavor>-<TAG>`) and of `make docker-worker-gateway` and `make docker-node-record-api` (`dev-<binary>-<TAG>`); it holds no release, there is no devnet release channel, and nothing in the release process reads it.
    The earlier package `ghcr.io/telcoin-association/telcoin-network` never held a release and is no longer used.
 4. **The repository's default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions).
    `draft-release` asks for `contents: write` in its own `permissions:` block, which GitHub grants regardless of that default; without it `gh release create` fails with a 403.

@@ -70,21 +70,30 @@ The bind is the contract; the firewall is defense in depth.
 
 ## Container deployment
 
-`etc/compose.yaml` binds each validator's listeners to its compose-network address (`--healthcheck 10.10.0.21:8080 --metrics 10.10.0.21:9101` for validator1, and so on) and publishes no health or metrics `ports:`.
-The compose `healthcheck:` on each validator probes `/health/network` from inside the container.
+`etc/compose.yaml` publishes no health or metrics listener under `ports:`: each binds its container's compose-network address, or loopback inside the container.
+`node-record-api` is the exception, with no listener of its own for health: its probes share its API listener, which is published on host loopback.
 
-`etc/compose.observability.yaml` adds a Prometheus service on the same network that scrapes the four validators.
-Its UI is published on host loopback only (`127.0.0.1:9090:9090`).
+| Service | Bridge address | Health | Metrics |
+| --- | --- | --- | --- |
+| `validator1`..`validator4` | `10.10.0.21`-`10.10.0.24` | `--healthcheck 10.10.0.2N:8080` | `--metrics 10.10.0.2N:9101` |
+| `observer` | `10.10.0.31` | `--healthcheck 10.10.0.31:8080` | `--metrics 10.10.0.31:9101` |
+| `worker-gateway1`..`worker-gateway4` | `10.10.0.41`-`10.10.0.44` | `--probe-addr 127.0.0.1:8546`, inside the container | `--metrics 10.10.0.4N:9101` |
+| `node-record-api` | `10.10.0.51` | `/healthz` and `/readyz` on its API listener, published on `127.0.0.1:8090` | `10.10.0.51:9101` |
+
+The compose `healthcheck:` probes `/health/network` on each validator and on the observer, `/ready/any` on each gateway's probe listener, and `/readyz` on `node-record-api`, each from inside its container.
+
+The `observability` profile of `etc/compose.yaml` runs Prometheus in the host network namespace, bound to `127.0.0.1:9090`, so on a Linux host it scrapes the bridge addresses without any published metrics port.
 
 ```bash
-cd etc
-docker compose -f compose.yaml -f compose.observability.yaml up
+docker compose -f etc/compose.yaml --profile observability up --build --remove-orphans --detach
 ```
+
+[Host network observability](host-network-observability.md#compose-profile) lists its targets and dashboards.
 
 Manual health query from inside a validator container (the image has no curl):
 
 ```bash
-docker compose exec validator1 bash -c 'exec 3<>/dev/tcp/10.10.0.21/8080; printf "GET /health/network HTTP/1.1\r\n\r\n" >&3; head -c 200 <&3'
+docker compose -f etc/compose.yaml exec validator1 bash -c 'exec 3<>/dev/tcp/10.10.0.21/8080; printf "GET /health/network HTTP/1.1\r\n\r\n" >&3; head -c 200 <&3'
 ```
 
 Single-container deployments keep loopback binds and run the collector as a sidecar that shares the network namespace (`network_mode: "service:<node>"`).
@@ -94,12 +103,18 @@ Single-container deployments keep loopback binds and run the collector as a side
 - Never add `- 9101:9101` or `- 8080:8080` under `ports:`. A published port on `0.0.0.0` republishes the listener on every host interface.
 - Publish to host loopback (`127.0.0.1:9101:9101`) when a host-local tool needs the listener.
 - `--http.addr 0.0.0.0` is the RPC listener. It is governed separately and is not covered here.
+- In `etc/compose.yaml` only the gateways' client ports (8545-8542) are published on every interface.
+  The validators' RPC is published as debug ports on host loopback only (`127.0.0.1:18545:8545` to `127.0.0.1:18542:8545`), and so are the observer's RPC (`127.0.0.1:8541:8545`) and the `node-record-api` API (`127.0.0.1:8090:8080`).
 - A wildcard `--metrics 0.0.0.0:9101` or `--healthcheck 0.0.0.0:8080` is an explicit choice. It shows as `exposure=all-interfaces` with a warning.
 
 ## Gateway exposure
 
-The gateway service and its metrics-port exposure are tracked in issue #1672.
-This page covers the node's own listeners only.
+A worker gateway has three listeners: the client port (`--listen-addr`), the probe listener (`--probe-addr`) and metrics (`--metrics`).
+Only the client port is meant for clients; the probe and metrics listeners are unauthenticated, and the probe listener has no connection cap.
+In `etc/compose.yaml` each gateway binds its client port to `0.0.0.0:8545`, published on host port 8545, 8544, 8543 or 8542 on every interface.
+It binds its probe listener to `127.0.0.1:8546` inside its container, where only the compose healthcheck reaches it, and its metrics to its bridge address, `10.10.0.4N:9101`, unpublished.
+`node-record-api` binds its metrics to `10.10.0.51:9101`, unpublished, and publishes its API on host loopback only.
+For production, `bin/worker-gateway/README.md` ("Firewalling") keeps the gateway's metrics port inside the monitoring network and its probe port reachable from the orchestrator only.
 
 ## Metric label policy
 

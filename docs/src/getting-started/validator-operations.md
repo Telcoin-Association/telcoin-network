@@ -85,7 +85,7 @@ There is no automatic update: operators decide when to install a release.
 
 A release provides:
 
-- a git tag signed with a maintainer key from `.github/maintainer-gpg-keys/`;
+- a git tag signed with a maintainer key from the allowlist in [`tn-release-signing`](https://github.com/Telcoin-Association/tn-release-signing), at the commit `main` records for the `release` submodule;
 - a `SHA256SUMS` file covering the tarball and the `IMAGE_DIGEST` file, with detached maintainer signatures in `SHA256SUMS.asc`;
 - the image digest in `IMAGE_DIGEST`, so the image can be pulled by digest instead of by tag;
 - the changelog section for that tag, also shown on the release notes page.

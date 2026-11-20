@@ -1,0 +1,12 @@
+# The components a release tagged at this commit ships, one name per line, in any order.
+#
+# etc/release.sh reads this file as committed at the tagged commit and builds, signs, verifies
+# and publishes each component it names; a tag whose commit has no such file ships the node
+# alone. Removing a line means releases from that commit on ship without that component.
+# node is required, and every name must be one that etc/release.sh on main knows (a release
+# runs main's script, which refuses an unknown or repeated name). Blank lines and lines
+# starting with # are ignored. etc/ci-lanes.sh checks on every pull request that the script
+# accepts this file as committed.
+node
+worker-gateway
+node-record-api

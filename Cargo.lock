@@ -10052,6 +10052,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "const-str 0.5.7",
  "eyre",
  "futures",
  "hex",
@@ -10361,6 +10362,7 @@ dependencies = [
  "alloy",
  "axum",
  "clap",
+ "const-str 0.5.7",
  "eyre",
  "fdlimit",
  "futures",

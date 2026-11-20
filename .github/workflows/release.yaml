@@ -1,27 +1,45 @@
 # Public releases: check a release tag, open a draft release for it, and check the
 # release again once a maintainer has published it.
 #
-# CI validates and drafts; it never builds. The binary and the image are built on a
-# maintainer's host by `make release-build`, from a commit whose full local suite, e2e
-# included, was attested on-chain. CI cannot run that suite, and a job that compiled
-# the workspace would run every dependency's build code next to a token that can write
-# releases. The only job here with a write token runs the pinned actions/checkout,
-# which receives the token for its fetch and does not leave it in the checkout, and
-# etc/release.sh, which calls gh. That token guards nothing by itself: anyone with write
-# access can get the same permission from a workflow on their own branch. No token in CI
-# can sign: the signatures on the tag and on SHA256SUMS come from maintainer keys that
-# never touch a runner, and they are what protects a release. The procedure:
+# CI validates and drafts; it never builds. A release ships a binary and an image for
+# every component its tag lists: the node always, and the edge services worker-gateway
+# and node-record-api when the tagged commit's etc/release-components names them. All of
+# them are built on a maintainer's host by `make release-build`, from a commit whose full
+# local suite, e2e included, was attested on-chain. CI cannot run that suite, and a job
+# that compiled the workspace would run every dependency's build code next to a token
+# that can write releases. The only job here with a write token runs the pinned
+# actions/checkout, which receives the token for its fetch and does not leave it in the
+# checkout, and etc/release.sh, which calls gh. That token guards nothing by itself:
+# anyone with write access can get the same permission from a workflow on their own
+# branch. No token in CI can sign: the signatures on the tag, on SHA256SUMS and, when an
+# edge service ships, on SHA256SUMS-edge come from maintainer keys that never touch a
+# runner, and they are what protects a release. The procedure:
 # https://docs.telcoin.network/maintainers/releasing.html
 #
 # Every job checks out main as it stands when the job starts, never the tagged tree,
 # and takes etc/release.sh, .github/scripts/verify_commit_hash.sh and the key allowlist
-# (.github/maintainer-gpg-keys) from there, for the reason the `attest` job in pr.yaml
+# (release/keys) from there, for the reason the `attest` job in pr.yaml
 # gives: a tag on a commit that edits a script or adds a key would otherwise be judged
 # by its own edit. This file itself is not covered by that. GitHub reads the job
 # definitions from the tagged commit (for a dispatch, from the branch it is run on), so
 # who may push a `v*` tag is decided by the tag ruleset, a repository setting
 # (.github/ACTIONS.md, "Release workflow"). The ruleset limits who can create, move or
 # delete a `v*` tag and nothing else; it does not limit who can write releases.
+#
+# From the tagged tree etc/release.sh reads what it checks or publishes (the Cargo
+# version, the CHANGELOG section, the chain configs) and one file that steers it,
+# etc/release-components, which lists the components the tag ships; a tag without it
+# ships the node alone. That is safe because every step that builds, signs, verifies or
+# publishes reads the file only after the tag's signature and attestation checks pass,
+# and the file only chooses which components to expect: every check on them still comes
+# from main. `notes` and `draft` read it with no tag check of their own, but only render
+# the release body's text from it, and this workflow runs them after its tag check:
+# `notes` after "Check the tag" in validate-tag, `draft` in a job that needs validate-tag.
+#
+# release/ is a submodule, the tn-release-signing repository that holds the maintainer
+# keys. etc/release.sh reads them at the commit main records for it and needs the
+# submodule checked out to do so, which is why every checkout below sets
+# `submodules: true`.
 #
 # The post-publish check (`verify-release`) is detective only. The release is already
 # public when it runs, so a failure is an alarm for a maintainer, not a gate.
@@ -68,8 +86,9 @@ on:
 # Everything here reads the repository; validate-tag also reads its own workflow run, and
 # draft-release alone adds the write it needs to create the draft (least privilege, CodeQL
 # actions/missing-workflow-permissions). No job asks for `packages`, so the token cannot write
-# the release image packages, ghcr.io/telcoin-association/tn-mainnet for mainnet tags and
-# tn-testnet for adiri tags: `make release-build` pushes to them with a maintainer's own login.
+# the release image packages: ghcr.io/telcoin-association/tn-mainnet for mainnet tags and
+# tn-testnet for adiri tags, and tn-worker-gateway and tn-node-record-api for both. `make
+# release-build` pushes to them with a maintainer's own login.
 permissions:
   contents: read
 
@@ -91,9 +110,12 @@ env:
 jobs:
   # Proves: the tag is an annotated tag signed by a key in the allowlist on main; it
   # points at a commit on main whose Cargo version and CHANGELOG section match the tag;
-  # and that commit's hash is in the attestation registry on adiri (hence `cast`). The
-  # step summary shows the notes the draft will carry, and the log of "Check the tag" starts
-  # with the parse of the tag, whose PACKAGE is the ghcr package the image goes to.
+  # that commit's hash is in the attestation registry on adiri (hence `cast`); and the
+  # commit's etc/release-components, when it has one, names known components, each once,
+  # the node among them. The step summary shows the notes the draft will carry, and the
+  # log of "Check the tag" starts with the parse of the tag, whose PACKAGE is the ghcr
+  # package the node image goes to, and also lists the components the tag ships with the
+  # image of each.
   # Does not prove: who pushed the tag, or that it cannot be moved or deleted later.
   # That is the tag ruleset's job, a repository setting no workflow can check.
   validate-tag:
@@ -119,6 +141,7 @@ jobs:
         with:
           ref: refs/heads/main
           fetch-depth: 0
+          submodules: true
           persist-credentials: false
 
       # This step supplies `cast` for the read-only registry call, whose answer decides
@@ -186,7 +209,7 @@ jobs:
     # The only write in this workflow. contents: write lets the token create, edit,
     # publish and delete releases and their assets, and push any branch or tag that no
     # ruleset protects. It holds no artifact and cannot sign one, and the install page's
-    # check verifies SHA256SUMS.asc against the keys on main.
+    # checks verify SHA256SUMS.asc and SHA256SUMS-edge.asc against the keys on main.
     permissions:
       contents: write
     steps:
@@ -195,6 +218,7 @@ jobs:
         with:
           ref: refs/heads/main
           fetch-depth: 0
+          submodules: true
           persist-credentials: false
 
       - name: Create or update the draft release
@@ -204,24 +228,30 @@ jobs:
 
   # Proves: the published release is still what `make release-publish` verified, which
   # re-checks the asset set after its prompt and again after publishing. It repeats the
-  # tag checks, then checks the asset set and SHA256SUMS, the maintainer signatures on
-  # SHA256SUMS against the allowlist on main, the image digest against the registry, and
-  # that the binary in the image is the one in the tarball and reports the tagged commit.
-  # `verify` takes the image package from the tag's channel, so this job also fails when
-  # IMAGE_DIGEST names an image outside it, such as a tn-testnet image on a mainnet tag.
+  # tag checks, then checks the asset set that the components the tag ships call for;
+  # SHA256SUMS and, when an edge service ships, SHA256SUMS-edge, each with enough maintainer
+  # signatures from the allowlist on main (SHA256SUMS.asc, SHA256SUMS-edge.asc); each
+  # image digest against the registry; and that the binary in each image is the one in
+  # its tarball and reports the tagged commit. `verify` takes the node's image package
+  # from the tag's channel and each edge service's from its own package, so this job also
+  # fails when a digest file names an image outside its package, such as a tn-testnet
+  # image on a mainnet tag. The log shows one `verified` line for the node, then one for
+  # each edge service.
   # Does not prove anything in advance: the release is public before this runs, so a
   # failure is an alarm, not a gate. Keeping the release from changing after this check
   # is the job of immutable releases, a repository setting.
   verify-release:
     if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'verify')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A tag that ships the edge services has three images to pull and run instead of one.
+    timeout-minutes: 30
     steps:
       # From main, as in validate-tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/heads/main
           fetch-depth: 0
+          submodules: true
           persist-credentials: false
 
       # This step supplies `cast` for the read-only registry call, whose answer decides

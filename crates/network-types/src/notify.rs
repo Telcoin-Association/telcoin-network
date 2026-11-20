@@ -3,7 +3,7 @@
 //! These messages are passed as unreliable send and
 //! don't expect a response.
 use serde::{Deserialize, Serialize};
-use tn_types::{AuthorityIdentifier, BlockHash, SealedBatch, SealedHeader, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, SealedBatch, WorkerId};
 
 /// Used by the primary to request that the worker sync the target missing batches.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,11 +81,4 @@ impl WorkerOthersBatchMessage {
 pub struct BatchMessage {
     /// The sending worker's batch.
     pub sealed_batch: SealedBatch,
-}
-
-/// Engine to primary when canonical tip is updated.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CanonicalUpdateMessage {
-    /// The latest execution result.
-    pub tip: SealedHeader,
 }

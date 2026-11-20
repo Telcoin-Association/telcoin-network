@@ -59,7 +59,7 @@ const MIN_QUIET_V6_PREFIX: u8 = 32;
 
 /// Mostly stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, long_version = crate::version::LONG_VERSION, about, long_about = None)]
 pub(crate) struct Cli {
     /// Address the gateway listens on for client JSON-RPC, and for its own
     /// `/health` (liveness) and `/ready` (readiness) endpoints.
@@ -4386,5 +4386,74 @@ mod tests {
         .expect_err("--config conflicts with the inline upstream flags");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert_eq!(redacted_parse_error(&err), None);
+    }
+
+    /// The flags the node deployment scripts (tn-node-deployment,
+    /// `lib/gateway.sh`) pass in the unit they render. The scripts refuse an
+    /// image whose `--help` lacks one, so renaming or removing one here breaks
+    /// every installed gateway at its next update.
+    const DEPLOYMENT_FLAGS: [&str; 8] = [
+        "--listen-addr",
+        "--probe-addr",
+        "--metrics",
+        "--upstream-rpc-url",
+        "--upstream-readiness-url",
+        "--worker-id",
+        "--redirect-queries",
+        "--trusted-proxies",
+    ];
+
+    /// Whether `help` lists `flag` whole, matched as the deployment scripts
+    /// match it: with no letter, digit or `-` on either side, so
+    /// `--redirect-queries-header` does not count as `--redirect-queries`.
+    fn lists_flag(help: &str, flag: &str) -> bool {
+        let part_of_a_flag = |c: char| c.is_ascii_alphanumeric() || c == '-';
+        help.match_indices(flag).any(|(at, _)| {
+            let before = help[..at].chars().next_back();
+            let after = help[at + flag.len()..].chars().next();
+            !before.is_some_and(part_of_a_flag) && !after.is_some_and(part_of_a_flag)
+        })
+    }
+
+    /// The deployment scripts check every flag in [`DEPLOYMENT_FLAGS`] against
+    /// the image's `--help`, which they run in a container with no network, a
+    /// read-only root and an unprivileged user, before they accept the image.
+    /// So `--help` must list each flag whole, and must succeed with no other
+    /// argument and nothing from the environment.
+    #[test]
+    fn help_lists_every_flag_the_deployment_scripts_pass() {
+        use clap::CommandFactory as _;
+
+        // `--help` alone, parsed with no env fallback, stops the parse with
+        // clap's help, which `main` lets clap print and exit 0 with
+        let err = test_command()
+            .try_get_matches_from(["worker-gateway", "--help"])
+            .expect_err("--help stops the parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert_eq!(err.exit_code(), 0);
+        assert_eq!(redacted_parse_error(&err), None);
+        let printed = err.to_string();
+        let rendered = Cli::command().render_long_help().to_string();
+        let command = Cli::command();
+        for flag in DEPLOYMENT_FLAGS {
+            assert!(lists_flag(&rendered, flag), "--help must list {flag}:\n{rendered}");
+            assert!(lists_flag(&printed, flag), "--help must print {flag}:\n{printed}");
+            // the help's prose names some flags too, so a renamed flag can stay
+            // in `--help` after it is gone from the command line, which the
+            // scripts' check cannot see
+            let long = flag.trim_start_matches("--");
+            assert!(
+                command.get_arguments().any(|arg| arg.get_long() == Some(long)),
+                "{flag} must be a flag the gateway accepts"
+            );
+        }
+
+        // the match takes whole flags only
+        assert!(lists_flag("  --metrics <METRICS>", "--metrics"));
+        assert!(lists_flag("--metrics", "--metrics"));
+        assert!(!lists_flag("  --redirect-queries-header <LINE>", "--redirect-queries"));
+        assert!(!lists_flag("  x--metrics", "--metrics"));
+        assert!(rendered.contains("--redirect-queries-header"));
+        assert!(!lists_flag(&rendered, "--redirect-queries-head"), "a prefix of a flag is no flag");
     }
 }

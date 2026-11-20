@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy clippy-fix docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint yubikey-setup
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy clippy-fix docker-login docker-adiri docker-devnet docker-worker-gateway docker-node-record-api docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint yubikey-setup
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -9,10 +9,13 @@ NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
 
 .DEFAULT: help
 
-# Image repository of the ad-hoc images that docker-adiri, docker-devnet and docker-push
-# build or push. Release images have their own packages, ghcr.io/telcoin-association/tn-mainnet
-# for mainnet tags and ghcr.io/telcoin-association/tn-testnet for adiri tags, and only
-# etc/release.sh writes them (release-build pushes the tag, release-publish moves the alias).
+# Image repository of the ad-hoc images that docker-adiri, docker-devnet, docker-worker-gateway,
+# docker-node-record-api and docker-push build or push. Release images have their own
+# packages, and only etc/release.sh writes them (release-build pushes the tag, release-publish
+# moves the alias): the node's are ghcr.io/telcoin-association/tn-mainnet for mainnet tags and
+# ghcr.io/telcoin-association/tn-testnet for adiri tags; the edge services' are
+# ghcr.io/telcoin-association/tn-worker-gateway and ghcr.io/telcoin-association/tn-node-record-api,
+# each shared by mainnet and adiri tags.
 GHCR_IMAGE := ghcr.io/telcoin-association/tn-dev
 
 # Ad-hoc images are always $(GHCR_IMAGE):dev-<flavor>-$(TAG), so TAG defaults to the
@@ -23,6 +26,7 @@ TAG ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 # Linter images for release-lint, pinned by digest.
 ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
 SHELLCHECK_IMAGE := koalaman/shellcheck-alpine:v0.11.0@sha256:9955be09ea7f0dbf7ae942ac1f2094355bb30d96fffba0ec09f5432207544002
+BASH32_IMAGE := bash:3.2@sha256:2556c2da19c32c1614d318645c73a7bf64d38be21cf69e98e3ca51f053983719
 
 # git commit embedded in the image version string (vergen override; avoids needing .git in
 # the build context). Falls back to `unknown` outside a git checkout.
@@ -108,6 +112,13 @@ help:
 	@echo "make docker-devnet" ;
 	@echo "    :::> Build a multi-arch devnet (faucet) image and push it to ghcr.io/telcoin-association/tn-dev as dev-devnet-<TAG>." ;
 	@echo ;
+	@echo "make docker-worker-gateway" ;
+	@echo "    :::> Build a multi-arch worker-gateway image and push it to ghcr.io/telcoin-association/tn-dev as dev-worker-gateway-<TAG>." ;
+	@echo ;
+	@echo "make docker-node-record-api" ;
+	@echo "    :::> Build a multi-arch node-record-api image and push it to ghcr.io/telcoin-association/tn-dev as dev-node-record-api-<TAG>." ;
+	@echo "    :::> Needs the tn-contracts submodule: run make init-submodules first." ;
+	@echo ;
 	@echo "make docker-push" ;
 	@echo "    :::> Push the local dev-adiri-<TAG> image to ghcr.io/telcoin-association/tn-dev." ;
 	@echo ;
@@ -118,7 +129,7 @@ help:
 	@echo "    :::> Bootstrap the docker builder for building telcoin-network binary container images." ;
 	@echo ;
 	@echo "make up" ;
-	@echo "    :::> Launch docker compose file with 4 local validators in detached state." ;
+	@echo "    :::> Launch the docker compose testnet in detached state: 4 local validators, each behind a worker gateway on host ports 8545-8542, and an observer (see etc/README.md)." ;
 	@echo ;
 	@echo "make down" ;
 	@echo "    :::> Bring the docker compose containers down and remove orphans and volumes." ;
@@ -142,22 +153,24 @@ help:
 	@echo "    :::> Create and push the GPG-signed release tag on the origin/main tip." ;
 	@echo ;
 	@echo "make release-build TAG=vX.Y.Z[-adiri][-rcN]" ;
-	@echo "    :::> Build the linux/amd64 image and tarball, push the image to tn-mainnet or tn-testnet by the tag's network, and upload the assets to the draft release." ;
+	@echo "    :::> Build the linux/amd64 image and tarball of every binary the tag ships (node, worker-gateway, node-record-api; etc/release-components at the tag lists them)," ;
+	@echo "    :::> push the node image to tn-mainnet or tn-testnet by the tag's network and the others to tn-worker-gateway and tn-node-record-api, and upload the assets to the draft release." ;
 	@echo ;
 	@echo "make release-sign TAG=vX.Y.Z[-adiri][-rcN]" ;
-	@echo "    :::> Add this maintainer's GPG signature over SHA256SUMS to the draft release." ;
+	@echo "    :::> Add this maintainer's GPG signatures over SHA256SUMS and, when the tag ships the edge services, SHA256SUMS-edge to the draft release." ;
 	@echo ;
 	@echo "make release-verify TAG=vX.Y.Z[-adiri][-rcN]" ;
-	@echo "    :::> Verify the tag, assets, signatures and image digest of a release." ;
+	@echo "    :::> Verify the tag, assets, signatures and image digests of a release." ;
 	@echo ;
 	@echo "make release-publish TAG=vX.Y.Z[-adiri][-rcN]" ;
-	@echo "    :::> Verify, then publish the draft release and move the latest or adiri image alias." ;
+	@echo "    :::> Verify, then publish the draft release and move the latest or adiri alias of every image." ;
 	@echo ;
 	@echo "make release-lint" ;
-	@echo "    :::> Run actionlint and shellcheck (pinned Docker images) on the release workflow and scripts." ;
+	@echo "    :::> Run actionlint and shellcheck (pinned Docker images) on the release workflow and scripts, and check etc/release.sh against bash 3.2." ;
 	@echo ;
 	@echo "make yubikey-setup" ;
-	@echo "    :::> One-time maintainer setup: provision the release signing key on a YubiKey (etc/yubikey-setup.sh run)." ;
+	@echo "    :::> One-time maintainer setup: provision the release signing key on a YubiKey (yubikey-setup.sh run in the release submodule)." ;
+	@echo "    :::> A new key is a pull request to tn-release-signing, then a release submodule pointer move here. Runbook: docs/src/maintainers/yubikey-setup.md." ;
 	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
@@ -559,6 +572,16 @@ docker-adiri:
 docker-devnet:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-devnet-$(TAG)" . --push ;
 
+# build and push ad-hoc edge service images for amd64 and arm64 as dev-worker-gateway-$(TAG) and
+# dev-node-record-api-$(TAG). Neither binary has cargo features, so one image serves every
+# network. These are unsigned; the signed images come from make release-build. node-record-api
+# needs make init-submodules first: tn-config embeds the tn-contracts artifacts at compile time.
+docker-worker-gateway:
+	docker buildx build -f ./bin/worker-gateway/Dockerfile --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-worker-gateway-$(TAG)" . --push ;
+
+docker-node-record-api:
+	docker buildx build -f ./bin/node-record-api/Dockerfile --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-node-record-api-$(TAG)" . --push ;
+
 # push the local ad-hoc adiri image to $(GHCR_IMAGE)
 docker-push:
 	docker push "$(GHCR_IMAGE):dev-adiri-$(TAG)" ;
@@ -634,10 +657,28 @@ release-prep release-tag release-build release-sign release-verify release-publi
 	./etc/release.sh $(patsubst release-%,%,$@) "$(TAG)"
 
 # one-time maintainer setup for the release signing key; runbook: docs/src/maintainers/yubikey-setup.md
+# The script belongs to tn-release-signing, which this repository carries as the release
+# submodule. It works only from the root of a checkout of that repository, so it runs from
+# release/. The allowlist file it stages goes to tn-release-signing as a pull request, and the
+# key signs releases here once that merges and the release submodule pointer moves past it.
 yubikey-setup:
-	./etc/yubikey-setup.sh run
+	@test -f release/yubikey-setup.sh || { echo "run git submodule update --init -- release first"; exit 2; }
+	cd release && ./yubikey-setup.sh run
 
-# lint the release workflows and scripts with pinned actionlint and shellcheck images
+# Constructs bash 3.2 lacks, as one awk extended regular expression for release-lint: mapfile,
+# readarray, declare -A and local -A, declare -g (also inside a flag cluster such as -gA), the
+# ${x,,} and ${x^^} case modifications, ;;&, &>> and |&.
+BASH32_LACKS := (^|[^[:alnum:]_])(mapfile|readarray)([^[:alnum:]_]|$$)|(^|[^[:alnum:]_])(declare|local)([[:space:]]+-[[:alpha:]]+)*[[:space:]]+-[[:alpha:]]*A|(^|[^[:alnum:]_])declare([[:space:]]+-[[:alpha:]]+)*[[:space:]]+-[[:alpha:]]*g|\$$\{[^}]*(,,|\^\^)|;;&|&>>|[|]&
+
+# lint the release workflows and scripts with pinned actionlint and shellcheck images; the
+# scripts in the release submodule are linted in their own repository.
+# etc/release.sh also runs on maintainers' Macs, whose bash is 3.2. bash -n in the pinned bash 3.2
+# image rejects the syntax 3.2 cannot parse; mapfile, declare -A and ${x,,} parse there and only
+# fail when they run, so the awk step after it refuses every line matching BASH32_LACKS. It
+# strips comments first (a whole comment line, or a # after whitespace), so a comment that
+# names these constructs passes.
 release-lint:
 	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color .github/workflows/release.yaml .github/workflows/docs.yaml
-	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE) shellcheck -x -S style etc/release.sh etc/yubikey-setup.sh .github/scripts/verify_commit_hash.sh
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE) shellcheck -x -S style etc/release.sh .github/scripts/verify_commit_hash.sh
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(BASH32_IMAGE) bash -n etc/release.sh
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(BASH32_IMAGE) awk '{ s = $$0; sub(/^[[:space:]]*#.*/, "", s); sub(/[[:space:]]#.*/, "", s) } s ~ /$(BASH32_LACKS)/ { print FILENAME ":" FNR ": bash 3.2 lacks a construct on this line: " $$0; bad = 1 } END { exit bad }' etc/release.sh
