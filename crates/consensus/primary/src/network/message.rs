@@ -54,6 +54,18 @@ impl TNMessage for PrimaryResponse {
     }
 }
 
+/// The most parent certificates one [`PrimaryRequest::Vote`] carries on the wire.
+///
+/// An honest request carries at most one parent certificate for each committee member, so this
+/// value must stay at or above the largest committee size. The decoder rejects a longer list from
+/// its length prefix, before it decodes one certificate. Each certificate holds two BLS
+/// signatures, and the decode of each signature decompresses a curve point. Without the bound,
+/// the sender sets the decode cost of one request, up to the message size cap.
+///
+/// A full parent set for a committee near this size does not fit in the default
+/// `max_rpc_message_size`, so change the two values together.
+const MAX_VOTE_PARENTS: usize = 256;
+
 /// Requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimaryRequest {
@@ -63,6 +75,9 @@ pub enum PrimaryRequest {
         header: Arc<Header>,
         /// Parent certificates provided by the requesting peer in case the primary's peer is
         /// missing them. The peer requires parent certs in order to vote.
+        ///
+        /// The decoder accepts at most `MAX_VOTE_PARENTS` certificates.
+        #[serde(deserialize_with = "bounded_vote_parents")]
         parents: Vec<Certificate>,
     },
     /// Exchange peer information.
@@ -82,6 +97,57 @@ pub enum PrimaryRequest {
         /// Block hash requesting if not None.
         hash: Option<EpochDigest>,
     },
+}
+
+/// Decode the `parents` of a [`PrimaryRequest::Vote`] with the [`MAX_VOTE_PARENTS`] bound.
+///
+/// Only the decoder changes. The derived `Serialize` still writes the list, so the bytes on the
+/// wire are those of a plain `Vec<Certificate>`.
+fn bounded_vote_parents<'de, D>(deserializer: D) -> Result<Vec<Certificate>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedVoteParents)
+}
+
+/// Visitor that enforces [`MAX_VOTE_PARENTS`] from the length prefix and from the count.
+struct BoundedVoteParents;
+
+impl BoundedVoteParents {
+    /// Accept a count of parents at or under [`MAX_VOTE_PARENTS`]. Give the length error for a
+    /// larger count.
+    fn check_count<E>(&self, count: usize) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        if count > MAX_VOTE_PARENTS {
+            Err(E::invalid_length(count, self))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BoundedVoteParents {
+    type Value = Vec<Certificate>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "at most {MAX_VOTE_PARENTS} parent certificates")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        // reject from the prefix before any certificate is decoded
+        self.check_count::<A::Error>(seq.size_hint().unwrap_or(0))?;
+        // take one past the cap so an unhinted stream over the cap is still rejected
+        let parents = std::iter::from_fn(|| seq.next_element::<Certificate>().transpose())
+            .take(MAX_VOTE_PARENTS.saturating_add(1))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.check_count::<A::Error>(parents.len())?;
+        Ok(parents)
+    }
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -342,10 +408,33 @@ impl From<PeerExchangeMap> for PrimaryResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::PrimaryRequest;
+    use super::{PrimaryRequest, MAX_VOTE_PARENTS};
+    use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tn_network_libp2p::{PeerExchangeMap, ServiceClass, TNMessage};
-    use tn_types::Header;
+    use tn_types::{encode, try_decode, Certificate, Header};
+
+    /// The vote request with the derived decoder, which has no bound on `parents`. This is the
+    /// request as nodes decoded it before the bound. `Vote` is variant 0 here and in
+    /// [`PrimaryRequest`], so the two encodings can be compared.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    enum UnboundedVoteRequest {
+        /// Mirror of [`PrimaryRequest::Vote`].
+        Vote {
+            /// The header for the round.
+            header: Arc<Header>,
+            /// The parent certificates, with no bound at decode.
+            parents: Vec<Certificate>,
+        },
+    }
+
+    /// A vote request for the default header with `count` default parent certificates.
+    fn vote_with_parents(count: usize) -> PrimaryRequest {
+        PrimaryRequest::Vote {
+            header: Arc::new(Header::default()),
+            parents: vec![Certificate::default(); count],
+        }
+    }
 
     /// A vote request has the vote class.
     #[test]
@@ -367,5 +456,56 @@ mod tests {
     fn peer_exchange_is_other_class() {
         let request = PrimaryRequest::PeerExchange { peers: PeerExchangeMap::default() };
         assert_eq!(request.service_class(), ServiceClass::Other);
+    }
+
+    /// A vote request with exactly `MAX_VOTE_PARENTS` parents decodes.
+    #[test]
+    fn vote_at_parent_cap_decodes() {
+        let request = vote_with_parents(MAX_VOTE_PARENTS);
+        let decoded = try_decode::<PrimaryRequest>(&encode(&request))
+            .expect("a request at the parent cap decodes");
+        assert_eq!(decoded, request);
+    }
+
+    /// A length prefix one over the cap fails with the length error, before the decoder reads a
+    /// certificate.
+    #[test]
+    fn vote_over_parent_cap_is_rejected_from_the_length_prefix() {
+        // `parents` is the last field, so the encoding of an empty list ends with the prefix 0
+        let empty = encode(&vote_with_parents(0));
+        let (last, head) = empty.split_last().expect("the encoded request has bytes");
+        assert_eq!(*last, 0);
+        // a list of unit values encodes as its length prefix with no element bytes after it
+        let unit_list = (0..=MAX_VOTE_PARENTS).map(|_| ()).collect::<Vec<_>>();
+        assert_eq!(unit_list.len(), MAX_VOTE_PARENTS + 1);
+        let over_cap = head.iter().copied().chain(encode(&unit_list)).collect::<Vec<u8>>();
+
+        // without the bound, the decoder reads past the prefix and fails at the end of the input
+        let error = try_decode::<PrimaryRequest>(&over_cap)
+            .expect_err("a length prefix over the parent cap is rejected");
+        assert!(
+            error.to_string().contains(&format!("invalid length {}", MAX_VOTE_PARENTS + 1)),
+            "expected the length error, got: {error}"
+        );
+    }
+
+    /// The bound changes the decoder only. A vote request has the bytes that the derived codec
+    /// gives it, and each decoder reads the bytes of the other.
+    #[test]
+    fn vote_wire_bytes_match_the_derived_codec() {
+        let header = Arc::new(Header::default());
+        let parents = vec![Certificate::default(); 3];
+        let unbounded =
+            UnboundedVoteRequest::Vote { header: header.clone(), parents: parents.clone() };
+        let bounded = PrimaryRequest::Vote { header, parents };
+
+        let bytes = encode(&bounded);
+        assert_eq!(bytes, encode(&unbounded));
+        let from_bounded =
+            try_decode::<PrimaryRequest>(&bytes).expect("the bounded decoder reads the bytes");
+        assert_eq!(from_bounded, bounded);
+        let from_unbounded = try_decode::<UnboundedVoteRequest>(&bytes)
+            .expect("the derived decoder reads the bytes");
+        assert_eq!(from_unbounded, unbounded);
     }
 }
