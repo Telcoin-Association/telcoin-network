@@ -12,7 +12,7 @@ use std::{
 };
 
 use tn_network_libp2p::error::NetworkError;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode};
 use tn_storage::{
     consensus::ConsensusChain,
     epoch_records::{EpochDbError, EpochRecordValidation},
@@ -97,6 +97,33 @@ struct StartupSyncState<Collect, Progress> {
     progress: Progress,
 }
 
+/// Whether a record collection asks peers for the record of the epoch that this node runs (issue
+/// #1880).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnEpoch {
+    /// Ask peers for every epoch, the running epoch included. The startup sync uses this: it runs
+    /// before the node sets its mode.
+    Request,
+    /// Do not ask peers for the record of the running epoch while the node mode is
+    /// [`NodeMode::CvvActive`] (see [`Collection::built_epoch`]). Only the record collector uses
+    /// this.
+    SkipWhileActive,
+}
+
+/// The epoch that this node runs, read from its own epoch store: epoch 0 while the store holds
+/// only the epoch-0 dummy anchor, else the epoch after the latest stored record. `None` when the
+/// store holds no record.
+///
+/// This node's own epoch close stores the record of the closed epoch, so the result moves to the
+/// next epoch at once.
+async fn running_epoch(consensus_chain: &ConsensusChain) -> Option<Epoch> {
+    if consensus_chain.epochs().contains_dummy_epoch0().await {
+        Some(0)
+    } else {
+        consensus_chain.epochs().latest_record().await.map(|record| record.epoch.saturating_add(1))
+    }
+}
+
 /// What the passes of one record collection share: the record collector keeps one for its whole
 /// life, the startup sync makes a new one for every pass.
 struct Collection<'m> {
@@ -117,12 +144,61 @@ struct Collection<'m> {
     unlanded_walk: Option<(Epoch, tokio::time::Instant)>,
     /// Where the walk and conflict counters go.
     metrics: &'m StateSyncMetrics,
+    /// Whether the passes ask peers for the record of the epoch that this node runs (see
+    /// [`Collection::built_epoch`]).
+    own_epoch: OwnEpoch,
 }
 
 impl<'m> Collection<'m> {
-    /// A collection with no gap open yet.
+    /// A collection with no gap open yet that asks peers for every epoch.
     fn new(metrics: &'m StateSyncMetrics) -> Self {
-        Self { gaps: BTreeSet::new(), retry_from: 0, unlanded_walk: None, metrics }
+        Self {
+            gaps: BTreeSet::new(),
+            retry_from: 0,
+            unlanded_walk: None,
+            metrics,
+            own_epoch: OwnEpoch::Request,
+        }
+    }
+
+    /// A collection with no gap open yet that does not ask peers for the record of the epoch that
+    /// this node builds (see [`Collection::built_epoch`]). Only the record collector uses it.
+    fn for_collector(metrics: &'m StateSyncMetrics) -> Self {
+        Self { own_epoch: OwnEpoch::SkipWhileActive, ..Self::new(metrics) }
+    }
+
+    /// The epoch whose record this node builds itself, so a pass must not ask peers for it.
+    ///
+    /// `Some` only for a collection from [`Collection::for_collector`] while the node mode is
+    /// [`NodeMode::CvvActive`]: then it is the epoch that this node runs ([`running_epoch`]). An
+    /// active validator builds and certifies the record of the epoch that it runs. Before that
+    /// epoch closes, no honest peer has a certified record for it. In all other cases a pass asks
+    /// peers: a certified record for the local epoch is how a node finds out that the network
+    /// closed that epoch, so the rule does not use committee membership alone.
+    ///
+    /// A pass cannot go past this epoch in any case: this node holds no record of the epoch that
+    /// it runs, so it cannot walk past it ([`Collection::may_walk_past`]). When this node closes
+    /// an epoch, it stores its own record of that epoch, so the running epoch moves on at once and
+    /// the next pass asks for the record as before. A change to [`NodeMode::CvvInactive`] restores
+    /// the request on the next pass. A missing record below the running epoch is never skipped.
+    /// [`retry_gaps`] needs no check: a gap is an epoch with this node's own stored record, so it
+    /// is always below the running epoch.
+    ///
+    /// Limits: the startup sync runs before the node sets its mode, so it still asks for the
+    /// record of the running epoch, also when a validator restarts in epoch 0. Observers and nodes
+    /// that sync from genesis also ask. Those cases rely on operators not reusing genesis BLS keys.
+    async fn built_epoch(
+        &self,
+        consensus_bus: &ConsensusBusApp,
+        consensus_chain: &ConsensusChain,
+    ) -> Option<Epoch> {
+        match self.own_epoch {
+            OwnEpoch::Request => None,
+            OwnEpoch::SkipWhileActive => match consensus_bus.current_node_mode() {
+                NodeMode::CvvActive => running_epoch(consensus_chain).await,
+                NodeMode::CvvInactive | NodeMode::Observer => None,
+            },
+        }
     }
 
     /// Whether a pass told by a peer that it holds no certified record of `epoch` may go on to the
@@ -546,6 +622,10 @@ fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
 /// refused record included, unless it fails: a conflicting certified record or our own store
 /// failing to save a record ends it at once, before the persist, as it ends a pass that did not
 /// walk; a failed persist ends it before the publish.
+///
+/// A pass does not ask peers for the record of the epoch that this node builds (see
+/// [`Collection::built_epoch`]): it ends before that epoch with the persist and the publish
+/// below, and the epoch is not a gap, a refusal or a failure.
 async fn collect_epoch_records(
     last_epoch: Epoch,
     consensus_chain: &ConsensusChain,
@@ -565,7 +645,9 @@ async fn collect_epoch_records(
     // whether this pass walked at all: such a pass ends at the persist below, whatever stops it
     // short of a failure
     let mut walked_any = false;
-    for epoch in last_epoch.. {
+    // the epoch whose record this node builds itself: the pass ends before it (issue #1880)
+    let built_epoch = collection.built_epoch(consensus_bus, consensus_chain).await;
+    for epoch in (last_epoch..).take_while(|epoch| built_epoch.is_none_or(|built| *epoch < built)) {
         // If we already have epoch record AND it's certificate then continue.
         if let Some((rec, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
             // Advance result_epoch so we correctly track the last confirmed epoch,
@@ -870,6 +952,9 @@ pub async fn spawn_epoch_record_collector(
 /// asks up to three peers in turn), after the pass and under [`GAP_RETRY_DEADLINE`] and the
 /// shutdown signal, so the next pass's work (the certified-record and republish signals), the
 /// gauge and the shutdown select wait at most one retry interval on it.
+///
+/// The collector's [`Collection`] does not ask peers for the record of the epoch that this node
+/// builds while the node mode is [`NodeMode::CvvActive`] (see [`Collection::built_epoch`]).
 async fn spawn_epoch_record_collector_with(
     consensus_chain: ConsensusChain,
     primary_handle: PrimaryNetworkHandle,
@@ -886,7 +971,7 @@ async fn spawn_epoch_record_collector_with(
         // a certificate are skipped immediately by get_epoch_by_number, so this
         // is cheap for nodes that are fully caught up.
         let mut last_epoch: Epoch = 0;
-        let mut collection = Collection::new(&metrics);
+        let mut collection = Collection::for_collector(&metrics);
         let retry_interval = Duration::from_secs(EPOCH_COLLECT_RETRY_SECS);
         let mut gaps_retried_at = tokio::time::Instant::now();
         loop {
@@ -978,8 +1063,8 @@ mod tests {
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{
-        encode, BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, EpochCertificate,
-        EpochRecord, Intent, IntentMessage, IntentScope, Signer as _,
+        encode, BlockNumHash, BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature,
+        EpochCertificate, EpochRecord, Intent, IntentMessage, IntentScope, Signer as _,
     };
     use tokio::sync::mpsc;
 
@@ -1193,6 +1278,93 @@ mod tests {
 
         // The rejected record was never saved.
         assert!(consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
+    }
+
+    /// An active validator does not ask peers for the record of the epoch that it runs (issue
+    /// #1880). The record collector's pass ends before epoch 0 and keeps the dummy anchor, so a
+    /// certified record 0 with a closing block that this node did not execute is not stored. An
+    /// observer still stores the served record: this is the limit of the change.
+    #[tokio::test]
+    async fn test_collect_epoch_records_skips_epoch_this_node_builds() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(5).expect("5 > 0"))
+            .build();
+        let auths: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<BlsPublicKey> = auths.iter().map(|a| a.primary_public_key()).collect();
+        let signers: Vec<&BlsKeypair> = auths.iter().map(|a| a.keypair()).collect();
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .expect("consensus chain");
+
+        // A record 0 that a super-quorum of the genesis keys certified, with a closing block that
+        // this node did not execute.
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            final_state: BlockNumHash::new(7, Default::default()),
+            final_consensus: ConsensusNumHash::new(5, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let cert0 = make_cert(&rec0, &signers, &[0, 1, 2, 3]);
+        assert!(rec0.verify_with_cert(&cert0), "cert verifies");
+
+        // This node runs epoch 0: it holds only the dummy anchor for the same keys.
+        consensus_chain
+            .epochs()
+            .save_dummy_epoch0(EpochRecord {
+                epoch: 0,
+                committee: keys.clone(),
+                next_committee: keys.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("save dummy epoch 0");
+
+        let served = HashMap::from([(0, (rec0.clone(), cert0))]);
+        let handle = mock_epoch_record_network(served, keys[0], 1);
+        let consensus_bus = ConsensusBus::new();
+        consensus_bus.app().node_mode().send_replace(NodeMode::CvvActive);
+        let mut collection = Collection::for_collector(&STATE_SYNC_METRICS);
+
+        let collected = collect_epoch_records(
+            0,
+            &consensus_chain,
+            &handle,
+            consensus_bus.app(),
+            &mut collection,
+        )
+        .await
+        .expect("an active validator's pass");
+        assert_eq!(
+            collected,
+            CollectedPass { epoch: 0, definitive: true },
+            "the pass ends before the running epoch"
+        );
+        assert!(
+            consensus_chain.epochs().contains_dummy_epoch0().await,
+            "an active validator keeps the dummy anchor of the epoch that it runs"
+        );
+        assert_eq!(
+            *consensus_bus.app().certified_record_epoch().borrow(),
+            None,
+            "no certified record is published"
+        );
+
+        // An observer still asks peers, so it stores the served record.
+        consensus_bus.app().node_mode().send_replace(NodeMode::Observer);
+        collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app(), &mut collection)
+            .await
+            .expect("an observer's pass");
+        let stored = consensus_chain
+            .epochs()
+            .get_epoch_by_number(0)
+            .await
+            .map(|(record, certificate)| (record, certificate.is_some()));
+        assert_eq!(stored, Some((rec0, true)), "an observer stores the certified record 0");
     }
 
     /// A certified record from peers that conflicts with our own uncertified record is refused by
@@ -2062,6 +2234,8 @@ mod tests {
         let (requests_tx, mut requests) = mpsc::unbounded_channel();
         let handle = mock_changing_network(answers.clone(), Default::default(), peer, requests_tx);
         let bus = ConsensusBus::new();
+        // a node that catches up: an active validator does not ask for its running epoch (#1880)
+        bus.app().node_mode().send_replace(NodeMode::CvvInactive);
         let shutdown = tn_types::ShutdownNotifier::new();
         let task_manager = tn_types::TaskManager::default();
         let (metrics, snapshotter) = local_metrics();
@@ -2388,6 +2562,8 @@ mod tests {
         let (requests_tx, mut requests) = mpsc::unbounded_channel();
         let handle = mock_changing_network(answers, silent.clone(), peer, requests_tx);
         let bus = ConsensusBus::new();
+        // a node that catches up: an active validator does not ask for its running epoch (#1880)
+        bus.app().node_mode().send_replace(NodeMode::CvvInactive);
         let collector_shutdown = tn_types::ShutdownNotifier::new();
         // never notified: the task manager reports the collector's own exit
         let manager_shutdown = tn_types::ShutdownNotifier::new();
