@@ -14,6 +14,9 @@ const ROARING_SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
 
 /// Roaring's portable serialization cookie for a bitmap that may contain run containers; the
 /// container count is packed into the cookie word's high 16 bits as `count - 1`.
+///
+/// Honest nodes never write this cookie: roaring 0.10.12 `serialize_into` writes only
+/// [`ROARING_SERIAL_COOKIE_NO_RUNCONTAINER`]. [`roaring_container_count`] rejects it.
 const ROARING_SERIAL_COOKIE: u32 = 12347;
 
 /// Upper bound on the container count accepted when deserializing a bitmap.
@@ -45,6 +48,13 @@ const MAX_BITMAP_CONTAINERS: u64 = 4;
 /// in `RoaringBitmap::deserialize_from`. Errors on a truncated header or an unrecognized cookie,
 /// both of which `deserialize_from` would also reject.
 ///
+/// Also errors on `ROARING_SERIAL_COOKIE`, which `deserialize_from` accepts (GHSA-2x6m-43m8-h548).
+/// Roaring 0.10 has no run store. It expands each run container into an array or bitmap store
+/// that it sizes from the run lengths, so a 4-byte run of 65_536 values becomes an 8 KiB store.
+/// A bound on the container count does not stop this expansion. Honest nodes never write run
+/// containers. With only the no-run cookie accepted, the wire bytes of each container are at
+/// least the heap bytes of its store.
+///
 /// This is the single source of truth for the header parse: `RoaringBitmapSerde` bounds
 /// certificate bitmaps with it here, and the primary network's `MissingCertificatesRequest`
 /// bounds its `skip_rounds` bitmaps with it.
@@ -61,7 +71,7 @@ pub fn roaring_container_count(serialized: &[u8]) -> Result<u64, &'static str> {
     if cookie == ROARING_SERIAL_COOKIE_NO_RUNCONTAINER {
         le_u32(4).map(u64::from)
     } else if cookie & 0xFFFF == ROARING_SERIAL_COOKIE {
-        Ok(u64::from(cookie >> 16) + 1)
+        Err("roaring bitmap uses run containers, which honest nodes never write")
     } else {
         Err("roaring bitmap has an unrecognized cookie")
     }
@@ -258,9 +268,45 @@ mod tests {
     }
 
     #[test]
-    fn run_container_cookie_count_is_read_correctly() {
+    fn run_container_cookie_is_rejected() {
         // count - 1 packed into the high 16 bits.
         let cookie = ROARING_SERIAL_COOKIE | (2_u32 << 16);
-        assert_eq!(roaring_container_count(&cookie.to_le_bytes()), Ok(3));
+        assert_eq!(
+            roaring_container_count(&cookie.to_le_bytes()),
+            Err("roaring bitmap uses run containers, which honest nodes never write")
+        );
+    }
+
+    /// GHSA-2x6m-43m8-h548: a run-encoded bitmap is rejected on decode, although roaring itself
+    /// accepts it and its container count is under the bound.
+    #[test]
+    fn run_encoded_bitmap_is_rejected() {
+        // 1 container, flagged as a run container, holding 1 run of the values 0..=9.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&ROARING_SERIAL_COOKIE.to_le_bytes());
+        bytes.push(0b1);
+        bytes.extend_from_slice(&[0, 0, 9, 0]);
+        bytes.extend_from_slice(&[1, 0, 0, 0, 9, 0]);
+        assert_eq!(
+            RoaringBitmap::deserialize_from(&bytes[..]).expect("roaring accepts run containers"),
+            (0..10_u32).collect::<RoaringBitmap>(),
+            "test fixture should be a valid run-encoded bitmap"
+        );
+
+        // The BCS encoding of `Vec<u8>` is the same as the encoding of `Wrapper`.
+        let encoded = bcs::to_bytes(&bytes).expect("encode");
+        let err = bcs::from_bytes::<Wrapper>(&encoded).expect_err("must reject");
+        assert!(err.to_string().contains("run containers"), "unexpected error: {err}");
+    }
+
+    /// Peers reject the run cookie, so the bytes this node writes must not have it. roaring 0.11
+    /// writes the run cookie for a bitmap that holds a run container. If a roaring upgrade
+    /// changes the output, this test fails before peers reject the new bytes.
+    #[test]
+    fn honest_serialization_uses_the_no_run_cookie() {
+        let bitmap = RoaringBitmap::from_sorted_iter(0..1_000_u32).expect("sorted");
+        let encoded = bcs::to_bytes(&Wrapper { bitmap }).expect("encode");
+        let bytes: Vec<u8> = bcs::from_bytes(&encoded).expect("bitmap bytes");
+        assert_eq!(bytes.get(..4), Some(&ROARING_SERIAL_COOKIE_NO_RUNCONTAINER.to_le_bytes()[..]));
     }
 }
