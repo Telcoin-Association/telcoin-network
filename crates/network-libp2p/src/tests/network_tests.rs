@@ -256,6 +256,41 @@ async fn established_peer_count_excludes_pending_dials() -> eyre::Result<()> {
     Ok(())
 }
 
+/// The close of the last connection removes the peer from the request-routing queue when the peer
+/// manager holds no record for that peer id and thus sends no `PeerDisconnected` (issue #1884).
+#[tokio::test]
+async fn last_connection_close_removes_peer_without_peer_manager_record() -> eyre::Result<()> {
+    use libp2p::{core::ConnectedPoint, swarm::ConnectionId};
+
+    let TestTypes { mut peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = &mut peer1.network;
+    let peer_id = *peer2.network.swarm.local_peer_id();
+    let addr = peer2.config.primary_address();
+
+    // Add the routing entry directly. The peer manager never sees this peer, so it holds no
+    // record for the peer id: the state that a record move leaves for the old id.
+    network.process_peer_manager_event(PeerEvent::PeerConnected(peer_id, addr.clone()))?;
+    assert_eq!(query_peer_counts(network).await?.1, 1);
+
+    // The swarm event is the only signal for this close. No `PeerDisconnected` follows it.
+    network
+        .process_event(SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(1),
+            endpoint: ConnectedPoint::Listener { local_addr: addr.clone(), send_back_addr: addr },
+            num_established: 0,
+            cause: None,
+        })
+        .await?;
+    assert_eq!(
+        query_peer_counts(network).await?.1,
+        0,
+        "the close of the last connection must remove the routing entry"
+    );
+    Ok(())
+}
+
 /// Building a consensus config with a peer-score config whose `min_score > max_score` must fail
 /// at construction, before any `PeerManager`/`Score` exists. This pins the startup wiring of
 /// `ScoreConfig::validate` into `ConsensusConfig::new_with_committee`: without that call the bad

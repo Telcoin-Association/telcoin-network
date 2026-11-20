@@ -1388,6 +1388,10 @@ where
                 // direct advertisement even when the bounded publication cache saw this peer
                 // before.
                 self.published_to_peers.pop(&peer_id);
+                // The peer manager sends `PeerDisconnected` only for a peer id whose record is
+                // connected or disconnecting. Remove the routing entry here too, so a close that
+                // the peer manager does not report cannot leave a stale id in the queue.
+                self.connected_peers.retain(|peer| *peer != peer_id);
                 self.swarm
                     .behaviour_mut()
                     .kademlia
