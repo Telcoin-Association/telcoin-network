@@ -9556,6 +9556,7 @@ dependencies = [
  "eyre",
  "fdlimit",
  "human_bytes",
+ "humantime",
  "libc",
  "opentelemetry",
  "opentelemetry-otlp",

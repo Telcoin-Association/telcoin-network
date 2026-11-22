@@ -68,7 +68,11 @@ pub fn set_genesis_defaults(genesis: &mut Genesis) {
 }
 
 /// Set the genesis default config and the supplied timestamp without consulting the clock.
-fn set_genesis_defaults_at(genesis: &mut Genesis, timestamp: u64) {
+///
+/// This is [`set_genesis_defaults`] with the timestamp chosen by the caller. The genesis ceremony
+/// uses it to write a timestamp fixed in advance, and tests use it for reproducible block hashes.
+/// The timestamp is not validated here.
+pub fn set_genesis_defaults_at(genesis: &mut Genesis, timestamp: u64) {
     // Configure hardforks or Reth will be cross with us...
     genesis.config.homestead_block = Some(0);
     genesis.config.eip150_block = Some(0);

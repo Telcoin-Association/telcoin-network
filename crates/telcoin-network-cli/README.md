@@ -244,6 +244,7 @@ telcoin-network genesis \
 | Flag                                                 | Default        | Description                                                                               |
 | ---------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------- |
 | `--chain-id`                                         | `911329` (0xde7e1) | Numeric chain ID. Accepts decimal or `0x`-prefixed hex                                |
+| `--genesis-timestamp`                                | ceremony time  | Genesis timestamp, as unix seconds (`1796214660`) or an RFC 3339 UTC timestamp (`2026-12-02T12:31:00Z`). No validator creates a header before it. Must be after the current time and at most 366 days ahead. Required on mainnet (chain ID 731) |
 | `--consensus-registry-owner`                         | `0x...07a0`    | Owner address for the ConsensusRegistry contract. Use a governance multisig in production |
 | `--basefee-address`                                  | `0x...07a0`    | Address that receives all transaction base fees                                           |
 | `--initial-stake-per-validator`, `--stake`           | `1000000`      | TEL staked per validator at genesis (input in whole TEL, stored as wei)                   |

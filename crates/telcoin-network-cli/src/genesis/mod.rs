@@ -7,13 +7,20 @@ use secp256k1::{
     rand::{rngs::StdRng, SeedableRng},
     Secp256k1,
 };
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    time::{Duration, UNIX_EPOCH},
+};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, TelcoinDirs as _,
     GOVERNANCE_SAFE_ADDRESS,
 };
 use tn_reth::{system_calls::ConsensusRegistry, RethChainSpec, RethEnv};
-use tn_types::{keccak256, set_genesis_defaults, Address, ExecHeader, GenesisAccount, U256};
+use tn_types::{
+    keccak256, now, set_genesis_defaults_at, Address, ExecHeader, GenesisAccount, MAINNET_CHAIN_ID,
+    U256,
+};
 use tracing::info;
 
 use crate::args::{clap_address_parser, clap_u256_parser_to_18_decimals, maybe_hex};
@@ -120,6 +127,14 @@ pub struct GenesisArgs {
     /// Default is 0xde7e1 (911329).  Used mostly for testing.
     #[arg(long, default_value_t = 911329, value_parser=maybe_hex)]
     pub chain_id: u64,
+    /// The genesis timestamp, as unix seconds or an RFC 3339 UTC timestamp.
+    ///
+    /// Accepts unix seconds (`1796214660`) or an RFC 3339 timestamp in UTC
+    /// (`2026-12-02T12:31:00Z`). This is the earliest time any validator may create a block
+    /// header. The value must be after the current time and at most 366 days ahead. Required on
+    /// mainnet (chain id 731); on other chains the default is the time the ceremony runs.
+    #[arg(long = "genesis-timestamp", value_name = "TIME", value_parser = parse_genesis_timestamp)]
+    pub genesis_timestamp: Option<u64>,
     /// Per-worker fee config overrides at genesis.
     ///
     /// Format: WORKER_ID:STRATEGY:VALUE (e.g., 0:0:100000000 for worker 0 with EIP-1559 at 100M
@@ -228,7 +243,14 @@ impl GenesisArgs {
 
     /// Validate the ceremony inputs, then generate the genesis and initial committee files.
     pub fn execute(&self, data_dir: PathBuf) -> eyre::Result<()> {
-        info!(target: "genesis::ceremony", "Creating a new chain genesis with initial validators");
+        // before anything is read or written, so a refused ceremony leaves the datadir untouched
+        let genesis_timestamp =
+            resolve_genesis_timestamp(self.genesis_timestamp, self.chain_id, now())?;
+        info!(
+            target: "genesis::ceremony",
+            genesis_timestamp,
+            "Creating a new chain genesis with initial validators"
+        );
 
         let chain: RethChainSpec<ExecHeader> = RethChainSpec::default();
         // load network genesis
@@ -259,7 +281,7 @@ impl GenesisArgs {
         };
 
         let mut genesis = network_genesis.genesis().clone();
-        set_genesis_defaults(&mut genesis);
+        set_genesis_defaults_at(&mut genesis, genesis_timestamp);
         genesis.config.chain_id = self.chain_id;
 
         // try to create a runtime if one doesn't already exist
@@ -340,6 +362,73 @@ impl GenesisArgs {
 
         Ok(())
     }
+}
+
+/// The smallest bare integer [`parse_genesis_timestamp`] refuses as milliseconds.
+///
+/// 10^11 seconds is past the year 5000, while unix time in milliseconds has been above 10^12
+/// since 2001, so no plausible value falls on the wrong side.
+const MILLISECONDS_THRESHOLD: u64 = 100_000_000_000;
+
+/// How far ahead of the ceremony a genesis timestamp may be: 366 days, in seconds.
+const MAX_GENESIS_LEAD_SECS: u64 = 366 * 24 * 60 * 60;
+
+/// Parse `--genesis-timestamp` as unix seconds or an RFC 3339 UTC timestamp.
+///
+/// A bare integer is unix seconds, and one of [`MILLISECONDS_THRESHOLD`] or more is refused.
+/// Anything else goes through [`humantime::parse_rfc3339`], which accepts only UTC (`Z` or
+/// `+00:00`) and refuses every other offset. A fractional second is refused because the genesis
+/// timestamp is whole seconds and rounding would move it.
+fn parse_genesis_timestamp(value: &str) -> eyre::Result<u64> {
+    if let Ok(secs) = value.parse::<u64>() {
+        if secs >= MILLISECONDS_THRESHOLD {
+            eyre::bail!(
+                "{secs} looks like milliseconds: pass unix seconds (below {MILLISECONDS_THRESHOLD}) \
+                 or an RFC 3339 UTC timestamp such as 2026-12-02T12:31:00Z"
+            );
+        }
+        return Ok(secs);
+    }
+    let since_epoch = humantime::parse_rfc3339(value)
+        .map_err(|e| {
+            eyre::eyre!(
+                "'{value}' is neither unix seconds nor an RFC 3339 UTC timestamp such as \
+                 2026-12-02T12:31:00Z: {e}"
+            )
+        })?
+        .duration_since(UNIX_EPOCH)?;
+    if since_epoch.subsec_nanos() != 0 {
+        eyre::bail!("'{value}' has a fractional second: the genesis timestamp is whole seconds");
+    }
+    Ok(since_epoch.as_secs())
+}
+
+/// Choose the genesis timestamp for a ceremony on `chain_id` run at time `now`.
+///
+/// A requested timestamp must be after `now` and at most [`MAX_GENESIS_LEAD_SECS`] ahead of it.
+/// Without one, a mainnet ceremony ([`MAINNET_CHAIN_ID`]) is refused and any other chain uses
+/// `now`.
+fn resolve_genesis_timestamp(requested: Option<u64>, chain_id: u64, now: u64) -> eyre::Result<u64> {
+    let Some(timestamp) = requested else {
+        if chain_id == MAINNET_CHAIN_ID {
+            eyre::bail!(
+                "a mainnet ceremony (chain id {MAINNET_CHAIN_ID}) requires --genesis-timestamp \
+                 <TIME>: unix seconds or an RFC 3339 UTC timestamp"
+            );
+        }
+        return Ok(now);
+    };
+    if timestamp <= now {
+        eyre::bail!("--genesis-timestamp {timestamp} is not after the current time {now}");
+    }
+    let latest = now.saturating_add(MAX_GENESIS_LEAD_SECS);
+    if timestamp > latest {
+        eyre::bail!(
+            "--genesis-timestamp {timestamp} is more than 366 days after the current time {now}: \
+             the latest accepted value is {latest}"
+        );
+    }
+    Ok(timestamp)
 }
 
 #[cfg(test)]
@@ -475,6 +564,7 @@ mod tests {
             max_batch_delay_ms: None,
             gc_depth: None,
             chain_id: 2017,
+            genesis_timestamp: None,
             worker_fee_configs: configs.into_iter().map(String::from).collect(),
             accounts: None,
         }
@@ -560,6 +650,218 @@ mod tests {
             err.to_string().contains("at least one --worker-fee-config is required"),
             "unexpected error: {err}"
         );
+    }
+
+    /// 2026-12-02 12:31:00 UTC as unix seconds.
+    const SCHEDULED_GENESIS_SECS: u64 = 1_796_214_660;
+
+    /// A fixed ceremony time for the clock-free validation tests.
+    const CEREMONY_NOW: u64 = 1_790_000_000;
+
+    /// A bare integer is unix seconds, up to one below the milliseconds threshold.
+    #[test]
+    fn parse_genesis_timestamp_reads_unix_seconds() -> eyre::Result<()> {
+        assert_eq!(parse_genesis_timestamp("1796214660")?, SCHEDULED_GENESIS_SECS);
+        assert_eq!(parse_genesis_timestamp("99999999999")?, MILLISECONDS_THRESHOLD - 1);
+        Ok(())
+    }
+
+    /// An RFC 3339 UTC timestamp gives the same unix seconds, with `Z`, `+00:00` or a zero
+    /// fraction.
+    #[test]
+    fn parse_genesis_timestamp_reads_rfc3339_utc() -> eyre::Result<()> {
+        for value in
+            ["2026-12-02T12:31:00Z", "2026-12-02T12:31:00+00:00", "2026-12-02T12:31:00.000Z"]
+        {
+            assert_eq!(parse_genesis_timestamp(value)?, SCHEDULED_GENESIS_SECS, "{value}");
+        }
+        Ok(())
+    }
+
+    /// A bare integer of 10^11 or more is refused as milliseconds, not read as a far-future
+    /// second.
+    #[test]
+    fn parse_genesis_timestamp_rejects_milliseconds() {
+        for value in ["100000000000", "1796214660000"] {
+            let err = parse_genesis_timestamp(value).unwrap_err().to_string();
+            assert!(err.contains("looks like milliseconds"), "{value}: {err}");
+        }
+    }
+
+    /// Only UTC is accepted. An offset other than `+00:00` is refused, not converted, so a local
+    /// time cannot shift the genesis by hours; `-00:00` (RFC 3339's unknown offset) is refused
+    /// too.
+    #[test]
+    fn parse_genesis_timestamp_rejects_non_utc_offsets() {
+        for value in
+            ["2026-12-02T13:31:00+01:00", "2026-12-02T07:31:00-05:00", "2026-12-02T12:31:00-00:00"]
+        {
+            let err = parse_genesis_timestamp(value).unwrap_err().to_string();
+            assert!(err.contains("is neither unix seconds nor an RFC 3339 UTC"), "{value}: {err}");
+        }
+    }
+
+    /// A non-zero fractional second is refused rather than rounded.
+    #[test]
+    fn parse_genesis_timestamp_rejects_fractional_seconds() {
+        let err = parse_genesis_timestamp("2026-12-02T12:31:00.5Z").unwrap_err().to_string();
+        assert!(err.contains("has a fractional second"), "{err}");
+    }
+
+    /// Values in neither accepted form are refused.
+    #[test]
+    fn parse_genesis_timestamp_rejects_garbage() {
+        for value in [
+            "",
+            "tomorrow",
+            "-1",
+            "1.5",
+            "0x6b0f3884",
+            "18446744073709551616",
+            "2026-12-02",
+            "2026-12-02 12:31:00",
+            "2026-12-02T12:31:00",
+            "2026-12-02t12:31:00z",
+            "2026-13-02T12:31:00Z",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert!(parse_genesis_timestamp(value).is_err(), "{value} must be refused");
+        }
+    }
+
+    /// The flag reaches `GenesisArgs` through clap in both forms, is absent by default, and a
+    /// millisecond value fails argument parsing.
+    #[test]
+    fn genesis_timestamp_flag_parses_through_clap() -> eyre::Result<()> {
+        let parse = |extra: &[&str]| {
+            CommandParser::<GenesisArgs>::try_parse_from(
+                std::iter::once("tn").chain(extra.iter().copied()),
+            )
+            .map(|command| command.args.genesis_timestamp)
+        };
+        assert_eq!(parse(&[])?, None);
+        assert_eq!(parse(&["--genesis-timestamp", "1796214660"])?, Some(SCHEDULED_GENESIS_SECS));
+        assert_eq!(
+            parse(&["--genesis-timestamp", "2026-12-02T12:31:00Z"])?,
+            Some(SCHEDULED_GENESIS_SECS)
+        );
+        assert!(parse(&["--genesis-timestamp", "1796214660000"]).is_err());
+        Ok(())
+    }
+
+    /// A timestamp at or before the ceremony time is refused; one second later is accepted.
+    #[test]
+    fn resolve_genesis_timestamp_rejects_past_and_present() -> eyre::Result<()> {
+        for requested in [0, CEREMONY_NOW - 1, CEREMONY_NOW] {
+            let err = resolve_genesis_timestamp(Some(requested), MAINNET_CHAIN_ID, CEREMONY_NOW)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is not after the current time"), "{requested}: {err}");
+        }
+        assert_eq!(
+            resolve_genesis_timestamp(Some(CEREMONY_NOW + 1), MAINNET_CHAIN_ID, CEREMONY_NOW)?,
+            CEREMONY_NOW + 1
+        );
+        Ok(())
+    }
+
+    /// Exactly 366 days ahead is accepted; one second more is refused.
+    #[test]
+    fn resolve_genesis_timestamp_rejects_more_than_366_days_ahead() -> eyre::Result<()> {
+        let latest = CEREMONY_NOW + MAX_GENESIS_LEAD_SECS;
+        assert_eq!(
+            resolve_genesis_timestamp(Some(latest), MAINNET_CHAIN_ID, CEREMONY_NOW)?,
+            latest
+        );
+        for requested in [latest + 1, MILLISECONDS_THRESHOLD - 1, u64::MAX] {
+            let err = resolve_genesis_timestamp(Some(requested), MAINNET_CHAIN_ID, CEREMONY_NOW)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is more than 366 days after"), "{requested}: {err}");
+        }
+        Ok(())
+    }
+
+    /// A mainnet ceremony without the flag is refused with an error naming the flag.
+    #[test]
+    fn resolve_genesis_timestamp_requires_the_flag_on_mainnet() -> eyre::Result<()> {
+        let err = resolve_genesis_timestamp(None, MAINNET_CHAIN_ID, CEREMONY_NOW)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires --genesis-timestamp"), "{err}");
+        assert_eq!(
+            resolve_genesis_timestamp(
+                Some(SCHEDULED_GENESIS_SECS),
+                MAINNET_CHAIN_ID,
+                CEREMONY_NOW
+            )?,
+            SCHEDULED_GENESIS_SECS
+        );
+        Ok(())
+    }
+
+    /// Any other chain without the flag uses the ceremony time.
+    #[test]
+    fn resolve_genesis_timestamp_defaults_to_now_off_mainnet() -> eyre::Result<()> {
+        for chain_id in [tn_types::ADIRI_CHAIN_ID, 487, 911329] {
+            assert_eq!(resolve_genesis_timestamp(None, chain_id, CEREMONY_NOW)?, CEREMONY_NOW);
+        }
+        Ok(())
+    }
+
+    /// A ceremony run with a future `--genesis-timestamp` writes exactly that value into the
+    /// genesis it produces.
+    #[test]
+    fn test_genesis_writes_the_requested_timestamp() -> eyre::Result<()> {
+        let (directory, mut args) = worker_count_ceremony(1, &[])?;
+        let timestamp = now() + 3_600;
+        args.genesis_timestamp = Some(timestamp);
+        let data_dir = directory.path().to_path_buf();
+        args.execute(data_dir.clone())?;
+        let genesis: Genesis =
+            Config::load_from_path(data_dir.genesis_file_path(), ConfigFmt::YAML)?;
+        assert_eq!(genesis.timestamp, timestamp);
+        Ok(())
+    }
+
+    /// A refused timestamp stops the ceremony before it reads its inputs or writes any output.
+    #[test]
+    fn test_genesis_refused_timestamp_writes_nothing() -> eyre::Result<()> {
+        let (directory, mut args) = worker_count_ceremony(1, &[])?;
+        let data_dir = directory.path().to_path_buf();
+        let cases = [
+            (Some(now().saturating_sub(1)), args.chain_id, "is not after the current time"),
+            (None, MAINNET_CHAIN_ID, "requires --genesis-timestamp"),
+        ];
+        for (requested, chain_id, expected) in cases {
+            args.genesis_timestamp = requested;
+            args.chain_id = chain_id;
+            let error = args
+                .execute(data_dir.clone())
+                .err()
+                .ok_or_else(|| eyre::eyre!("genesis must refuse {requested:?} on {chain_id}"))?;
+            assert!(error.to_string().contains(expected), "unexpected ceremony error: {error}");
+            assert!(
+                [
+                    data_dir.genesis_file_path(),
+                    data_dir.committee_path(),
+                    data_dir.node_config_parameters_path(),
+                ]
+                .iter()
+                .all(|path| !path.exists()),
+                "refused ceremony must not write genesis, committee or parameters"
+            );
+        }
+
+        // an empty datadir fails on the timestamp, not on its missing validators, and stays empty
+        let empty = tempfile::tempdir()?;
+        let error = args
+            .execute(empty.path().to_path_buf())
+            .err()
+            .ok_or_else(|| eyre::eyre!("genesis must refuse mainnet without a timestamp"))?;
+        assert!(error.to_string().contains("requires --genesis-timestamp"), "{error}");
+        assert!(std::fs::read_dir(empty.path())?.next().is_none(), "refused ceremony wrote a file");
+        Ok(())
     }
 
     /// The committed mainnet placeholder owner: `--consensus-registry-owner` AND the
@@ -673,7 +975,12 @@ mod tests {
     /// - epoch issuance [`MAINNET_EPOCH_ISSUANCE_TEL`] (25,806 TEL), passed explicitly (stake
     ///   amount / min withdrawal stay on the clap defaults, which also match the committed storage:
     ///   1M TEL / 1k TEL);
-    /// - 1s max/min header delays, preserving the committed parameters.yaml.
+    /// - 1s max/min header delays, preserving the committed parameters.yaml;
+    /// - genesis timestamp 1796214660 (2026-12-02 12:31:00 UTC), the scheduled mainnet genesis.
+    ///
+    /// The ceremony refuses a genesis timestamp that is not after the current time, so from the
+    /// mainnet genesis time on it refuses this one as past and the test fails. It no longer applies
+    /// then: the mainnet files are final by the genesis time and are not regenerated.
     ///
     /// The validator BLS/network keys are freshly minted placeholders by design: the
     /// committed placeholder identities' proof-of-possession signatures cannot be
@@ -737,6 +1044,8 @@ mod tests {
             "1000",
             "--min-header-delay-ms",
             "1000",
+            "--genesis-timestamp",
+            "1796214660",
         ]);
         ceremony.args.execute(shared.clone()).expect("mainnet genesis ceremony");
 
