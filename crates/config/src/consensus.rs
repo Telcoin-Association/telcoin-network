@@ -39,12 +39,10 @@ struct ConsensusConfigInner<DB> {
     prior_epoch: PriorEpoch,
 }
 
-/// What an epoch inherits from the block it starts after: the previous epoch's closing block, or
-/// genesis for epoch 0.
+/// What an epoch inherits from the close of the epoch before it.
 ///
-/// The record and the close are read at the previous epoch's closing block. Epoch 0 follows
-/// genesis rather than a closed epoch, so it has neither; instead it carries the genesis time as
-/// [`Self::genesis_start`]. [`PriorEpoch::genesis`] builds epoch 0 without that floor.
+/// Both values are read at the previous epoch's closing block.
+/// Epoch 0 follows genesis rather than a closed epoch; build it with [`PriorEpoch::genesis`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PriorEpoch {
     /// Digest of the previous epoch's `EpochRecord` ([`EpochDigest::default`] for epoch 0).
@@ -56,17 +54,12 @@ pub struct PriorEpoch {
     ///
     /// See [`ConsensusConfig::prior_epoch_close`].
     pub close: Option<TimestampSec>,
-    /// Timestamp, in seconds, of the genesis block, carried only by epoch 0 (`None` for every
-    /// later epoch and for [`PriorEpoch::genesis`]).
-    ///
-    /// See [`ConsensusConfig::genesis_floor`].
-    pub genesis_start: Option<TimestampSec>,
 }
 
 impl PriorEpoch {
-    /// Epoch 0 for tests: no prior record, no close to floor on, and no genesis floor.
+    /// Epoch 0: no prior record and no close to floor on.
     pub fn genesis() -> Self {
-        Self { record: EpochDigest::default(), close: None, genesis_start: None }
+        Self { record: EpochDigest::default(), close: None }
     }
 }
 
@@ -169,7 +162,7 @@ where
             committee,
             network_config,
             vec![],
-            PriorEpoch { record: prior_epoch_record, close: None, genesis_start: None },
+            PriorEpoch { record: prior_epoch_record, close: None },
         )
     }
 
@@ -343,19 +336,6 @@ where
     /// value so EVM time does not run backwards across the epoch seam.
     pub fn prior_epoch_close(&self) -> Option<TimestampSec> {
         self.inner.prior_epoch.close
-    }
-
-    /// Returns the genesis time, in seconds, as a lower bound on when the epoch's headers are
-    /// created.
-    ///
-    /// `Some` only in epoch 0, and only in the config epoch startup builds; `None` for every later
-    /// epoch and from every test constructor. Validators may start well before genesis, and no
-    /// epoch-0 header may be created before this time: the proposer holds its first header until
-    /// then and stamps it no earlier, and the voter refuses any header whose `created_at` is
-    /// earlier, so a header created before genesis cannot gather a quorum of honest votes. A
-    /// floor already in the past bounds nothing.
-    pub fn genesis_floor(&self) -> Option<TimestampSec> {
-        self.inner.prior_epoch.genesis_start
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.
@@ -713,11 +693,7 @@ mod tests {
             committee,
             NetworkConfig::default(),
             vec![],
-            PriorEpoch {
-                record: EpochDigest::default(),
-                close: prior_epoch_close,
-                genesis_start: None,
-            },
+            PriorEpoch { record: EpochDigest::default(), close: prior_epoch_close },
         )
         .expect("default test config passes new_for_epoch validation")
     }
@@ -900,29 +876,6 @@ mod tests {
         assert_eq!(config_for_epoch(1, Some(close)).prior_epoch_close(), Some(close));
     }
 
-    /// The genesis floor epoch startup hands `new_for_epoch` comes back from `genesis_floor`
-    /// unchanged, and its absence stays absent, so no consensus component sees a floor epoch
-    /// startup did not set.
-    #[test]
-    fn new_for_epoch_threads_genesis_floor() {
-        let genesis: TimestampSec = 1_700_000_000;
-        for genesis_start in [None, Some(genesis)] {
-            let (committee, key_config) = committee_and_keys(0);
-            let config = ConsensusConfig::new_for_epoch(
-                Config::default_for_test(),
-                NoStorage,
-                key_config,
-                committee,
-                NetworkConfig::default(),
-                vec![],
-                PriorEpoch { record: EpochDigest::default(), close: None, genesis_start },
-            )
-            .expect("default test config passes new_for_epoch validation");
-            assert_eq!(config.genesis_floor(), genesis_start);
-            assert_eq!(config.prior_epoch_close(), None, "the floor is not a prior close");
-        }
-    }
-
     /// Building an epoch's config does not judge the vote window: a node replaying an epoch its
     /// committee already closed must be able to enter it. The window is checked on the built
     /// config instead, which still rejects a short `vote_timeout` and names the knob.
@@ -940,7 +893,7 @@ mod tests {
             committee,
             NetworkConfig::default(),
             vec![],
-            PriorEpoch { record: EpochDigest::default(), close: None, genesis_start: None },
+            PriorEpoch { record: EpochDigest::default(), close: None },
         )
         .expect("new_for_epoch must build an epoch's config whatever its vote_timeout");
 
@@ -957,8 +910,8 @@ mod tests {
             .expect("the default parameters must pass the epoch timing check");
     }
 
-    /// Test-facing constructors never seed a floor, neither a prior close nor a genesis floor;
-    /// tests that need one build the config through `new_for_epoch`, the path epoch startup uses.
+    /// Test-facing constructors never seed a floor; tests that need one build the config through
+    /// `new_for_epoch`, the path epoch startup uses.
     #[test]
     fn test_constructors_carry_no_prior_close() {
         let (committee, key_config) = committee_and_keys(1);
@@ -971,7 +924,6 @@ mod tests {
         )
         .expect("test config");
         assert_eq!(config.prior_epoch_close(), None);
-        assert_eq!(config.genesis_floor(), None);
 
         let config = ConsensusConfig::new_with_committee_and_prior_epoch_record_for_test(
             Config::default_for_test(),
@@ -983,6 +935,5 @@ mod tests {
         )
         .expect("test config");
         assert_eq!(config.prior_epoch_close(), None);
-        assert_eq!(config.genesis_floor(), None);
     }
 }

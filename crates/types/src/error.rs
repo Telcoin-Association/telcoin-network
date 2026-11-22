@@ -315,16 +315,6 @@ pub enum HeaderError {
     /// The header's timestamp is too far in the future
     #[error("Invalid timestamp. Created at: {created} ms, received {received} ms")]
     InvalidTimestamp { created: TimestampMs, received: TimestampMs },
-    /// The header was created before the genesis time, which bounds header creation in epoch 0
-    /// (`ConsensusConfig::genesis_floor` in `tn-config`).
-    ///
-    /// `created` is the header's `created_at` and `genesis` the floor, both in milliseconds. The
-    /// check reads the header's timestamp, never the voter's clock, so clock skew between honest
-    /// validators cannot trigger it. The refusal is final for the header and carries no penalty:
-    /// an author that proposes early runs without the proposer's genesis hold, a configuration
-    /// fault, and the network needs it once genesis is reached.
-    #[error("Header created before genesis: created at {created} ms, genesis at {genesis} ms")]
-    CreatedBeforeGenesis { created: TimestampMs, genesis: TimestampMs },
     /// The header's sub-second creation time is outside `0..=999` milliseconds.
     #[error("Invalid header created_at_millis {0}: must be below 1000")]
     InvalidTimestampMillis(u16),

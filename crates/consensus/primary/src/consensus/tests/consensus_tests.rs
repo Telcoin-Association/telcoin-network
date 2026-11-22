@@ -1364,11 +1364,7 @@ fn config_with_prior_epoch_close(
         fixture_config.committee().clone(),
         fixture_config.network_config().clone(),
         fixture_config.next_committee_keys().to_vec(),
-        PriorEpoch {
-            record: fixture_config.prior_epoch_record(),
-            close: prior_epoch_close,
-            genesis_start: None,
-        },
+        PriorEpoch { record: fixture_config.prior_epoch_record(), close: prior_epoch_close },
     )
     .expect("fixture parameters satisfy the epoch constructor");
     assert_eq!(config.prior_epoch_close(), prior_epoch_close);

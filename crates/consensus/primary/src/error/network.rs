@@ -312,12 +312,6 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // a snapshot-restored voter cannot check a block below its floor; the requester's header
         // may be valid, and the voters with the full history decide it
         HeaderError::BelowRestoreFloor { .. } => None,
-        // ignore (a configuration fault, not an attack)
-        //
-        // an epoch-0 header created before genesis comes from an author running without the
-        // proposer's genesis hold. refusing the vote is enough to keep it uncertified; a penalty
-        // would cut off a validator the committee needs for quorum once genesis is reached
-        HeaderError::CreatedBeforeGenesis { .. } => None,
     }
 }
 
@@ -543,26 +537,6 @@ mod tests {
         assert_eq!(penalty_from_header_error(&error), None);
         let error = PrimaryNetworkError::InvalidHeader(error);
         assert!(Option::<Penalty>::from(&error).is_none());
-        assert!(matches!(PrimaryResponse::into_error_ref(&error), PrimaryResponse::Error(_)));
-    }
-
-    /// An epoch-0 header created before genesis comes from an author without the proposer's
-    /// genesis hold: the refusal carries no penalty and strikes no one, and it is final (not
-    /// retryable), so the requester stops asking this voter for the header.
-    #[test]
-    fn created_before_genesis_refusal_is_final_and_not_penalized() {
-        use crate::network::PrimaryResponse;
-        use tn_types::TimestampMs;
-
-        let error = HeaderError::CreatedBeforeGenesis {
-            created: TimestampMs::from_millis(1_999),
-            genesis: TimestampMs::from_parts(2, 0),
-        };
-        assert!(error.to_string().contains("created before genesis"), "unexpected text: {error}");
-        assert_eq!(penalty_from_header_error(&error), None);
-        let error = PrimaryNetworkError::InvalidHeader(error);
-        assert!(Option::<Penalty>::from(&error).is_none());
-        assert!(!error.strikes_gossip_author());
         assert!(matches!(PrimaryResponse::into_error_ref(&error), PrimaryResponse::Error(_)));
     }
 

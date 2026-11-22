@@ -394,7 +394,7 @@ where
         watch_genesis(
             &epoch_task_manager,
             consensus_config.shutdown(),
-            consensus_config.genesis_floor(),
+            (current_epoch == 0).then_some(epoch_start),
             self.epoch_boundary,
             consensus_config.parameters().max_header_delay,
             proposer_started,
@@ -1297,20 +1297,19 @@ fn produces_batches(in_committee: bool, proposer_started: bool) -> bool {
 
 /// Make epoch 0's wait for genesis visible to an operator, without touching consensus.
 ///
-/// `genesis` is the epoch's genesis floor
-/// ([`ConsensusConfig::genesis_floor`](tn_config::ConsensusConfig::genesis_floor)), `Some` only in
-/// epoch 0. A node can enter epoch 0 a day or more before genesis, and until then no header is
-/// proposed or voted for and no block exists, whatever the node's mode. So every node that enters
-/// with genesis still ahead, observers and non-members included, runs [`genesis_countdown`] as the
-/// non-critical [`GENESIS_COUNTDOWN_TASK`] on the epoch's task manager: its exit or panic cannot
-/// end the epoch, and it ends with the epoch's shutdown (`epoch_shutdown`) or its task manager. An
-/// active validator's proposer also logs its own hold, under its own target.
+/// `genesis` is the genesis time, `Some` only in epoch 0. A node can enter epoch 0 a day or more
+/// before genesis, and until then no header is proposed and no block exists, whatever
+/// the node's mode. So every node that enters with genesis still ahead, observers and non-members
+/// included, runs [`genesis_countdown`] as the non-critical [`GENESIS_COUNTDOWN_TASK`] on the
+/// epoch's task manager: its exit or panic cannot end the epoch, and it ends with the epoch's
+/// shutdown (`epoch_shutdown`) or its task manager. An active validator's proposer also logs its
+/// own hold, under its own target.
 ///
-/// A floor already passed starts nothing. An active validator that enters after genesis knowing of
-/// no commit, so late that the epoch boundary is due ([`epoch_zero_starts_late`]), is warned once
-/// that, if the network has not committed yet, the first commit at or past the boundary closes
-/// epoch 0. That is the existing close rule, and nothing here changes it. `latest_consensus` is
-/// the highest consensus number the node knows of when it enters the epoch
+/// A genesis time already passed starts nothing. An active validator that enters after genesis
+/// knowing of no commit, so late that the epoch boundary is due ([`epoch_zero_starts_late`]), is
+/// warned once that, if the network has not committed yet, the first commit at or past the boundary
+/// closes epoch 0. That is the existing close rule, and nothing here changes it. `latest_consensus`
+/// is the highest consensus number the node knows of when it enters the epoch
 /// (`EpochManager::latest_known_consensus_number`). A node on a fresh data directory can know of
 /// none while the network has committed, so the warning does not claim that nothing has.
 fn watch_genesis(
@@ -4008,8 +4007,8 @@ pub(super) mod tests {
     }
 
     /// Epoch 0 entered before genesis runs the countdown as a non-critical epoch task, on an
-    /// active validator and on any other node alike, and the task ends with the epoch. No floor,
-    /// or a floor already passed, starts nothing, however late the node is.
+    /// active validator and on any other node alike, and the task ends with the epoch. No genesis
+    /// time, or one already passed, starts nothing, however late the node is.
     #[tokio::test(start_paused = true)]
     async fn genesis_countdown_runs_only_before_genesis_and_ends_with_the_epoch() {
         tn_types::test_utils::init_test_tracing();
