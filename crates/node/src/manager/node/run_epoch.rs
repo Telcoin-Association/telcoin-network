@@ -1670,7 +1670,10 @@ pub(super) mod tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use std::{
         cell::{Cell, RefCell},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
         time::Instant,
     };
     use tempfile::TempDir;
@@ -3988,8 +3991,6 @@ pub(super) mod tests {
     /// clock has barely moved and genesis was a day away when the countdown started.
     #[tokio::test(start_paused = true)]
     async fn genesis_countdown_honours_a_wall_clock_step() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
         let genesis = 1_796_214_660;
         let wall = Arc::new(AtomicU64::new(genesis - 86_400));
         let clock = {
