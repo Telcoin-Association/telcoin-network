@@ -40,6 +40,39 @@ For the registry ABI that is live today, read the `tn-contracts` sources or the 
 ## mainnet
 
 `mainnet/` (chain ID 731) holds placeholders, not the real mainnet configuration.
-Its validators are throwaway keys from the ignored test `regenerate_mainnet_chain_configs` in `crates/telcoin-network-cli/src/genesis/mod.rs`, which is rerun after a `tn-contracts` artifact bump.
-That test rewrites `genesis.yaml`, `committee.yaml` and `parameters.yaml` only. `bootstrap_servers.yaml` holds an earlier placeholder set on loopback addresses and is edited by hand.
-The real files will come from the mainnet genesis ceremony; the real bootstrap servers are set in `bootstrap_servers.yaml` before launch.
+
+### The validator files
+
+`mainnet/validators/` holds the inputs of the genesis ceremony: one node-info file per genesis validator, in the format `telcoin-network keytool generate validator` writes as `node-info.yaml`.
+The files are named `validator-00.yaml` to `validator-09.yaml`.
+File N belongs to the validator that stakes under genesis validator Safe N, the Nth address of `tn-contracts/deployments/genesis/validator-safes.yaml` (`tn_config::genesis_validator_safes()`).
+Its `execution_address` must be that Safe, and its proof of possession must be signed over it.
+
+Today the ten files are throwaway placeholders from the ignored test `mint_mainnet_placeholder_validators` in `crates/telcoin-network-cli/src/genesis/mod.rs`.
+Their names start with `placeholder-validator-`, their addresses are in 192.0.2.0/24 (a documentation range that is never routed), and their private keys were discarded when the test finished.
+The test refuses to replace a file that is not one of its placeholders.
+
+### Regenerating the configs
+
+The ignored test `regenerate_mainnet_chain_configs` in the same file runs the genesis ceremony over the ten validator files and rewrites `genesis.yaml`, `committee.yaml` and `parameters.yaml`.
+It mints no keys.
+Before the ceremony it refuses a directory that does not hold exactly the ten files, a file whose `execution_address` is not its Safe, a proof of possession that does not verify for the file's BLS key and Safe, and a BLS key listed in two files.
+Rerun it after a `tn-contracts` artifact bump and after any change to the validator files:
+
+```
+cargo test -p telcoin-network-cli regenerate_mainnet_chain_configs -- --ignored
+```
+
+The ceremony stamps the current time as the genesis timestamp, so two runs over the same files differ only in the `timestamp` line of `genesis.yaml`.
+Run each ignored test by name: an unfiltered `-- --ignored` run starts both at once.
+
+`bootstrap_servers.yaml` is not written by the ceremony. It holds an earlier placeholder set on loopback addresses and is edited by hand; the real bootstrap servers are set there before launch.
+
+### Final data
+
+When the ten operators' node-info files are collected:
+
+1. Replace `mainnet/validators/validator-NN.yaml` with the file of the operator assigned Safe NN, keeping the file names.
+2. Run `regenerate_mainnet_chain_configs` as above.
+3. Run the tests that read these files: `cargo nextest run -p tn-types -p tn-config -p telcoin-network-cli` and `cargo nextest run -p tn-reth -E 'test(mainnet)'`.
+4. Commit the ten validator files together with the regenerated `genesis.yaml`, `committee.yaml` and `parameters.yaml`.

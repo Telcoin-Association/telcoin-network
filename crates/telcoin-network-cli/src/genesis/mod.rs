@@ -347,11 +347,14 @@ mod tests {
     use super::*;
     use alloy::primitives::b256;
     use clap::Parser as _;
-    use tn_config::NodeInfo;
+    use eyre::WrapErr as _;
+    use std::{collections::BTreeSet, path::Path};
+    use tn_config::{genesis_validator_safes, NodeInfo};
     use tn_reth::system_calls::CONSENSUS_REGISTRY_ADDRESS;
     use tn_types::{
-        generate_proof_of_possession_bls_for_test, test_utils::CommandParser, Address, BlsKeypair,
-        Committee, Genesis, Multiaddr, NetworkKeypair, NodeP2pInfo, B256, MAINNET_GENESIS, U256,
+        generate_proof_of_possession_bls_for_test, test_utils::CommandParser,
+        verify_proof_of_possession_bls, Address, BlsKeypair, Committee, Genesis, Multiaddr,
+        NetworkKeypair, NodeP2pInfo, P2pNode, B256, MAINNET_GENESIS, U256,
     };
 
     /// Prepare signed validator inputs and parse the real genesis CLI defaults and fee flags.
@@ -644,11 +647,218 @@ mod tests {
         );
     }
 
-    /// Regenerate the committed `chain-configs/mainnet/{genesis,committee,parameters}.yaml`
-    /// placeholders from the CURRENT tn-contracts artifacts (issue #1063).
+    /// The prefix of every placeholder validator's `name`, so that readers of the committed files
+    /// and [`mint_mainnet_placeholder_validators`] can tell placeholders from collected files.
+    const PLACEHOLDER_VALIDATOR_NAME_PREFIX: &str = "placeholder-validator-";
+
+    /// The committed `chain-configs/mainnet` directory of this checkout.
+    fn mainnet_chain_configs_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("chain-configs")
+            .join("mainnet")
+    }
+
+    /// The committed genesis ceremony inputs: one node-info file per genesis validator Safe.
+    fn mainnet_validators_dir() -> PathBuf {
+        mainnet_chain_configs_dir().join("validators")
+    }
+
+    /// The name of genesis validator `index`'s node-info file. That validator stakes under
+    /// `genesis_validator_safes()[index]`.
+    fn mainnet_validator_file_name(index: usize) -> String {
+        format!("validator-{index:02}.yaml")
+    }
+
+    /// Read the genesis validator inputs in `dir` and check them against `safes`.
     ///
-    /// WHEN to run: after a tn-contracts submodule/artifact bump, or whenever a mainnet gate
-    /// fails (`mainnet_genesis_registry_code_matches_current_artifact` /
+    /// `dir` must hold exactly one file per Safe, named by [`mainnet_validator_file_name`], and
+    /// nothing else. File `N` must parse as node-info, name Safe `N` as its execution address,
+    /// carry a proof of possession that verifies for its BLS key and Safe `N`, and use a BLS key
+    /// that no other file uses. Returns the parsed files in Safe order.
+    ///
+    /// The ceremony verifies each proof against whatever address its file names, and its error
+    /// does not name the file. It also keys validators by BLS key, so a key listed twice would
+    /// silently seat one validator fewer.
+    fn check_mainnet_validators(dir: &Path, safes: &[Address]) -> eyre::Result<Vec<NodeInfo>> {
+        let expected: BTreeSet<String> =
+            (0..safes.len()).map(mainnet_validator_file_name).collect();
+        let found = std::fs::read_dir(dir)
+            .wrap_err_with(|| format!("read validators directory {}", dir.display()))?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<eyre::Result<BTreeSet<String>>>()?;
+        eyre::ensure!(
+            found == expected,
+            "{} must hold exactly the {} files {expected:?}, one for each genesis validator Safe, \
+             but holds {found:?}",
+            dir.display(),
+            expected.len()
+        );
+
+        let mut bls_keys = BTreeSet::new();
+        safes
+            .iter()
+            .enumerate()
+            .map(|(index, safe)| {
+                let path = dir.join(mainnet_validator_file_name(index));
+                let bytes =
+                    std::fs::read(&path).wrap_err_with(|| format!("read {}", path.display()))?;
+                let validator: NodeInfo = serde_yaml::from_slice(&bytes)
+                    .wrap_err_with(|| format!("{} is not a node-info file", path.display()))?;
+                eyre::ensure!(
+                    validator.execution_address == *safe,
+                    "{} names execution address {} but genesis validator {index} stakes under \
+                     Safe {safe}",
+                    path.display(),
+                    validator.execution_address
+                );
+                verify_proof_of_possession_bls(
+                    &validator.proof_of_possession,
+                    &validator.bls_public_key,
+                    safe,
+                )
+                .wrap_err_with(|| {
+                    format!(
+                        "{}: the proof of possession does not verify for its BLS key and Safe \
+                         {safe}",
+                        path.display()
+                    )
+                })?;
+                eyre::ensure!(
+                    bls_keys.insert(validator.bls_public_key),
+                    "{} repeats the BLS key {} of an earlier file",
+                    path.display(),
+                    validator.bls_public_key
+                );
+                Ok(validator)
+            })
+            .collect()
+    }
+
+    /// Copy every entry of the committed validators directory `source` into the ceremony's
+    /// validators directory `staged`, then check the copies with [`check_mainnet_validators`].
+    ///
+    /// The copies are what the ceremony reads, so checking them rather than `source` leaves no
+    /// window in which a file can change between the check and the ceremony. Copying every
+    /// entry makes a stray file in `source` fail the check instead of being skipped.
+    fn stage_mainnet_validators(
+        source: &Path,
+        staged: &Path,
+        safes: &[Address],
+    ) -> eyre::Result<()> {
+        for entry in std::fs::read_dir(source)
+            .wrap_err_with(|| format!("read validators directory {}", source.display()))?
+        {
+            let entry = entry?;
+            std::fs::copy(entry.path(), staged.join(entry.file_name()))
+                .wrap_err_with(|| format!("copy {} into the ceremony", entry.path().display()))?;
+        }
+        check_mainnet_validators(staged, safes)?;
+        Ok(())
+    }
+
+    /// Mint throwaway placeholder validators into `chain-configs/mainnet/validators`, one for
+    /// each genesis validator Safe.
+    ///
+    /// The keys are throwaway. Each validator is minted by the in-process `keytool generate
+    /// validator` in a temporary datadir, with its proof of possession signed over
+    /// `genesis_validator_safes()[N]`, and only its public `node-info.yaml` is kept. The private
+    /// halves are discarded with the temporary datadirs when the test ends, so no node can run
+    /// as a placeholder validator. Real mainnet keys are never produced by this test: every
+    /// operator generates their own keys on their own machine and submits only the node-info
+    /// file.
+    ///
+    /// Placeholder `N` is named `placeholder-validator-NN` and advertises one worker on
+    /// `192.0.2.(10 + N)`, port 49590 for the primary and 49594 for the worker. 192.0.2.0/24 is
+    /// TEST-NET-1 (RFC 5737), which is never routed. Each run mints new keys, so it rewrites all
+    /// the files.
+    ///
+    /// The test checks the minted set with [`check_mainnet_validators`] before it replaces
+    /// anything, and it refuses to replace a file whose `name` does not start with
+    /// [`PLACEHOLDER_VALIDATOR_NAME_PREFIX`], so it never overwrites collected node-info files.
+    ///
+    /// HOW to run: `cargo test -p telcoin-network-cli mint_mainnet_placeholder_validators --
+    /// --ignored`, then run [`regenerate_mainnet_chain_configs`] and commit the validator files
+    /// together with the regenerated configs.
+    #[test]
+    #[ignore = "replaces the placeholder files in chain-configs/mainnet/validators with freshly minted throwaway validators; run explicitly, then regenerate_mainnet_chain_configs"]
+    fn mint_mainnet_placeholder_validators() {
+        use crate::keytool::KeyArgs;
+
+        let safes = genesis_validator_safes();
+        let tmp = tempfile::tempdir().expect("tempdir for the throwaway placeholder keys");
+        let minted = tmp.path().join("validators");
+        std::fs::create_dir_all(&minted).expect("create the minted validators dir");
+        safes.iter().enumerate().for_each(|(index, safe)| {
+            let name = format!("{PLACEHOLDER_VALIDATOR_NAME_PREFIX}{index:02}");
+            let address = safe.to_string();
+            let host = format!("192.0.2.{}", 10 + index);
+            let primary = format!("/ip4/{host}/udp/49590/quic-v1");
+            let worker = format!("/ip4/{host}/udp/49594/quic-v1");
+            let datadir = tmp.path().join(&name);
+            let keytool = CommandParser::<KeyArgs>::parse_from([
+                "tn",
+                "generate",
+                "validator",
+                "--address",
+                address.as_str(),
+                "--name",
+                name.as_str(),
+                "--workers",
+                "1",
+                "--external-primary-addr",
+                primary.as_str(),
+                "--external-worker-addrs",
+                worker.as_str(),
+            ]);
+            keytool.args.execute(datadir.clone(), None).expect("keytool generate validator");
+            std::fs::copy(
+                datadir.node_info_path(),
+                minted.join(mainnet_validator_file_name(index)),
+            )
+            .expect("copy node-info.yaml into the minted validators dir");
+        });
+        check_mainnet_validators(&minted, &safes)
+            .expect("minted placeholders must pass the ceremony input checks");
+
+        let target = mainnet_validators_dir();
+        std::fs::create_dir_all(&target).expect("create chain-configs/mainnet/validators");
+        let existing: Vec<PathBuf> = std::fs::read_dir(&target)
+            .expect("read chain-configs/mainnet/validators")
+            .map(|entry| entry.expect("read a chain-configs/mainnet/validators entry").path())
+            .collect();
+        existing.iter().for_each(|path| {
+            let validator: Option<NodeInfo> =
+                std::fs::read(path).ok().and_then(|bytes| serde_yaml::from_slice(&bytes).ok());
+            assert!(
+                validator
+                    .as_ref()
+                    .is_some_and(|info| info.name.starts_with(PLACEHOLDER_VALIDATOR_NAME_PREFIX)),
+                "{} is not a placeholder minted by this test; it never replaces collected \
+                 node-info files, so remove the file by hand if a placeholder must replace it",
+                path.display()
+            );
+        });
+        existing.iter().for_each(|path| {
+            std::fs::remove_file(path)
+                .unwrap_or_else(|e| panic!("remove placeholder {}: {e}", path.display()))
+        });
+        (0..safes.len()).for_each(|index| {
+            let name = mainnet_validator_file_name(index);
+            std::fs::copy(minted.join(&name), target.join(&name))
+                .unwrap_or_else(|e| panic!("write placeholder {name}: {e}"));
+        });
+        check_mainnet_validators(&target, &safes)
+            .expect("written placeholders must pass the ceremony input checks");
+    }
+
+    /// Regenerate the committed `chain-configs/mainnet/{genesis,committee,parameters}.yaml` from
+    /// the committed validator inputs and the CURRENT tn-contracts artifacts (issue #1063).
+    ///
+    /// WHEN to run: after a tn-contracts submodule/artifact bump, after a change to
+    /// `chain-configs/mainnet/validators`, or whenever a mainnet gate fails
+    /// (`mainnet_genesis_registry_code_matches_current_artifact` /
     /// `mainnet_chain_configs_load_via_the_node_paths` in `crates/config`,
     /// `test_mainnet_genesis_registry_serves_post_fork_reads` in `crates/tn-reth`, or
     /// `mainnet_genesis_encodes_the_six_hour_epoch_target` in this module).
@@ -661,9 +871,11 @@ mod tests {
     /// `bootstrap_servers` map (kept, not dropped, because older binaries require the key).
     ///
     /// This is the full genesis ceremony (`GenesisArgs::execute`) driven in-process the same
-    /// way the e2e suite drives it (`crates/e2e-tests/src/lib.rs`): mint 4 placeholder
-    /// validators via the in-process keytool, then run the ceremony with flags mirroring the
-    /// committed placeholder identity:
+    /// way the e2e suite drives it (`crates/e2e-tests/src/lib.rs`): stage the committed
+    /// node-info files `chain-configs/mainnet/validators/validator-00.yaml` to `validator-09.yaml`
+    /// as the ceremony's validators ([`stage_mainnet_validators`] refuses a set that does not
+    /// hold one file per genesis validator Safe, each staked under and signed over its Safe),
+    /// then run the ceremony with flags mirroring the committed placeholder identity:
     /// - chain id 0x2db (731), unchanged from the committed genesis;
     /// - owner + dev-funded account [`MAINNET_PLACEHOLDER_OWNER`];
     /// - basefee address 0x99..99, preserving the committed parameters.yaml;
@@ -675,47 +887,30 @@ mod tests {
     ///   1M TEL / 1k TEL);
     /// - 1s max/min header delays, preserving the committed parameters.yaml.
     ///
-    /// The validator BLS/network keys are freshly minted placeholders by design: the
-    /// committed placeholder identities' proof-of-possession signatures cannot be
-    /// reproduced (the keytool mints random keys), and `chain-configs/README.md` documents
-    /// these files as placeholders until the real mainnet ceremony.
+    /// The test mints no keys, so two runs over the same validator files differ only in the
+    /// genesis timestamp, which the ceremony takes from the wall clock. Until the collected
+    /// node-info files replace them, the committed validator files are the throwaway placeholders
+    /// of [`mint_mainnet_placeholder_validators`] (`chain-configs/README.md`).
     ///
     /// All three ceremony outputs are read into memory BEFORE any file under
     /// `chain-configs/mainnet` is written, so a missing/unreadable output aborts without
     /// leaving a half-regenerated (2-of-3) config set behind.
     #[test]
-    #[ignore = "regenerates chain-configs/mainnet in the working tree from the current tn-contracts artifacts; run explicitly after an artifact bump or when the mainnet config gates fail"]
+    #[ignore = "regenerates chain-configs/mainnet in the working tree from its validator files and the current tn-contracts artifacts; run explicitly after an artifact bump, a validator file change, or when the mainnet config gates fail"]
     fn regenerate_mainnet_chain_configs() {
-        use crate::keytool::KeyArgs;
-
         let tmp = tempfile::tempdir().expect("tempdir for the mainnet regeneration ceremony");
         let shared = tmp.path().join("mainnet-genesis");
         let validators_dir = shared.join("genesis").join("validators");
         std::fs::create_dir_all(&validators_dir).expect("create genesis validators dir");
-
-        // placeholder validators mirror the committed placeholder execution addresses
-        let placeholders = [
-            ("validator-1", "0x1111111111111111111111111111111111111111"),
-            ("validator-2", "0x2222222222222222222222222222222222222222"),
-            ("validator-3", "0x3333333333333333333333333333333333333333"),
-            ("validator-4", "0x4444444444444444444444444444444444444444"),
-        ];
-        placeholders.iter().for_each(|(name, address)| {
-            let datadir = tmp.path().join(name);
-            let keytool = CommandParser::<KeyArgs>::parse_from([
-                "tn",
-                "generate",
-                "validator",
-                "--address",
-                address,
-            ]);
-            keytool.args.execute(datadir.clone(), None).expect("keytool generate validator");
-            std::fs::copy(
-                datadir.join("node-info.yaml"),
-                validators_dir.join(format!("{name}.yaml")),
-            )
-            .expect("copy node-info.yaml into the shared genesis dir");
-        });
+        stage_mainnet_validators(
+            &mainnet_validators_dir(),
+            &validators_dir,
+            &genesis_validator_safes(),
+        )
+        .expect(
+            "chain-configs/mainnet/validators must hold one node-info file per genesis validator \
+             Safe, staked under and signed over that Safe",
+        );
 
         let epoch_duration = MAINNET_EPOCH_DURATION_SECS.to_string();
         let epoch_issuance = MAINNET_EPOCH_ISSUANCE_TEL.to_string();
@@ -743,11 +938,7 @@ mod tests {
         // splice the ceremony output over the committed placeholders: read ALL three
         // outputs first (any read failure aborts before chain-configs is touched), then
         // write, so a partial ceremony can never leave a half-regenerated config set
-        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("chain-configs")
-            .join("mainnet");
+        let target = mainnet_chain_configs_dir();
         let outputs = [
             (shared.join("genesis").join("genesis.yaml"), target.join("genesis.yaml")),
             (shared.join("genesis").join("committee.yaml"), target.join("committee.yaml")),
@@ -782,5 +973,134 @@ mod tests {
             std::fs::write(destination, bytes)
                 .unwrap_or_else(|e| panic!("write regenerated {}: {e}", destination.display()))
         });
+    }
+
+    /// A node-info file for a validator whose BLS key is derived from `seed`, naming
+    /// `execution_address` and carrying a proof of possession signed over `signed_address`.
+    fn signed_validator(
+        seed: u8,
+        execution_address: Address,
+        signed_address: Address,
+    ) -> eyre::Result<NodeInfo> {
+        let keypair = BlsKeypair::generate(&mut StdRng::from_seed([seed; 32]));
+        let p2p_node = || -> P2pNode {
+            (NetworkKeypair::generate_ed25519().public().clone().into(), Multiaddr::empty()).into()
+        };
+        Ok(NodeInfo {
+            name: format!("{PLACEHOLDER_VALIDATOR_NAME_PREFIX}{seed:02}"),
+            bls_public_key: *keypair.public(),
+            p2p_info: NodeP2pInfo::new(p2p_node(), vec![p2p_node()]),
+            execution_address,
+            proof_of_possession: generate_proof_of_possession_bls_for_test(
+                &keypair,
+                &signed_address,
+            )?,
+        })
+    }
+
+    /// One valid node-info file for each Safe in `safes`, in Safe order, with distinct keys.
+    fn signed_validators(safes: &[Address]) -> eyre::Result<Vec<NodeInfo>> {
+        safes.iter().zip(1_u8..).map(|(safe, seed)| signed_validator(seed, *safe, *safe)).collect()
+    }
+
+    /// Write `validators` as a committed validators directory, file `N` holding entry `N`, and
+    /// stage it into a ceremony directory the way [`regenerate_mainnet_chain_configs`] does.
+    ///
+    /// The outer result reports a broken fixture; the inner one is the staging result.
+    fn stage_validators(validators: Vec<NodeInfo>) -> eyre::Result<eyre::Result<()>> {
+        let directory = tempfile::tempdir()?;
+        let committed = directory.path().join("committed");
+        let staged = directory.path().join("staged");
+        std::fs::create_dir_all(&committed)?;
+        std::fs::create_dir_all(&staged)?;
+        validators.into_iter().enumerate().try_for_each(|(index, validator)| {
+            Config::write_to_path(
+                committed.join(mainnet_validator_file_name(index)),
+                validator,
+                ConfigFmt::YAML,
+            )
+        })?;
+        Ok(stage_mainnet_validators(&committed, &staged, &genesis_validator_safes()))
+    }
+
+    /// Stage `validators` and return the message of the refusal, with its causes.
+    fn staging_refusal(validators: Vec<NodeInfo>) -> eyre::Result<String> {
+        stage_validators(validators)?
+            .err()
+            .map(|error| format!("{error:#}"))
+            .ok_or_else(|| eyre::eyre!("staging must refuse this validators directory"))
+    }
+
+    /// One signed file per genesis validator Safe stages, so each refusal below comes from the
+    /// single defect its test introduces.
+    #[test]
+    fn staging_accepts_one_signed_file_per_genesis_validator_safe() -> eyre::Result<()> {
+        stage_validators(signed_validators(&genesis_validator_safes())?)?
+    }
+
+    /// A missing file is refused instead of seating a smaller genesis committee.
+    #[test]
+    fn staging_refuses_nine_validator_files() -> eyre::Result<()> {
+        let mut validators = signed_validators(&genesis_validator_safes())?;
+        validators.pop();
+        let refusal = staging_refusal(validators)?;
+        assert!(
+            refusal.contains("must hold exactly the 10 files"),
+            "unexpected refusal: {refusal}"
+        );
+        Ok(())
+    }
+
+    /// A file staked under another validator's Safe is refused, although its proof verifies for
+    /// the address it names.
+    #[test]
+    fn staging_refuses_a_file_staked_under_the_wrong_safe() -> eyre::Result<()> {
+        let safes = genesis_validator_safes();
+        let mut validators = signed_validators(&safes)?;
+        validators.swap(3, 4);
+        let refusal = staging_refusal(validators)?;
+        assert!(
+            refusal.contains(&format!(
+                "validator-03.yaml names execution address {} but genesis validator 3 stakes \
+                 under Safe {}",
+                safes[4], safes[3]
+            )),
+            "unexpected refusal: {refusal}"
+        );
+        Ok(())
+    }
+
+    /// A proof signed over another address is refused, although the file names its own Safe.
+    #[test]
+    fn staging_refuses_a_proof_signed_over_another_address() -> eyre::Result<()> {
+        let safes = genesis_validator_safes();
+        let mut validators = signed_validators(&safes)?;
+        validators[5] = signed_validator(6, safes[5], Address::repeat_byte(0x55))?;
+        let refusal = staging_refusal(validators)?;
+        assert!(
+            refusal.contains(&format!(
+                "validator-05.yaml: the proof of possession does not verify for its BLS key and \
+                 Safe {}",
+                safes[5]
+            )),
+            "unexpected refusal: {refusal}"
+        );
+        Ok(())
+    }
+
+    /// A BLS key in two files is refused: the ceremony keys validators by BLS key and would seat
+    /// only one of them.
+    #[test]
+    fn staging_refuses_a_bls_key_listed_twice() -> eyre::Result<()> {
+        let safes = genesis_validator_safes();
+        let mut validators = signed_validators(&safes)?;
+        // seed 7 is validator 6's key, signed over safe 7 so that the proof verifies
+        validators[7] = signed_validator(7, safes[7], safes[7])?;
+        let refusal = staging_refusal(validators)?;
+        assert!(
+            refusal.contains("validator-07.yaml repeats the BLS key"),
+            "unexpected refusal: {refusal}"
+        );
+        Ok(())
     }
 }
