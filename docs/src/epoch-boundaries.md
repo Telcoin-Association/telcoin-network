@@ -16,6 +16,22 @@ Each epoch has a predefined time boundary. The consensus layer monitors the comm
 
 The execution engine checks this flag during block finalization. When present, it triggers the epoch-closing system calls before completing the block. If the epoch's final consensus output contains no transaction batches, a single empty block is created specifically to carry these system calls.
 
+### Epoch 0 and the Genesis Time
+
+Epoch 0 starts at the genesis timestamp in `genesis.yaml`, and its boundary is that timestamp plus the epoch duration. The genesis ceremony can fix the timestamp in advance (`--genesis-timestamp`) and validators can start before it, so in epoch 0 the genesis timestamp is a lower bound on every header's `created_at`. Two parts of the node read it:
+
+* **Proposer** — an active validator that enters epoch 0 before the genesis time holds its first header until its clock reaches that time, reading the clock at least once a second. It then sets the header's `created_at` no earlier than the genesis time, even if its clock stepped back during the wait. An epoch-0 header created before the genesis time that it finds in its store, which only a build without this rule can have left there, is not re-sent unless the node holds a certificate for it: the proposer builds a new header for that round instead, held and stamped like any other. A certified early header is kept and re-sent, because a second certified header for the same round would be an equivocation.
+* **Voter** — a validator refuses to vote for an epoch-0 header whose `created_at` is before the genesis time. The check reads the header's timestamp, never the voter's clock, so clock skew between validators cannot make one refuse another's header, and the refusal carries no penalty for the header's author. The refusal does not count as the voter's decision for the author's round, so a later header from the same author for that round is judged on its own and can still earn the vote; a vote the voter has cast for the round still refuses every other header for it.
+
+A certificate needs a quorum of votes, so no epoch-0 header created before genesis is certified, and no block is built before genesis, unless validators without this rule form a quorum by themselves. Fewer of them can still stop epoch 0 at round 1: a build without the rule re-sends its refused header and builds no other for the round, so once more validators run such a build than the committee can spare from a quorum, round 1 never gathers a quorum of certificates. A vote cast for an early header while a validator ran such a build is kept after it upgrades and refuses that author's replacement header. Every validator must therefore run a release that contains the rule from its first start on the network's genesis (see [Starting before genesis](getting-started/validator-operations.md#starting-before-genesis)). After the genesis time, as on a restart after genesis, a proposer has nothing to hold and its headers pass the voter's check, and no later epoch has the bound.
+
+The rule deliberately leaves these unchanged:
+
+* **Commit floor** — epoch 0 still has none; its commit timestamps are at or after the genesis time because each is at least its leader header's `created_at`.
+* **Close rule** — epoch 0 closes like any other epoch (see [Epoch Boundary Detection](#epoch-boundary-detection)), so a committee that forms after its boundary has passed closes epoch 0 at its first commit.
+* **Transaction pool** — a transaction the pool takes before genesis can only execute in a block, and no block is built before genesis.
+* **Certificate acceptance** — certificates a node receives by gossip, as parents of a header it votes on, from the certificate fetcher or during catch-up are not checked against the genesis time, because each carries a quorum of votes and so holds an early header only if a quorum voted for one.
+
 ### Step 1: Distribute Validator Rewards
 
 #### How Rewards Are Tracked

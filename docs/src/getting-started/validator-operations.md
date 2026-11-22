@@ -145,6 +145,126 @@ For an emergency patch, name an incident owner, a release owner, and an independ
 Freeze unrelated rollout changes, state the affected versions and activation deadline, use the same signature and digest checks, and record each validator's completion.
 A protocol fork needs a separately approved activation plan and explicit readiness evidence from enough validator stake.
 
+## Starting before genesis
+
+A network can fix its genesis time in advance: the genesis ceremony's `--genesis-timestamp` flag writes it into `genesis.yaml`, and a mainnet ceremony requires the flag (see [`chain-configs/README.md`](https://github.com/Telcoin-Association/telcoin-network/blob/main/chain-configs/README.md#genesis-timestamp)).
+Validators can then start their nodes hours or days before that time.
+No validator creates or certifies a header before it, so the first block follows the genesis time however early the nodes started.
+[Epoch 0 and the genesis time](../epoch-boundaries.md#epoch-0-and-the-genesis-time) states the rule.
+
+Every validator must run a release that contains this rule, from its first start on the network's genesis.
+A build without it proposes its first header as soon as the node starts, and stores it.
+Validators that run the rule refuse to vote for that header, which keeps it uncertified only while the validators without the rule are too few to form a quorum by themselves: enough of them can certify headers and build blocks before genesis.
+Fewer of them can still stop the start.
+A build without the rule re-sends the same refused header and builds no other for its round, so that validator's round-1 header is never certified; once more validators run such a build than the committee can spare from a quorum (more than three in a committee of ten), epoch 0 does not get past round 1 after genesis.
+
+A validator that ran a build without the rule on this genesis before the genesis time may have stored such an early header.
+Started with a release that has the rule, what it does with that header depends on whether the earlier build already gathered a certificate for it.
+
+If the node holds no certificate for the early header, it does not re-send it.
+Its proposer logs a warning under the `primary::proposer` target, builds a new header for the same round, and holds it until the genesis time like any other:
+
+```text
+found a header created before genesis in the store, which a build without the genesis rule leaves when it ran on this genesis; replacing it with a new header round=1 created_at_ms=1796041860000 genesis_timestamp=1796214660
+```
+
+Only the author of a header can assemble its certificate, and the votes it had collected were kept in memory only, so an early header without a stored certificate can never be certified and replacing it is safe.
+That rests on the earlier build having stored every certificate durably before sending it, which builds from v0.17.0-adiri on do.
+An older build could send a certificate before its record was durable, so a node that ran one on this genesis is a case for the network's coordinators whatever the release logs.
+
+If the node does hold a certificate for the early header, enough validators without the rule voted for it before genesis.
+The node keeps that header and its certificate, because a second certified header for the same round would be an equivocation, and logs:
+
+```text
+found a certified header created before genesis in the store, which a build without the genesis rule produced on this genesis; keeping it
+```
+
+That line means a quorum of validators ran a build without the rule on this genesis before the genesis time, and a header created before genesis has been certified.
+Report it to the network's coordinators before the genesis time.
+
+Validators with the rule refuse the early header and still vote for its replacement.
+A validator keeps every vote it has cast, though, including a vote for an early header cast while it ran a build without the rule, and that vote makes it refuse the replacement header from the same author for the same round.
+So the safe course is that every validator runs a release with the rule from its first start on the network's genesis, mainnet's included.
+
+A node that was started on the network's genesis with any build other than the release is stopped, nothing in its data directory is deleted, and the network's coordinators are told before the genesis time.
+Removing that node's databases is not a fix on its own.
+If a header it created before genesis was certified, the node forgets the certificate it holds and proposes a second header for the same round, validators that removed their databases too can vote for that second header, and the first certificate still exists on other nodes.
+An operator cannot tell from one node whether that happened, so the coordinators choose one of these courses:
+
+* starting the release on the same data directory, which replaces a stored early header that was never certified, as described above;
+* removing `consensus-db/`, `db/` and `static_files/` on every node that ran the other build, keeping `node-keys/`, `node-info.yaml`, `parameters.yaml` and `genesis/`;
+* a new genesis.
+
+To help them decide, report whether the node's consensus header number ([tn\_latestConsensusHeader](../rpc-methods/tn/tn_latestconsensusheader.md)) or block number ([eth\_blockNumber](../rpc-methods/eth/eth_blocknumber.md)) was above zero before the genesis time, and, if the release has run on that data directory, whether it logged either of the two stored-header warnings above.
+
+### Before the genesis time
+
+1. Install and verify the release as [Installing a release](installing-a-release.md) describes.
+2. Start the node with the network's genesis and the validator's usual configuration, at any time before the genesis time.
+3. Leave it running, and check that it waits as [Watching the wait](#watching-the-wait) describes.
+
+A node that has only run releases with the rule holds again when it is restarted before genesis: the hold depends only on the clock, and the node stores no epoch-0 header before the genesis time.
+A node whose data directory a build without the rule started on this genesis is not restarted on its own, with or without its databases: it stays stopped, with nothing deleted, until the network's coordinators have chosen a course, as described above.
+Keep the host clock synchronized: each proposer goes by its own clock.
+
+### What the node does while it waits
+
+The node enters epoch 0 at once, as at any start.
+It starts its networks, connects to its peers, and serves RPC, health and metrics; the genesis time holds back only the creation of headers.
+An active validator builds its first header and holds it until its clock reaches the genesis time.
+It reads the clock again at least once a second, so a clock correction during a wait of days takes effect within a second.
+It refuses to vote for any epoch-0 header created before the genesis time, and does not penalize the header's author.
+No header is certified and no block is built before genesis, so the chain stays at block 0.
+Observers and nodes outside the committee enter epoch 0 the same way, and have nothing to follow until genesis.
+
+### Watching the wait
+
+| Signal | While the node waits |
+| --- | --- |
+| Log, target `epoch-manager`, at `info` | `waiting for genesis: epoch 0 opens in <h>h <mm>m <ss>s`, with `genesis_timestamp` (unix seconds) and `remaining_secs`: once on entry, then at every whole 10 minutes before genesis, then every minute during the last 10 minutes. Every node that enters epoch 0 before genesis logs it, observers included |
+| Log, target `primary::proposer`, at `info` | `waiting for genesis before proposing a header`, with `genesis_timestamp`, `remaining_secs` and `round`, once, when an active validator starts holding its header |
+| `tn_epoch_start_timestamp_seconds` | The current epoch's start. In epoch 0 it is the genesis time, so it stays ahead of `time()` until genesis, and `tn_epoch_start_timestamp_seconds - time()` is the wait left. After epoch 0 it is the previous epoch's closing block. `tn_epoch_boundary_timestamp_seconds` beside it is the epoch's boundary: in epoch 0, the genesis time plus the epoch duration |
+| `net_peerCount` | Above `0x0` once the worker network has peers (see [net\_peerCount](../rpc-methods/net/net_peercount.md)) |
+| `/health/network` | `200` once every swarm has peers, as at any other time; it does not report consensus (see [Private observability listeners](observability-listeners.md)) |
+| `tn_admissionSnapshot` | The committee keys each swarm has resolved and is connected to (`resolved_current`, `connected_current`), on the validator's loopback RPC (see [tn\_admissionSnapshot](../rpc-methods/tn/tn_admissionsnapshot.md)) |
+| `tn_primary_quorum_observation_active` | `1` on an active validator, with `tn_primary_last_commit_timestamp_seconds` at `0` until the first commit after genesis. [Consensus liveness](consensus-liveness.md#dashboard-and-alert-examples) shows how to keep its startup alert quiet until then |
+
+A wait line, here the one logged on entry, reads:
+
+```text
+waiting for genesis: epoch 0 opens in 0h 20m 30s genesis_timestamp=1796214660 remaining_secs=1230
+```
+
+After the entry line, the lines fall on whole intervals before genesis, so every node logs the same remaining times.
+
+### At the genesis time
+
+The node logs `genesis time reached: epoch 0 is open`, with `genesis_timestamp`, under the `epoch-manager` target, and its countdown ends.
+An active validator's proposer logs `genesis time reached, proposing the held header`, with `genesis_timestamp` and `round`, and sends the header with a `created_at` no earlier than the genesis time.
+A node that enters epoch 0 after the genesis time holds nothing and logs none of these lines.
+
+Once validators that form a quorum have sent their headers, the headers are certified and rounds advance.
+The first commit comes about a second after the genesis time, and from then on the consensus header number that [tn\_latestConsensusHeader](../rpc-methods/tn/tn_latestconsensusheader.md) reports advances with every commit.
+A commit that carries no transaction builds no block unless it closes the epoch, so [eth\_blockNumber](../rpc-methods/eth/eth_blocknumber.md) stays `0` until a commit includes the first transaction or epoch 0 closes.
+Transactions submitted before genesis wait in the transaction pool, and the first blocks after genesis include them, starting with block 1.
+Every block's timestamp is at or after the genesis time.
+
+### Starting late
+
+Epoch 0's boundary is the genesis time plus the epoch duration, whenever the validators start.
+A committee that forms after genesis has only the rest of epoch 0.
+One that forms after the boundary has passed closes epoch 0 at its first commit, under the usual close rule (see [Epoch boundary detection](../epoch-boundaries.md#epoch-boundary-detection)); epoch 1 then starts at that commit's block and runs a full epoch duration.
+An active validator that enters epoch 0 after the genesis time knowing of no commit, when its boundary has passed or is less than one maximum header delay away, logs one warning under the `epoch-manager` target:
+
+```text
+epoch 0 started after genesis, this node knows of no commit, and the epoch's boundary has passed or is less than one header delay away: if the network has not committed yet, the first commit at or past the boundary closes epoch 0 genesis_timestamp=1796214660 late_secs=30000 epoch_boundary=1796236260
+```
+
+`late_secs` is how long after the genesis time the node entered epoch 0.
+A node knows of a commit once it has saved one or its peers have published one by gossip, whether or not that commit built a block.
+A validator restarted inside a running epoch 0 holds the epoch's commits and does not log the warning, however close the boundary is, even when no block has been built yet.
+A validator on a fresh data directory can enter epoch 0 before it hears of the network's commits, so on a running network it can log the warning too; that is why the warning only says what happens if the network has not committed.
+
 ## Capacity monitoring
 
 Resource use rises with network load, and some limits are fixed in the release.

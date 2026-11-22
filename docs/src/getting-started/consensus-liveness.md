@@ -54,6 +54,10 @@ rounds, or epochs become metric labels.
 - **Startup:** Before an active consensus driver starts, observation is inactive and timestamps
   are zero. Once active, the start timestamp is set and the commit timestamp remains zero until
   a successful output handoff. Give the first commit an explicit startup grace period.
+  A validator started before a scheduled genesis has an active observer from its start, but no
+  commit can happen before the genesis time, so count that grace period from
+  `tn_epoch_start_timestamp_seconds` too (see
+  [Starting before genesis](validator-operations.md#starting-before-genesis)).
 - **Recovery and catch-up:** The observer starts beyond the highest round in the restored DAG
   or committed cursor. This also excludes restored uncommitted rounds: counting only their
   post-restart arrivals would miss authors already in the DAG and create false shortfalls.
@@ -113,16 +117,19 @@ A stall after at least one commit, including when no new rounds or certificates 
   and (tn_primary_quorum_observation_active == 1)
 ```
 
-An active task that has never committed after its startup allowance:
+An active task that has never committed after its startup allowance, counted from the later of
+the observer start and the epoch start (the genesis time in epoch 0):
 
 ```promql
 (tn_primary_last_commit_timestamp_seconds == 0)
   and (time() - tn_primary_liveness_started_timestamp_seconds > 120)
+  and (time() - tn_epoch_start_timestamp_seconds > 120)
   and (tn_primary_quorum_observation_active == 1)
 ```
 
 For alerts, use `for: 1m` to tolerate scrape jitter and brief handoff delays. Show "starting"
-instead of "stalled" while the commit timestamp is zero and the start age is at most 120 seconds.
+instead of "stalled" while the commit timestamp is zero and the start age is at most 120 seconds,
+and "waiting for genesis" while `tn_epoch_start_timestamp_seconds` is ahead of `time()`.
 Show "inactive" for `tn_primary_quorum_observation_active == 0`. Use the scrape target's
 `up == 0` alert for an unreachable process, and detect missing instrumentation on reachable
 targets with a deployment-scoped expression such as:

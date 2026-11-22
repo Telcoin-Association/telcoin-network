@@ -43,3 +43,23 @@ For the registry ABI that is live today, read the `tn-contracts` sources or the 
 Its validators are throwaway keys from the ignored test `regenerate_mainnet_chain_configs` in `crates/telcoin-network-cli/src/genesis/mod.rs`, which is rerun after a `tn-contracts` artifact bump.
 That test rewrites `genesis.yaml`, `committee.yaml` and `parameters.yaml` only. `bootstrap_servers.yaml` holds an earlier placeholder set on loopback addresses and is edited by hand.
 The real files will come from the mainnet genesis ceremony; the real bootstrap servers are set in `bootstrap_servers.yaml` before launch.
+
+## Genesis timestamp
+
+`telcoin-network genesis` writes the genesis timestamp into the `timestamp` field of `genesis.yaml`.
+`--genesis-timestamp <TIME>` fixes it in advance, so validators can start their nodes before it.
+Without the flag the ceremony writes the time it runs, except on mainnet (chain ID 731), where the flag is required and a ceremony without it is refused.
+`<TIME>` is either unix seconds (`1796214660`) or an RFC 3339 timestamp in UTC (`2026-12-02T12:31:00Z`; `+00:00` in place of `Z`, and a zero fraction such as `.000`, are accepted too).
+
+The ceremony refuses:
+
+- a bare integer of 10^11 or more, as a likely millisecond value;
+- an offset other than UTC, `-00:00` included, rather than converting it;
+- a fraction of a second other than zero;
+- a time at or before the current time;
+- a time more than 366 days after the current time.
+
+It checks the value, and the flag's presence on mainnet, before it reads any input or writes any file, so a refused ceremony leaves the datadir as it was.
+
+In epoch 0 the genesis timestamp is the earliest time a validator may create a header: a validator started before it holds its first header until then, and validators refuse to vote for an epoch-0 header created earlier.
+The rule is in `docs/src/epoch-boundaries.md` ("Epoch 0 and the Genesis Time"), and what an operator sees while a node waits is in `docs/src/getting-started/validator-operations.md` ("Starting before genesis").
