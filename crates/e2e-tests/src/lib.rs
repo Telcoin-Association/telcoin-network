@@ -42,6 +42,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand, NoArgs};
 use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig, Parameters};
@@ -222,7 +223,15 @@ pub fn config_local_testnet_with_epoch_duration(
     accounts: Option<Vec<(Address, GenesisAccount)>>,
     epoch_duration_secs: Option<u32>,
 ) -> eyre::Result<()> {
-    config_local_testnet_inner(temp_path, passphrase, accounts, epoch_duration_secs, &[], None)
+    config_local_testnet_inner(
+        temp_path,
+        passphrase,
+        accounts,
+        epoch_duration_secs,
+        &[],
+        None,
+        None,
+    )
 }
 
 /// Like [`config_local_testnet_with_epoch_duration`], but also lets the caller set per-worker
@@ -252,6 +261,7 @@ pub fn config_local_testnet_with_worker_fee_configs(
         epoch_duration_secs,
         worker_fee_configs,
         None,
+        None,
     )
 }
 
@@ -263,7 +273,7 @@ pub fn config_local_testnet_with_gc_depth(
     accounts: Option<Vec<(Address, GenesisAccount)>>,
     gc_depth: Option<u32>,
 ) -> eyre::Result<()> {
-    config_local_testnet_inner(temp_path, passphrase, accounts, None, &[], gc_depth)
+    config_local_testnet_inner(temp_path, passphrase, accounts, None, &[], gc_depth, None)
 }
 
 /// Like [`config_local_testnet_with_gc_depth`], but also sets the epoch duration in seconds, so a
@@ -282,15 +292,57 @@ pub fn config_local_testnet_with_gc_depth_and_epoch_duration(
         Some(epoch_duration_secs),
         &[],
         Some(gc_depth),
+        None,
     )
+}
+
+/// Like [`config_local_testnet_with_epoch_duration`], but schedules genesis `genesis_lead` after
+/// the current time, the way a network is founded to start at a fixed time: the ceremony runs with
+/// `--genesis-timestamp` set to now plus `genesis_lead`, so validators started right after this
+/// returns enter epoch 0 before genesis and must hold off until then.
+///
+/// Returns the genesis timestamp in unix seconds as read back from the `genesis.yaml` the ceremony
+/// wrote: no node creates an epoch-0 header before it. Measure a test's deadlines from it rather
+/// than from the test's own clock, because the ceremony itself takes part of `genesis_lead`. Fails
+/// if the file holds any other timestamp than the one requested.
+///
+/// The ceremony runs in this process and reads fork gates, so a test that pins fork epochs does so
+/// before calling this, as for every `config_local_testnet*` helper.
+pub fn config_local_testnet_with_genesis_timestamp(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    genesis_lead: Duration,
+    epoch_duration_secs: u32,
+) -> eyre::Result<u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let requested = now + genesis_lead.as_secs();
+    config_local_testnet_inner(
+        temp_path,
+        passphrase,
+        accounts,
+        Some(epoch_duration_secs),
+        &[],
+        None,
+        Some(requested),
+    )?;
+    let path = temp_path.join("shared-genesis/genesis/genesis.yaml");
+    let genesis: Genesis = Config::load_from_path(&path, ConfigFmt::YAML)?;
+    eyre::ensure!(
+        genesis.timestamp == requested,
+        "{} holds genesis timestamp {}, not the {requested} passed to --genesis-timestamp",
+        path.display(),
+        genesis.timestamp
+    );
+    Ok(genesis.timestamp)
 }
 
 /// Shared implementation for the `config_local_testnet*` helpers.
 ///
-/// Builds the genesis CLI argument vector, optionally appending `--epoch-duration-in-secs` and one
-/// `--worker-fee-config` flag per entry in `worker_fee_configs`, runs the genesis ceremony, and
-/// distributes the resulting genesis/committee/parameters files to every validator and the
-/// observer.
+/// Builds the genesis CLI argument vector, optionally appending `--epoch-duration-in-secs`,
+/// `--gc-depth`, `--genesis-timestamp` and one `--worker-fee-config` flag per entry in
+/// `worker_fee_configs`, runs the genesis ceremony, and distributes the resulting
+/// genesis/committee/parameters files to every validator and the observer.
 fn config_local_testnet_inner(
     temp_path: &Path,
     passphrase: Option<String>,
@@ -298,6 +350,7 @@ fn config_local_testnet_inner(
     epoch_duration_secs: Option<u32>,
     worker_fee_configs: &[&str],
     gc_depth: Option<u32>,
+    genesis_timestamp: Option<u64>,
 ) -> eyre::Result<()> {
     let validators = [
         ("validator-1", "0x1111111111111111111111111111111111111111"),
@@ -345,6 +398,10 @@ fn config_local_testnet_inner(
     if let Some(gc_depth) = gc_depth {
         genesis_args.push("--gc-depth".into());
         genesis_args.push(gc_depth.to_string());
+    }
+    if let Some(genesis_timestamp) = genesis_timestamp {
+        genesis_args.push("--genesis-timestamp".into());
+        genesis_args.push(genesis_timestamp.to_string());
     }
     // Append one `--worker-fee-config` flag per provided entry. When empty, clap falls back to the
     // genesis default (`0:0:u64::MAX`, an inert EIP-1559 strategy). Any provided configs replace

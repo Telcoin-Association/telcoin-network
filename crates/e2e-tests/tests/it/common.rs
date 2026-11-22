@@ -2315,7 +2315,7 @@ pub(crate) fn scrape_metric_value(addr: &str, name: &str) -> eyre::Result<f64> {
 /// A sample line is `name value` or `name{labels} value`; comment lines and every other series
 /// (including ones `name` is a prefix of) are skipped. A sample whose value does not parse is an
 /// error rather than a skipped line, so a format change cannot hide the series.
-fn sum_metric_samples(body: &str, name: &str) -> eyre::Result<Option<f64>> {
+pub(crate) fn sum_metric_samples(body: &str, name: &str) -> eyre::Result<Option<f64>> {
     let mut total = None;
     for line in body.lines().map(str::trim).filter(|line| !line.starts_with('#')) {
         let Some(rest) = line.strip_prefix(name) else { continue };

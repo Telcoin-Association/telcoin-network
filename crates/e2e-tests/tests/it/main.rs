@@ -23,6 +23,7 @@ mod restarts;
 mod resync;
 mod reth_db_migration;
 mod rpc_namespaces;
+mod scheduled_genesis;
 #[cfg(unix)]
 mod sigkill;
 mod staking;
