@@ -349,12 +349,14 @@ mod tests {
     use clap::Parser as _;
     use eyre::WrapErr as _;
     use std::{collections::BTreeSet, path::Path};
-    use tn_config::{genesis_validator_safes, NodeInfo};
+    use tn_config::{genesis_validator_safes, NodeInfo, WORKER_CONFIGS_ADDRESS};
     use tn_reth::system_calls::CONSENSUS_REGISTRY_ADDRESS;
     use tn_types::{
-        generate_proof_of_possession_bls_for_test, test_utils::CommandParser,
-        verify_proof_of_possession_bls, Address, BlsKeypair, Committee, Genesis, Multiaddr,
-        NetworkKeypair, NodeP2pInfo, P2pNode, B256, MAINNET_COMMITTEE, MAINNET_GENESIS, U256,
+        address, generate_proof_of_possession_bls_for_test, test_utils::CommandParser,
+        verify_proof_of_possession_bls, Address, BlsKeypair, BlsPublicKey, BootstrapServer,
+        Committee, Genesis, Multiaddr, NetworkKeypair, NodeP2pInfo, P2pNode, Protocol, B256,
+        MAINNET_BOOTSTRAP_SERVERS, MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_GENESIS_HASH,
+        MAINNET_GENESIS_TIMESTAMP, MAINNET_PARAMETERS, U256,
     };
 
     /// Prepare signed validator inputs and parse the real genesis CLI defaults and fee flags.
@@ -565,10 +567,34 @@ mod tests {
         );
     }
 
-    /// The committed mainnet placeholder owner: `--consensus-registry-owner` AND the
-    /// dev-funded account of the committed `chain-configs/mainnet/genesis.yaml` (see
-    /// `etc/genesis.sh`); restated here so regeneration reproduces the same identity.
-    const MAINNET_PLACEHOLDER_OWNER: &str = "0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a";
+    /// The placeholder owner of the committed mainnet `ConsensusRegistry` and `WorkerConfigs`,
+    /// the `--consensus-registry-owner` that [`regenerate_mainnet_chain_configs`] passes (see
+    /// `etc/genesis.sh`).
+    ///
+    /// The mainnet owner is a launch decision. The commit that installs the final mainnet data
+    /// passes it to the ceremony in place of this constant and keeps the constant, which
+    /// [`mainnet_final_data_is_complete`] refuses to find in either contract's storage.
+    const MAINNET_PLACEHOLDER_OWNER: Address = address!("3DCc9a6f3A71F0A6C8C659c65558321c374E917a");
+
+    /// The placeholder dev-funded account of the committed mainnet genesis, the
+    /// `--dev-funded-account` that [`regenerate_mainnet_chain_configs`] passes. The ceremony
+    /// allocates it one billion TEL.
+    ///
+    /// Whether mainnet has a dev-funded account, and which, is a launch decision. The commit
+    /// that installs the final mainnet data passes it in place of this constant, or drops the
+    /// flag, and keeps the constant: [`mainnet_final_data_is_complete`] fails while this account
+    /// holds a balance.
+    const MAINNET_PLACEHOLDER_DEV_FUNDED_ACCOUNT: Address =
+        address!("3DCc9a6f3A71F0A6C8C659c65558321c374E917a");
+
+    /// The placeholder basefee recipient of the committed mainnet `parameters.yaml`, the
+    /// `--basefee-address` that [`regenerate_mainnet_chain_configs`] passes.
+    ///
+    /// The mainnet recipient is a launch decision. The commit that installs the final mainnet
+    /// data passes it in place of this constant and keeps the constant, which
+    /// [`mainnet_final_data_is_complete`] refuses to find in `parameters.yaml`.
+    const MAINNET_PLACEHOLDER_BASEFEE_ADDRESS: Address =
+        address!("9999999999999999999999999999999999999999");
 
     /// The mainnet epoch duration in seconds: 6 hours, the same value testnet runs (issue
     /// #1512).
@@ -877,8 +903,10 @@ mod tests {
     /// hold one file per genesis validator Safe, each staked under and signed over its Safe),
     /// then run the ceremony with flags mirroring the committed placeholder identity:
     /// - chain id 0x2db (731), unchanged from the committed genesis;
-    /// - owner + dev-funded account [`MAINNET_PLACEHOLDER_OWNER`];
-    /// - basefee address 0x99..99, preserving the committed parameters.yaml;
+    /// - owner [`MAINNET_PLACEHOLDER_OWNER`] and dev-funded account
+    ///   [`MAINNET_PLACEHOLDER_DEV_FUNDED_ACCOUNT`];
+    /// - basefee address [`MAINNET_PLACEHOLDER_BASEFEE_ADDRESS`], preserving the committed
+    ///   parameters.yaml;
     /// - epoch duration [`MAINNET_EPOCH_DURATION_SECS`] (21600s, the mainnet target of issue
     ///   #1512). Do not decode this value from the committed file: that copied a stale 86400s into
     ///   each regeneration;
@@ -912,6 +940,9 @@ mod tests {
              Safe, staked under and signed over that Safe",
         );
 
+        let owner = MAINNET_PLACEHOLDER_OWNER.to_string();
+        let dev_funded_account = MAINNET_PLACEHOLDER_DEV_FUNDED_ACCOUNT.to_string();
+        let basefee_address = MAINNET_PLACEHOLDER_BASEFEE_ADDRESS.to_string();
         let epoch_duration = MAINNET_EPOCH_DURATION_SECS.to_string();
         let epoch_issuance = MAINNET_EPOCH_ISSUANCE_TEL.to_string();
         let ceremony = CommandParser::<GenesisArgs>::parse_from([
@@ -919,11 +950,11 @@ mod tests {
             "--chain-id",
             "0x2db",
             "--consensus-registry-owner",
-            MAINNET_PLACEHOLDER_OWNER,
+            owner.as_str(),
             "--dev-funded-account",
-            MAINNET_PLACEHOLDER_OWNER,
+            dev_funded_account.as_str(),
             "--basefee-address",
-            "0x9999999999999999999999999999999999999999",
+            basefee_address.as_str(),
             "--epoch-duration-in-secs",
             epoch_duration.as_str(),
             "--epoch-block-rewards",
@@ -1011,6 +1042,330 @@ mod tests {
                 mainnet_validator_file_name(index)
             );
         }
+        Ok(())
+    }
+
+    /// The embedded mainnet genesis hashes to [`MAINNET_GENESIS_HASH`] and carries the timestamp
+    /// [`MAINNET_GENESIS_TIMESTAMP`] (issue #1735).
+    ///
+    /// The hash is the one the node starts on: the sealed genesis header of the chain spec built
+    /// from the genesis, which covers the header fields and the state root of the alloc. Any
+    /// change to the bundled mainnet genesis changes it, a regeneration included, because the
+    /// ceremony stamps the wall clock into the timestamp.
+    #[test]
+    fn mainnet_genesis_hash_is_pinned() -> eyre::Result<()> {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        let timestamp = genesis.timestamp;
+        let hash = RethChainSpec::from(genesis).sealed_genesis_header().hash();
+        assert_eq!(
+            (hash, timestamp),
+            (MAINNET_GENESIS_HASH, MAINNET_GENESIS_TIMESTAMP),
+            "chain-configs/mainnet/genesis.yaml now hashes to {hash} with timestamp {timestamp}, \
+             but crates/types/src/genesis.rs pins MAINNET_GENESIS_HASH {MAINNET_GENESIS_HASH} and \
+             MAINNET_GENESIS_TIMESTAMP {MAINNET_GENESIS_TIMESTAMP}. The two constants change only \
+             together with the regenerated chain-configs/mainnet files, in one commit: if this \
+             change regenerated them, set the constants to the values above"
+        );
+        Ok(())
+    }
+
+    /// The genesis timestamp of the final mainnet genesis: 2026-12-02 12:31:00 UTC.
+    const MAINNET_LAUNCH_TIMESTAMP: u64 = 1_796_214_660;
+
+    /// Why a mainnet peer cannot reach `address`, or `None` when it starts with a public IP
+    /// address and names no port 0.
+    ///
+    /// The node dials the IP address of a multiaddr and does not resolve DNS names, so a name is
+    /// refused like a non-public address. The non-public hosts are loopback, unspecified,
+    /// private (RFC 1918, fc00::/7), carrier-grade NAT (100.64.0.0/10), link-local
+    /// (169.254.0.0/16, fe80::/10), documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24,
+    /// 2001:db8::/32), multicast (224.0.0.0/4, ff00::/8), the broadcast address and the reserved
+    /// IPv4 ranges 0.0.0.0/8, 192.0.0.0/24, 198.18.0.0/15 and 240.0.0.0/4.
+    fn unreachable_address_reason(address: &Multiaddr) -> Option<&'static str> {
+        let ipv4_reason = |ip: std::net::Ipv4Addr| {
+            let octets = ip.octets();
+            if ip.is_loopback() {
+                Some("a loopback address")
+            } else if ip.is_unspecified() {
+                Some("the unspecified address")
+            } else if ip.is_private() {
+                Some("a private address")
+            } else if matches!(octets, [100, 64..=127, _, _]) {
+                Some("a carrier-grade NAT address")
+            } else if ip.is_link_local() {
+                Some("a link-local address")
+            } else if matches!(octets, [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]) {
+                Some("in a documentation range")
+            } else if ip.is_multicast() {
+                Some("a multicast address")
+            } else if ip.is_broadcast() {
+                Some("the broadcast address")
+            } else if matches!(
+                octets,
+                [0, ..] | [192, 0, 0, _] | [198, 18..=19, _, _] | [240..=255, ..]
+            ) {
+                Some("in a reserved range")
+            } else {
+                None
+            }
+        };
+        let ipv6_reason = |ip: std::net::Ipv6Addr| {
+            let segments = ip.segments();
+            if ip.is_loopback() {
+                Some("a loopback address")
+            } else if ip.is_unspecified() {
+                Some("the unspecified address")
+            } else if ip.is_unique_local() {
+                Some("a private (unique local) address")
+            } else if ip.is_unicast_link_local() {
+                Some("a link-local address")
+            } else if ip.is_multicast() {
+                Some("a multicast address")
+            } else if segments[..2] == [0x2001, 0x0db8] {
+                Some("in a documentation range")
+            } else {
+                None
+            }
+        };
+        let host_reason = match address.iter().next() {
+            Some(Protocol::Ip4(ip)) => ipv4_reason(ip),
+            Some(Protocol::Ip6(ip)) => {
+                ip.to_ipv4_mapped().map_or_else(|| ipv6_reason(ip), ipv4_reason)
+            }
+            Some(
+                Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_),
+            ) => Some("a DNS name, which the node does not resolve"),
+            _ => Some("not an IP address"),
+        };
+        host_reason.or_else(|| {
+            address
+                .iter()
+                .any(|protocol| matches!(protocol, Protocol::Udp(0) | Protocol::Tcp(0)))
+                .then_some("on port 0, which no peer can dial")
+        })
+    }
+
+    /// [`unreachable_address_reason`] passes public IP addresses and refuses every other kind of
+    /// host the final-data gate names.
+    #[test]
+    fn unreachable_address_reason_refuses_non_public_hosts() {
+        let reason = |address: &str| {
+            unreachable_address_reason(&address.parse().expect("test multiaddr parses"))
+        };
+        for public in [
+            "/ip4/8.8.8.8/udp/49590/quic-v1",
+            "/ip6/2606:4700::1111/udp/49590/quic-v1",
+            "/ip4/100.63.255.254/udp/49590/quic-v1",
+            "/ip4/100.128.0.1/udp/49590/quic-v1",
+            "/ip4/198.17.255.254/udp/49590/quic-v1",
+            "/ip4/198.20.0.1/udp/49590/quic-v1",
+            "/ip4/223.255.255.254/udp/49590/quic-v1",
+        ] {
+            assert_eq!(reason(public), None, "{public} is a public address");
+        }
+        for (address, expected) in [
+            ("/ip4/127.0.0.1/udp/49590/quic-v1", "a loopback address"),
+            ("/ip6/::1/udp/49590/quic-v1", "a loopback address"),
+            ("/ip4/0.0.0.0/udp/49590/quic-v1", "the unspecified address"),
+            ("/ip6/::/udp/49590/quic-v1", "the unspecified address"),
+            ("/ip4/10.1.2.3/udp/49590/quic-v1", "a private address"),
+            ("/ip4/172.16.0.1/udp/49590/quic-v1", "a private address"),
+            ("/ip4/192.168.1.1/udp/49590/quic-v1", "a private address"),
+            ("/ip6/::ffff:10.0.0.1/udp/49590/quic-v1", "a private address"),
+            ("/ip6/fd00::1/udp/49590/quic-v1", "a private (unique local) address"),
+            ("/ip6/fc00::1/udp/49590/quic-v1", "a private (unique local) address"),
+            ("/ip4/100.64.0.1/udp/49590/quic-v1", "a carrier-grade NAT address"),
+            ("/ip4/100.127.255.254/udp/49590/quic-v1", "a carrier-grade NAT address"),
+            ("/ip4/169.254.1.1/udp/49590/quic-v1", "a link-local address"),
+            ("/ip6/fe80::1/udp/49590/quic-v1", "a link-local address"),
+            ("/ip4/224.0.0.1/udp/49590/quic-v1", "a multicast address"),
+            ("/ip4/239.255.255.250/udp/49590/quic-v1", "a multicast address"),
+            ("/ip6/ff02::1/udp/49590/quic-v1", "a multicast address"),
+            ("/ip4/255.255.255.255/udp/49590/quic-v1", "the broadcast address"),
+            ("/ip4/0.1.2.3/udp/49590/quic-v1", "in a reserved range"),
+            ("/ip4/192.0.0.8/udp/49590/quic-v1", "in a reserved range"),
+            ("/ip4/198.18.0.1/udp/49590/quic-v1", "in a reserved range"),
+            ("/ip4/198.19.255.254/udp/49590/quic-v1", "in a reserved range"),
+            ("/ip4/240.0.0.1/udp/49590/quic-v1", "in a reserved range"),
+            ("/ip6/::ffff:100.64.0.1/udp/49590/quic-v1", "a carrier-grade NAT address"),
+            ("/ip4/8.8.8.8/udp/0/quic-v1", "on port 0, which no peer can dial"),
+            ("/ip6/2606:4700::1111/udp/0/quic-v1", "on port 0, which no peer can dial"),
+            ("/ip4/192.0.2.10/udp/49590/quic-v1", "in a documentation range"),
+            ("/ip4/198.51.100.7/udp/49590/quic-v1", "in a documentation range"),
+            ("/ip4/203.0.113.9/udp/49590/quic-v1", "in a documentation range"),
+            ("/ip6/2001:db8::1/udp/49590/quic-v1", "in a documentation range"),
+            (
+                "/dns4/validator.example.org/udp/49590/quic-v1",
+                "a DNS name, which the node does not resolve",
+            ),
+            (
+                "/dns/validator.example.org/udp/49590/quic-v1",
+                "a DNS name, which the node does not resolve",
+            ),
+        ] {
+            assert_eq!(reason(address), Some(expected), "{address}");
+        }
+    }
+
+    /// The network addresses a node advertises, each labelled with its role.
+    fn labelled_network_addresses(
+        primary: &P2pNode,
+        workers: &[P2pNode],
+    ) -> Vec<(String, Multiaddr)> {
+        std::iter::once(("primary".to_string(), primary.network_address.clone()))
+            .chain(
+                workers
+                    .iter()
+                    .enumerate()
+                    .map(|(id, worker)| (format!("worker {id}"), worker.network_address.clone())),
+            )
+            .collect()
+    }
+
+    /// The storage slots of `account` in `genesis` whose word holds `address` at any byte offset.
+    ///
+    /// An `Ownable` owner shares its slot with other packed fields, so the search does not depend
+    /// on where a contract's storage layout puts it.
+    fn slots_holding_address(genesis: &Genesis, account: Address, address: Address) -> Vec<B256> {
+        genesis
+            .alloc
+            .get(&account)
+            .and_then(|account| account.storage.as_ref())
+            .into_iter()
+            .flatten()
+            .filter(|(_, word)| {
+                word.0.windows(address.len()).any(|window| window == address.as_slice())
+            })
+            .map(|(slot, _)| *slot)
+            .collect()
+    }
+
+    /// The committed mainnet chain configs hold the final mainnet data and no placeholder.
+    ///
+    /// The commit that installs the final mainnet data removes the `#[ignore]`. Until then the
+    /// gate fails. It reads the committed files and reports, one message per item and naming the
+    /// file to fix:
+    /// - a genesis timestamp other than [`MAINNET_LAUNCH_TIMESTAMP`];
+    /// - a `ConsensusRegistry` or `WorkerConfigs` whose storage holds the placeholder owner
+    ///   [`MAINNET_PLACEHOLDER_OWNER`];
+    /// - a balance on the placeholder dev-funded account
+    ///   [`MAINNET_PLACEHOLDER_DEV_FUNDED_ACCOUNT`];
+    /// - the placeholder basefee recipient [`MAINNET_PLACEHOLDER_BASEFEE_ADDRESS`] in
+    ///   `parameters.yaml`;
+    /// - a validator file whose `name` starts with [`PLACEHOLDER_VALIDATOR_NAME_PREFIX`];
+    /// - a validator network address, or an address in `bootstrap_servers.yaml`, that
+    ///   [`unreachable_address_reason`] refuses: a non-public host such as a loopback, private,
+    ///   carrier-grade NAT, link-local, documentation, multicast or reserved address, a DNS name,
+    ///   which the node does not resolve, or port 0;
+    /// - a `bootstrap_servers.yaml` that lists no server.
+    ///
+    /// A validator file's network addresses are not signed by its proof of possession, which
+    /// covers only the BLS key and the execution address, and they do not enter the genesis or
+    /// the committed committee (the regeneration empties its bootstrap map), so they matter only
+    /// where `bootstrap_servers.yaml` is written from them.
+    ///
+    /// The owner, the dev-funded account and the basefee recipient are launch decisions, passed
+    /// as arguments of [`regenerate_mainnet_chain_configs`]. The gate compares them with the
+    /// placeholder constants that the regeneration passes today, so it cannot drift from what the
+    /// regeneration writes. The final-data commit also decides the funding of the Issuance
+    /// contract and the TEL total-supply slot, which this gate does not check.
+    #[test]
+    #[ignore = "fails until the commit that installs the final mainnet data, which removes this attribute"]
+    fn mainnet_final_data_is_complete() -> eyre::Result<()> {
+        let mut problems = Vec::new();
+
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        if genesis.timestamp != MAINNET_LAUNCH_TIMESTAMP {
+            problems.push(format!(
+                "chain-configs/mainnet/genesis.yaml: the genesis timestamp is {}, not the launch \
+                 timestamp {MAINNET_LAUNCH_TIMESTAMP} (2026-12-02 12:31:00 UTC)",
+                genesis.timestamp
+            ));
+        }
+        for (contract, account) in [
+            ("ConsensusRegistry", CONSENSUS_REGISTRY_ADDRESS),
+            ("WorkerConfigs", WORKER_CONFIGS_ADDRESS),
+        ] {
+            let slots = slots_holding_address(&genesis, account, MAINNET_PLACEHOLDER_OWNER);
+            if !slots.is_empty() {
+                problems.push(format!(
+                    "chain-configs/mainnet/genesis.yaml: the {contract} owner is the placeholder \
+                     {MAINNET_PLACEHOLDER_OWNER} (storage slots {slots:?}); the owner is a launch \
+                     decision, set by `--consensus-registry-owner` in \
+                     regenerate_mainnet_chain_configs"
+                ));
+            }
+        }
+        if let Some(account) = genesis
+            .alloc
+            .get(&MAINNET_PLACEHOLDER_DEV_FUNDED_ACCOUNT)
+            .filter(|account| !account.balance.is_zero())
+        {
+            problems.push(format!(
+                "chain-configs/mainnet/genesis.yaml: the placeholder dev-funded account \
+                 {MAINNET_PLACEHOLDER_DEV_FUNDED_ACCOUNT} holds {} wei; the dev-funded account is a \
+                 launch decision, set by `--dev-funded-account` in regenerate_mainnet_chain_configs",
+                account.balance
+            ));
+        }
+        let parameters: Parameters = serde_yaml::from_str(MAINNET_PARAMETERS)?;
+        if parameters.basefee_address == MAINNET_PLACEHOLDER_BASEFEE_ADDRESS {
+            problems.push(format!(
+                "chain-configs/mainnet/parameters.yaml: the basefee recipient is the placeholder \
+                 {MAINNET_PLACEHOLDER_BASEFEE_ADDRESS}; the recipient is a launch decision, set by \
+                 `--basefee-address` in regenerate_mainnet_chain_configs"
+            ));
+        }
+
+        let validators =
+            check_mainnet_validators(&mainnet_validators_dir(), &genesis_validator_safes())?;
+        for (index, validator) in validators.iter().enumerate() {
+            let file =
+                format!("chain-configs/mainnet/validators/{}", mainnet_validator_file_name(index));
+            if validator.name.starts_with(PLACEHOLDER_VALIDATOR_NAME_PREFIX) {
+                problems.push(format!(
+                    "{file}: `{}` is a placeholder, not a collected node-info file",
+                    validator.name
+                ));
+            }
+            let p2p = &validator.p2p_info;
+            for (role, address) in labelled_network_addresses(&p2p.primary, &p2p.workers) {
+                if let Some(reason) = unreachable_address_reason(&address) {
+                    problems.push(format!("{file}: the {role} address {address} is {reason}"));
+                }
+            }
+        }
+
+        let bootstrap_file = "chain-configs/mainnet/bootstrap_servers.yaml";
+        match serde_yaml::from_str::<Option<BTreeMap<BlsPublicKey, BootstrapServer>>>(
+            MAINNET_BOOTSTRAP_SERVERS,
+        ) {
+            Err(e) => problems.push(format!("{bootstrap_file} does not parse: {e}")),
+            Ok(servers) => {
+                let servers = servers.unwrap_or_default();
+                if servers.is_empty() {
+                    problems.push(format!("{bootstrap_file} lists no bootstrap server"));
+                }
+                for (key, server) in &servers {
+                    for (role, address) in
+                        labelled_network_addresses(&server.primary, &server.workers)
+                    {
+                        if let Some(reason) = unreachable_address_reason(&address) {
+                            problems.push(format!(
+                                "{bootstrap_file}: the {role} address {address} of server {key} \
+                                 is {reason}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "the committed mainnet chain configs do not hold the final mainnet data yet:\n{}",
+            problems.join("\n")
+        );
         Ok(())
     }
 

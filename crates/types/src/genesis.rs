@@ -8,7 +8,7 @@
 use crate::{now, Genesis, MIN_PROTOCOL_BASE_FEE};
 use alloy::{
     genesis::GenesisAccount,
-    primitives::{address, U256},
+    primitives::{address, b256, B256, U256},
 };
 use reth_chainspec::ChainSpec;
 use std::sync::{Arc, LazyLock};
@@ -151,6 +151,20 @@ pub const MAINNET_PARAMETERS: &str = include_str!("../../../chain-configs/mainne
 /// The mainnet bootstrap servers, in the shape of [`TESTNET_BOOTSTRAP_SERVERS`].
 pub const MAINNET_BOOTSTRAP_SERVERS: &str =
     include_str!("../../../chain-configs/mainnet/bootstrap_servers.yaml");
+
+/// The block hash of the embedded mainnet genesis [`MAINNET_GENESIS`].
+///
+/// A unit test recomputes the hash from the embedded file, so the bundled mainnet genesis cannot
+/// change without this constant changing with it. The genesis ceremony takes the genesis
+/// timestamp from the wall clock, so this value and [`MAINNET_GENESIS_TIMESTAMP`] belong to the
+/// committed placeholder genesis. The commit that installs the final mainnet genesis replaces
+/// both with the final genesis's values.
+pub const MAINNET_GENESIS_HASH: B256 =
+    b256!("0xd4a2aba1109c2b3cd4ccf830b36758c46da6926ebdaf76665de2fe9190c6b013");
+
+/// The timestamp, in seconds since the unix epoch, of the embedded mainnet genesis
+/// [`MAINNET_GENESIS`], whose block hash is [`MAINNET_GENESIS_HASH`].
+pub const MAINNET_GENESIS_TIMESTAMP: u64 = 1_795_314_111;
 
 #[cfg(test)]
 mod tests {
