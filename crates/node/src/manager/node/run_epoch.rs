@@ -42,7 +42,7 @@ use tn_types::{
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
     BlockHash, BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput,
     Database as TNDatabase, DbTxMut as _, Epoch, EpochDigest, EpochRecord, SealedHeader,
-    ShutdownNotifier, TaskJoinError, TaskManager, TnReceiver,
+    ShutdownNotifier, TaskJoinError, TaskManager, TimestampSec, TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -53,6 +53,14 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 /// before the rest are aborted. Matches the epoch task manager's join wait: epoch handoff must not
 /// wait long.
 const EPOCH_TASK_EXIT_GRACE: Duration = Duration::from_millis(200);
+/// Name of the non-critical epoch task that logs the countdown to genesis ([`watch_genesis`]).
+const GENESIS_COUNTDOWN_TASK: &str = "genesis-countdown";
+/// Seconds between the genesis countdown's lines, and the length of its final stretch.
+const GENESIS_COUNTDOWN_INTERVAL: TimestampSec = 600;
+/// Seconds between the genesis countdown's lines during its final stretch.
+const GENESIS_COUNTDOWN_FINAL_INTERVAL: TimestampSec = 60;
+/// How long the genesis countdown sleeps before it reads the wall clock again.
+const GENESIS_COUNTDOWN_STEP: Duration = Duration::from_secs(1);
 
 /// Why `run_epoch` is being entered, and on exit what kind of transition just happened.
 ///
@@ -114,7 +122,8 @@ where
     ///    components. The previous and next committees' keys are resolved first in ONE batched read
     ///    pinned to the epoch-start header and threaded into both steps as parameters.
     /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
-    ///    builder, and the engine batch builder; reattach any orphaned batches.
+    ///    builder, and the engine batch builder; reattach any orphaned batches. An epoch 0 entered
+    ///    before genesis also starts the genesis countdown (`watch_genesis`).
     /// 6. `tokio::select!` over the exits: node shutdown, a store failure, the epoch boundary
     ///    (`wait_for_epoch_boundary`), the epoch task manager ending early (a CVV resync or a task
     ///    error), and a later epoch's certified record showing this active validator's epoch
@@ -154,7 +163,7 @@ where
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
         debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
         self.metrics.current.set(committee.epoch() as f64);
-        self.metrics.boundary_timestamp_seconds.set(self.epoch_boundary as f64);
+        self.metrics.record_epoch_window(epoch_start, self.epoch_boundary);
 
         let reth_env = engine.get_reth_env().await;
 
@@ -382,6 +391,15 @@ where
         // slow-execution test (bench F1-3) is meant to cover it.
         let node_mode = self.consensus_bus.current_node_mode();
         let proposer_started = starts_proposer(node_mode);
+        watch_genesis(
+            &epoch_task_manager,
+            consensus_config.shutdown(),
+            consensus_config.genesis_floor(),
+            self.epoch_boundary,
+            consensus_config.parameters().max_header_delay,
+            proposer_started,
+            self.latest_known_consensus_number(),
+        );
         // Shared with the consensus task, which saves into it; `finish_epoch` seals it once that
         // task has ended, or `finish_stopped_epoch` when a node stop drops this epoch first.
         self.certificate_pack = proposer_started.then(|| {
@@ -755,6 +773,21 @@ where
         .await?;
         self.consensus_chain.new_epoch(previous_epoch_rec, committee).await?;
         Ok(prior_epoch_record)
+    }
+
+    /// The highest consensus number this node knows of: the latest output saved to its consensus
+    /// chain or, if higher, the latest one its peers have published by gossip. Both are read from
+    /// memory.
+    ///
+    /// A commit counts whether or not it built an execution block. Output that carries no batch
+    /// builds no block unless it closes the epoch, so the execution tip can stay at the genesis
+    /// block through all of an epoch 0 that has committed many times. A node on a fresh data
+    /// directory that has not yet heard its peers' gossip knows of no commit, whatever the network
+    /// has done.
+    fn latest_known_consensus_number(&self) -> u64 {
+        self.consensus_chain
+            .latest_consensus_number()
+            .max(self.consensus_bus.published_consensus_num_hash().1)
     }
 
     /// Forward one consensus output to the engine and record progress.
@@ -1260,6 +1293,133 @@ fn starts_proposer(mode: NodeMode) -> bool {
 /// builder, including a non-member whose [`NodeMode::CvvInactive`] carried over.
 fn produces_batches(in_committee: bool, proposer_started: bool) -> bool {
     !in_committee || proposer_started
+}
+
+/// Make epoch 0's wait for genesis visible to an operator, without touching consensus.
+///
+/// `genesis` is the epoch's genesis floor
+/// ([`ConsensusConfig::genesis_floor`](tn_config::ConsensusConfig::genesis_floor)), `Some` only in
+/// epoch 0. A node can enter epoch 0 a day or more before genesis, and until then no header is
+/// proposed or voted for and no block exists, whatever the node's mode. So every node that enters
+/// with genesis still ahead, observers and non-members included, runs [`genesis_countdown`] as the
+/// non-critical [`GENESIS_COUNTDOWN_TASK`] on the epoch's task manager: its exit or panic cannot
+/// end the epoch, and it ends with the epoch's shutdown (`epoch_shutdown`) or its task manager. An
+/// active validator's proposer also logs its own hold, under its own target.
+///
+/// A floor already passed starts nothing. An active validator that enters after genesis knowing of
+/// no commit, so late that the epoch boundary is due ([`epoch_zero_starts_late`]), is warned once
+/// that, if the network has not committed yet, the first commit at or past the boundary closes
+/// epoch 0. That is the existing close rule, and nothing here changes it. `latest_consensus` is
+/// the highest consensus number the node knows of when it enters the epoch
+/// (`EpochManager::latest_known_consensus_number`). A node on a fresh data directory can know of
+/// none while the network has committed, so the warning does not claim that nothing has.
+fn watch_genesis(
+    task_manager: &TaskManager,
+    epoch_shutdown: &ShutdownNotifier,
+    genesis: Option<TimestampSec>,
+    epoch_boundary: TimestampSec,
+    header_delay: Duration,
+    proposer_started: bool,
+    latest_consensus: u64,
+) {
+    let Some(genesis) = genesis else { return };
+    let now = tn_types::now();
+    if now < genesis {
+        let epoch_ended = epoch_shutdown.subscribe();
+        task_manager.spawn_task(GENESIS_COUNTDOWN_TASK, async move {
+            tokio::select! {
+                _ = epoch_ended => {}
+                _ = genesis_countdown(genesis, tn_types::now) => {}
+            }
+            Ok(())
+        });
+    } else if proposer_started
+        && epoch_zero_starts_late(now, epoch_boundary, header_delay, latest_consensus)
+    {
+        warn!(
+            target: "epoch-manager",
+            genesis_timestamp = genesis,
+            late_secs = now - genesis,
+            epoch_boundary,
+            "epoch 0 started after genesis, this node knows of no commit, and the epoch's boundary \
+             has passed or is less than one header delay away: if the network has not committed \
+             yet, the first commit at or past the boundary closes epoch 0",
+        );
+    }
+}
+
+/// Whether epoch 0, entered at `now`, starts late: the node knows of no commit (`latest_consensus`,
+/// the highest consensus number it knows of, is 0), and the epoch's `boundary` has passed or is
+/// less than one `header_delay` away.
+///
+/// Consensus numbers start at 1 with epoch 0's first commit and count commits that built no
+/// execution block. A validator restarted inside a running epoch 0 holds the epoch's saved commits,
+/// so it does not start late however close the boundary is, even while no transaction has been
+/// included and its execution tip is still the genesis block.
+fn epoch_zero_starts_late(
+    now: TimestampSec,
+    boundary: TimestampSec,
+    header_delay: Duration,
+    latest_consensus: u64,
+) -> bool {
+    latest_consensus == 0 && (boundary <= now || Duration::from_secs(boundary - now) < header_delay)
+}
+
+/// Log epoch 0's countdown to `genesis` until `clock` reaches it.
+///
+/// One line on entry, one at each time [`next_countdown_line`] names, and a last line once genesis
+/// is reached. The wait can last days, so the clock is read again every [`GENESIS_COUNTDOWN_STEP`]
+/// rather than slept toward the next line: a sleep runs on tokio's monotonic clock, and a step of
+/// the wall clock would go unnoticed until the sleep ended. A step forward past several lines logs
+/// one line, and a step back schedules the lines from the new reading. [`watch_genesis`] passes
+/// [`tn_types::now`]; the parameter lets tests drive the countdown with a clock they control.
+async fn genesis_countdown(genesis: TimestampSec, clock: impl Fn() -> TimestampSec) {
+    // zero makes the first line due on entry
+    let mut due = 0;
+    loop {
+        let now = clock();
+        let Some(next) = next_countdown_line(now, genesis) else { break };
+        if now >= due {
+            let remaining_secs = genesis - now;
+            info!(
+                target: "epoch-manager",
+                genesis_timestamp = genesis,
+                remaining_secs,
+                "waiting for genesis: epoch 0 opens in {}h {:02}m {:02}s",
+                remaining_secs / 3600,
+                remaining_secs % 3600 / 60,
+                remaining_secs % 60,
+            );
+        }
+        due = next;
+        tokio::time::sleep(GENESIS_COUNTDOWN_STEP).await;
+    }
+    info!(
+        target: "epoch-manager",
+        genesis_timestamp = genesis,
+        "genesis time reached: epoch 0 is open",
+    );
+}
+
+/// The time of the genesis countdown's next line after `now`, or `None` once `now` has reached
+/// `genesis`.
+///
+/// Lines fall on whole intervals before genesis, not on intervals since the node started, so every
+/// node logs the same remaining times: every [`GENESIS_COUNTDOWN_INTERVAL`] seconds while genesis
+/// is further away than that, every [`GENESIS_COUNTDOWN_FINAL_INTERVAL`] seconds within it, and
+/// genesis itself last, where the countdown ends.
+fn next_countdown_line(now: TimestampSec, genesis: TimestampSec) -> Option<TimestampSec> {
+    if now >= genesis {
+        return None;
+    }
+    let remaining = genesis - now;
+    let interval = if remaining > GENESIS_COUNTDOWN_INTERVAL {
+        GENESIS_COUNTDOWN_INTERVAL
+    } else {
+        GENESIS_COUNTDOWN_FINAL_INTERVAL
+    };
+    // the earliest time after `now` that lies a whole number of intervals before genesis
+    Some(genesis - (remaining - 1) / interval * interval)
 }
 
 /// Resolve the record that seeds the new epoch's chain and the digest that anchors its epoch-close
@@ -3714,5 +3874,195 @@ pub(super) mod tests {
             "the boundary the engine never got is not stashed",
         );
         Ok(())
+    }
+
+    /// The countdown's lines fall on whole intervals before genesis: every ten minutes, every
+    /// minute during the last ten, then genesis itself, and none once genesis is reached.
+    #[test]
+    fn genesis_countdown_lines_follow_the_cadence() {
+        let genesis = 1_796_214_660;
+        let cases = [
+            // far ahead: the next whole ten minutes before genesis (genesis is 60 s past one)
+            (0, Some(60)),
+            (genesis - 86_400, Some(genesis - 85_800)),
+            // entered between two lines: the first one comes sooner than ten minutes
+            (genesis - 1_430, Some(genesis - 1_200)),
+            (genesis - 1_201, Some(genesis - 1_200)),
+            (genesis - 1_200, Some(genesis - 600)),
+            (genesis - 601, Some(genesis - 600)),
+            // the last ten minutes: every minute
+            (genesis - 600, Some(genesis - 540)),
+            (genesis - 599, Some(genesis - 540)),
+            (genesis - 61, Some(genesis - 60)),
+            (genesis - 60, Some(genesis)),
+            (genesis - 1, Some(genesis)),
+            // genesis reached: the countdown ends
+            (genesis, None),
+            (genesis + 1, None),
+            (u64::MAX, None),
+        ];
+        for (now, expected) in cases {
+            assert_eq!(next_countdown_line(now, genesis), expected, "now = {now}");
+        }
+
+        // walking the schedule from an entry visits each line once, in order
+        let mut now = genesis - 1_830;
+        let mut remaining = Vec::new();
+        while let Some(next) = next_countdown_line(now, genesis) {
+            remaining.push(genesis - next);
+            now = next;
+        }
+        assert_eq!(remaining, [1_800, 1_200, 600, 540, 480, 420, 360, 300, 240, 180, 120, 60, 0]);
+
+        // from any second, the next line is ahead by at most one interval and on its grid
+        for now in genesis - 1_800..genesis {
+            let next = next_countdown_line(now, genesis).expect("genesis is ahead");
+            let interval = if genesis - now > 600 { 600 } else { 60 };
+            assert!(
+                next > now && next - now <= interval && (genesis - next).is_multiple_of(interval),
+                "now = genesis - {}, next = genesis - {}",
+                genesis - now,
+                genesis - next,
+            );
+        }
+    }
+
+    /// The late-start warning's condition: the node knows of no epoch-0 commit, and the epoch's
+    /// boundary has passed or is less than one header delay away.
+    #[test]
+    fn epoch_zero_starts_late_only_knowing_of_no_commit_with_the_boundary_due() {
+        let delay = Duration::from_secs(10);
+        assert!(epoch_zero_starts_late(1_000, 900, delay, 0), "passed");
+        assert!(epoch_zero_starts_late(1_000, 1_000, delay, 0), "reached");
+        assert!(epoch_zero_starts_late(1_000, 1_009, delay, 0), "closer than one header delay");
+        assert!(!epoch_zero_starts_late(1_000, 1_010, delay, 0), "one header delay away");
+        assert!(!epoch_zero_starts_late(1_000, 22_600, delay, 0), "hours away");
+
+        // a validator restarted inside a running epoch 0, near or past its boundary
+        assert!(!epoch_zero_starts_late(1_000, 900, delay, 1), "passed, one commit known");
+        assert!(!epoch_zero_starts_late(1_000, 1_009, delay, 2_160), "due, epoch 0 running");
+    }
+
+    /// The late-start warning's signal counts a commit that built no execution block. An epoch 0
+    /// without a transaction keeps committing while the execution tip stays at the genesis block
+    /// until the epoch closes, so a validator restarted near the end of it must know of the commits
+    /// it saved. A node that saved none knows of the later ones its peers publish.
+    #[tokio::test]
+    async fn latest_known_consensus_number_counts_commits_that_built_no_block() -> eyre::Result<()>
+    {
+        let temp = TempDir::with_prefix("latest_known_consensus")?;
+        let (manager, _engine, reth_env, _tasks, committee) = manager_with_engine(&temp).await?;
+        assert_eq!(manager.latest_known_consensus_number(), 0, "a fresh data directory");
+
+        let author = committee.authorities().first().expect("a committee member").id();
+        manager.consensus_chain.save_consensus_output(committed_output_by(author, &[])).await?;
+        assert_eq!(reth_env.canonical_tip().number, 0, "the execution tip is the genesis block");
+        assert_eq!(manager.latest_known_consensus_number(), 1, "a saved commit without a block");
+
+        assert!(manager.consensus_bus.publish_consensus_num_hash_if_newer(
+            0,
+            60,
+            ConsensusHeaderDigest::default(),
+        ));
+        assert_eq!(manager.latest_known_consensus_number(), 60, "a later commit peers published");
+        Ok(())
+    }
+
+    /// The countdown reads its clock every step and ends within a step of reaching genesis.
+    #[tokio::test(start_paused = true)]
+    async fn genesis_countdown_ends_once_the_clock_reaches_genesis() {
+        tn_types::test_utils::init_test_tracing();
+        let genesis = 1_796_214_660;
+        let start = tokio::time::Instant::now();
+        let clock = move || genesis - 1_230 + start.elapsed().as_secs();
+        genesis_countdown(genesis, clock).await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_secs(1_230)
+                && waited <= Duration::from_secs(1_230) + GENESIS_COUNTDOWN_STEP,
+            "waited {waited:?}"
+        );
+    }
+
+    /// A wall clock that steps past genesis ends the countdown within a step, though tokio's
+    /// clock has barely moved and genesis was a day away when the countdown started.
+    #[tokio::test(start_paused = true)]
+    async fn genesis_countdown_honours_a_wall_clock_step() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let genesis = 1_796_214_660;
+        let wall = Arc::new(AtomicU64::new(genesis - 86_400));
+        let clock = {
+            let wall = wall.clone();
+            move || wall.load(Ordering::Relaxed)
+        };
+        let countdown = tokio::spawn(genesis_countdown(genesis, clock));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!countdown.is_finished(), "genesis is a day away on the wall clock");
+        wall.store(genesis, Ordering::Relaxed);
+        tokio::time::timeout(2 * GENESIS_COUNTDOWN_STEP, countdown)
+            .await
+            .expect("the countdown saw the step")
+            .expect("the countdown did not panic");
+    }
+
+    /// Epoch 0 entered before genesis runs the countdown as a non-critical epoch task, on an
+    /// active validator and on any other node alike, and the task ends with the epoch. No floor,
+    /// or a floor already passed, starts nothing, however late the node is.
+    #[tokio::test(start_paused = true)]
+    async fn genesis_countdown_runs_only_before_genesis_and_ends_with_the_epoch() {
+        tn_types::test_utils::init_test_tracing();
+        let now = tn_types::now();
+        let delay = Duration::from_secs(10);
+        let countdown = format!("Task: {GENESIS_COUNTDOWN_TASK} (not critical)");
+
+        for proposer_started in [true, false] {
+            let epoch_shutdown = ShutdownNotifier::new();
+            let mut task_manager = TaskManager::new("genesis watch");
+            let genesis = now + 3_600;
+            watch_genesis(
+                &task_manager,
+                &epoch_shutdown,
+                Some(genesis),
+                genesis + 21_600,
+                delay,
+                proposer_started,
+                0,
+            );
+            assert!(task_manager.to_string().contains(&countdown), "{task_manager}");
+            assert!(
+                !task_manager.wait_for_exit(Duration::from_secs(5)).await,
+                "the countdown waits for genesis"
+            );
+            epoch_shutdown.notify();
+            assert!(
+                task_manager.wait_for_exit(Duration::from_secs(1)).await,
+                "the countdown ends with the epoch"
+            );
+        }
+
+        for (genesis, boundary, proposer_started, latest_consensus) in [
+            (None, now + 21_600, true, 0),
+            // restarted inside epoch 0 after genesis
+            (Some(now - 3_600), now + 18_000, true, 1_800),
+            // so late that the first commit closes epoch 0: warned on a validator, spawns nothing
+            (Some(now - 30_000), now - 8_400, true, 0),
+            (Some(now - 30_000), now - 8_400, false, 0),
+            (Some(now - 21_595), now + 5, true, 0),
+            // restarted inside epoch 0 just before its boundary: not warned, spawns nothing
+            (Some(now - 21_595), now + 5, true, 2_159),
+        ] {
+            let task_manager = TaskManager::new("genesis watch");
+            watch_genesis(
+                &task_manager,
+                &ShutdownNotifier::new(),
+                genesis,
+                boundary,
+                delay,
+                proposer_started,
+                latest_consensus,
+            );
+            assert!(!task_manager.to_string().contains("Task:"), "{task_manager}");
+        }
     }
 }

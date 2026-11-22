@@ -4,6 +4,7 @@ use reth_metrics::{
     metrics::{Counter, Gauge},
     Metrics,
 };
+use tn_types::TimestampSec;
 
 use crate::manager::RunEpochMode;
 
@@ -15,7 +16,12 @@ use crate::manager::RunEpochMode;
 pub(crate) struct EpochMetrics {
     /// The current epoch.
     pub(crate) current: Gauge,
-    /// Unix timestamp (seconds) when the current epoch is scheduled to close.
+    /// Unix timestamp (seconds) when the current epoch started: the genesis time for epoch 0,
+    /// the previous epoch's closing block after it. Set with the boundary by
+    /// [`Self::record_epoch_window`].
+    pub(crate) start_timestamp_seconds: Gauge,
+    /// Unix timestamp (seconds) when the current epoch is scheduled to close. Set with the start
+    /// by [`Self::record_epoch_window`].
     pub(crate) boundary_timestamp_seconds: Gauge,
     /// Consensus outputs replayed from the consensus chain after a restart.
     pub(crate) replayed_outputs_total: Counter,
@@ -27,6 +33,16 @@ pub(crate) struct EpochMetrics {
 }
 
 impl EpochMetrics {
+    /// Record the window of the epoch being entered: when it started and when it is scheduled to
+    /// close.
+    ///
+    /// Epoch 0 can start a day or more before its genesis time, so a start gauge in the future
+    /// tells a dashboard that the node is waiting for genesis.
+    pub(crate) fn record_epoch_window(&self, start: TimestampSec, boundary: TimestampSec) {
+        self.start_timestamp_seconds.set(start as f64);
+        self.boundary_timestamp_seconds.set(boundary as f64);
+    }
+
     /// Record a `run_epoch` iteration by mode.
     ///
     /// Counts epoch transitions AND mid-epoch restarts/mode changes - a node cycling
@@ -92,7 +108,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             let metrics = EpochMetrics::new_with_labels(Vec::<metrics::Label>::new());
             metrics.current.set(3.0);
-            metrics.boundary_timestamp_seconds.set(1_700_000_000.0);
+            metrics.record_epoch_window(1_699_978_400, 1_700_000_000);
             metrics.replayed_outputs_total.increment(2);
             metrics.final_state_mismatches_total.increment(1);
             metrics.record_epoch_run(&RunEpochMode::Initial);
@@ -118,7 +134,10 @@ mod tests {
         let (key, _, _, value) = find("tn_epoch.runs_total");
         assert!(matches!(value, DebugValue::Counter(1)));
         assert!(key.key().labels().any(|l| l.key() == "mode" && l.value() == "initial"));
-        find("tn_epoch.boundary_timestamp_seconds");
+        let (_, _, _, value) = find("tn_epoch.start_timestamp_seconds");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 1_699_978_400.0));
+        let (_, _, _, value) = find("tn_epoch.boundary_timestamp_seconds");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 1_700_000_000.0));
         find("tn_epoch.replayed_outputs_total");
         let (_, _, _, value) = find("tn_epoch.final_state_mismatches_total");
         assert!(matches!(value, DebugValue::Counter(1)));
@@ -149,5 +168,29 @@ mod tests {
         let identity = "tn_epoch.epoch_close_identity_check_total";
         assert_eq!(count(identity, "ok"), 1);
         assert_eq!(count(identity, "mismatch"), 2);
+    }
+
+    /// The epoch window gauges render under the names a Prometheus scrape of the node shows, with
+    /// a start in the future for an epoch 0 entered before genesis.
+    #[test]
+    fn epoch_window_gauges_render_for_prometheus() -> eyre::Result<()> {
+        let (recorder, handle) = tn_metrics::build_recorder()?;
+        let genesis = 1_796_214_660;
+        let boundary = genesis + 21_600;
+        metrics::with_local_recorder(&recorder, || {
+            EpochMetrics::default().record_epoch_window(genesis, boundary);
+        });
+
+        let rendered = handle.render();
+        let gauge = |name: &str| {
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("{name} not rendered:\n{rendered}"))
+        };
+        assert_eq!(gauge("tn_epoch_start_timestamp_seconds"), genesis as f64);
+        assert_eq!(gauge("tn_epoch_boundary_timestamp_seconds"), boundary as f64);
+        Ok(())
     }
 }

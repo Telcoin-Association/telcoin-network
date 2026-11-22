@@ -8,7 +8,11 @@ use crate::{
 use tn_config::ConsensusConfig;
 use tn_types::{Database, TnSender as _};
 use tokio::{sync::watch, time::interval};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
+
+#[cfg(test)]
+#[path = "../tests/gc_tests.rs"]
+mod gc_tests;
 
 /// Long running task that manages the garbage collection events from consensus.
 ///
@@ -40,11 +44,18 @@ where
     /// to advance. The fallback timer is used to attempt to recover by requesting certificates
     /// from peers.
     async fn process_max_round_timeout(&self) -> GarbageCollectorResult<()> {
-        // log warning
-        warn!(target: "primary::gc",
-            "no consensus commit happened for {:?}, triggering certificate fetching.",
-            self.config.network_config().sync_config().max_consenus_round_timeout
-        );
+        let timeout = self.config.network_config().sync_config().max_consenus_round_timeout;
+        // nothing commits before genesis, and a wait of days would warn at every timeout
+        if self.config.genesis_floor().is_some_and(|genesis| tn_types::now() < genesis) {
+            debug!(target: "primary::gc",
+                "no consensus commit happened for {timeout:?} before genesis, triggering \
+                 certificate fetching."
+            );
+        } else {
+            warn!(target: "primary::gc",
+                "no consensus commit happened for {timeout:?}, triggering certificate fetching."
+            );
+        }
 
         // trigger fetch certs
         if let Err(e) =

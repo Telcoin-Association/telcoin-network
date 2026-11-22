@@ -10,12 +10,15 @@ use tracing::{
     field::{Field, Visit},
     span,
     subscriber::Interest,
-    Event, Metadata, Subscriber,
+    Event, Level, Metadata, Subscriber,
 };
 
-/// One captured event: its message and its other fields, in the order the macro lists them.
+/// One captured event: its level, its message and its other fields, in the order the macro lists
+/// them.
 #[derive(Clone, Debug)]
 pub(crate) struct CapturedEvent {
+    /// The level the event was logged at.
+    pub(crate) level: Level,
     /// The event's message text.
     pub(crate) message: String,
     /// `(name, value)` per field other than the message, each value as `Debug` formats it.
@@ -77,7 +80,11 @@ impl Subscriber for LogCapture {
     fn event(&self, event: &Event<'_>) {
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
-        self.events.lock().push(CapturedEvent { message: visitor.message, fields: visitor.fields });
+        self.events.lock().push(CapturedEvent {
+            level: *event.metadata().level(),
+            message: visitor.message,
+            fields: visitor.fields,
+        });
     }
 
     fn enter(&self, _span: &span::Id) {}
