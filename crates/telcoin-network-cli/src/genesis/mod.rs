@@ -677,6 +677,56 @@ mod tests {
     /// and [`mint_mainnet_placeholder_validators`] can tell placeholders from collected files.
     const PLACEHOLDER_VALIDATOR_NAME_PREFIX: &str = "placeholder-validator-";
 
+    /// The BLS public keys of the placeholder validators of
+    /// [`mint_mainnet_placeholder_validators`], in the base58 form their node-info files hold,
+    /// `validator-00.yaml` first.
+    ///
+    /// Their private keys were discarded when the placeholders were minted, so a validator with
+    /// one of these keys can never sign. [`mainnet_final_data_is_complete`] refuses them whatever
+    /// the file's `name` says, and [`mainnet_placeholder_validator_keys_are_pinned`] keeps this
+    /// list in step with the committed placeholder files.
+    const PLACEHOLDER_VALIDATOR_BLS_PUBLIC_KEYS: [&str; 10] = [
+        "p8ZQ6KCubgiiyVvvS7MaeksxqBJTL1VRZeBSUXEpDjUiM3a4hfY5bGSm5pygaDe9XZKwQKQ5yfnwaGv3LzxNuWAPHEEUn9mva5ALT6R1DFF9acKVAk4ViXS9BbB7BfvKSxc",
+        "puXJBUXuQ2Zzs2vCC1ijNRxbvJdUpUcrreNCJQfHWM5YQD5svXezdToAK8VxpBp3SiRUwi1hgHV636aFwrsJZV2mRRYYQakghJH25JsT937wnUXYrpVLP7atYDxSoF2SrR5",
+        "renYDn7ryuApiw2roXXJy8DkCXFfZyjWJHb2cdx4hEFMinPJ23XHkJJNF3vo98uTQUNcvEAKn2xSeHuonDCsHSyYCgdSZMdbZKDKRnq5jrBEsKJ2YsDj8C7PTZsG4rzdF8e",
+        "23yKA4SQSppCfchFutqrgyiMPC8KPBFPqJp3yJT2BaxBBu77FvAkWLszakZTy1RkzrqerLPkgG7zDqJdMYmdqaDrP56pBo6DgWFa9TrFchorP8HwVDDrkRR3R7d8w6jz3BJh",
+        "oyDr8TVebAbZhRDoV7mkRGRCvXv1dczvPNHuYbSvdoRwzDHWh6VdQSEgXu3wuU8FT5hbkUg3wHWdsqSFcV8ov9sez6mEtpPMyEka5eidpw7ArNFtxXt87pFo6FzHyJZ9RSj",
+        "zojpLkvZEsydyW796fwaLxttHMDTUe3XSPozB1ZA7ERpzx8fTPH2S8LH8rzGutFVrXnEqKrGi8w1nWnyqCE7PHBH35mKWQvWmpiiqH88gUiiDEM7etrnUmmxTVELuzaSLFN",
+        "nAKWydkkqvdKgkM3o4cN9H1fqy2iWuxwQXDebGeT5JAAvqaVcV4FTFdZ4oARKWz9XWzr1PGuTHUCegGnA5ftLJLKJp42DWVgiNm8M7N4EQSqVj8XxMCxb847HuMbCYEyzFw",
+        "zRPvRaMvg4v4MMnAanm9KotWrPKzWNKCJVuat1rU3ndvJkPBDB2eUpWosWHqg3rcWZxus9ccdNZaQHmZDWoqvWfvnWsA1sif9f9SNSgut3Wwtq2U58KSUQv1WMn8Uo3C5JN",
+        "ufQMPuKwN69qi5eDLTE6U2vN3kKKz6CDQbACVB7Yqwt2Jr1qMJ2ne4t44LXgAwSTzkxDyQ2vkiuYUHgsTLJiUMfWiNBLmgYon6fRJh42zyZ75gLa7dpfuFgsASMM57j1UrT",
+        "22cibK1Uoa5NombUkidHK9UQZKu6GtRYDQ6YXCvK5jytXmsHMAtror34Jzkb9rfyKNHjDjyKNdT4PNGWf3xSdEsL5auiNZtrT7RvXeUE3tKVasWzahBaK5Byshb1Pndmc9ih",
+    ];
+
+    /// The network keys of the placeholder validators, in the base58 form their node-info files
+    /// hold: the primary key then the worker key of `validator-00.yaml`, then those of the next
+    /// file.
+    ///
+    /// Their private keys were discarded with the BLS keys, so a node advertising one of them has
+    /// no working network identity. See [`PLACEHOLDER_VALIDATOR_BLS_PUBLIC_KEYS`].
+    const PLACEHOLDER_VALIDATOR_NETWORK_KEYS: [&str; 20] = [
+        "4XTTM3XYBz14PrkdXhMfSqALdbrG7aBArzc8a17GYr9dntxux",
+        "4XTTM25MPeMYhxoLTYhLic2zaix1AVHNNkXThJGHEhnaDLnnD",
+        "4XTTM8k8Xxw4Kdi2wDQ5wftGvTE9Y8JDgrqTLm9egCkZY8GYC",
+        "4XTTMGUfhftUq7kmTUFzqs9rmMQrJ1LFPWhBvFP2yw4JroyZL",
+        "4XTTM7TgUSdY9oAgSg1hZM3nEkn86P7n8kNnsbVpsKq3Rkz47",
+        "4XTTM7dhCsTntNMK5VtZvfboqkU5xHJPgFymG1SebcEFhjB9d",
+        "4XTTM3QtfKJYLGV7jENB5PT1R2N4gDPmBRabyC5jHZc1SarAU",
+        "4XTTMA7Xx2rsothXtRAPDzwRDxhFUkuMQgcqHApyujZo9VjLP",
+        "4XTTM2dBYELgrkXPrndRqVrQcFSKW5WLMhjNbEZttNgSt52R6",
+        "4XTTM5XbbA4mMqqfvzC2Q8yobB7m4AS8cn1GyV15YCbw7KfcQ",
+        "4XTTM3HCMGYPrqitffAqAQCscmgdmtQRDd8Qf2zJxmJUAjZJd",
+        "4XTTM3tZDjBYLT3Jw3Ze4NpiRBB3XPnN3MGkrtmTKkAyLdm4e",
+        "4XTTMDctv8ihvJJZ4kUr5SCVyrEfEtN2XvSahj5ff7aXWPDrU",
+        "4XTTMDR4QxYo54NLz5Q1aRxLDaryUvZeU6rr3h8mCHyUea7CE",
+        "4XTTMG6BieoqVvkGif23TCurNZi35GySrPLM3RkhC4gYgHz6X",
+        "4XTTM3DjXKnyoykRoLAGkM2ZE5qK1ajgKQJfsLnfAvMmRGGkA",
+        "4XTTM6iaodfksmwF9y35dxYfgdc3dbeBakZfJJ8d1BTV3Kcfh",
+        "4XTTMAmiQrRSmAX5kiVv32NvoyPvePGkEYBhcPXWG7fBWwP9m",
+        "4XTTMEdpquV4DA94rJZkumThdTWVkmLUMJ9iUCA3Uit7gWDUk",
+        "4XTTMG9rK68J8sKXT7HCXcg3eRQYEnPneg5LmhBNrhbJd6MZW",
+    ];
+
     /// The committed `chain-configs/mainnet` directory of this checkout.
     fn mainnet_chain_configs_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -805,8 +855,9 @@ mod tests {
     /// [`PLACEHOLDER_VALIDATOR_NAME_PREFIX`], so it never overwrites collected node-info files.
     ///
     /// HOW to run: `cargo test -p telcoin-network-cli mint_mainnet_placeholder_validators --
-    /// --ignored`, then run [`regenerate_mainnet_chain_configs`] and commit the validator files
-    /// together with the regenerated configs.
+    /// --ignored`, then run [`regenerate_mainnet_chain_configs`], pin the new keys in
+    /// [`PLACEHOLDER_VALIDATOR_BLS_PUBLIC_KEYS`] and [`PLACEHOLDER_VALIDATOR_NETWORK_KEYS`], and
+    /// commit the validator files together with the regenerated configs and the pins.
     #[test]
     #[ignore = "replaces the placeholder files in chain-configs/mainnet/validators with freshly minted throwaway validators; run explicitly, then regenerate_mainnet_chain_configs"]
     fn mint_mainnet_placeholder_validators() {
@@ -1222,6 +1273,34 @@ mod tests {
             .collect()
     }
 
+    /// The identity keys of `validator`, each labelled with its role and whether it is one of
+    /// the placeholder keys [`PLACEHOLDER_VALIDATOR_BLS_PUBLIC_KEYS`] and
+    /// [`PLACEHOLDER_VALIDATOR_NETWORK_KEYS`].
+    ///
+    /// The keys are compared in their base58 form, which is how the node-info files and the
+    /// pinned lists hold them.
+    fn labelled_identity_keys(validator: &NodeInfo) -> Vec<(String, bool)> {
+        let p2p = &validator.p2p_info;
+        let bls_key = validator.bls_public_key.to_string();
+        let network_keys = std::iter::once(("primary".to_string(), &p2p.primary))
+            .chain(
+                p2p.workers.iter().enumerate().map(|(id, worker)| (format!("worker {id}"), worker)),
+            )
+            .map(|(role, node)| {
+                let key = node.network_key.to_string();
+                (
+                    format!("{role} network key"),
+                    PLACEHOLDER_VALIDATOR_NETWORK_KEYS.contains(&key.as_str()),
+                )
+            });
+        std::iter::once((
+            "BLS key".to_string(),
+            PLACEHOLDER_VALIDATOR_BLS_PUBLIC_KEYS.contains(&bls_key.as_str()),
+        ))
+        .chain(network_keys)
+        .collect()
+    }
+
     /// The storage slots of `account` in `genesis` whose word holds `address` at any byte offset.
     ///
     /// An `Ownable` owner shares its slot with other packed fields, so the search does not depend
@@ -1252,7 +1331,10 @@ mod tests {
     ///   [`MAINNET_PLACEHOLDER_DEV_FUNDED_ACCOUNT`];
     /// - the placeholder basefee recipient [`MAINNET_PLACEHOLDER_BASEFEE_ADDRESS`] in
     ///   `parameters.yaml`;
-    /// - a validator file whose `name` starts with [`PLACEHOLDER_VALIDATOR_NAME_PREFIX`];
+    /// - a validator file whose `name` starts with [`PLACEHOLDER_VALIDATOR_NAME_PREFIX`], or that
+    ///   holds a placeholder BLS or network key under any `name`
+    ///   ([`PLACEHOLDER_VALIDATOR_BLS_PUBLIC_KEYS`], [`PLACEHOLDER_VALIDATOR_NETWORK_KEYS`]), in
+    ///   one message for the file that names every reason;
     /// - a validator network address, or an address in `bootstrap_servers.yaml`, that
     ///   [`unreachable_address_reason`] refuses: a non-public host such as a loopback, private,
     ///   carrier-grade NAT, link-local, documentation, multicast or reserved address, a DNS name,
@@ -1322,11 +1404,25 @@ mod tests {
         for (index, validator) in validators.iter().enumerate() {
             let file =
                 format!("chain-configs/mainnet/validators/{}", mainnet_validator_file_name(index));
+            let mut reasons = Vec::new();
             if validator.name.starts_with(PLACEHOLDER_VALIDATOR_NAME_PREFIX) {
-                problems.push(format!(
-                    "{file}: `{}` is a placeholder, not a collected node-info file",
+                reasons.push(format!(
+                    "`{}` is a placeholder, not a collected node-info file",
                     validator.name
                 ));
+            }
+            let placeholder_keys: Vec<String> = labelled_identity_keys(validator)
+                .into_iter()
+                .filter_map(|(key, placeholder)| placeholder.then_some(key))
+                .collect();
+            if !placeholder_keys.is_empty() {
+                reasons.push(format!(
+                    "the file holds placeholder keys, whose private keys do not exist: the {}",
+                    placeholder_keys.join(", the ")
+                ));
+            }
+            if !reasons.is_empty() {
+                problems.push(format!("{file}: {}", reasons.join("; ")));
             }
             let p2p = &validator.p2p_info;
             for (role, address) in labelled_network_addresses(&p2p.primary, &p2p.workers) {
@@ -1366,6 +1462,39 @@ mod tests {
             "the committed mainnet chain configs do not hold the final mainnet data yet:\n{}",
             problems.join("\n")
         );
+        Ok(())
+    }
+
+    /// Every committed validator file whose `name` starts with
+    /// [`PLACEHOLDER_VALIDATOR_NAME_PREFIX`] holds only pinned placeholder keys.
+    ///
+    /// [`mainnet_final_data_is_complete`] refuses the placeholders by their keys as well as by
+    /// their names, so the pins must list the keys of the committed placeholders. Each run of
+    /// [`mint_mainnet_placeholder_validators`] mints new keys and fails this test until the pins
+    /// are updated. Once the collected files replace the placeholders, no file carries the prefix
+    /// and the test has nothing to compare.
+    #[test]
+    fn mainnet_placeholder_validator_keys_are_pinned() -> eyre::Result<()> {
+        let validators =
+            check_mainnet_validators(&mainnet_validators_dir(), &genesis_validator_safes())?;
+        for (index, validator) in validators.iter().enumerate() {
+            if !validator.name.starts_with(PLACEHOLDER_VALIDATOR_NAME_PREFIX) {
+                continue;
+            }
+            let unpinned: Vec<String> = labelled_identity_keys(validator)
+                .into_iter()
+                .filter_map(|(key, placeholder)| (!placeholder).then_some(key))
+                .collect();
+            assert!(
+                unpinned.is_empty(),
+                "chain-configs/mainnet/validators/{}: the placeholder `{}` holds keys that are not \
+                 pinned ({}); update PLACEHOLDER_VALIDATOR_BLS_PUBLIC_KEYS and \
+                 PLACEHOLDER_VALIDATOR_NETWORK_KEYS to the keys of the committed placeholder files",
+                mainnet_validator_file_name(index),
+                validator.name,
+                unpinned.join(", ")
+            );
+        }
         Ok(())
     }
 
