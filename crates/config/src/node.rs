@@ -678,7 +678,8 @@ mod test {
     /// `<datadir>/genesis/committee.yaml`, which the epoch manager later reads back via
     /// `Config::load_from_path::<Committee>` (crates/node/src/manager/node.rs). This gate
     /// drives all three files through exactly those paths, so a schema-stale committed file
-    /// fails here instead of at node startup.
+    /// fails here instead of at node startup. It also checks that the committee seats exactly
+    /// one validator under each genesis validator Safe.
     #[test]
     fn mainnet_chain_configs_load_via_the_node_paths() {
         let _genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
@@ -699,10 +700,17 @@ mod test {
                      (issue #1063) - {REGENERATION_LEVER}: {e}"
                 )
             });
+        // the ceremony keys authorities by BLS key, so compare the stake addresses as a set
+        let stake_addresses: std::collections::BTreeSet<Address> =
+            committee.authorities().iter().map(|authority| authority.execution_address()).collect();
         assert_eq!(
-            committee.size(),
-            4,
-            "mainnet placeholder committee must seat the 4 placeholder validators"
+            (committee.size(), stake_addresses),
+            (
+                crate::genesis_validator_safes().len(),
+                crate::genesis_validator_safes().into_iter().collect()
+            ),
+            "the mainnet genesis committee must seat one validator under each genesis validator \
+             Safe - {REGENERATION_LEVER}"
         );
     }
 

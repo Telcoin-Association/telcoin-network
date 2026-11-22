@@ -1,0 +1,14 @@
+---
+name: placeholder-validator-05
+bls_public_key: zojpLkvZEsydyW796fwaLxttHMDTUe3XSPozB1ZA7ERpzx8fTPH2S8LH8rzGutFVrXnEqKrGi8w1nWnyqCE7PHBH35mKWQvWmpiiqH88gUiiDEM7etrnUmmxTVELuzaSLFN
+p2p_info:
+  primary:
+    network_address: /ip4/192.0.2.15/udp/49590/quic-v1/p2p/12D3KooWBxWhRPvnEMm1dWNkHAynd5z7QjRmVuoRJmuCj4rdmnXX
+    network_key: 4XTTM3HCMGYPrqitffAqAQCscmgdmtQRDd8Qf2zJxmJUAjZJd
+    rpc: ~
+  workers:
+    - network_address: /ip4/192.0.2.15/udp/49594/quic-v1/p2p/12D3KooWCZsZt35FqgBH1uBeFnpb2aPrv7NbE49dAZ3ZhwMofzHY
+      network_key: 4XTTM3tZDjBYLT3Jw3Ze4NpiRBB3XPnN3MGkrtmTKkAyLdm4e
+      rpc: ~
+execution_address: "0x000000000000000000000000000007310005eed5"
+proof_of_possession: 6QD7kRheopN4dz2XdWiEBs5GewthBCXMekNDTXff7R21CJn65YmNYABtLsp5A3dEbL
