@@ -4,7 +4,7 @@ use super::*;
 use crate::consensus::LeaderSwapTable;
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
-use tn_config::{ConsensusConfig, NetworkConfig, PriorEpoch};
+use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
@@ -75,7 +75,7 @@ async fn test_multi_worker_proposed_header_payload() -> eyre::Result<()> {
         author: primary.id(),
         prior_epoch_record: proposer.prior_epoch_record,
         key_config: config.key_config().clone(),
-        genesis_floor: None,
+        genesis_time: None,
     };
     let header = Proposer::propose_header(
         identity,
@@ -556,7 +556,7 @@ async fn propose_round_two(
         author: primary.id(),
         prior_epoch_record: config.prior_epoch_record(),
         key_config: config.key_config().clone(),
-        genesis_floor: None,
+        genesis_time: None,
     };
 
     let start = tokio::time::Instant::now();
@@ -1340,31 +1340,25 @@ async fn test_epoch_start_proposes_round_one_on_genesis_parents() {
     assert!(header.validate(&committee).is_ok());
 }
 
-// ---- the genesis floor ----
+// ---- the genesis hold ----
 
-/// `primary`'s config rebuilt through the constructor epoch startup uses, with `genesis_floor`
-/// (unix seconds) as its floor: the fixture's test constructors carry none.
-fn config_with_genesis_floor(
+/// `primary`'s config rebuilt with its node config's genesis timestamp set to `genesis_timestamp`
+/// (unix seconds): the fixture stamps genesis at the moment it is built.
+fn config_with_genesis_time(
     primary: &AuthorityFixture<MemDatabase>,
-    genesis_floor: Option<TimestampSec>,
+    genesis_timestamp: TimestampSec,
 ) -> ConsensusConfig<MemDatabase> {
     let fixture_config = primary.consensus_config();
-    let config = ConsensusConfig::new_for_epoch(
-        fixture_config.config().clone(),
+    let mut node_config = fixture_config.config().clone();
+    node_config.genesis.timestamp = genesis_timestamp;
+    ConsensusConfig::new_with_committee_for_test(
+        node_config,
         fixture_config.node_storage().clone(),
         fixture_config.key_config().clone(),
         fixture_config.committee().clone(),
         fixture_config.network_config().clone(),
-        fixture_config.next_committee_keys().to_vec(),
-        PriorEpoch {
-            record: fixture_config.prior_epoch_record(),
-            close: fixture_config.prior_epoch_close(),
-            genesis_start: genesis_floor,
-        },
     )
-    .expect("fixture parameters satisfy the epoch constructor");
-    assert_eq!(config.genesis_floor(), genesis_floor);
-    config
+    .expect("fixture config")
 }
 
 /// The genesis wait reads the clock again at least once a second rather than sleeping the whole
@@ -1428,72 +1422,79 @@ async fn test_genesis_wait_reads_the_clock_at_least_once_a_second() {
     );
 }
 
-/// With the genesis floor ahead of the clock, the proposer holds its first header until the floor
-/// and stamps it no earlier than the floor.
+/// With the epoch-0 config's genesis time ahead of the clock, the proposer holds its first header
+/// until genesis and stamps it no earlier than genesis.
 ///
 /// Runs on the wall clock, because the wait does. Nothing bounds how late the header may come, so
-/// a loaded machine only delays it; the header reaching the certifier's channel at or after the
-/// floor shows the proposer waited, rather than stamping the floor on a header it sent early.
+/// a loaded machine only delays it; the header reaching the certifier's channel at or after
+/// genesis shows the proposer waited, rather than stamping genesis on a header it sent early.
 #[tokio::test]
-async fn test_first_header_waits_for_a_future_genesis_floor() {
+async fn test_first_header_waits_for_a_future_genesis() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
+    assert_eq!(committee.epoch(), 0, "the hold applies to epoch 0 only");
     let primary = fixture.authorities().next().unwrap();
     // a whole second, two to three seconds ahead of the wall clock
-    let floor: TimestampSec = now() + 3;
-    let floor_ms = TimestampMs::from_parts(floor, 0);
-    let config = config_with_genesis_floor(primary, Some(floor));
+    let genesis: TimestampSec = now() + 3;
+    let genesis_ms = TimestampMs::from_parts(genesis, 0);
+    let config = config_with_genesis_time(primary, genesis);
     let cb = ConsensusBus::new();
     let mut rx_headers = cb.subscribe_headers();
     let task_manager = TaskManager::default();
     let proposer = proposer_on(&config, &committee, &cb, &task_manager);
     assert!(
-        now_ms() < floor_ms,
-        "the floor passed before the proposer started, so nothing would be held; the fixture \
-         needs a longer lead"
+        now_ms() < genesis_ms,
+        "genesis passed before the proposer started, so nothing would be held; the fixture needs \
+         a longer lead"
     );
 
     proposer.spawn(&task_manager);
     let header = tokio::time::timeout(Duration::from_secs(60), rx_headers.recv())
         .await
-        .expect("the proposer sends its first header once the floor passes")
+        .expect("the proposer sends its first header once genesis passes")
         .expect("header channel stayed open");
     let received = now_ms();
     assert!(
-        received >= floor_ms,
-        "the first header reached the certifier at {received}, before the genesis floor {floor_ms}"
+        received >= genesis_ms,
+        "the first header reached the certifier at {received}, before genesis {genesis_ms}"
     );
     assert!(
-        header.created_at_ms() >= floor_ms,
-        "the first header is stamped {}, before the genesis floor {floor_ms}",
+        header.created_at_ms() >= genesis_ms,
+        "the first header is stamped {}, before genesis {genesis_ms}",
         header.created_at_ms()
     );
     assert_eq!(header.round(), 1, "the held header is the epoch's first");
     assert!(header.validate(&committee).is_ok());
 }
 
-/// A genesis floor already passed, like no floor at all, leaves the proposal as it was: it does
-/// not sleep, and the header is stamped from the clock rather than from the floor.
+/// A genesis time already passed in epoch 0, or one still ahead in a later epoch, leaves the
+/// proposal as it was: it does not sleep, and the header is stamped from the clock rather than
+/// from genesis.
 ///
-/// Tokio's clock is paused, so any sleep on the way would show as elapsed time.
+/// The proposal takes its genesis time from a proposer built by `Proposer::new`, so the later
+/// epoch's case pins the epoch-0 condition there: its genesis is ahead of the clock and would hold
+/// the header without that condition. Tokio's clock is paused, so any sleep on the way would show
+/// as elapsed time.
 #[tokio::test(start_paused = true)]
-async fn test_past_or_absent_genesis_floor_leaves_the_proposal_unchanged() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let committee = fixture.committee();
-    let primary = fixture.authorities().next().unwrap();
-    let config = primary.consensus_config();
-    let an_hour_ago = TimestampMs::from_parts(now() - 3_600, 0);
-    for genesis_floor in [None, Some(an_hour_ago)] {
+async fn test_past_genesis_or_later_epoch_leaves_the_proposal_unchanged() {
+    // a few seconds ahead, so a missing epoch condition fails the test instead of hanging it
+    for (epoch, genesis) in [(0, now() - 3_600), (1, now() + 3)] {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(epoch).build();
+        let committee = fixture.committee();
+        let primary = fixture.authorities().next().unwrap();
+        let config = config_with_genesis_time(primary, genesis);
         let cb = ConsensusBus::new();
         // keep the header channel subscribed so `send` is not silently dropped
         let _rx_headers = cb.subscribe_headers();
+        let task_manager = TaskManager::default();
+        let proposer = proposer_on(&config, &committee, &cb, &task_manager);
         let identity = HeaderIdentity {
             round: 1,
-            epoch: committee.epoch(),
+            epoch,
             author: primary.id(),
             prior_epoch_record: config.prior_epoch_record(),
             key_config: config.key_config().clone(),
-            genesis_floor,
+            genesis_time: proposer.genesis_time,
         };
         let before = now_ms();
         let start = tokio::time::Instant::now();
@@ -1511,17 +1512,17 @@ async fn test_past_or_absent_genesis_floor_leaves_the_proposal_unchanged() {
         let waited = start.elapsed();
         let after = now_ms();
 
-        assert_eq!(waited, Duration::ZERO, "{genesis_floor:?}: the proposal must not sleep");
+        assert_eq!(waited, Duration::ZERO, "epoch {epoch}: the proposal must not sleep");
         assert!(
             (before.secs()..=after.secs()).contains(header.created_at()),
-            "{genesis_floor:?}: the header must be stamped from the clock, between {before} and \
+            "epoch {epoch}: the header must be stamped from the clock, between {before} and \
              {after}, not at {}",
             header.created_at_ms()
         );
     }
 }
 
-/// A proposer holding its first header for a genesis floor two days away does not hold up the
+/// A proposer holding its first header for a genesis time two days away does not hold up the
 /// epoch's teardown, done here as the epoch manager does it: the consensus shutdown ends the run
 /// loop at once, and aborting the epoch's tasks ends the held proposal at its current sleep.
 #[tokio::test]
@@ -1530,7 +1531,7 @@ async fn test_genesis_hold_does_not_delay_epoch_teardown() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let primary = fixture.authorities().next().unwrap();
-    let config = config_with_genesis_floor(primary, Some(now() + TWO_DAYS));
+    let config = config_with_genesis_time(primary, now() + TWO_DAYS);
     let cb = ConsensusBus::new();
     let mut rx_headers = cb.subscribe_headers();
     let mut rx_round = cb.app().primary_round_updates().subscribe();
@@ -1548,7 +1549,7 @@ async fn test_genesis_hold_does_not_delay_epoch_teardown() {
             .expect("round watch stayed open");
         assert!(
             tokio::time::timeout(Duration::from_secs(1), rx_headers.recv()).await.is_err(),
-            "no header may be sent two days before the genesis floor"
+            "no header may be sent two days before genesis"
         );
         shutdown.notify();
     });
@@ -1558,329 +1559,6 @@ async fn test_genesis_hold_does_not_delay_epoch_teardown() {
     assert!(
         task_manager.wait_for_exit(Duration::from_secs(30)).await,
         "every epoch task, the held proposal included, must end once aborted"
-    );
-}
-
-/// A round-1 header stored before genesis by a build without the genesis hold is never sent
-/// again, whether the floor is still ahead of the clock or already passed: the proposer builds a
-/// new round-1 header, holds it until the floor, stamps it no earlier, and stores it in place of
-/// the early one, and the max-delay re-send that follows carries the new header.
-///
-/// No voter with the genesis rule votes for the early header, so sending it would cost the
-/// validator its round 1. Runs on the wall clock, because the hold does.
-#[tokio::test]
-async fn test_header_stored_before_genesis_is_replaced_not_resent() {
-    for floor in [now() + 3, now() - 60] {
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-        let primary = fixture.authorities().next().unwrap();
-        let floor_ms = TimestampMs::from_parts(floor, 0);
-        let config = config_with_genesis_floor(primary, Some(floor));
-        // the header a build without the hold proposed at once, an hour before genesis
-        let early = HeaderBuilder::from_header(&build_header_at(
-            &primary.id(),
-            1,
-            committee.epoch(),
-            &[B256::random()],
-        ))
-        .created_at(floor - 3_600)
-        .build();
-        config.node_storage().write_last_proposed(&early).unwrap();
-
-        let cb = ConsensusBus::new();
-        let mut rx_headers = cb.subscribe_headers();
-        let task_manager = TaskManager::default();
-        let proposer = proposer_on(&config, &committee, &cb, &task_manager);
-        let resendable = proposer.resendable_last_proposed();
-        proposer.spawn(&task_manager);
-
-        // the header sent on start, then the one the max-delay tick re-sends
-        let first = tokio::time::timeout(Duration::from_secs(30), rx_headers.recv())
-            .await
-            .expect("the proposer sends a header on start")
-            .expect("header channel stayed open");
-        let received = now_ms();
-        let resent = tokio::time::timeout(Duration::from_secs(30), rx_headers.recv())
-            .await
-            .expect("the max-delay tick re-sends a header")
-            .expect("header channel stayed open");
-        let sent = format!(
-            "floor {floor_ms}: the store held {} created at {}; the proposer sent {} created at {} \
-             (received at {received}), then re-sent {} created at {}",
-            early.digest(),
-            early.created_at_ms(),
-            first.digest(),
-            first.created_at_ms(),
-            resent.digest(),
-            resent.created_at_ms(),
-        );
-
-        assert_ne!(first.digest(), early.digest(), "the early header was sent: {sent}");
-        assert_eq!(first.round(), 1, "the new header is for the early header's round: {sent}");
-        assert!(received >= floor_ms, "the new header was not held until genesis: {sent}");
-        assert!(first.created_at_ms() >= floor_ms, "the new header is stamped early: {sent}");
-        assert_eq!(resent, first, "the re-send must carry the new header: {sent}");
-        assert_eq!(
-            config.node_storage().get_last_proposed().unwrap(),
-            Some(first),
-            "the new header replaces the early one as the stored record: {sent}"
-        );
-        assert_eq!(resendable, None, "the early header was offered to the max-delay re-send");
-    }
-}
-
-/// A header stored before genesis that this node already certified, while it ran a build without
-/// the genesis hold, is kept: the proposer sends it again unchanged, on start and on the max-delay
-/// tick, and builds no other header for its round.
-///
-/// The certificate may already be on the network, so a second header for the round could be
-/// certified too: the author's own vote counts toward both, and voters that voted for the early
-/// header keep that vote. Sending the stored header again lets the certifier re-publish its
-/// certificate instead. Runs on the wall clock, because the hold would.
-#[tokio::test]
-async fn test_certified_header_stored_before_genesis_is_kept_and_resent() {
-    for floor in [now() + 3, now() - 60] {
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-        let primary = fixture.authorities().next().unwrap();
-        let config = config_with_genesis_floor(primary, Some(floor));
-        let early = HeaderBuilder::from_header(&build_header_at(
-            &primary.id(),
-            1,
-            committee.epoch(),
-            &[B256::random()],
-        ))
-        .created_at(floor - 3_600)
-        .build();
-        config.node_storage().write_last_proposed(&early).unwrap();
-        // the certificate the certifier of that build assembled and stored for the early header
-        let certificate = Certificate::new_unsigned_for_test(&committee, early.clone(), Vec::new())
-            .expect("unsigned certificate");
-        config
-            .node_storage()
-            .insert::<ProposedCertificates>(&early.digest(), &certificate)
-            .unwrap();
-
-        let cb = ConsensusBus::new();
-        let mut rx_headers = cb.subscribe_headers();
-        let task_manager = TaskManager::default();
-        let proposer = proposer_on(&config, &committee, &cb, &task_manager);
-        assert_eq!(
-            proposer.resendable_last_proposed(),
-            Some(early.clone()),
-            "floor {floor}: the certified early header must be offered to the max-delay re-send"
-        );
-        proposer.spawn(&task_manager);
-
-        for sent in ["on start", "on the max-delay tick"] {
-            let header = tokio::time::timeout(Duration::from_secs(30), rx_headers.recv())
-                .await
-                .unwrap_or_else(|_| panic!("floor {floor}: the proposer sends a header {sent}"))
-                .expect("header channel stayed open");
-            assert_eq!(
-                header,
-                early,
-                "floor {floor}: the header sent {sent} must be the certified early header, not \
-                 one created at {}",
-                header.created_at_ms()
-            );
-        }
-        assert_eq!(
-            config.node_storage().get_last_proposed().unwrap(),
-            Some(early),
-            "floor {floor}: the certified early header must stay the stored record"
-        );
-    }
-}
-
-/// A header stored before genesis is replaced when the certificate store holds a certificate for
-/// another header of the same round but none for it: the proposer looks the certificate up by the
-/// stored header's own digest, as the certifier does.
-#[tokio::test]
-async fn test_header_stored_before_genesis_is_replaced_beside_another_headers_certificate() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let committee = fixture.committee();
-    let primary = fixture.authorities().next().unwrap();
-    let floor = now() - 60;
-    let floor_ms = TimestampMs::from_parts(floor, 0);
-    let config = config_with_genesis_floor(primary, Some(floor));
-    let early_header = |digest| {
-        HeaderBuilder::from_header(&build_header_at(&primary.id(), 1, committee.epoch(), &[digest]))
-            .created_at(floor - 3_600)
-            .build()
-    };
-    let early = early_header(B256::random());
-    let other = early_header(B256::random());
-    assert_ne!(other.digest(), early.digest(), "two headers for the same round");
-    config.node_storage().write_last_proposed(&early).unwrap();
-    let certificate = Certificate::new_unsigned_for_test(&committee, other.clone(), Vec::new())
-        .expect("unsigned certificate");
-    config.node_storage().insert::<ProposedCertificates>(&other.digest(), &certificate).unwrap();
-
-    let cb = ConsensusBus::new();
-    let mut rx_headers = cb.subscribe_headers();
-    let task_manager = TaskManager::default();
-    let proposer = proposer_on(&config, &committee, &cb, &task_manager);
-    assert_eq!(
-        proposer.resendable_last_proposed(),
-        None,
-        "the uncertified early header was offered to the max-delay re-send"
-    );
-    proposer.spawn(&task_manager);
-
-    let first = tokio::time::timeout(Duration::from_secs(30), rx_headers.recv())
-        .await
-        .expect("the proposer sends a header on start")
-        .expect("header channel stayed open");
-    assert_ne!(first.digest(), early.digest(), "the uncertified early header was sent");
-    assert_ne!(first.digest(), other.digest(), "the other certified header was sent");
-    assert_eq!(first.round(), 1, "the new header is for the early header's round");
-    assert!(first.created_at_ms() >= floor_ms, "the new header is stamped early");
-    assert_eq!(
-        config.node_storage().get_last_proposed().unwrap(),
-        Some(first),
-        "the new header replaces the early one as the stored record"
-    );
-}
-
-/// A stored header created exactly at the genesis floor is not created before genesis: the
-/// proposer sends it again unchanged, on start and on the max-delay tick, and keeps the record.
-///
-/// This is the stamp a header gets in production when the hold ends on the floor, or within the
-/// genesis second before the sub-second fork, so replacing it would make an honest node that ran
-/// only this build send a second header for a round after a restart.
-#[tokio::test]
-async fn test_header_stored_at_the_genesis_floor_is_resent() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let committee = fixture.committee();
-    let primary = fixture.authorities().next().unwrap();
-    let floor = now() - 60;
-    let config = config_with_genesis_floor(primary, Some(floor));
-    let stored = HeaderBuilder::from_header(&build_header_at(
-        &primary.id(),
-        1,
-        committee.epoch(),
-        &[B256::random()],
-    ))
-    .created_at(floor)
-    .build();
-    assert_eq!(stored.created_at_ms(), TimestampMs::from_parts(floor, 0), "stamped at the floor");
-    config.node_storage().write_last_proposed(&stored).unwrap();
-
-    let cb = ConsensusBus::new();
-    let mut rx_headers = cb.subscribe_headers();
-    let task_manager = TaskManager::default();
-    let proposer = proposer_on(&config, &committee, &cb, &task_manager);
-    assert_eq!(
-        proposer.resendable_last_proposed(),
-        Some(stored.clone()),
-        "a header stamped at the floor must be offered to the max-delay re-send"
-    );
-    proposer.spawn(&task_manager);
-
-    for sent in ["on start", "on the max-delay tick"] {
-        let header = tokio::time::timeout(Duration::from_secs(30), rx_headers.recv())
-            .await
-            .unwrap_or_else(|_| panic!("the proposer sends a header {sent}"))
-            .expect("header channel stayed open");
-        assert_eq!(header, stored, "the header sent {sent} must be the stored one");
-    }
-    assert_eq!(
-        config.node_storage().get_last_proposed().unwrap(),
-        Some(stored),
-        "the header stamped at the floor must stay the stored record"
-    );
-}
-
-/// A stored header created one millisecond before the genesis floor is created before genesis:
-/// the proposer replaces it and does not offer it to the max-delay re-send. With
-/// [`test_header_stored_at_the_genesis_floor_is_resent`] this pins the floor comparison to the
-/// millisecond.
-///
-/// A header carries its sub-second part only with the sub-second fork active, so the test pins it.
-#[tokio::test]
-async fn test_header_stored_a_millisecond_before_the_genesis_floor_is_replaced() {
-    pin_subsecond_fork(true);
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let committee = fixture.committee();
-    let primary = fixture.authorities().next().unwrap();
-    let floor = now() - 60;
-    let floor_ms = TimestampMs::from_parts(floor, 0);
-    let config = config_with_genesis_floor(primary, Some(floor));
-    let early = HeaderBuilder::from_header(&build_header_at(
-        &primary.id(),
-        1,
-        committee.epoch(),
-        &[B256::random()],
-    ))
-    .created_at_ms(TimestampMs::from_millis(floor_ms.as_millis() - 1))
-    .build();
-    assert_eq!(
-        early.created_at_ms().as_millis(),
-        floor_ms.as_millis() - 1,
-        "stamped a millisecond before the floor"
-    );
-    config.node_storage().write_last_proposed(&early).unwrap();
-
-    let cb = ConsensusBus::new();
-    let mut rx_headers = cb.subscribe_headers();
-    let task_manager = TaskManager::default();
-    let proposer = proposer_on(&config, &committee, &cb, &task_manager);
-    assert_eq!(
-        proposer.resendable_last_proposed(),
-        None,
-        "a header stamped a millisecond before the floor was offered to the max-delay re-send"
-    );
-    proposer.spawn(&task_manager);
-
-    let first = tokio::time::timeout(Duration::from_secs(30), rx_headers.recv())
-        .await
-        .expect("the proposer sends a header on start")
-        .expect("header channel stayed open");
-    assert_ne!(first.digest(), early.digest(), "the early header was sent");
-    assert_eq!(first.round(), 1, "the new header is for the early header's round");
-    assert!(first.created_at_ms() >= floor_ms, "the new header is stamped early");
-    assert_eq!(
-        config.node_storage().get_last_proposed().unwrap(),
-        Some(first),
-        "the new header replaces the early one as the stored record"
-    );
-}
-
-/// A wall clock that steps back below the genesis floor after the hold still stamps the header at
-/// the floor, and a parent bound above the floor wins over both.
-///
-/// `propose_header` reads the wall clock itself, so the clamp it applies is driven here with the
-/// readings a clock stepped back after the hold would give it.
-#[test]
-fn test_created_at_clamp_holds_the_genesis_floor_after_a_clock_step_back() {
-    let floor = TimestampMs::from_parts(1_796_214_660, 0);
-    // the hold ended at the floor, then the clock stepped back five seconds
-    let stepped_back = TimestampMs::from_millis(floor.as_millis() - 5_000);
-    // the bound round 1's genesis parents set, far below the floor
-    let genesis_bound = Some(TimestampMs::from_millis(1));
-
-    assert_eq!(
-        clamp_created_at(stepped_back, genesis_bound, Some(floor)),
-        floor,
-        "a clock stepped back after the hold must not stamp the header before genesis"
-    );
-    let parent_bound = floor.saturating_add_millis(250);
-    assert_eq!(
-        clamp_created_at(stepped_back, Some(parent_bound), Some(floor)),
-        parent_bound,
-        "a parent bound above the floor must still win"
-    );
-    let later = floor.saturating_add_millis(1_000);
-    assert_eq!(
-        clamp_created_at(later, Some(parent_bound), Some(floor)),
-        later,
-        "a clock past both bounds stamps its own reading"
-    );
-    assert_eq!(
-        clamp_created_at(stepped_back, genesis_bound, None),
-        stepped_back,
-        "without a floor only the parents bound the clock"
     );
 }
 

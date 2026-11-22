@@ -46,7 +46,9 @@ where
     async fn process_max_round_timeout(&self) -> GarbageCollectorResult<()> {
         let timeout = self.config.network_config().sync_config().max_consenus_round_timeout;
         // nothing commits before genesis, and a wait of days would warn at every timeout
-        if self.config.genesis_floor().is_some_and(|genesis| tn_types::now() < genesis) {
+        if self.config.committee().epoch() == 0
+            && tn_types::now() < self.config.config().genesis().timestamp
+        {
             debug!(target: "primary::gc",
                 "no consensus commit happened for {timeout:?} before genesis, triggering \
                  certificate fetching."

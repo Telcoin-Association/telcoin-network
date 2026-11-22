@@ -33,10 +33,7 @@ use std::{
     time::Instant,
 };
 use tn_config::{ConsensusConfig, KeyConfig};
-use tn_storage::{
-    tables::{LastProposed, ProposedCertificates},
-    ProposerStore,
-};
+use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
     forks::{seed_signature_active, subsecond_timestamp_active},
     now_ms, AuthorityIdentifier, BlockHash, BlockNumHash, BlockNumber, Certificate, Committee,
@@ -53,7 +50,7 @@ use tracing::{debug, enabled, error, info, instrument, trace, warn};
 type PendingHeaderTask = oneshot::Receiver<ProposerResult<Header>>;
 
 /// The longest the proposer sleeps between clock reads while it holds a header for the genesis
-/// floor ([`ConsensusConfig::genesis_floor`]).
+/// time.
 const GENESIS_WAIT_STEP: Duration = Duration::from_secs(1);
 
 /// Messages sent to the proposer about this primary's own workers' block digests
@@ -196,9 +193,9 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// The cross-epoch anchor of the [`EpochSeedMessage`]: the digest of the previous epoch's
     /// [`EpochRecord`](tn_types::EpochRecord), resolved once when the epoch's primary spawns.
     prior_epoch_record: EpochDigest,
-    /// The epoch's genesis floor ([`ConsensusConfig::genesis_floor`]): no header this proposer
-    /// builds is created before it. `None` outside epoch 0.
-    genesis_floor: Option<TimestampMs>,
+    /// The genesis time from the node config: no header this proposer builds is created before
+    /// it. `None` outside epoch 0.
+    genesis_time: Option<TimestampMs>,
     /// Handle used to sign this authority's per-`(author, round)` [`EpochSeedMessage`].
     ///
     /// The seed message binds the header's round, so it cannot be signed once for the epoch; the
@@ -233,12 +230,11 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     order_hold_metrics: OrderHoldHandles,
 }
 
-/// The identity a proposer stamps on a header it authors, and the floor on its creation time.
+/// The identity a proposer stamps on a header it authors.
 ///
-/// These values are fixed for a given proposal and are read straight through into [`Header::new`],
-/// the floor as a bound on its `created_at`. They are grouped into one type so the spawned
-/// header-building task takes a single self-describing argument instead of a long list of
-/// positional scalars.
+/// These values are fixed for a given proposal and are read straight through into [`Header::new`].
+/// They are grouped into one type so the spawned header-building task takes a single
+/// self-describing argument instead of a long list of positional scalars.
 struct HeaderIdentity {
     /// The round the header is proposed for.
     round: Round,
@@ -254,9 +250,9 @@ struct HeaderIdentity {
     /// message binds the header's round, so the signer travels with the identity and the signature
     /// is produced immediately before [`Header::new`].
     key_config: KeyConfig,
-    /// The earliest time the header may be created: the epoch's genesis floor, or `None` when the
-    /// epoch has none. [`Proposer::propose_header`] holds the header until then.
-    genesis_floor: Option<TimestampMs>,
+    /// The earliest time the header may be created: the genesis time in epoch 0, `None` after.
+    /// [`Proposer::propose_header`] holds the header until then.
+    genesis_time: Option<TimestampMs>,
 }
 
 /// Why the proposer builds a header and what its queue held at that moment, carried into
@@ -389,7 +385,8 @@ impl<DB: Database> Proposer<DB> {
             advance_round: true,
             task_spawner,
             prior_epoch_record: config.prior_epoch_record(),
-            genesis_floor: config.genesis_floor().map(|secs| TimestampMs::from_parts(secs, 0)),
+            genesis_time: (config.committee().epoch() == 0)
+                .then(|| TimestampMs::from_parts(config.config().genesis().timestamp, 0)),
             key_config: config.key_config().clone(),
             headers_proposed: HeadersProposedHandles::new(),
             digests_requeued: DigestsRequeuedHandles::new(),
@@ -411,8 +408,8 @@ impl<DB: Database> Proposer<DB> {
     /// - exec_inputs: what [`ExecBlockInputs::choose`] needs to pick the header's execution block;
     ///   the ring is read once, right before [`Header::new`], where the tip was read before.
     ///
-    /// In epoch 0 a node started before genesis holds the header here until the genesis floor
-    /// (`identity.genesis_floor`), which can be days away. The hold needs no shutdown handling of
+    /// In epoch 0 a node started before genesis holds the header here until the genesis time
+    /// (`identity.genesis_time`), which can be days away. The hold needs no shutdown handling of
     /// its own. [`Self::run`] stops on its shutdown notice whatever this task is doing, because it
     /// only polls the result channel. This task runs on the epoch's task manager, which cancels it
     /// at its current sleep of at most [`GENESIS_WAIT_STEP`] when the epoch's tasks are aborted or
@@ -433,29 +430,30 @@ impl<DB: Database> Proposer<DB> {
             author,
             prior_epoch_record,
             key_config,
-            genesis_floor,
+            genesis_time,
         } = identity;
 
         // epoch 0 waits for genesis here, before anything is read from the clock or the chain: the
         // seed signature, the execution block and `created_at` all come after the wait, and
-        // `created_at` is clamped to the floor below, so the header is never stamped before
+        // `created_at` is clamped to the genesis time below, so the header is never stamped before
         // genesis and its seed signature does not exist days ahead of it. its round, parents and
         // digests were fixed earlier, when the proposer drained them, and do not go stale while it
         // waits: the run loop proposes nothing else while a proposal is pending, digests that
         // arrive meanwhile stay queued for the next header, and a header started before genesis
         // builds on the genesis certificates, the only parents that can exist then
-        if let Some(floor) = genesis_floor {
+        if let Some(genesis) = genesis_time {
             let current_time = now_ms();
-            if current_time < floor {
-                let genesis_timestamp = floor.secs();
+            if current_time < genesis {
+                let genesis_timestamp = genesis.secs();
                 info!(
                     target: "primary::proposer",
                     genesis_timestamp,
-                    remaining_secs = (floor.as_millis() - current_time.as_millis()).div_ceil(1000),
+                    remaining_secs =
+                        (genesis.as_millis() - current_time.as_millis()).div_ceil(1000),
                     round = current_round,
                     "waiting for genesis before proposing a header",
                 );
-                wait_for_floor(floor, now_ms).await;
+                wait_for_floor(genesis, now_ms).await;
                 info!(
                     target: "primary::proposer",
                     genesis_timestamp,
@@ -514,7 +512,7 @@ impl<DB: Database> Proposer<DB> {
         // clamped instead of trusting the waits alone: the parent sleep runs on tokio's monotonic
         // clock while `now_ms` reads the wall clock, and the wall clock can step back after either
         // wait. the later of the two bounds wins (`None` orders below every bound)
-        let created_at = clamp_created_at(now_ms(), min_created_at, genesis_floor);
+        let created_at = now_ms().max(min_created_at.max(genesis_time).unwrap_or_default());
 
         // synchronous: the ring's read guard is released before the next await
         let exec = exec_inputs.choose(consensus_bus);
@@ -1334,8 +1332,6 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// If a different header was already produced for the same round, then
     /// this method returns the earlier header. Otherwise the newly created header is returned.
-    /// An earlier header created before the genesis floor that this node holds no certificate for
-    /// counts as not produced (see `Self::replaces_stored_header`).
     ///
     /// `reason` is the propose-condition branch that fired; a new header reports it, a re-sent
     /// header ignores it.
@@ -1360,42 +1356,8 @@ impl<DB: Database> Proposer<DB> {
             .proposer_store
             .get_last_proposed()
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
-        let possible_header_to_repropose = match last_proposed
-            .filter(|h| h.round() == current_round && h.epoch() == current_epoch)
-        {
-            // an uncertified header created before genesis is treated as not proposed, for the
-            // reasons `Self::replaces_stored_header` gives: the new header built below is held
-            // until genesis and replaces the record behind the durability barrier in
-            // `store_and_send_header`, and a restart before then decides again. a read error
-            // fails the proposal rather than replace a header that may be certified
-            Some(header) if self.replaces_stored_header(&header)? => {
-                warn!(
-                    target: "primary::proposer",
-                    round = current_round,
-                    created_at_ms = header.created_at_ms().as_millis(),
-                    genesis_timestamp = self.genesis_floor.map(TimestampMs::secs),
-                    "found a header created before genesis in the store, which a build without \
-                     the genesis rule leaves when it ran on this genesis; replacing it with a new \
-                     header"
-                );
-                None
-            }
-            // a certified one stays this node's header for the round and is sent again, so the
-            // certifier re-publishes its certificate
-            Some(header) if self.created_before_genesis(&header) => {
-                warn!(
-                    target: "primary::proposer",
-                    round = current_round,
-                    created_at_ms = header.created_at_ms().as_millis(),
-                    genesis_timestamp = self.genesis_floor.map(TimestampMs::secs),
-                    digest = %header.digest(),
-                    "found a certified header created before genesis in the store, which a build \
-                     without the genesis rule produced on this genesis; keeping it"
-                );
-                Some(header)
-            }
-            stored => stored,
-        };
+        let possible_header_to_repropose =
+            last_proposed.filter(|h| h.round() == current_round && h.epoch() == current_epoch);
         let proposer_store = self.proposer_store.clone();
 
         match possible_header_to_repropose {
@@ -1459,7 +1421,7 @@ impl<DB: Database> Proposer<DB> {
                 let authority_id = self.authority_id.clone();
                 let prior_epoch_record = self.prior_epoch_record;
                 let key_config = self.key_config.clone();
-                let genesis_floor = self.genesis_floor;
+                let genesis_time = self.genesis_time;
                 let exec_inputs = ExecBlockInputs::new(&self.committee, &authority_id, &parents);
 
                 let consensus_bus = self.consensus_bus.clone();
@@ -1471,7 +1433,7 @@ impl<DB: Database> Proposer<DB> {
                         author: authority_id,
                         prior_epoch_record,
                         key_config,
-                        genesis_floor,
+                        genesis_time,
                     };
                     let proposal = Proposer::propose_header(
                         identity,
@@ -1571,10 +1533,6 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// A store read error is logged and skips this re-send; the next proposal reads the record
     /// again in `Self::propose_next_header`, which fails on the same error.
-    ///
-    /// A header that `Self::propose_next_header` replaces is never re-sent: the same
-    /// `Self::replaces_stored_header` decides both. A store read error there skips the re-send
-    /// too.
     fn resendable_last_proposed(&self) -> Option<Header> {
         let current_epoch = self.committee.epoch();
         self.proposer_store
@@ -1589,58 +1547,6 @@ impl<DB: Database> Proposer<DB> {
             .ok()
             .flatten()
             .filter(|header| header.epoch() == current_epoch && header.round() >= self.round)
-            .filter(|header| {
-                self.replaces_stored_header(header)
-                    .inspect_err(|err| {
-                        warn!(
-                            target: "primary::proposer",
-                            ?err,
-                            "could not read ProposedCertificates for the max-delay re-send"
-                        );
-                    })
-                    .is_ok_and(|replaces| !replaces)
-            })
-    }
-
-    /// Whether `header`, read from this node's store, was created before this epoch's genesis
-    /// floor: only a build without the genesis hold stores such a header. Always false without a
-    /// floor.
-    fn created_before_genesis(&self, header: &Header) -> bool {
-        self.genesis_floor.is_some_and(|floor| header.created_at_ms() < floor)
-    }
-
-    /// Whether the stored `header` is replaced by a new header for its round instead of being sent
-    /// again: it was created before the genesis floor and this node holds no certificate for it.
-    /// Always false, without a store read, for a header at or after the floor and without a floor.
-    ///
-    /// Voters with the genesis rule refuse such a header, so sending it again would cost this
-    /// validator the round. A second header for the round is safe only if the first can never be
-    /// certified, and counting votes cannot show that: the certifier signs this node's own vote for
-    /// every header it proposes without consulting a vote record, voters that voted for the first
-    /// header while they ran a build without the rule keep that vote, and colluding voters vote for
-    /// both, so both headers could reach a quorum.
-    ///
-    /// The argument rests on who can certify the header instead. A voter sends its vote only in
-    /// answer to the author's own request, and only this node's certifier aggregates the votes, in
-    /// memory and for one proposal at a time. It stores every certificate it assembles in
-    /// `ProposedCertificates` and waits for that record to be durable before the certificate
-    /// leaves the node. So with no certificate in the store, none exists anywhere, the votes the
-    /// earlier run collected ended with that run, and none can be collected later, because this
-    /// node never sends the header to its certifier again: `Self::propose_next_header` and
-    /// `Self::resendable_last_proposed` both decide here. A header with a stored certificate is
-    /// kept and sent again, and the certifier, which looks the certificate up by the same digest,
-    /// re-publishes it instead of collecting votes.
-    ///
-    /// A store read error is returned rather than read as no certificate.
-    fn replaces_stored_header(&self, header: &Header) -> ProposerResult<bool> {
-        if !self.created_before_genesis(header) {
-            return Ok(false);
-        }
-        let certificate = self
-            .proposer_store
-            .get::<ProposedCertificates>(&header.digest())
-            .map_err(|e| ProposerError::StoreError(e.to_string()))?;
-        Ok(certificate.is_none())
     }
 
     /// Log `proposer stopped` when the proposer shuts down, which ends its epoch: what it leaves to
@@ -2032,16 +1938,6 @@ async fn wait_for_floor(floor: TimestampMs, clock: impl Fn() -> TimestampMs) {
         let remaining = Duration::from_millis(floor.as_millis() - now.as_millis());
         sleep(remaining.min(GENESIS_WAIT_STEP)).await;
     }
-}
-
-/// The `created_at` of a header built when the wall clock reads `now`: no earlier than the
-/// parents' bound `min_created_at` or the genesis floor, whichever is later.
-fn clamp_created_at(
-    now: TimestampMs,
-    min_created_at: Option<TimestampMs>,
-    genesis_floor: Option<TimestampMs>,
-) -> TimestampMs {
-    now.max(min_created_at.max(genesis_floor).unwrap_or_default())
 }
 
 /// How far below its own tip the quorum rule may name a block, in entries of the recent-blocks
