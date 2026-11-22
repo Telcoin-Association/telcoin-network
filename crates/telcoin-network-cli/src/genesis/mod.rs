@@ -354,7 +354,7 @@ mod tests {
     use tn_types::{
         generate_proof_of_possession_bls_for_test, test_utils::CommandParser,
         verify_proof_of_possession_bls, Address, BlsKeypair, Committee, Genesis, Multiaddr,
-        NetworkKeypair, NodeP2pInfo, P2pNode, B256, MAINNET_GENESIS, U256,
+        NetworkKeypair, NodeP2pInfo, P2pNode, B256, MAINNET_COMMITTEE, MAINNET_GENESIS, U256,
     };
 
     /// Prepare signed validator inputs and parse the real genesis CLI defaults and fee flags.
@@ -973,6 +973,45 @@ mod tests {
             std::fs::write(destination, bytes)
                 .unwrap_or_else(|e| panic!("write regenerated {}: {e}", destination.display()))
         });
+    }
+
+    /// The committed mainnet committee seats exactly the ten genesis validators, with distinct BLS
+    /// keys, each under its own Safe: the authority holding the BLS key of
+    /// `chain-configs/mainnet/validators/validator-NN.yaml` stakes under
+    /// `genesis_validator_safes()[NN]`.
+    ///
+    /// `mainnet_chain_configs_load_via_the_node_paths` in `crates/config` compares the
+    /// committee's stake addresses with the Safes as a set. This gate ties each committed
+    /// validator file to its seat, so a `committee.yaml` generated from other validator files
+    /// fails here.
+    #[test]
+    fn mainnet_committee_seats_each_validator_file_under_its_safe() -> eyre::Result<()> {
+        let safes = genesis_validator_safes();
+        let validators = check_mainnet_validators(&mainnet_validators_dir(), &safes)?;
+        let committee: Committee = serde_yaml::from_str(MAINNET_COMMITTEE)?;
+        let bls_keys: BTreeSet<_> =
+            committee.authorities().iter().map(|authority| *authority.protocol_key()).collect();
+        assert_eq!(
+            (committee.size(), bls_keys.len()),
+            (safes.len(), safes.len()),
+            "chain-configs/mainnet/committee.yaml must seat {} authorities with distinct BLS keys \
+             - {MAINNET_REGENERATION_LEVER}",
+            safes.len()
+        );
+        for (index, (validator, safe)) in validators.iter().zip(&safes).enumerate() {
+            let seat = committee
+                .authority_by_key(&validator.bls_public_key)
+                .map(|authority| authority.execution_address());
+            assert_eq!(
+                seat,
+                Some(*safe),
+                "chain-configs/mainnet/committee.yaml must seat the BLS key of \
+                 chain-configs/mainnet/validators/{} under Safe {safe} - \
+                 {MAINNET_REGENERATION_LEVER}",
+                mainnet_validator_file_name(index)
+            );
+        }
+        Ok(())
     }
 
     /// A node-info file for a validator whose BLS key is derived from `seed`, naming

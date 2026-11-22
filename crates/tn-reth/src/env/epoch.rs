@@ -1829,6 +1829,191 @@ mod tests {
         Ok(())
     }
 
+    /// How to regenerate the committed mainnet chain configs when a mainnet genesis gate fails.
+    const MAINNET_REGENERATION_LEVER: &str =
+        "regenerate chain-configs/mainnet with `cargo test -p telcoin-network-cli \
+         regenerate_mainnet_chain_configs -- --ignored`";
+
+    /// Boot a temp chain over the committed mainnet genesis, the `MAINNET_GENESIS` bytes compiled
+    /// into the binary. Its canonical tip is the genesis block.
+    fn mainnet_genesis_env(
+        tmp: &TempDir,
+        task_manager: &TaskManager,
+    ) -> eyre::Result<(tn_types::Genesis, RethEnv)> {
+        let genesis: tn_types::Genesis = serde_yaml::from_str(tn_types::MAINNET_GENESIS)?;
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
+        let env = RethEnv::new_for_temp_chain(chain, tmp.path(), task_manager, None)?;
+        Ok((genesis, env))
+    }
+
+    /// The stake per genesis validator of the mainnet `ConsensusRegistry`, in whole TEL.
+    const MAINNET_STAKE_PER_VALIDATOR_TEL: &str = "1000000";
+
+    /// The minimum withdrawal of the mainnet `ConsensusRegistry`, in whole TEL.
+    const MAINNET_MIN_WITHDRAW_TEL: &str = "1000";
+
+    /// The `ConsensusRegistry` of the committed mainnet genesis holds one stake for each of the
+    /// ten genesis validators, and the validator Safes hold no balance.
+    ///
+    /// The stake configuration is read from the registry (`getCurrentStakeConfig`) and must hold
+    /// the pinned [`MAINNET_STAKE_PER_VALIDATOR_TEL`] and [`MAINNET_MIN_WITHDRAW_TEL`], which the
+    /// regeneration takes from the `genesis` CLI defaults. Each Safe's own balance breakdown must
+    /// show the full stake outstanding and no rewards.
+    #[tokio::test]
+    async fn mainnet_genesis_registry_holds_the_ten_genesis_stakes() -> eyre::Result<()> {
+        let tmp = TempDir::new()?;
+        let task_manager = TaskManager::new("mainnet genesis stakes");
+        let (genesis, env) = mainnet_genesis_env(&tmp, &task_manager)?;
+        let safes = tn_config::genesis_validator_safes();
+
+        let stake_config = env.read_consensus_registry::<ConsensusRegistry::StakeConfig>(
+            ConsensusRegistry::getCurrentStakeConfigCall {}.abi_encode().into(),
+        )?;
+        let stake = stake_config.stakeAmount;
+        assert_eq!(
+            (stake, stake_config.minWithdrawAmount),
+            (parse_ether(MAINNET_STAKE_PER_VALIDATOR_TEL)?, parse_ether(MAINNET_MIN_WITHDRAW_TEL)?),
+            "chain-configs/mainnet/genesis.yaml: the ConsensusRegistry stakes (left: stake per \
+             validator, minimum withdrawal, in wei) differ from the pinned \
+             {MAINNET_STAKE_PER_VALIDATOR_TEL} TEL and {MAINNET_MIN_WITHDRAW_TEL} TEL (right). \
+             The regeneration takes both from the `genesis` defaults of \
+             `--initial-stake-per-validator` and `--min-withdraw-amount`; a change to either is \
+             deliberate and updates this pin together with the regenerated genesis, in one commit"
+        );
+        let registry_balance =
+            genesis.alloc.get(&CONSENSUS_REGISTRY_ADDRESS).map(|account| account.balance);
+        assert_eq!(
+            registry_balance,
+            stake.checked_mul(U256::from(safes.len())),
+            "chain-configs/mainnet/genesis.yaml: the ConsensusRegistry must hold one stake of \
+             {stake} wei for each of the {} genesis validators - {MAINNET_REGENERATION_LEVER}",
+            safes.len()
+        );
+
+        for safe in &safes {
+            let breakdown = env.read_consensus_registry::<(U256, U256, U256)>(
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: *safe }
+                    .abi_encode()
+                    .into(),
+            )?;
+            assert_eq!(
+                breakdown,
+                (stake, stake, U256::ZERO),
+                "chain-configs/mainnet/genesis.yaml: the registry balance breakdown (outstanding, \
+                 initial stake, rewards) of validator Safe {safe} must be one full stake and no \
+                 rewards - {MAINNET_REGENERATION_LEVER}"
+            );
+            assert_eq!(
+                genesis.alloc.get(safe).map(|account| account.balance),
+                Some(U256::ZERO),
+                "chain-configs/mainnet/genesis.yaml: validator Safe {safe} must be a genesis \
+                 account with no balance - {MAINNET_REGENERATION_LEVER}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The `ConsensusRegistry` of the committed mainnet genesis seats the committee of
+    /// `committee.yaml` under the ten genesis validator Safes: its Active set is the committee's
+    /// execution addresses, epoch 0 pairs each of them with the committee's BLS key for it, the
+    /// two epochs the constructor seeds after genesis seat the same ten, and the next committee
+    /// size is ten.
+    ///
+    /// Epoch 0 is read through `epoch_state_at_epoch_start`, the read the node issues at every
+    /// epoch start, and its validators are paired with their BLS keys in order, as the node pairs
+    /// them. `test_mainnet_genesis_registry_serves_post_fork_reads` checks the counts and the key
+    /// sets; this gate checks which address holds which key.
+    #[tokio::test]
+    async fn mainnet_genesis_registry_seats_the_committee_under_the_validator_safes(
+    ) -> eyre::Result<()> {
+        let tmp = TempDir::new()?;
+        let task_manager = TaskManager::new("mainnet genesis committee seats");
+        let (_genesis, env) = mainnet_genesis_env(&tmp, &task_manager)?;
+        let mut safes = tn_config::genesis_validator_safes();
+        safes.sort();
+
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let seats: BTreeSet<(Address, Bytes)> = committee
+            .authorities()
+            .iter()
+            .map(|authority| {
+                (authority.execution_address(), authority.protocol_key().to_bytes().to_vec().into())
+            })
+            .collect();
+        // the set orders seats by address, and a second key under one address repeats it
+        let committee_addresses: Vec<Address> = seats.iter().map(|(address, _)| *address).collect();
+        assert_eq!(
+            committee_addresses, safes,
+            "chain-configs/mainnet/committee.yaml must seat one authority under each genesis \
+             validator Safe - {MAINNET_REGENERATION_LEVER}"
+        );
+
+        let active = env.read_consensus_registry::<Vec<ConsensusRegistry::ValidatorInfo>>(
+            ConsensusRegistry::getValidatorsInfoCall { status: ValidatorStatus::Active.into() }
+                .abi_encode()
+                .into(),
+        )?;
+        let mut active_addresses: Vec<Address> =
+            active.iter().map(|validator| validator.validatorAddress).collect();
+        active_addresses.sort();
+        assert_eq!(
+            active_addresses, committee_addresses,
+            "chain-configs/mainnet/genesis.yaml: the registry's Active validators must be the \
+             execution addresses of committee.yaml - {MAINNET_REGENERATION_LEVER}"
+        );
+
+        let (epoch_state, _pin) = env.epoch_state_at_epoch_start()?;
+        assert_eq!(epoch_state.epoch, 0, "the mainnet genesis must open epoch 0");
+        assert_eq!(
+            epoch_state.validators.len(),
+            epoch_state.bls_pubkeys.len(),
+            "the epoch 0 committee must list one BLS key per validator"
+        );
+        let registry_seats: BTreeSet<(Address, Bytes)> = epoch_state
+            .validators
+            .iter()
+            .map(|validator| validator.validatorAddress)
+            .zip(epoch_state.bls_pubkeys.iter().cloned())
+            .collect();
+        let mispaired: Vec<_> = registry_seats.symmetric_difference(&seats).collect();
+        assert!(
+            epoch_state.validators.len() == committee.size() && mispaired.is_empty(),
+            "chain-configs/mainnet/genesis.yaml: the registry's epoch 0 committee of {} must pair \
+             each of the {} committee.yaml execution addresses with that authority's BLS key; \
+             these (address, BLS key) seats are on one side only: {mispaired:?} - \
+             {MAINNET_REGENERATION_LEVER}",
+            epoch_state.validators.len(),
+            committee.size()
+        );
+
+        let genesis_hash = env.canonical_tip().hash();
+        for epoch in 1..=2 {
+            let mut members: Vec<Address> = env
+                .validators_for_epoch_at_block(epoch, genesis_hash)?
+                .iter()
+                .map(|validator| validator.validatorAddress)
+                .collect();
+            members.sort();
+            assert_eq!(
+                members, safes,
+                "chain-configs/mainnet/genesis.yaml: the registry's epoch {epoch} committee must \
+                 be the ten genesis validator Safes - {MAINNET_REGENERATION_LEVER}"
+            );
+        }
+
+        let next_committee_size = env.read_consensus_registry::<u16>(
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(
+            usize::from(next_committee_size),
+            safes.len(),
+            "chain-configs/mainnet/genesis.yaml: the registry's next committee size must be the \
+             {} genesis validators - {MAINNET_REGENERATION_LEVER}",
+            safes.len()
+        );
+        Ok(())
+    }
+
     /// An epoch-closing block publishes what each of its system calls spent.
     ///
     /// The boundary calls are submitted at `gas_price: 0`, so their gas never enters the block's
