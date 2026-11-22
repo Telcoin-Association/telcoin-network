@@ -149,53 +149,12 @@ A protocol fork needs a separately approved activation plan and explicit readine
 
 A network can fix its genesis time in advance: the genesis ceremony's `--genesis-timestamp` flag writes it into `genesis.yaml`, and a mainnet ceremony requires the flag (see [`chain-configs/README.md`](https://github.com/Telcoin-Association/telcoin-network/blob/main/chain-configs/README.md#genesis-timestamp)).
 Validators can then start their nodes hours or days before that time.
-No validator creates or certifies a header before it, so the first block follows the genesis time however early the nodes started.
-[Epoch 0 and the genesis time](../epoch-boundaries.md#epoch-0-and-the-genesis-time) states the rule.
+An active validator on this release holds its first header until that time, so the first block follows the genesis time however early the nodes started.
+[Epoch 0 and the genesis time](../epoch-boundaries.md#epoch-0-and-the-genesis-time) describes the hold.
 
-Every validator must run a release that contains this rule, from its first start on the network's genesis.
-A build without it proposes its first header as soon as the node starts, and stores it.
-Validators that run the rule refuse to vote for that header, which keeps it uncertified only while the validators without the rule are too few to form a quorum by themselves: enough of them can certify headers and build blocks before genesis.
-Fewer of them can still stop the start.
-A build without the rule re-sends the same refused header and builds no other for its round, so that validator's round-1 header is never certified; once more validators run such a build than the committee can spare from a quorum (more than three in a committee of ten), epoch 0 does not get past round 1 after genesis.
-
-A validator that ran a build without the rule on this genesis before the genesis time may have stored such an early header.
-Started with a release that has the rule, what it does with that header depends on whether the earlier build already gathered a certificate for it.
-
-If the node holds no certificate for the early header, it does not re-send it.
-Its proposer logs a warning under the `primary::proposer` target, builds a new header for the same round, and holds it until the genesis time like any other:
-
-```text
-found a header created before genesis in the store, which a build without the genesis rule leaves when it ran on this genesis; replacing it with a new header round=1 created_at_ms=1796041860000 genesis_timestamp=1796214660
-```
-
-Only the author of a header can assemble its certificate, and the votes it had collected were kept in memory only, so an early header without a stored certificate can never be certified and replacing it is safe.
-That rests on the earlier build having stored every certificate durably before sending it, which builds from v0.17.0-adiri on do.
-An older build could send a certificate before its record was durable, so a node that ran one on this genesis is a case for the network's coordinators whatever the release logs.
-
-If the node does hold a certificate for the early header, enough validators without the rule voted for it before genesis.
-The node keeps that header and its certificate, because a second certified header for the same round would be an equivocation, and logs:
-
-```text
-found a certified header created before genesis in the store, which a build without the genesis rule produced on this genesis; keeping it
-```
-
-That line means a quorum of validators ran a build without the rule on this genesis before the genesis time, and a header created before genesis has been certified.
-Report it to the network's coordinators before the genesis time.
-
-Validators with the rule refuse the early header and still vote for its replacement.
-A validator keeps every vote it has cast, though, including a vote for an early header cast while it ran a build without the rule, and that vote makes it refuse the replacement header from the same author for the same round.
-So the safe course is that every validator runs a release with the rule from its first start on the network's genesis, mainnet's included.
-
-A node that was started on the network's genesis with any build other than the release is stopped, nothing in its data directory is deleted, and the network's coordinators are told before the genesis time.
-Removing that node's databases is not a fix on its own.
-If a header it created before genesis was certified, the node forgets the certificate it holds and proposes a second header for the same round, validators that removed their databases too can vote for that second header, and the first certificate still exists on other nodes.
-An operator cannot tell from one node whether that happened, so the coordinators choose one of these courses:
-
-* starting the release on the same data directory, which replaces a stored early header that was never certified, as described above;
-* removing `consensus-db/`, `db/` and `static_files/` on every node that ran the other build, keeping `node-keys/`, `node-info.yaml`, `parameters.yaml` and `genesis/`;
-* a new genesis.
-
-To help them decide, report whether the node's consensus header number ([tn\_latestConsensusHeader](../rpc-methods/tn/tn_latestconsensusheader.md)) or block number ([eth\_blockNumber](../rpc-methods/eth/eth_blocknumber.md)) was above zero before the genesis time, and, if the release has run on that data directory, whether it logged either of the two stored-header warnings above.
+Every validator must run this release at genesis.
+Nothing refuses a header from a build without the hold.
+Fewer than a quorum of validators on such a build cannot commit a block before genesis: a round advances only on a quorum of certified headers, and validators with the hold propose none before genesis.
 
 ### Before the genesis time
 
@@ -203,18 +162,17 @@ To help them decide, report whether the node's consensus header number ([tn\_lat
 2. Start the node with the network's genesis and the validator's usual configuration, at any time before the genesis time.
 3. Leave it running, and check that it waits as [Watching the wait](#watching-the-wait) describes.
 
-A node that has only run releases with the rule holds again when it is restarted before genesis: the hold depends only on the clock, and the node stores no epoch-0 header before the genesis time.
-A node whose data directory a build without the rule started on this genesis is not restarted on its own, with or without its databases: it stays stopped, with nothing deleted, until the network's coordinators have chosen a course, as described above.
+A node that has only run builds with the hold waits again when it is restarted before genesis: the hold depends only on the clock, and the node stores no epoch-0 header before the genesis time.
 Keep the host clock synchronized: each proposer goes by its own clock.
 
 ### What the node does while it waits
 
 The node enters epoch 0 at once, as at any start.
 It starts its networks, connects to its peers, and serves RPC, health and metrics; the genesis time holds back only the creation of headers.
-An active validator builds its first header and holds it until its clock reaches the genesis time.
+An active validator holds its first header until its clock reaches the genesis time.
 It reads the clock again at least once a second, so a clock correction during a wait of days takes effect within a second.
-It refuses to vote for any epoch-0 header created before the genesis time, and does not penalize the header's author.
-No header is certified and no block is built before genesis, so the chain stays at block 0.
+Until the genesis time it logs its `no consensus commit happened` line, under the `primary::gc` target, at `debug` instead of `warn`.
+No block is built before genesis, so the chain stays at block 0.
 Observers and nodes outside the committee enter epoch 0 the same way, and have nothing to follow until genesis.
 
 ### Watching the wait

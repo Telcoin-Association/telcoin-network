@@ -61,5 +61,6 @@ The ceremony refuses:
 
 It checks the value, and the flag's presence on mainnet, before it reads any input or writes any file, so a refused ceremony leaves the datadir as it was.
 
-In epoch 0 the genesis timestamp is the earliest time a validator may create a header: a validator started before it holds its first header until then, and validators refuse to vote for an epoch-0 header created earlier.
-The rule is in `docs/src/epoch-boundaries.md` ("Epoch 0 and the Genesis Time"), and what an operator sees while a node waits is in `docs/src/getting-started/validator-operations.md` ("Starting before genesis").
+In epoch 0 a validator started before the genesis timestamp holds its first header until then.
+Every validator must run this release at genesis: nothing refuses a header from a build without the hold, but fewer than a quorum of validators on such a build cannot commit a block before genesis.
+`docs/src/epoch-boundaries.md` ("Epoch 0 and the Genesis Time") describes the hold, and `docs/src/getting-started/validator-operations.md` ("Starting before genesis") what an operator sees while a node waits.
