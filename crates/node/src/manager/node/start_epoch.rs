@@ -424,7 +424,8 @@ where
     ///
     /// `epoch_start` is the timestamp of the pinned header, the previous epoch's closing block
     /// (genesis for epoch 0), from the same entry read as `committee`. It becomes the config's
-    /// [`ConsensusConfig::prior_epoch_close`] for every epoch after 0.
+    /// [`ConsensusConfig::prior_epoch_close`] for every epoch after 0. In epoch 0 it is the
+    /// genesis time and becomes the config's [`ConsensusConfig::genesis_floor`] instead.
     ///
     /// The vote-window check ([`ConsensusConfig::validate_epoch_timing`]) runs here, after
     /// [`ConsensusConfig::new_for_epoch`] has built the config and enforced the operational
@@ -457,8 +458,10 @@ where
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
 
         let epoch = committee.epoch();
-        // epoch 0's pin is genesis, not a closed epoch, so there is no seam to floor
+        // epoch 0's pin is genesis, not a closed epoch, so there is no seam to floor; its
+        // timestamp is the genesis time instead, which no epoch-0 header may precede
         let prior_epoch_close = (epoch > 0).then_some(epoch_start);
+        let genesis_start = (epoch == 0).then_some(epoch_start);
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -468,7 +471,7 @@ where
             committee,
             network_config.clone(),
             next_committee_keys,
-            PriorEpoch { record: prior_epoch_record, close: prior_epoch_close },
+            PriorEpoch { record: prior_epoch_record, close: prior_epoch_close, genesis_start },
         )?;
 
         match self.epoch_position(epoch).await {
@@ -2303,6 +2306,151 @@ mod tests {
             epoch_one.prior_epoch_close(),
             Some(EPOCH_START),
             "epoch 1 must floor its first commit on the timestamp of epoch 0's closing block"
+        );
+        Ok(())
+    }
+
+    /// Epoch 0's entry read is pinned to genesis, so the pinned header's timestamp is the genesis
+    /// time, and `configure_consensus` makes it epoch 0's floor on header creation. A later
+    /// epoch's pin is the previous epoch's closing block, whose timestamp floors nothing about
+    /// header creation, so its config carries no genesis floor.
+    #[tokio::test]
+    async fn configure_consensus_carries_the_genesis_floor_only_in_epoch_zero() -> eyre::Result<()>
+    {
+        use super::*;
+        use crate::engine::TnBuilder;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::KeyConfig;
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::{BlsKeypair, TimestampSec};
+
+        // both epochs get the same pinned-header timestamp, so only the committee's epoch decides
+        // whether it becomes the genesis floor
+        const EPOCH_START: TimestampSec = 1_700_000_000;
+
+        let temp = tempfile::TempDir::new()?;
+        let datadir = temp.path().to_path_buf();
+        let config = Config::default_for_test();
+        let genesis = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(308)));
+        let manager = EpochManager::new(
+            TnBuilder::new(node_config, config, reth_db),
+            datadir,
+            MemDatabase::default(),
+            keys,
+            "test",
+        )
+        .await?;
+        let network_config = NetworkConfig::default();
+
+        let epoch_zero = manager
+            .configure_consensus(
+                &network_config,
+                genesis,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await?;
+        assert_eq!(
+            epoch_zero.genesis_floor(),
+            Some(EPOCH_START),
+            "epoch 0 must not create headers before the genesis time its entry read pinned"
+        );
+
+        let committee =
+            CommitteeFixture::builder(MemDatabase::default).epoch(1).build().committee();
+        let epoch_one = manager
+            .configure_consensus(
+                &network_config,
+                committee,
+                vec![],
+                EpochDigest::default(),
+                EPOCH_START,
+            )
+            .await?;
+        assert_eq!(
+            epoch_one.genesis_floor(),
+            None,
+            "only epoch 0 waits for genesis; a later epoch's pin is a closing block"
+        );
+        Ok(())
+    }
+
+    /// A validator restarted inside epoch 0 after genesis enters the epoch with epoch-0 blocks on
+    /// its chain. The entry read still pins genesis, so the floor its config carries is the genesis
+    /// header's timestamp, not the timestamp of a block executed since.
+    #[tokio::test]
+    async fn epoch_zero_floor_is_the_genesis_timestamp_after_epoch_zero_blocks() -> eyre::Result<()>
+    {
+        use super::*;
+        use crate::engine::TnBuilder;
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_config::KeyConfig;
+        use tn_reth::{
+            payload::TNPayload,
+            test_utils::{
+                consensus_output_for_tests_at, execute_payload_and_update_canonical_chain,
+                test_genesis_with_consensus_registry,
+            },
+            RethEnv,
+        };
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::BlsKeypair;
+
+        let temp = tempfile::TempDir::new()?;
+        let datadir = temp.path().to_path_buf();
+        let config = Config::default_for_test_with_genesis(test_genesis_with_consensus_registry(4));
+        let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        let tasks = TaskManager::default();
+        let reth_env =
+            RethEnv::new(&node_config, &tasks, reth_db.clone(), None, GasAccumulator::new(1))?;
+        let builder = TnBuilder::new(node_config, config, reth_db);
+        let engine = ExecutionNode::new(&builder, reth_env.clone())?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(308)));
+        let manager =
+            EpochManager::new(builder, datadir, MemDatabase::default(), keys, "test").await?;
+
+        // two epoch-0 blocks, each committed a minute after its parent, none closing the epoch
+        let genesis = reth_env.sealed_header_by_number(0)?.ok_or_eyre("the genesis header")?;
+        let mut tip = genesis.clone();
+        for (round, index) in [(2, 1), (4, 2)] {
+            let output = consensus_output_for_tests_at(round, 0, index, false, tip.timestamp + 60);
+            tip = execute_payload_and_update_canonical_chain(
+                &reth_env,
+                TNPayload::new_for_test(tip, &output),
+                vec![],
+            )?
+            .recovered_block
+            .clone_sealed_header();
+        }
+        assert_eq!(reth_env.canonical_tip().num_hash(), tip.num_hash());
+        assert_eq!(tip.number, 2);
+        assert!(tip.timestamp > genesis.timestamp, "the epoch-0 blocks are later than genesis");
+
+        let (committee, _epoch_info, epoch_start, pin) =
+            manager.get_committee_with_epoch_start_info(&engine).await?;
+        assert_eq!(committee.epoch(), 0, "the chain is still in epoch 0");
+        assert_eq!(pin.num_hash(), genesis.num_hash(), "epoch 0's entry read pins genesis");
+        let epoch_zero = manager
+            .configure_consensus(
+                &NetworkConfig::default(),
+                committee,
+                vec![],
+                EpochDigest::default(),
+                epoch_start,
+            )
+            .await?;
+        assert_eq!(
+            epoch_zero.genesis_floor(),
+            Some(genesis.timestamp),
+            "epoch 0's floor is the genesis time however far the chain has advanced in epoch 0"
         );
         Ok(())
     }
