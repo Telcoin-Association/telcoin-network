@@ -2,18 +2,19 @@
 //!
 //! The genesis ceremony can fix the genesis time ahead of the ceremony (`--genesis-timestamp`), so
 //! validators can be started well before their chain begins. Epoch 0 then opens with genesis still
-//! ahead. Every node is up, connected and observable while it waits, but no validator may create or
-//! certify a header before genesis: the proposer holds its first header until then, and voters
-//! refuse an epoch-0 header created earlier. So no consensus output and no execution block can
-//! exist before genesis, and from genesis on the chain runs as any other.
+//! ahead. Every node is up, connected and observable while it waits, as in any epoch, but its
+//! proposer holds its first epoch-0 header until genesis and never stamps a header's `created_at`
+//! before it. A round needs a quorum of headers to advance, so when every validator runs this
+//! build, nothing is committed before genesis: no consensus output and no execution block exists
+//! before it, and from genesis on the chain runs as any other.
 //!
 //! [`test_epoch_scheduled_genesis`] checks this with real node processes. Its first assertion is
 //! the absence poll ([`absence_poll`]): every validator's execution block number and consensus
-//! block number stay 0 until two seconds before genesis. A node that does not hold its headers for
-//! genesis, such as a build that has the ceremony flag but no genesis floor, commits as soon as a
-//! quorum is up and fails that assertion first, with a message that begins
-//! [`PRODUCED_BEFORE_GENESIS`]. Every check of a log line or a metric that only the floor produces
-//! is asserted after the poll.
+//! block number stay 0 until two seconds before genesis. Validators that do not hold their first
+//! header for genesis, such as a build that has the ceremony flag but not the genesis hold, commit
+//! as soon as a quorum of them is up and fail that assertion first, with a message that begins
+//! [`PRODUCED_BEFORE_GENESIS`]. Every check of a log line or a metric that only a build with the
+//! genesis hold produces is asserted after the poll.
 
 use super::common::{
     address_from_word, assert_epoch_records_verify, current_epoch, force_kill_and_reap, get_key,
@@ -199,7 +200,7 @@ async fn test_epoch_scheduled_genesis() -> eyre::Result<()> {
         waited.done_at - schedule.genesis_ms()
     );
 
-    // what only the genesis floor produces, read now that the poll has passed
+    // what only a build with the genesis hold produces, read now that the poll has passed
     for instance in 0..4 {
         let run = fleet.runs[instance];
         let waiting = logged(instance, run, COUNTDOWN_WAITING, genesis)?;
@@ -638,9 +639,9 @@ struct Waited {
 /// them during the wait, and submit a transfer.
 ///
 /// Every wait here ends by the end of the absence poll ([`WAIT_CHECKS_BY_MS`]). Nothing here
-/// asserts on a log line or a metric that only the genesis floor produces: those are recorded in
-/// [`Waited`] and asserted after the poll. Validator-4's proposer hold line is only waited for,
-/// without failing, so that its SIGTERM lands during the hold.
+/// asserts on a log line or a metric that only a build with the genesis hold produces: those are
+/// recorded in [`Waited`] and asserted after the poll. Validator-4's proposer hold line is only
+/// waited for, without failing, so that its SIGTERM lands during the hold.
 async fn observe_the_wait(fleet: &mut Fleet, schedule: Schedule) -> eyre::Result<Waited> {
     let by = WAIT_CHECKS_BY_MS;
     for instance in 0..4 {
