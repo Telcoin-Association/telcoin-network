@@ -578,12 +578,17 @@ fn execute_payload(
 /// Once the sub-second timestamp fork is active for the leader's epoch, `TNPayload::new` clamps
 /// the timestamp up to the parent block's so the EVM chain cannot move backwards. Consensus is
 /// meant to produce non-decreasing commit times on its own, so a clamp that changes the value
-/// means consensus let commit time go backwards, with one exception. Epoch 0 has no commit floor,
-/// and no vote checks a header against the genesis `timestamp`, which the host that built genesis
-/// stamped from its own clock. When the fork is active from genesis and the validators' clocks lag
-/// that timestamp at launch, the first commits of epoch 0 fall below it and are clamped although
-/// consensus is correct. The block stays deterministic either way (every node applies the same
-/// clamp to the same inputs); the counter and warning keep a consensus bug visible.
+/// means consensus let commit time go backwards, with one exception. Epoch 0 has no commit floor.
+/// Its bound is the genesis floor (`ConsensusConfig::genesis_floor`): the proposer holds its first
+/// epoch-0 header until the genesis `timestamp`, and a voter refuses any epoch-0 header created
+/// before it, so a quorum running that rule certifies no earlier leader. The floor is set only in
+/// the config a node's epoch startup builds, and the rule binds only when enough voters run it.
+/// Test fixtures carry no floor, and a network whose voters lack the rule can still certify
+/// headers created before the genesis `timestamp`. When the fork is active from genesis and such
+/// validators' clocks lag that timestamp at launch, the first commits of epoch 0 fall below it and
+/// are clamped although consensus is correct. The block stays deterministic either way (every
+/// node applies the same clamp to the same inputs); the counter and warning keep a consensus bug
+/// visible.
 fn report_timestamp_clamp(payload: &TNPayload, output: &ConsensusOutput) {
     let committed_at = output.committed_at();
     if payload.timestamp == committed_at {

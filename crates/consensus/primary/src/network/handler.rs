@@ -33,7 +33,7 @@ use tn_types::{
     now_ms, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
     ConsensusResult, ConsensusResultDigest, Database, Epoch, EpochCertificate, EpochDigest,
     EpochRecord, EpochSeedMessage, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
-    SignatureVerificationState, TnSender as _, Vote,
+    SignatureVerificationState, TimestampMs, TnSender as _, Vote,
 };
 use tokio::{sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -1251,12 +1251,29 @@ where
                 Ok(msg) => msg.clone(),
                 Err(e) => PrimaryResponse::into_error_ref(e),
             };
-            if matches!(cached_res, PrimaryResponse::RecoverableError(_)) {
+            if matches!(cached_res, PrimaryResponse::RecoverableError(_))
+                || matches!(
+                    res,
+                    Err(PrimaryNetworkError::InvalidHeader(
+                        HeaderError::CreatedBeforeGenesis { .. }
+                    ))
+                )
+            {
                 // a recoverable outcome (a timeout, a header too far ahead to wait out yet, an
                 // epoch race) decides nothing about this header, so keep the previous entry:
                 // recording this header would fail any other header from this author at or
                 // before its epoch and round as `AlreadyVotedForLaterRound` although this node
-                // never voted for it
+                // never voted for it.
+                //
+                // the final refusal of a header created before genesis keeps the previous entry
+                // too, unlike the other final refusals: this node signed nothing, and an honest
+                // author has such a header only when a build without the genesis rule ran before
+                // genesis. its proposer then replaces the header with a compliant one for the same
+                // round, which must be judged on its own. a vote this node cast for the round still
+                // refuses that header, from this entry or from the stored vote info
+                // `Self::vote_inner` checks. a repeat of the early header is refused again by
+                // `Self::vote_inner`, whose floor check comes before the seed verify, the execution
+                // check and the parent reads
                 *auth_last_vote = previous_vote;
             } else {
                 *auth_last_vote = Some((epoch, round, digest, Some(cached_res)));
@@ -1318,6 +1335,16 @@ where
             .is_some_and(|state| {
                 state.cast.as_ref().is_some_and(|vote| vote.header_digest() == digest)
             })
+    }
+
+    /// The last decision the in-memory vote guard for `author` holds: the epoch, round and digest
+    /// of the header it was made on, and the response cached for it.
+    #[cfg(test)]
+    pub(crate) async fn author_last_decision(
+        &self,
+        author: &AuthorityIdentifier,
+    ) -> Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)> {
+        self.auth_last_vote.get(author)?.lock().await.last.clone()
     }
 
     /// Hold the vote lock for `author`, as an in-flight vote request from that author does.
@@ -1405,11 +1432,11 @@ where
     /// clock.
     ///
     /// Tier 1, a lead within `max_header_time_drift_tolerance`, is `HeaderLead::Tolerated` with
-    /// the lead for the caller to wait out. The lead is zero for a header that is not ahead:
-    /// there is no lower bound on `created_at` (see the parent timestamp rule in
-    /// `Self::vote_inner`). Tier 2, a lead within the tolerance plus `vote_timeout`, is
-    /// `HeaderLead::Deferred` with the reason for a recoverable response. Tier 3, anything
-    /// further ahead, is an `InvalidTimestamp` error.
+    /// the lead for the caller to wait out. The lead is zero for a header that is not ahead: the
+    /// local clock sets no lower bound on `created_at`, and the only one is the genesis floor
+    /// `Self::vote_inner` checks in epoch 0 (see also its parent timestamp rule). Tier 2, a lead
+    /// within the tolerance plus `vote_timeout`, is `HeaderLead::Deferred` with the reason for a
+    /// recoverable response. Tier 3, anything further ahead, is an `InvalidTimestamp` error.
     ///
     /// `subsecond_active` is the sub-second timestamp fork gate for the header's epoch; while it
     /// is off, the lead is compared in whole seconds against the tolerance rounded up.
@@ -1530,6 +1557,23 @@ where
             num_parents <= committee.size(),
             HeaderError::TooManyParents(num_parents, committee.size()).into()
         );
+
+        // no epoch-0 header may be created before genesis. the floor is set only in epoch 0, and
+        // `Header::validate` has matched the header's epoch to the config's. the check reads the
+        // header's `created_at`, never this node's clock, so skew between honest validators cannot
+        // make one refuse another's header, and a floor already passed refuses nothing. a
+        // certificate needs a quorum of votes and every quorum holds honest voters, so their
+        // refusal here keeps an early header uncertified whatever its author runs. it is final
+        // and unpenalized, and `Self::vote_request` does not record it as the author's decision
+        // for the round
+        if let Some(genesis) = self.consensus_config.genesis_floor() {
+            let genesis = TimestampMs::from_parts(genesis, 0);
+            let created = header.created_at_ms();
+            ensure!(
+                created >= genesis,
+                HeaderError::CreatedBeforeGenesis { created, genesis }.into()
+            );
+        }
 
         // the header's own epoch selects the timestamp rules, never the local committee's
         let subsecond_active = subsecond_timestamp_active(header.epoch());
@@ -1699,9 +1743,11 @@ where
             // timestamps are whole seconds and several rounds can share one second, so the header
             // only has to be no older than each parent.
             //
-            // there is deliberately no lower bound on `created_at`: after a restart the proposer
+            // apart from the epoch-0 genesis floor checked above, there is deliberately no lower
+            // bound on `created_at` against this node's clock: after a restart the proposer
             // re-proposes its stored header for the current round unchanged, so an honest header
-            // can be far older than this node's clock
+            // can be far older than this node's clock. the floor is a fixed time, not the clock,
+            // so a re-proposed epoch-0 header still passes it
             let parent_created_at = parent.header().created_at_ms();
             let newer_than_parent = if subsecond_active {
                 header.created_at_ms() > parent_created_at

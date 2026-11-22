@@ -351,7 +351,9 @@ where
     /// `Some` only in epoch 0, and only in the config epoch startup builds; `None` for every later
     /// epoch and from every test constructor. Validators may start well before genesis, and no
     /// epoch-0 header may be created before this time: the proposer holds its first header until
-    /// then and stamps it no earlier. A floor already in the past bounds nothing.
+    /// then and stamps it no earlier, and the voter refuses any header whose `created_at` is
+    /// earlier, so a header created before genesis cannot gather a quorum of honest votes. A
+    /// floor already in the past bounds nothing.
     pub fn genesis_floor(&self) -> Option<TimestampSec> {
         self.inner.prior_epoch.genesis_start
     }

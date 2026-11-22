@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use tn_config::{ConsensusConfig, KeyConfig, Parameters, VOTE_EXECUTION_WAIT};
+use tn_config::{ConsensusConfig, KeyConfig, Parameters, PriorEpoch, VOTE_EXECUTION_WAIT};
 use tn_network_libp2p::{
     error::NetworkError,
     types::{
@@ -57,7 +57,7 @@ use tn_types::{
     CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
     EpochCertificate, EpochDigest, EpochRecord, EpochSeedMessage, EpochVote, ExecHeader, Hash as _,
     Header, HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager, TimestampMs,
-    TnReceiver as _, TnSender as _, VoteDigest, VoteInfo, B256,
+    TimestampSec, TnReceiver as _, TnSender as _, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -3261,6 +3261,464 @@ async fn test_vote_tier_three_lead_waits_only_for_an_unexecuted_block() -> eyre:
             "clock skew must reject the header without scoring its author"
         );
     }
+
+    Ok(())
+}
+
+/// Like [`create_test_types`] but the handler's config carries `genesis_floor` (unix seconds) as
+/// its genesis floor. The fixture's test constructors carry none, so the config is rebuilt through
+/// `ConsensusConfig::new_for_epoch`, the constructor epoch startup uses.
+async fn create_test_types_with_genesis_floor(
+    path: &Path,
+    genesis_floor: Option<TimestampSec>,
+) -> TestTypes {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    voter_with_genesis_floor(committee, path, genesis_floor).await
+}
+
+/// [`create_test_types_with_genesis_floor`] for an existing `committee`.
+///
+/// The handler, its config, bus and synchronizer are built afresh over the first authority's
+/// store, so passing the committee of an earlier call restarts that voter: only what the store
+/// holds carries over.
+async fn voter_with_genesis_floor(
+    committee: CommitteeFixture<MemDatabase>,
+    path: &Path,
+    genesis_floor: Option<TimestampSec>,
+) -> TestTypes {
+    let fixture_config = committee.first_authority().consensus_config();
+    let config = ConsensusConfig::new_for_epoch(
+        fixture_config.config().clone(),
+        fixture_config.node_storage().clone(),
+        fixture_config.key_config().clone(),
+        fixture_config.committee().clone(),
+        fixture_config.network_config().clone(),
+        fixture_config.next_committee_keys().to_vec(),
+        PriorEpoch {
+            record: fixture_config.prior_epoch_record(),
+            close: fixture_config.prior_epoch_close(),
+            genesis_start: genesis_floor,
+        },
+    )
+    .expect("fixture parameters satisfy the epoch constructor");
+    assert_eq!(config.genesis_floor(), genesis_floor);
+    let cb = ConsensusBus::new();
+
+    // spawn the synchronizer
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // last execution result
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+
+    // set the latest execution result to genesis - test headers are proposed for round 1
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler = RequestHandler::new(config, cb.app().clone(), synchronizer, consensus_chain);
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
+/// An epoch-0 header created before the genesis floor is refused for good: `CreatedBeforeGenesis`,
+/// no score penalty, and the same final refusal for a repeat.
+///
+/// The voter runs an hour ahead of genesis, as validators do when they start before a scheduled
+/// genesis, and the header is stamped from the clock, as a proposer without the genesis hold
+/// stamps it. The refusal is not recorded as the author's decision for the round, so the repeat
+/// is evaluated afresh and returns the error itself; an answer from the author's vote slot would
+/// return the already-converted response instead.
+#[tokio::test]
+async fn test_vote_refuses_header_created_before_genesis() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let floor = now() + 3_600;
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_with_genesis_floor(temp_dir.path(), Some(floor)).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at_ms(now_ms())
+        .build();
+    let created_at = header.created_at_ms();
+
+    let err = handler
+        .vote(peer, header.clone(), vec![])
+        .await
+        .expect_err("a header created before genesis must be refused");
+    assert_matches!(
+        &err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis { created, genesis })
+            if *created == created_at && *genesis == TimestampMs::from_parts(floor, 0)
+    );
+    assert!(err.to_string().contains("created before genesis"), "unexpected text: {err}");
+    assert!(
+        Option::<Penalty>::from(&err).is_none(),
+        "a header created before genesis must be refused without scoring its author"
+    );
+
+    let repeat = handler
+        .vote(peer, header, vec![])
+        .await
+        .expect_err("a repeat of a header created before genesis must be refused again");
+    assert_matches!(
+        &repeat,
+        PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis { created, .. })
+            if *created == created_at,
+        "the repeat must be refused by the floor check again"
+    );
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&repeat),
+        PrimaryResponse::Error(_),
+        "the refusal of the repeat must be final"
+    );
+
+    Ok(())
+}
+
+/// The genesis floor is inclusive and exact to the millisecond: a header created one millisecond
+/// before it is refused with `CreatedBeforeGenesis`, and one created exactly at it, or later, earns
+/// a vote.
+///
+/// The floor is in the past, as for a validator restarted during epoch 0 after genesis, so the
+/// drift tiers leave every case alone. Each case gets a fresh voter, because a vote is recorded
+/// for its author and round.
+#[tokio::test]
+async fn test_vote_genesis_floor_is_inclusive() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let floor = now() - 60;
+    let floor_ms = TimestampMs::from_parts(floor, 0);
+    for (created_at, refused) in [
+        (TimestampMs::from_millis(floor_ms.as_millis() - 1), true),
+        (floor_ms, false),
+        (now_ms(), false),
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+            create_test_types_with_genesis_floor(temp_dir.path(), Some(floor)).await;
+        let peer = *committee.last_authority().authority().protocol_key();
+        let header = committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at_ms(created_at)
+            .build();
+        // anti-vacuity: the sub-second part survives the build, so the first case really is one
+        // millisecond below the floor
+        assert_eq!(header.created_at_ms(), created_at);
+
+        let res = handler.vote(peer, header, vec![]).await;
+        if refused {
+            assert_matches!(
+                res,
+                Err(PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis {
+                    created,
+                    genesis,
+                })) if created == created_at && genesis == floor_ms,
+                "a header created at {created_at} ms must be refused below the floor {floor_ms} ms"
+            );
+        } else {
+            assert_matches!(
+                res,
+                Ok(PrimaryResponse::Vote(_)),
+                "a header created at {created_at} ms must earn a vote at or above the floor \
+                 {floor_ms} ms"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Before the sub-second timestamp fork, headers carry whole seconds and the floor is a whole
+/// second, so the boundary falls on the genesis second: a header from the second before it is
+/// refused, and one from the genesis second earns a vote. A creation time one millisecond below
+/// the floor truncates into the second before and is refused; one late in the genesis second
+/// truncates to the floor and earns a vote.
+#[tokio::test]
+async fn test_vote_genesis_floor_before_the_subsecond_fork() -> eyre::Result<()> {
+    pin_subsecond_fork(false);
+    let floor = now() - 60;
+    let floor_ms = TimestampMs::from_parts(floor, 0);
+    for (created_at, refused) in [
+        (TimestampMs::from_parts(floor - 1, 0), true),
+        (TimestampMs::from_millis(floor_ms.as_millis() - 1), true),
+        (floor_ms, false),
+        (TimestampMs::from_parts(floor, 999), false),
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+            create_test_types_with_genesis_floor(temp_dir.path(), Some(floor)).await;
+        let peer = *committee.last_authority().authority().protocol_key();
+        let header = committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at_ms(created_at)
+            .build();
+        // anti-vacuity: the build drops the sub-second part, as a pre-fork header carries none
+        assert_eq!(header.created_at_ms(), TimestampMs::from_parts(created_at.secs(), 0));
+
+        let res = handler.vote(peer, header, vec![]).await;
+        if refused {
+            assert_matches!(
+                res,
+                Err(PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis {
+                    genesis,
+                    ..
+                })) if genesis == floor_ms,
+                "a header created at {created_at} ms must be refused below the floor {floor_ms} ms"
+            );
+        } else {
+            assert_matches!(
+                res,
+                Ok(PrimaryResponse::Vote(_)),
+                "a header created at {created_at} ms must earn a vote in the genesis second \
+                 {floor_ms} ms"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Without a genesis floor the voter sets no lower bound on `created_at`: a header created at unix
+/// second 1, long before any genesis, still earns a vote. That holds for the fixture's own config
+/// and for one built through the epoch constructor without a floor, as every epoch after 0 is.
+#[tokio::test]
+async fn test_vote_without_genesis_floor_sets_no_lower_bound() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    for rebuilt in [false, true] {
+        let temp_dir = TempDir::new().unwrap();
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } = if rebuilt {
+            create_test_types_with_genesis_floor(temp_dir.path(), None).await
+        } else {
+            create_test_types(temp_dir.path()).await
+        };
+        let peer = *committee.last_authority().authority().protocol_key();
+        let header = committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(1)
+            .build();
+
+        assert_matches!(
+            handler.vote(peer, header, vec![]).await?,
+            PrimaryResponse::Vote(_),
+            "rebuilt config {rebuilt}: a header with no genesis floor must earn a vote however old"
+        );
+    }
+
+    Ok(())
+}
+
+/// Refusing a header created before genesis does not decide its author's round: a compliant
+/// header from the same author for that round, as a proposer builds once it finds an early header
+/// in its store, is judged on its own and earns this voter's vote. That vote then holds the round
+/// as any vote does: the early header again, and any other header for the round, are refused.
+#[tokio::test]
+async fn test_vote_refusal_before_genesis_leaves_the_round_to_a_compliant_header(
+) -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let floor = now() - 60;
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_with_genesis_floor(temp_dir.path(), Some(floor)).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let header_at = |created_at| {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at_ms(created_at)
+            .build()
+    };
+    let early = header_at(TimestampMs::from_parts(floor - 3_600, 0));
+    let compliant = header_at(TimestampMs::from_parts(floor, 0));
+    let other = header_at(now_ms());
+    assert!(
+        early.round() == compliant.round() && compliant.round() == other.round(),
+        "the three headers must compete for one round"
+    );
+
+    assert_matches!(
+        handler.vote(peer, early.clone(), vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis { .. }))
+    );
+    let res = handler.vote(peer, compliant.clone(), vec![]).await;
+    assert_matches!(
+        &res,
+        Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == compliant.digest(),
+        "after refusing the early header, the compliant one must earn a vote, not {res:?}"
+    );
+
+    for header in [early, other] {
+        assert_matches!(
+            handler.vote(peer, header, vec![]).await,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound {
+                theirs: 1,
+                ours: 1,
+            })),
+            "a voter that voted for the compliant header must refuse any other for its round"
+        );
+    }
+
+    Ok(())
+}
+
+/// Refusing a header created before genesis leaves the author's earlier decision in place: after
+/// an early round-2 header is refused, the author's entry is still the vote this voter cast for its
+/// round-1 header, with that vote cached in it.
+#[tokio::test]
+async fn test_vote_refusal_before_genesis_keeps_the_authors_earlier_entry() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let floor = now() - 60;
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_with_genesis_floor(temp_dir.path(), Some(floor)).await;
+    let epoch = committee.committee().epoch();
+    let author = committee.last_authority().id();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let block = BlockNumHash::new(parent.number(), parent.hash());
+    let voted = committee
+        .header_builder_last_authority()
+        .latest_execution_block(block)
+        .created_at_ms(TimestampMs::from_parts(floor, 0))
+        .build();
+    // a valid seed signature for its round, so the floor check alone refuses it
+    let early = committee
+        .header_builder_last_authority()
+        .round(2)
+        .seed_signature(committee.last_authority().seed_signature(epoch, 2))
+        .latest_execution_block(block)
+        .created_at_ms(TimestampMs::from_parts(floor - 3_600, 0))
+        .build();
+
+    assert_matches!(
+        handler.vote(peer, voted.clone(), vec![]).await,
+        Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == voted.digest()
+    );
+    assert_matches!(
+        handler.vote(peer, early, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis { .. }))
+    );
+    let entry = handler.author_last_decision(&author).await;
+    assert_matches!(
+        &entry,
+        Some((e, 1, digest, Some(PrimaryResponse::Vote(vote))))
+            if *e == epoch && *digest == voted.digest() && vote.header_digest() == voted.digest(),
+        "the refusal must leave the author's round-1 vote entry as it was, not {entry:?}"
+    );
+
+    Ok(())
+}
+
+/// A voter restarted between an early header and the compliant one for the same round decides as
+/// one that kept running: the refusal left nothing in the store, and the compliant header earns
+/// a vote. Restarted again after that vote, with the in-memory entry gone, the voter still refuses
+/// the early header for its creation time, refuses any other header for the round from the stored
+/// vote info (`AlreadyVoted`), and recasts its vote for the compliant one.
+#[tokio::test]
+async fn test_vote_restarts_around_a_refusal_before_genesis_change_nothing() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let floor = now() - 60;
+    let first_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager, .. } =
+        create_test_types_with_genesis_floor(first_dir.path(), Some(floor)).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let header_at = |created_at| {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at_ms(created_at)
+            .build()
+    };
+    let early = header_at(TimestampMs::from_parts(floor - 3_600, 0));
+    let compliant = header_at(TimestampMs::from_parts(floor, 0));
+    let other = header_at(now_ms());
+
+    assert_matches!(
+        handler.vote(peer, early.clone(), vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis { .. }))
+    );
+
+    drop((handler, task_manager));
+    let second_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager, .. } =
+        voter_with_genesis_floor(committee, second_dir.path(), Some(floor)).await;
+    let res = handler.vote(peer, compliant.clone(), vec![]).await;
+    assert_matches!(
+        &res,
+        Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == compliant.digest(),
+        "after a restart that followed the refusal, the compliant header must earn a vote, not \
+         {res:?}"
+    );
+
+    drop((handler, task_manager));
+    let third_dir = TempDir::new().unwrap();
+    let TestTypes { handler, task_manager: _task_manager, .. } =
+        voter_with_genesis_floor(committee, third_dir.path(), Some(floor)).await;
+    let res = handler.vote(peer, early, vec![]).await;
+    assert_matches!(
+        &res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis { .. })),
+        "after a restart, the early header must still be refused for its creation time, not \
+         {res:?}"
+    );
+    let res = handler.vote(peer, other, vec![]).await;
+    assert_matches!(
+        &res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(..))),
+        "after a restart, the stored vote must refuse any other header for the round, not {res:?}"
+    );
+    let res = handler.vote(peer, compliant.clone(), vec![]).await;
+    assert_matches!(
+        &res,
+        Ok(PrimaryResponse::Vote(vote)) if vote.header_digest() == compliant.digest(),
+        "after a restart, the vote for the compliant header must be recast, not {res:?}"
+    );
+
+    Ok(())
+}
+
+/// The floor check comes before the seed verify and the execution check: a header created before
+/// genesis that would also fail both is refused as `CreatedBeforeGenesis`. Those later checks cost
+/// a signature verify and an execution lookup per request, which an early header must not reach.
+#[tokio::test]
+async fn test_vote_floor_check_precedes_seed_and_execution_checks() -> eyre::Result<()> {
+    pin_subsecond_fork(true);
+    let temp_dir = TempDir::new().unwrap();
+    let floor = now() - 60;
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types_with_genesis_floor(temp_dir.path(), Some(floor)).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let created = TimestampMs::from_parts(floor - 3_600, 0);
+    let header = committee
+        .header_builder_last_authority()
+        // signed over another epoch's seed message, and a block this voter has not executed
+        .seed_signature(committee.last_authority().seed_signature(42, 1))
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .created_at_ms(created)
+        .build();
+
+    let res = handler.vote(peer, header, vec![]).await;
+    assert_matches!(
+        &res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::CreatedBeforeGenesis {
+            created: refused,
+            ..
+        })) if *refused == created,
+        "a header created before genesis must be refused for that before the seed and execution \
+         checks, not {res:?}"
+    );
 
     Ok(())
 }
