@@ -261,6 +261,28 @@ fn test_upsert_peer_seeds_multiaddrs_for_new_peer() {
     );
 }
 
+/// `peer_id_for_bls` is the reverse of `bls_for_peer`: it resolves a confirmed record from the
+/// peer store alone, so a penalty reported by BLS key can reach a public peer (issue #1891).
+#[test]
+fn test_peer_id_for_bls_resolves_confirmed_record_only() {
+    let mut all_peers = create_all_peers(None);
+    let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = network_key.clone().into();
+    let mut rng = StdRng::from_seed([11; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let unknown_bls = *BlsKeypair::generate(&mut rng).public();
+
+    assert_eq!(all_peers.peer_id_for_bls(&bls), None, "no record before upsert");
+
+    all_peers.upsert_peer(bls, network_key, vec![create_multiaddr(None)]);
+    assert_eq!(all_peers.peer_id_for_bls(&bls), Some(peer_id), "confirmed record resolves");
+    assert_eq!(all_peers.bls_for_peer(&peer_id), Some(bls), "forward and reverse lookups agree");
+    assert_eq!(all_peers.peer_id_for_bls(&unknown_bls), None, "unknown key has no record");
+
+    assert!(all_peers.evict_confirmed(bls).is_some(), "record evicted");
+    assert_eq!(all_peers.peer_id_for_bls(&bls), None, "no record after evict");
+}
+
 /// Build a peer with a bls key and two network keys for rotation scenarios:
 /// (bls, first network key, its peer id, rotated network key, its peer id).
 fn rotation_keys(seed: u8) -> (BlsPublicKey, NetworkPublicKey, PeerId, NetworkPublicKey, PeerId) {
