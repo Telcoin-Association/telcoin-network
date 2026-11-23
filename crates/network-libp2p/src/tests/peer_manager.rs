@@ -20,7 +20,7 @@ use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
@@ -1553,6 +1553,47 @@ async fn test_prune_connected_peers() {
     });
 
     assert!(!disconnect_events.is_empty(), "Expected disconnect events from pruning");
+}
+
+/// Regression guard for issue #1893: one peer above `target_num_peers`, every public peer at the
+/// default score. The heartbeat prunes the youngest connection and keeps the older ones. The
+/// existing `test_prune_connected_peers` checks only that something was pruned, which is how the
+/// random order among equal scores went unnoticed.
+#[tokio::test]
+async fn test_prune_connected_peers_drops_youngest_first() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let target = peer_manager.config.target_num_peers;
+    let base = Instant::now();
+
+    // target + 1 connected public peers; peer k connected k seconds after the first, so the last
+    // registered peer is the youngest
+    let peer_ids = (0..=target).map(|_| register_peer(&mut peer_manager, None)).collect::<Vec<_>>();
+    peer_ids.iter().zip(0u64..).for_each(|(peer_id, secs)| {
+        peer_manager
+            .peers
+            .get_peer_mut(peer_id)
+            .into_iter()
+            .for_each(|peer| peer.set_connected_since(Some(base + Duration::from_secs(secs))))
+    });
+    let youngest = peer_ids.last().copied();
+
+    // the heartbeat prunes exactly one peer: the youngest moves to `Disconnecting` and leaves the
+    // connected set, every older peer stays
+    peer_manager.heartbeat();
+    let remaining = peer_manager
+        .peers
+        .connected_peers_by_score_and_routability()
+        .into_iter()
+        .map(|(peer_id, _)| peer_id)
+        .collect::<HashSet<_>>();
+    let pruned =
+        peer_ids.iter().filter(|peer_id| !remaining.contains(peer_id)).copied().collect::<Vec<_>>();
+    assert_eq!(
+        pruned,
+        youngest.into_iter().collect::<Vec<_>>(),
+        "only the youngest connection is pruned"
+    );
+    assert_eq!(remaining.len(), target, "every older peer stays connected");
 }
 
 #[tokio::test]

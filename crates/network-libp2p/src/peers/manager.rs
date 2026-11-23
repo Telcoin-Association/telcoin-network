@@ -1500,7 +1500,9 @@ impl PeerManager {
     /// Prune peers to reach target peer counts.
     ///
     /// Trusted peers and validators are ignored. Peers are sorted from lowest to highest score and
-    /// removed until excess peer count reaches target.
+    /// removed until excess peer count reaches target. Among peers with the same score and
+    /// routability the youngest connection is pruned first, so a stable long-lived public peer
+    /// outlives churn from fresh connections (issue #1893).
     fn prune_connected_peers(&mut self) {
         // connected peers sorted from lowest to highest aggregate score
         // peers that do not participate in the kad routing table are prioritized for disconnect
