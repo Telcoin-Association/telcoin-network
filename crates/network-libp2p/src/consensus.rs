@@ -1771,11 +1771,22 @@ where
             }
             NetworkCommand::ReportPenalty { peer, penalty } => {
                 debug!(target: "network", "penalty reported for peer {peer}");
-                if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
-                    self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
-                } else {
-                    bounded_warn!(Command, target: "peer-manager", ?peer, "unable to assess penalty for peer");
-                }
+                // the committee cache carries the operator-configured binding and wins; a public
+                // (non-committee, unpinned) peer confirmed its identity in the peer store only,
+                // so fall back to the store here and nowhere else (issue #1891)
+                let peer_manager = &self.swarm.behaviour().peer_manager;
+                let resolved = peer_manager
+                    .auth_to_peer(peer)
+                    .map(|(peer_id, _)| peer_id)
+                    .or_else(|| peer_manager.confirmed_peer_id(&peer));
+                resolved.map_or_else(
+                    || {
+                        bounded_warn!(Command, target: "peer-manager", ?peer, "unable to assess penalty for peer");
+                    },
+                    |peer_id| {
+                        self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, penalty);
+                    },
+                );
             }
             NetworkCommand::ReportGossipValidation { message_id, propagation_source, verdict } => {
                 // the consumer's deferred verdict for a held gossip message (#1772)

@@ -2694,6 +2694,17 @@ impl PeerManager {
         self.peers.bls_for_peer(peer_id).filter(|bls| !self.stub_records.contains(bls))
     }
 
+    /// Find the peer id that confirmed `bls_key` through a verified signed record.
+    ///
+    /// The reverse of [`Self::peer_to_bls`]: it reads the peer store, not the committee-only
+    /// `known_peers` cache, so a non-committee, unpinned peer that advertised its own record
+    /// resolves as well. A configuration stub is a dial hint, not a confirmed identity, so it is
+    /// filtered the same way. This only routes an application penalty reported by BLS key
+    /// (issue #1891); the dial and send paths keep using [`Self::auth_to_peer`].
+    pub(crate) fn confirmed_peer_id(&self, bls_key: &BlsPublicKey) -> Option<PeerId> {
+        self.peers.peer_id_for_bls(bls_key).filter(|_| !self.stub_records.contains(bls_key))
+    }
+
     /// Visibility helper for behavior to evaluate pending outbound connection attempts.
     pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
         !self.peer_banned(peer_id) && self.peers.can_dial(peer_id)

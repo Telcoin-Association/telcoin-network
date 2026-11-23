@@ -1273,6 +1273,15 @@ impl AllPeers {
         self.peers.contains_key(&PeerIdentity::Confirmed(*bls_key))
     }
 
+    /// The peer id bound to the `Confirmed` record of `bls_key`, if one is stored.
+    ///
+    /// The reverse of [`Self::bls_for_peer`]. It reads the peer store only, so a non-committee,
+    /// unpinned peer that confirmed its own identity through a self-advertised record resolves
+    /// too (issue #1891).
+    pub(super) fn peer_id_for_bls(&self, bls_key: &BlsPublicKey) -> Option<PeerId> {
+        self.peers.get(&PeerIdentity::Confirmed(*bls_key)).and_then(Peer::peer_id)
+    }
+
     /// Evict the `Confirmed` record of `bls_key` and its `bls_by_peer_id` binding, but only while
     /// the peer has no recorded connection status.
     ///

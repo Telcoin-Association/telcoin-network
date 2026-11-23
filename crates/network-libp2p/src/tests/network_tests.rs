@@ -2498,6 +2498,75 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A public (non-committee, unpinned) peer that confirmed its identity through its own pushed
+/// record is banned by a penalty reported by BLS key, with no operator pin on the honest side
+/// (issue #1891). Before the fix the penalty was a no-op and the peer stayed connected.
+#[tokio::test]
+async fn test_penalty_by_bls_bans_self_advertised_public_peer() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+
+    let NetworkPeer { config: config_1, network_handle: honest_peer, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    let NetworkPeer { config: config_2, network_handle: malicious_peer, network, .. } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // Start listeners
+    honest_peer.start_listening(config_1.primary_address()).await?;
+    malicious_peer.start_listening(config_2.primary_address()).await?;
+
+    let malicious_id: PeerId = config_2.primary_networkkey().into();
+    let malicious_bls = config_2.key_config().primary_public_key();
+
+    // honest does NOT pin the malicious peer. it learns the `bls -> peer id` binding only from
+    // the record the malicious peer pushes about itself on connect, which the committee gate
+    // (#827) keeps out of `known_peers` and confirms in the peer store alone.
+    malicious_peer
+        .add_explicit_peer(
+            config_1.key_config().primary_public_key(),
+            config_1.primary_networkkey(),
+            config_1.primary_address(),
+        )
+        .await?;
+    malicious_peer.dial_by_bls(config_1.key_config().primary_public_key()).await?;
+
+    wait_until(Duration::from_secs(5), "malicious peer connects to honest", || async {
+        Ok(honest_peer.connected_peer_ids().await?.contains(&malicious_id))
+    })
+    .await?;
+
+    // the self-advertised record lands after the connection: wait for the forward binding
+    wait_until(Duration::from_secs(5), "honest confirms the malicious identity", || async {
+        Ok(honest_peer.verified_peer_bls(malicious_id).await? == Some(malicious_bls))
+    })
+    .await?;
+
+    // the penalty must resolve through the peer store, since the cache has no entry
+    honest_peer.report_penalty(malicious_bls, Penalty::Fatal).await;
+
+    // the ban disconnects on a heartbeat (several cycles on slow CI)
+    wait_until(
+        Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 4),
+        "malicious peer is disconnected",
+        || async { Ok(!honest_peer.connected_peer_ids().await?.contains(&malicious_id)) },
+    )
+    .await?;
+
+    let score = honest_peer
+        .peer_score(malicious_id)
+        .await?
+        .ok_or_else(|| eyre!("no score for the malicious peer"))?;
+    let min_score = config_1.network_config().peer_config().score_config.min_score_before_ban;
+    assert!(score <= min_score, "Peer should have ban-level score");
+
+    Ok(())
+}
+
 /// Every signed endpoint gets a fresh QUIC window, and the caller survives intermediate timeouts.
 #[tokio::test]
 async fn serial_dial_reaches_last_live_signed_address() -> eyre::Result<()> {
