@@ -20,7 +20,7 @@ use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
@@ -1563,7 +1563,7 @@ async fn test_prune_connected_peers() {
 async fn test_prune_connected_peers_drops_youngest_first() {
     let mut peer_manager = create_test_peer_manager(None);
     let target = peer_manager.config.target_num_peers;
-    let base = Instant::now();
+    let base = std::time::Instant::now();
 
     // target + 1 connected public peers; peer k connected k seconds after the first, so the last
     // registered peer is the youngest
