@@ -69,9 +69,20 @@ const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// inside this bound. Pairs with [`SYNC_ACK_TIMEOUT`] for the reply.
 pub(crate) const SYNC_REQUEST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Headroom added to `max_batch_size` for the sync-frame envelope (the `SyncFrame`
-/// enum tag and the `Data` length prefix) when bounding a decoded frame.
-const SYNC_FRAME_OVERHEAD: usize = 1024;
+/// Smallest transaction that decodes: a legacy RLP list of nine empty fields.
+///
+/// The batch validator decodes every transaction and counts only transaction bytes
+/// against `max_batch_size`, so a batch holds at most `max_batch_size / MIN_TX_LEN`
+/// transactions. Each one costs a ULEB128 length prefix in the batch encoding: one
+/// byte up to 127 bytes, two up to 16,383 bytes, three beyond. The prefix bytes per
+/// transaction byte peak at this floor, so `max_batch_size / MIN_TX_LEN` bounds the
+/// prefix bytes of any batch within the limit.
+const MIN_TX_LEN: usize = 10;
+
+/// Fixed part of the sync-frame envelope: the transaction count, the epoch, the
+/// beneficiary, the base fee, the worker id, the `SyncFrame` enum tag and the `Data`
+/// length prefix (less than 64 bytes in all).
+const SYNC_FRAME_ENVELOPE: usize = 64;
 
 /// Maximum number of retries through the full peer list in `request_batches()`.
 const MAX_BATCH_REQUEST_RETRIES: usize = 3;
@@ -146,9 +157,14 @@ fn slow_exchange_allowance(batches: usize) -> Duration {
 }
 
 /// The largest sync frame accepted for `epoch`: a `Data` frame carrying one
-/// encoded batch, plus envelope headroom.
+/// encoded batch, plus the headroom its encoding can add to `max_batch_size` (one
+/// length prefix per transaction and the fixed envelope).
+///
+/// Derived from [`max_batch_size`] so a fork that raises the batch limit raises this
+/// bound with it. The responder's write and the requester's read both use it.
 pub(crate) fn max_sync_frame_size(epoch: Epoch) -> usize {
-    max_batch_size(epoch).saturating_add(SYNC_FRAME_OVERHEAD)
+    let max = max_batch_size(epoch);
+    max.saturating_add(max / MIN_TX_LEN).saturating_add(SYNC_FRAME_ENVELOPE)
 }
 
 /// How a sync batch stream ended.

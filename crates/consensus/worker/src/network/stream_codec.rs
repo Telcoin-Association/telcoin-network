@@ -258,6 +258,72 @@ mod tests {
         assert_eq!(received, digests);
     }
 
+    /// Serves one batch at the `max_batch_size` byte limit, built from `tx_len`-byte
+    /// transactions, over the sync stream and reads it back.
+    async fn serve_and_read_full_batch(
+        consensus_chain: &ConsensusChain,
+        handle: &WorkerNetworkHandle,
+        max_frame: usize,
+        tx_len: usize,
+    ) {
+        let max_bytes = tn_types::max_batch_size(0);
+        let transactions = vec![vec![0x5a_u8; tx_len]; max_bytes / tx_len];
+        let batch = tn_types::Batch { transactions, ..Default::default() };
+        let digests = BTreeSet::from([batch.digest()]);
+        let db = setup_batch_db(std::slice::from_ref(&batch));
+
+        let mut output = Vec::new();
+        let served = send_sync_batches_over_stream(
+            &mut output,
+            &db,
+            consensus_chain,
+            &digests,
+            0,
+            max_frame,
+            SEND_STREAM_FRAME_TIMEOUT,
+        )
+        .await;
+        assert!(served.is_ok(), "serve a full batch of {tx_len}-byte transactions: {served:?}");
+
+        let mut cursor = Cursor::new(output);
+        read_sync_ack(&mut cursor, max_frame).await;
+        let received =
+            handle.read_sync_batches(&mut cursor, &digests).await.map(|r| r.into_batches());
+        assert!(
+            received.is_ok(),
+            "read back a full batch of {tx_len}-byte transactions: {:?}",
+            received.as_ref().err()
+        );
+        assert!(
+            matches!(received.as_deref(), Ok([(_, received)]) if *received == batch),
+            "one batch of {tx_len}-byte transactions, equal to the served batch"
+        );
+    }
+
+    /// A batch at the byte limit fits one sync frame whatever the sizes of its
+    /// transactions (#1892).
+    ///
+    /// `max_batch_size` counts transaction bytes, and the encoding adds a length
+    /// prefix for each transaction, so the frame bound has to cover the prefixes.
+    /// The cases are the smallest transaction that decodes (10 bytes, the most
+    /// prefix bytes a batch can carry), the smallest transaction with a two-byte
+    /// prefix (128 bytes), and the 2,000-byte shape from the issue (500
+    /// transactions, 1,000,000 transaction bytes).
+    #[tokio::test]
+    async fn full_batch_fits_sync_frame() {
+        let max_frame = crate::network::handle::max_sync_frame_size(0);
+        let temp_dir = TempDir::new().expect("tempdir");
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        serve_and_read_full_batch(&consensus_chain, &handle, max_frame, 10).await;
+        serve_and_read_full_batch(&consensus_chain, &handle, max_frame, 128).await;
+        serve_and_read_full_batch(&consensus_chain, &handle, max_frame, 2_000).await;
+    }
+
     /// A responder that holds only a subset of the requested batches serves those
     /// it has and still ends the stream cleanly; the requester accepts the
     /// partial result without error (mirrors the legacy partial-DB behaviour).
