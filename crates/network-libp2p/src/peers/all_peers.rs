@@ -22,6 +22,7 @@ use crate::{
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
 use std::{
+    cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
     net::IpAddr,
     sync::Arc,
@@ -1013,10 +1014,12 @@ impl AllPeers {
             .into()
     }
 
-    /// Sort connected peers considering both score and Kademlia routing table status.
+    /// Sort connected peers by score, Kademlia routing table status and connection age.
     ///
-    /// The shuffle ensures peers with equal scores are sorted in a random order. Peers with the
-    /// lowest score and are not part of the kademlia table are prioritized.
+    /// Peers with the lowest score that are not part of the kademlia table come first. Among peers
+    /// with the same score and routability the most recently connected peer comes first, so the
+    /// prune drops the youngest connection before a long-lived one (issue #1893). The shuffle keeps
+    /// exact ties in a random order.
     pub(super) fn connected_peers_by_score_and_routability(&self) -> Vec<(PeerId, &Peer)> {
         let mut connected_peers: Vec<(PeerId, &Peer)> = self
             .peers
@@ -1027,8 +1030,11 @@ impl AllPeers {
 
         // shuffle here for unbiased tie-breakers
         connected_peers.shuffle(&mut rand::rng());
-        // sort by (score, routable) - lowest score first, then non-routable first
-        connected_peers.sort_by_key(|(_, peer)| (peer.score(), peer.is_routable()));
+        // sort by (score, routable, youngest first) - lowest score first, then non-routable first,
+        // then the most recent connection first
+        connected_peers.sort_by_key(|(_, peer)| {
+            (peer.score(), peer.is_routable(), Reverse(peer.connected_since()))
+        });
         connected_peers
     }
 

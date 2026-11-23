@@ -119,6 +119,13 @@ pub(super) struct Peer {
     observed_ip_addresses: HashSet<IpAddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
+    /// Instant the current connection span began.
+    ///
+    /// Set when the status transitions into [`ConnectionStatus::Connected`] and cleared when it
+    /// leaves it. An extra connection on an already connected peer keeps the original instant.
+    /// Among peers with the same score and routability the youngest span is pruned first (issue
+    /// #1893).
+    connected_since: Option<Instant>,
     /// Whether the node operator explicitly allowlisted this peer.
     ///
     /// This is *operator* trust only: it is set at construction and never altered by epoch
@@ -153,6 +160,7 @@ impl Peer {
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
             connection_status: Default::default(),
+            connected_since: None,
             connection_direction: Default::default(),
             routable: false,
         }
@@ -174,6 +182,7 @@ impl Peer {
             multiaddrs: addrs.into_iter().take(MAX_MULTIADDRS_PER_PEER).collect(),
             observed_ip_addresses: Default::default(),
             connection_status: Default::default(),
+            connected_since: None,
             connection_direction: Default::default(),
             routable: false,
         }
@@ -189,6 +198,7 @@ impl Peer {
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
             connection_status: Default::default(),
+            connected_since: None,
             operator_allowlisted: false,
             connection_direction: None,
             routable: false,
@@ -212,6 +222,7 @@ impl Peer {
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
             connection_status: Default::default(),
+            connected_since: None,
             connection_direction: Default::default(),
             routable: false,
         }
@@ -356,7 +367,13 @@ impl Peer {
     }
 
     /// Sets the connection status.
+    ///
+    /// Leaving [`ConnectionStatus::Connected`] clears the connection span. An entry into it through
+    /// this setter (tests only) starts one (issue #1893).
     pub(super) fn set_connection_status(&mut self, connection_status: ConnectionStatus) {
+        self.connected_since = connection_status
+            .is_connected()
+            .then(|| self.connected_since.unwrap_or_else(Instant::now));
         self.connection_status = connection_status
     }
 
@@ -422,6 +439,7 @@ impl Peer {
             | ConnectionStatus::Disconnecting { .. }
             | ConnectionStatus::Unknown => {
                 self.connection_status = ConnectionStatus::Connected { num_in: 1, num_out: 0 };
+                self.connected_since = Some(Instant::now());
                 self.connection_direction = Some(ConnectionDirection::Incoming);
             }
         }
@@ -447,6 +465,7 @@ impl Peer {
             | ConnectionStatus::Disconnecting { .. }
             | ConnectionStatus::Unknown => {
                 self.connection_status = ConnectionStatus::Connected { num_in: 0, num_out: 1 };
+                self.connected_since = Some(Instant::now());
                 self.connection_direction = Some(ConnectionDirection::Outgoing);
             }
         }
@@ -552,10 +571,21 @@ impl Peer {
         self.routable
     }
 
+    /// Instant the current connection span began, `None` while the peer is not connected.
+    pub(super) fn connected_since(&self) -> Option<Instant> {
+        self.connected_since
+    }
+
     /// Number of distinct multiaddrs currently retained for this peer.
     #[cfg(test)]
     pub(super) fn multiaddr_count(&self) -> usize {
         self.multiaddrs.len()
+    }
+
+    /// Override the connection span start so a test can order peers by age without waiting.
+    #[cfg(test)]
+    pub(super) fn set_connected_since(&mut self, connected_since: Option<Instant>) {
+        self.connected_since = connected_since
     }
 }
 

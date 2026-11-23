@@ -1163,6 +1163,52 @@ fn test_pruning_logic() {
     assert_eq!(pruned.len(), expected); // 1 peer should be pruned
 }
 
+/// Regression guard for issue #1893: `connected_peers_by_score_and_routability` orders peers
+/// with the same score and routability youngest first, so `prune_connected_peers` drops the
+/// newest connection before a long-lived one. A lower score still sorts ahead of any younger peer.
+#[test]
+fn test_connected_peers_by_score_sorts_youngest_first() {
+    let mut all_peers = create_all_peers(None);
+    let base = Instant::now();
+
+    // three public peers at the default score; a later instant is a younger connection
+    let connect = |all_peers: &mut AllPeers, age_secs: u64| {
+        let peer_id = PeerId::random();
+        all_peers.update_connection_status(
+            &peer_id,
+            NewConnectionStatus::Connected {
+                multiaddr: create_multiaddr(None),
+                direction: ConnectionDirection::Incoming,
+            },
+        );
+        all_peers
+            .get_peer_mut(&peer_id)
+            .into_iter()
+            .for_each(|peer| peer.set_connected_since(Some(base + Duration::from_secs(age_secs))));
+        peer_id
+    };
+    let oldest = connect(&mut all_peers, 0);
+    let middle = connect(&mut all_peers, 1);
+    let youngest = connect(&mut all_peers, 2);
+
+    let order = |all_peers: &AllPeers| {
+        all_peers
+            .connected_peers_by_score_and_routability()
+            .into_iter()
+            .map(|(peer_id, _)| peer_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(&all_peers), vec![youngest, middle, oldest], "equal keys sort youngest first");
+
+    // a lower score sorts ahead of every younger peer
+    let _action = all_peers.process_penalty(&oldest, Penalty::Mild);
+    assert_eq!(
+        order(&all_peers),
+        vec![oldest, youngest, middle],
+        "a penalized peer sorts first regardless of age"
+    );
+}
+
 /// Regression guard for issue #799: overflow pruning must evict the OLDEST bans and keep the
 /// NEWEST. The heap previously stored `Reverse(instant)`, so it retained and then evicted the
 /// freshest bans instead. That let a peer banned moments ago be dropped from the ban set and
