@@ -2309,17 +2309,38 @@ pull_image() {
     done
 }
 
+# Prints the final tag of either channel that the CHANGELOG section of HEAD starts after, or
+# nothing when there is none. That is the nearest final tag reachable from HEAD, unless a final
+# release was since tagged on a branch that left main after it, as v0.17.0-adiri was: then the
+# one of those whose branch left last, so "$tag..HEAD" is main's commits since that branch
+# point, the ones that release did not ship.
+changelog_start() {
+    local prev fork t f
+    prev=$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-rc[0-9]*' HEAD 2>/dev/null) || prev=
+    fork=
+    if [ -n "$prev" ]; then fork=$(git rev-parse --verify --quiet "$prev^{commit}") || return 1; fi
+    while IFS= read -r t; do
+        case "$t" in '' | *-rc[0-9]*) continue ;; esac
+        if git merge-base --is-ancestor "$t" HEAD; then continue; fi
+        f=$(git merge-base "$t" HEAD) || continue
+        if [ -z "$fork" ] || git merge-base --is-ancestor "$fork" "$f"; then prev=$t fork=$f; fi
+    done <<EOF
+$(git tag --list 'v*')
+EOF
+    printf '%s\n' "$prev"
+}
+
 # Writes the commits since the previous final release as the "## [BASE]" section to $1, with
-# the pinned git-cliff image. The range starts at the nearest final tag of either channel
-# reachable from HEAD (the whole history when there is none), not at --unreleased, which
-# would start after an ignored rc tag and drop the rc's changes from the final's section.
+# the pinned git-cliff image. The range starts at changelog_start's tag (the whole history when
+# there is none), not at --unreleased, which would start after an ignored rc tag and drop the
+# rc's changes from the final's section.
 # A worktree's .git points into the common dir and a shared clone borrows objects through
 # alternates, so each of those is mounted read-only at its own path.
 cliff_section() {
     local out=$1 top common alt prev
     top=$(pwd)
     common=$(git rev-parse --path-format=absolute --git-common-dir) || die 2 "git rev-parse --git-common-dir failed"
-    prev=$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-rc[0-9]*' HEAD 2>/dev/null) || prev=
+    prev=$(changelog_start) || die 2 "cannot find the release the CHANGELOG section starts after"
     set -- -v "$top:$top:ro" -v "$common:$common:ro"
     if [ -f "$common/objects/info/alternates" ]; then
         while IFS= read -r alt; do
@@ -2453,11 +2474,13 @@ cmd_draft() {
 
 # build server: on a clean checkout of main's tip, bump the version and splice the CHANGELOG
 # section. The marker records main's tip so check-tag can prove nothing landed in between.
+# The v* tags are fetched as check-tag fetches them, because the section starts at one of
+# them and a release tagged on a branch is not fetched with main.
 cmd_prep() {
     local main_sha remote anchors changed name tag_re
     need docker cargo
     [ -z "$(git status --porcelain --untracked-files=no)" ] || die 2 "tracked files have local changes; prep needs a clean checkout of main"
-    if [ "$DRY_RUN" != 1 ]; then git_fetch +refs/heads/main:refs/remotes/origin/main; fi
+    if [ "$DRY_RUN" != 1 ]; then git_fetch +refs/heads/main:refs/remotes/origin/main 'refs/tags/v*:refs/tags/v*'; fi
     require_main_ref
     main_sha=$(git rev-parse "$MAIN_REF^{commit}")
     [ "$(git rev-parse HEAD)" = "$main_sha" ] || die 2 "HEAD is not the tip of main ($MAIN_REF = $main_sha)"

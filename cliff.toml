@@ -1,8 +1,9 @@
 # git-cliff configuration for CHANGELOG.md.
 #
 # `make release-prep TAG=<tag>` runs the pinned git-cliff image with
-# `--tag <tag> --strip all` on the commits since the nearest final tag of either
-# channel, and splices the new section in right after the
+# `--tag <tag> --strip all` on the commits since the previous final tag of either
+# channel (`changelog_start` in etc/release.sh picks it, a final tagged on a
+# release branch included), and splices the new section in right after the
 # `<!-- ANCHOR: releases -->` line. The Release notes page in the book includes
 # CHANGELOG.md from that anchor, so the header must end with it.
 # Only final tags get a section: rc tags are ignored and their commits roll
