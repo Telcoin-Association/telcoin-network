@@ -105,7 +105,8 @@ Every frame is length-prefixed and Snappy-compressed by the shared frame codec
 Each frame body carries both its uncompressed and compressed lengths for safe, precise stream parsing:
 
 1. **Uncompressed length**: Validated against the per-epoch frame-size bound
-   (`max_batch_size(epoch) + SYNC_FRAME_OVERHEAD`) *before* any buffer is grown, preventing memory
+   (`max_sync_frame_size(epoch)`: `max_batch_size(epoch)` plus the transactions' length prefixes
+   and the fixed fields) *before* any buffer is grown, preventing memory
    exhaustion attacks.
 
 2. **Compressed length**: Required for exact stream reading. TCP is a byte stream, not a message
