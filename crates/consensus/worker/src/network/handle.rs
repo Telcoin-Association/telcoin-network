@@ -69,9 +69,25 @@ const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// inside this bound. Pairs with [`SYNC_ACK_TIMEOUT`] for the reply.
 pub(crate) const SYNC_REQUEST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Headroom added to `max_batch_size` for the sync-frame envelope (the `SyncFrame`
-/// enum tag and the `Data` length prefix) when bounding a decoded frame.
-const SYNC_FRAME_OVERHEAD: usize = 1024;
+/// Length of the smallest transaction the batch validator decodes: a legacy RLP
+/// list of nine empty fields (a one-byte list header and nine `0x80` bytes).
+/// Typed transactions are longer.
+///
+/// Every transaction's BCS length prefix is at most a tenth of its length (one
+/// byte up to 127 bytes, two bytes from 128), so a batch within `max_batch_size`
+/// carries at most `max_batch_size / MIN_TX_LEN` prefix bytes.
+const MIN_TX_LEN: usize = 10;
+
+/// Bound on the fixed bytes of a `Data` sync frame: the batch's transaction count
+/// (at most 5 bytes), its `epoch`, `beneficiary` (20 bytes and a length prefix),
+/// `base_fee_per_gas` and `worker_id` (35 bytes together), the `SyncFrame` tag
+/// (1 byte) and the `Data` length prefix (at most 5 bytes). That is at most 46
+/// bytes today.
+///
+/// `full_batch_of_small_transactions_fits_sync_frame` serves a full batch of
+/// 10-byte transactions, whose fixed bytes come to 42, 22 under this bound. A
+/// `Batch` field added later that is longer than that fails the test.
+const SYNC_FRAME_ENVELOPE: usize = 64;
 
 /// Maximum number of retries through the full peer list in `request_batches()`.
 const MAX_BATCH_REQUEST_RETRIES: usize = 3;
@@ -146,9 +162,15 @@ fn slow_exchange_allowance(batches: usize) -> Duration {
 }
 
 /// The largest sync frame accepted for `epoch`: a `Data` frame carrying one
-/// encoded batch, plus envelope headroom.
+/// encoded batch.
+///
+/// `max_batch_size` counts transaction bytes only, so the bound adds the most
+/// length-prefix bytes a batch within it can carry (see [`MIN_TX_LEN`]) and the
+/// fixed fields ([`SYNC_FRAME_ENVELOPE`]). The bound follows `max_batch_size`, so a
+/// fork that changes the batch limit changes it too.
 pub(crate) fn max_sync_frame_size(epoch: Epoch) -> usize {
-    max_batch_size(epoch).saturating_add(SYNC_FRAME_OVERHEAD)
+    let max_batch = max_batch_size(epoch);
+    max_batch.saturating_add(max_batch / MIN_TX_LEN).saturating_add(SYNC_FRAME_ENVELOPE)
 }
 
 /// How a sync batch stream ended.

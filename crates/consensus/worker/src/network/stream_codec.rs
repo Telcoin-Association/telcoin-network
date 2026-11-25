@@ -258,6 +258,57 @@ mod tests {
         assert_eq!(received, digests);
     }
 
+    /// A batch at the byte limit fits one sync frame whatever the sizes of its
+    /// transactions.
+    ///
+    /// The batch limit counts transaction bytes, and the encoding adds a length
+    /// prefix for each transaction, so the frame headroom has to cover the
+    /// prefixes. The cases are the smallest transaction that decodes (10 bytes,
+    /// the most prefix bytes a batch can carry), the smallest transaction with a
+    /// two-byte prefix (128 bytes), and a 2,000-byte transaction.
+    #[tokio::test]
+    async fn full_batch_of_small_transactions_fits_sync_frame() {
+        let max_frame = crate::network::handle::max_sync_frame_size(0);
+        let max_bytes = tn_types::max_batch_size(0);
+        let temp_dir = TempDir::new().expect("tempdir");
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        for tx_len in [10, 128, 2_000] {
+            let transactions = vec![vec![0x5a_u8; tx_len]; max_bytes / tx_len];
+            let batch = tn_types::Batch { transactions, ..Default::default() };
+            let digests = BTreeSet::from([batch.digest()]);
+            let db = setup_batch_db(std::slice::from_ref(&batch));
+
+            let mut output = Vec::new();
+            send_sync_batches_over_stream(
+                &mut output,
+                &db,
+                &consensus_chain,
+                &digests,
+                0,
+                max_frame,
+                SEND_STREAM_FRAME_TIMEOUT,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("serve a full batch of {tx_len}-byte transactions: {e}"));
+
+            let mut cursor = Cursor::new(output);
+            read_sync_ack(&mut cursor, max_frame).await;
+            let result = handle
+                .read_sync_batches(&mut cursor, &digests)
+                .await
+                .unwrap_or_else(|e| panic!("read a full batch of {tx_len}-byte transactions: {e}"))
+                .into_batches();
+
+            assert_eq!(result.len(), 1, "one batch of {tx_len}-byte transactions");
+            assert_eq!(result[0].1, batch);
+        }
+    }
+
     /// A responder that holds only a subset of the requested batches serves those
     /// it has and still ends the stream cleanly; the requester accepts the
     /// partial result without error (mirrors the legacy partial-DB behaviour).
