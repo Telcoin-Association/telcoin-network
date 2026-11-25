@@ -1,10 +1,13 @@
 # Prometheus configuration for the observability compose profile.
 #
-# The telcoin-node job scrapes the four local validators over the compose bridge
-# (each node binds --metrics to its fixed 10.10.0.2N address) and names them
-# validator1..4 in the instance label. The node job scrapes node_exporter on
-# loopback. Every series therefore carries the job and instance labels the
-# dashboard and the rules scope on.
+# Every compose-network target binds its metrics listener to its fixed 10.10.0.x bridge
+# address, and the instance label carries its compose service name. The telcoin-node job
+# scrapes the four local validators (validator1..4) and the observer; the observer is not a
+# committee member, so it reports zero expected committee peers and the committee alerts skip
+# it. The worker-gateway job scrapes the four gateways (worker-gateway1..4) and the
+# node-record-api job the node record service. The node job scrapes node_exporter on
+# loopback. Every series therefore carries the job and instance labels the dashboards and the
+# rules scope on.
 # See docs/src/getting-started/host-network-observability.md.
 global:
   scrape_interval: 15s
@@ -24,6 +27,22 @@ scrape_configs:
         labels: { instance: validator3 }
       - targets: ["10.10.0.24:9101"]
         labels: { instance: validator4 }
+      - targets: ["10.10.0.31:9101"]
+        labels: { instance: observer }
+  - job_name: worker-gateway
+    static_configs:
+      - targets: ["10.10.0.41:9101"]
+        labels: { instance: worker-gateway1 }
+      - targets: ["10.10.0.42:9101"]
+        labels: { instance: worker-gateway2 }
+      - targets: ["10.10.0.43:9101"]
+        labels: { instance: worker-gateway3 }
+      - targets: ["10.10.0.44:9101"]
+        labels: { instance: worker-gateway4 }
+  - job_name: node-record-api
+    static_configs:
+      - targets: ["10.10.0.51:9101"]
+        labels: { instance: node-record-api }
   - job_name: node
     static_configs:
       - targets: ["127.0.0.1:9100"]

@@ -1,5 +1,36 @@
-# Health and metrics bind each validator's compose-network address and are not published to
-# the host; see docs/src/getting-started/observability-listeners.md and compose.observability.yaml.
+# Clients reach the chain through four worker gateways on host ports 8545-8542, one in front of
+# each validator: a gateway sends transaction submissions to its validator and every other call to
+# the observer. Each validator's own RPC is published on host loopback only (18545-18542), as a
+# debug port that bypasses its gateway. node-record-api, on host loopback 8090, lists the
+# validators' signed node records and the gateway URLs they advertise. Health and metrics bind each
+# node's compose-network address and are not published to the host; the observability profile of
+# this file scrapes them (see docs/src/getting-started/observability-listeners.md).
+
+# Edge limits shared by the four gateways, off (0) by default: a load generator on this host
+# reaches a gateway from one address, which the production per-client limits would throttle.
+# The production values are the gateway's defaults. To restore them, set
+# WORKER_GATEWAY_RATE_LIMIT_PER_IP=100, WORKER_GATEWAY_RATE_LIMIT_GLOBAL=3000 and
+# WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP=32 in the shell or in etc/.env before `make up`; on a
+# running stack, recreate the gateways alone with
+#   docker compose -f etc/compose.yaml up -d --no-deps worker-gateway1 worker-gateway2 worker-gateway3 worker-gateway4
+# The capacity caps (connections, in-flight requests, request size, batch length) keep their
+# production defaults either way.
+x-worker-gateway-env: &worker-gateway-env
+  RUST_LOG: info
+  WORKER_GATEWAY_RATE_LIMIT_PER_IP: "${WORKER_GATEWAY_RATE_LIMIT_PER_IP:-0}"
+  WORKER_GATEWAY_RATE_LIMIT_GLOBAL: "${WORKER_GATEWAY_RATE_LIMIT_GLOBAL:-0}"
+  WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP: "${WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP:-0}"
+
+# /ready/any on the gateway's probe listener, as the reference Kubernetes readinessProbe checks
+# it: 200 while the gateway can serve a route, that is while its validator takes submissions or
+# the observer answers reads. The image has bash but no HTTP client.
+x-worker-gateway-healthcheck: &worker-gateway-healthcheck
+  test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8546 && printf 'GET /ready/any HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 60s
+
 services:
   # build image once
   telcoin-base:
@@ -18,6 +49,12 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.21/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x1111111111111111111111111111111111111111
       - TN_BLS_PASSPHRASE=local
+      # The URL this validator advertises in its node record, where the observer forwards the
+      # transactions it accepts: worker-gateway1's address on this network, as a validator
+      # advertises its public gateway on mainnet. Not 127.0.0.1, which the observer would take for
+      # its own loopback. setup_validator.sh applies it with new keys, so a change here takes
+      # effect after `make down`.
+      - RPC_HTTP=http://10.10.0.41:8545/
     user: "root"
     command:
       - "bash"
@@ -34,6 +71,7 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.22/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x2222222222222222222222222222222222222222
       - TN_BLS_PASSPHRASE=local
+      - RPC_HTTP=http://10.10.0.42:8545/
     user: "root"
     command:
       - "bash"
@@ -50,6 +88,7 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.23/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x3333333333333333333333333333333333333333
       - TN_BLS_PASSPHRASE=local
+      - RPC_HTTP=http://10.10.0.43:8545/
     user: "root"
     command:
       - "bash"
@@ -66,6 +105,7 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.24/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x4444444444444444444444444444444444444444
       - TN_BLS_PASSPHRASE=local
+      - RPC_HTTP=http://10.10.0.44:8545/
     user: "root"
     command:
       - "bash"
@@ -73,6 +113,25 @@ services:
     volumes:
       - ./setup_validator.sh:/setup_validator.sh
       - validator4-data:/home/nonroot/data
+  # Observer keys. genesis.sh never reads this node-info, so the observer stays out of the
+  # committee. No RPC_HTTP: observers forward only to committee members' URLs.
+  setup-observer:
+    image: local-telcoin-network:latest
+    depends_on:
+      - telcoin-base
+    environment:
+      - NODE_TYPE=observer
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/10.10.0.31/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.31/udp/49595/quic-v1
+      - EXECUTION_ADDRESS=0x5555555555555555555555555555555555555555
+      - TN_BLS_PASSPHRASE=local
+    user: "root"
+    command:
+      - "bash"
+      - "/setup_validator.sh"
+    volumes:
+      - ./setup_validator.sh:/setup_validator.sh
+      - observer-data:/home/nonroot/data
 
   # create and distribute genesis files
   comittee:
@@ -81,15 +140,26 @@ services:
     environment:
       - RUST_LOG=info,genesis=debug,engine=debug
       - TN_BLS_PASSPHRASE=local
+      # Address funded at genesis. The default has no key in this repository, so to sign
+      # transactions set TN_DEV_FUNDED_ACCOUNT to an address you hold the key for, in the shell
+      # or etc/.env. It applies to a new genesis only (after `make down`).
+      - TN_DEV_FUNDED_ACCOUNT=${TN_DEV_FUNDED_ACCOUNT:-0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a}
     user: "root"
     command:
       - "bash"
       - "/genesis.sh"
+    # Genesis reads every validator's node-info, so it starts only once each setup has exited 0,
+    # and `up` fails when one of them fails. It need not wait for setup-observer: the observer is
+    # not in the genesis, and the two write different files in the observer's volume.
     depends_on:
-      - setup1
-      - setup2
-      - setup3
-      - setup4
+      setup1:
+        condition: service_completed_successfully
+      setup2:
+        condition: service_completed_successfully
+      setup3:
+        condition: service_completed_successfully
+      setup4:
+        condition: service_completed_successfully
     volumes:
       - ./genesis.sh:/genesis.sh
       - sharedgenesisdir:/home/nonroot/data/genesis
@@ -97,17 +167,18 @@ services:
       - validator2-data:/home/nonroot/data/validator-2
       - validator3-data:/home/nonroot/data/validator-3
       - validator4-data:/home/nonroot/data/validator-4
+      - observer-data:/home/nonroot/data/observer
 
   # start nodes
-
-  # Each node binds --metrics to its fixed bridge address so the host-network
-
-  # Prometheus of the observability profile can scrape it. The port is not published.
+  # Each node binds --metrics to its fixed bridge address so the host-network Prometheus of the
+  # observability profile can scrape it. The port is not published.
   validator1:
     container_name: validator1
     image: local-telcoin-network:latest
+    # Starts once genesis.sh has exited 0, so the chain config is in place.
     depends_on:
-      - comittee
+      comittee:
+        condition: service_completed_successfully
     environment:
       # engine=debug logs execution as hashes and counts; the output and block struct dumps
       # need engine::dump=trace, the per-transaction EVM lines engine::evm=trace.
@@ -122,8 +193,10 @@ services:
       --http.port 8545
       --healthcheck 10.10.0.21:8080
       --metrics 10.10.0.21:9101
+    # Debug port: this validator's RPC straight from host loopback, bypassing worker-gateway1.
+    # Clients use the gateway's port. 127.0.0.1, not localhost, which may resolve to ::1.
     ports:
-      - 8545:8545
+      - 127.0.0.1:18545:8545
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.21/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
       interval: 30s
@@ -139,7 +212,8 @@ services:
     container_name: validator2
     image: local-telcoin-network:latest
     depends_on:
-      - comittee
+      comittee:
+        condition: service_completed_successfully
     environment:
       - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup2 service
@@ -153,7 +227,7 @@ services:
       --healthcheck 10.10.0.22:8080
       --metrics 10.10.0.22:9101
     ports:
-      - 8544:8545
+      - 127.0.0.1:18544:8545
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.22/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
       interval: 30s
@@ -169,7 +243,8 @@ services:
     container_name: validator3
     image: local-telcoin-network:latest
     depends_on:
-      - comittee
+      comittee:
+        condition: service_completed_successfully
     environment:
       - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup3 service
@@ -183,7 +258,7 @@ services:
       --healthcheck 10.10.0.23:8080
       --metrics 10.10.0.23:9101
     ports:
-      - 8543:8545
+      - 127.0.0.1:18543:8545
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.23/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
       interval: 30s
@@ -199,7 +274,8 @@ services:
     container_name: validator4
     image: local-telcoin-network:latest
     depends_on:
-      - comittee
+      comittee:
+        condition: service_completed_successfully
     environment:
       - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup4 service
@@ -213,7 +289,7 @@ services:
       --healthcheck 10.10.0.24:8080
       --metrics 10.10.0.24:9101
     ports:
-      - 8542:8545
+      - 127.0.0.1:18542:8545
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.24/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
       interval: 30s
@@ -225,6 +301,216 @@ services:
     networks:
       validators:
         ipv4_address: 10.10.0.24
+  # Follows the chain without joining the committee, with the same listeners as a validator. The
+  # worker gateways send it every call that is not a submission. A transaction sent to it is
+  # forwarded to the gateway the sender's validator advertises, so it reaches the validator the
+  # same way as on mainnet (genesis.sh lets this observer dial those private addresses). Its RPC is
+  # published on host loopback only.
+  observer:
+    container_name: observer
+    image: local-telcoin-network:latest
+    # Starts once its keys exist and genesis.sh has given it the chain config.
+    depends_on:
+      setup-observer:
+        condition: service_completed_successfully
+      comittee:
+        condition: service_completed_successfully
+    environment:
+      - RUST_LOG=info
+      - TN_BLS_PASSPHRASE=local # must match value used in setup-observer service
+    user: "1101:1101"
+    command: >
+      /usr/local/bin/telcoin node
+      --datadir /home/nonroot/data
+      --http
+      --http.addr 0.0.0.0
+      --http.port 8545
+      --healthcheck 10.10.0.31:8080
+      --metrics 10.10.0.31:9101
+    ports:
+      - 127.0.0.1:8541:8545
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.31/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    volumes:
+      - observer-data:/home/nonroot/data
+    networks:
+      validators:
+        ipv4_address: 10.10.0.31
+
+  # A worker gateway in front of each validator, as on mainnet. It sends transaction submissions,
+  # and the nonce and receipt reads only the validator's pool can answer, to its validator, and
+  # every other call to the observer (--redirect-queries). The upstreams are IP literals: a
+  # private address passes the gateway's startup checks over plain http without a warning, where
+  # a service name such as validator1 would log one.
+  worker-gateway1:
+    container_name: worker-gateway1
+    image: local-telcoin-worker-gateway:latest
+    # Built once here; worker-gateway2..4 run the same image.
+    build:
+      context: ../
+      dockerfile: bin/worker-gateway/Dockerfile
+    # Started, not healthy: the gateway stays not-ready until its upstreams answer.
+    depends_on:
+      validator1:
+        condition: service_started
+      observer:
+        condition: service_started
+    environment: *worker-gateway-env
+    command: >
+      --listen-addr 0.0.0.0:8545
+      --probe-addr 127.0.0.1:8546
+      --metrics 10.10.0.41:9101
+      --upstream-rpc-url http://10.10.0.21:8545
+      --upstream-readiness-url http://10.10.0.21:8080/health/workers
+      --redirect-queries http://10.10.0.31:8545
+    ports:
+      - 8545:8545
+    healthcheck: *worker-gateway-healthcheck
+    # Above the gateway's shutdown on SIGTERM: a 45s in-flight drain and a 1s margin.
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.41
+  worker-gateway2:
+    container_name: worker-gateway2
+    image: local-telcoin-worker-gateway:latest
+    depends_on:
+      validator2:
+        condition: service_started
+      observer:
+        condition: service_started
+    environment: *worker-gateway-env
+    command: >
+      --listen-addr 0.0.0.0:8545
+      --probe-addr 127.0.0.1:8546
+      --metrics 10.10.0.42:9101
+      --upstream-rpc-url http://10.10.0.22:8545
+      --upstream-readiness-url http://10.10.0.22:8080/health/workers
+      --redirect-queries http://10.10.0.31:8545
+    ports:
+      - 8544:8545
+    healthcheck: *worker-gateway-healthcheck
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.42
+  worker-gateway3:
+    container_name: worker-gateway3
+    image: local-telcoin-worker-gateway:latest
+    depends_on:
+      validator3:
+        condition: service_started
+      observer:
+        condition: service_started
+    environment: *worker-gateway-env
+    command: >
+      --listen-addr 0.0.0.0:8545
+      --probe-addr 127.0.0.1:8546
+      --metrics 10.10.0.43:9101
+      --upstream-rpc-url http://10.10.0.23:8545
+      --upstream-readiness-url http://10.10.0.23:8080/health/workers
+      --redirect-queries http://10.10.0.31:8545
+    ports:
+      - 8543:8545
+    healthcheck: *worker-gateway-healthcheck
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.43
+  worker-gateway4:
+    container_name: worker-gateway4
+    image: local-telcoin-worker-gateway:latest
+    depends_on:
+      validator4:
+        condition: service_started
+      observer:
+        condition: service_started
+    environment: *worker-gateway-env
+    command: >
+      --listen-addr 0.0.0.0:8545
+      --probe-addr 127.0.0.1:8546
+      --metrics 10.10.0.44:9101
+      --upstream-rpc-url http://10.10.0.24:8545
+      --upstream-readiness-url http://10.10.0.24:8080/health/workers
+      --redirect-queries http://10.10.0.31:8545
+    ports:
+      - 8542:8545
+    healthcheck: *worker-gateway-healthcheck
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.44
+
+  # Reads the validators' signed node records from the worker-0 DHT (QUIC to each validator's
+  # worker port, from an ephemeral identity that never listens) and serves them as JSON:
+  # /v1/records lists every record, /v1/rpcs the RPC URLs they advertise, here the gateways'.
+  # The genesis committee.yaml gives it the validators' keys and, through its bootstrap servers,
+  # the DHT addresses to dial; the observer's RPC gives it the live committee and epoch
+  # boundaries. It writes nothing to disk, so the root filesystem stays read-only.
+  node-record-api:
+    container_name: node-record-api
+    image: local-telcoin-node-record-api:latest
+    build:
+      context: ../
+      dockerfile: bin/node-record-api/Dockerfile
+    # The committee file must exist at startup; genesis.sh has written it once comittee exits 0.
+    # The observer need only be started: a failed RPC call leaves the committee file's keys, and
+    # the next cycle retries.
+    depends_on:
+      comittee:
+        condition: service_completed_successfully
+      observer:
+        condition: service_started
+    environment:
+      NODE_RECORD_API_LISTEN_ADDR: 0.0.0.0:8080
+      NODE_RECORD_API_METRICS_ADDR: 10.10.0.51:9101
+      # Decimal: the genesis's 0x1e7. A wrong id is no error, only an empty directory.
+      NODE_RECORD_API_CHAIN_ID: "487"
+      NODE_RECORD_API_COMMITTEE_FILE: /etc/node-record-api/genesis/committee.yaml
+      NODE_RECORD_API_RPC_URL: http://10.10.0.31:8545
+      # Above the 15s DHT query timeout, and short enough that the directory is ready within a
+      # cycle or two of the validators publishing their records.
+      NODE_RECORD_API_REFRESH_INTERVAL: 30s
+      # This binary reads its log filter here, not from RUST_LOG.
+      NODE_RECORD_API_LOG_FILTER: info
+    volumes:
+      - sharedgenesisdir:/etc/node-record-api/genesis:ro
+    ports:
+      - 127.0.0.1:8090:8080
+    # /readyz is 200 once a refresh cycle has finished and at least one cached record is fresh,
+    # so the service is healthy only while it serves the validators' records. The image has bash
+    # but no HTTP client.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    # Above the daemon's shutdown on SIGTERM: a 30s drain and a 1s margin, as the reference
+    # Kubernetes Deployment allows it.
+    stop_grace_period: 40s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      validators:
+        ipv4_address: 10.10.0.51
 
   # Observability profile: off by default, so `make up` is unchanged.
   # Start it with `docker compose --profile observability up -d`.
@@ -267,6 +553,7 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/telcoin-node-metrics.json:/var/lib/grafana/dashboards/telcoin-node-metrics.json:ro
+      - ../bin/worker-gateway/grafana-worker-gateway.json:/var/lib/grafana/dashboards/telcoin-worker-gateway.json:ro
       - grafana-data:/var/lib/grafana
 
 volumes:
@@ -274,6 +561,7 @@ volumes:
   validator2-data:
   validator3-data:
   validator4-data:
+  observer-data:
   sharedgenesisdir:
   prometheus-data:
   grafana-data:

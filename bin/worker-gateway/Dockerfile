@@ -5,9 +5,10 @@
 # paths the gateway's build needs: a rust:1.94 builder stage compiles a single
 # stripped release binary, which is copied into a slim debian runtime that runs
 # as a non-root user (uid 1101). Build from the repository root so the whole
-# workspace is in the build context:
+# workspace is in the build context, and pass the commit for `--version`:
 #
-#   docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:<tag> .
+#   docker build -f bin/worker-gateway/Dockerfile \
+#     --build-arg GIT_SHA=$(git rev-parse HEAD) -t telcoin-worker-gateway:<tag> .
 #
 # `docker run` and `docker stop` give a container 10s between SIGTERM and
 # SIGKILL, less than the gateway's shutdown: --shutdown-delay, then the
@@ -25,11 +26,15 @@
 #   docker buildx imagetools inspect rust:1.94-slim-bookworm
 #   docker buildx imagetools inspect debian:bookworm-slim
 #
-# and replace the sha256 after the tag; keep the rust tag in step with
-# RUSTUP_TOOLCHAIN below.
+# and replace the sha256 after the tag; keep RUSTUP_TOOLCHAIN below equal to
+# the rustc the new builder image ships.
 FROM rust:1.94-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
 
-ENV RUSTUP_TOOLCHAIN=1.94
+# The exact toolchain the image above ships (rustc 1.94.1), so rustup never
+# downloads one at build time; a channel such as 1.94 makes it fetch that
+# channel's manifest. Change it with the base image:
+#   docker run --rm <image> rustc --version
+ENV RUSTUP_TOOLCHAIN=1.94.1
 
 # Strip symbols and debuginfo from the release binary, as etc/Dockerfile does.
 # Scoped to this build only, so the workspace's release profile is unchanged.
@@ -63,6 +68,13 @@ COPY patches/ ./patches/
 # The vendored reth: the root Cargo.toml's reth-* dependencies are paths into it.
 COPY vendor/ ./vendor/
 
+# GIT_SHA is the full commit hash `--version` prints: src/version.rs reads
+# VERGEN_GIT_SHA at compile time, so the build needs neither the .git dir nor
+# the git binary. Declared here, after the COPY steps, so a new commit leaves
+# the layers above cached. Defaults to `unknown` for ad-hoc builds.
+ARG GIT_SHA=unknown
+ENV VERGEN_GIT_SHA=${GIT_SHA}
+
 # Build only the gateway binary, then move it out of the cache mount so the
 # runtime stage can COPY it. --locked makes the build fail instead of resolving
 # versions other than the ones in Cargo.lock.
@@ -75,6 +87,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 # production image (pinned by index digest, see the top of this file)
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+
+# OCI image annotations, as the node image has them: the source label links the
+# ghcr.io package page back to the repository.
+LABEL org.opencontainers.image.source="https://github.com/Telcoin-Association/telcoin-network" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.title="worker-gateway" \
+      org.opencontainers.image.description="Telcoin Network worker gateway — reverse proxy in front of worker JSON-RPC"
 
 # The gateway links rustls, not openssl, so no TLS library is installed.
 # ca-certificates is required for an https worker or --redirect-queries URL

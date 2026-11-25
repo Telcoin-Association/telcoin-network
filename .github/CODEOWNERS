@@ -41,3 +41,11 @@ rustfmt.toml       @grantkee @sstanfield @MavenRain @Huwonk
 .rustfmt.toml      @grantkee @sstanfield @MavenRain @Huwonk
 clippy.toml        @grantkee @sstanfield @MavenRain @Huwonk
 .clippy.toml       @grantkee @sstanfield @MavenRain @Huwonk
+
+# Release signing. The `release` submodule pointer decides which maintainer keys may sign
+# a release, and .gitmodules decides where the pointer is fetched from, so a change to
+# either needs a review from a key holder. These lines name the key holders, not the
+# MAINTAINERS list, and stay last: GitHub applies the last line that matches a path, so
+# no broader pattern added above can take them over.
+/release           @grantkee @MavenRain
+/.gitmodules       @grantkee @MavenRain

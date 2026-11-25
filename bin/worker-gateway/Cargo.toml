@@ -16,6 +16,9 @@ path = "src/main.rs"
 [dependencies]
 # cli + runtime
 clap = { workspace = true, features = ["derive", "env"] }
+# joins the `--version` text at compile time (see `version::LONG_VERSION`); the
+# node's cli already uses it, so this adds no new crate
+const-str = { workspace = true }
 eyre = { workspace = true }
 fdlimit = { workspace = true }
 # errno values and getrlimit (see server::is_connection_error, fd::current_limit); already in the lock through tokio and fdlimit

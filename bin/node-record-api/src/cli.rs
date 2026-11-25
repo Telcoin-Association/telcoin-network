@@ -27,7 +27,7 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024;
 
 /// HTTP/JSON directory of validators' DHT-advertised JSON-RPC endpoints.
 #[derive(Debug, Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, long_version = crate::version::LONG_VERSION, about, long_about = None)]
 pub struct Cli {
     /// Address the API listens on, for `/v1/*` and its own `/healthz` (liveness) and `/readyz`
     /// (readiness) endpoints.

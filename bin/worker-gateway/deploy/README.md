@@ -22,12 +22,12 @@ A Grafana dashboard for the metrics these expose lives at
 
 ## Placeholders to replace
 
-- **Image ref** (`deployment.yaml`): `telcoin-worker-gateway:<tag>` is a
-  placeholder for a local build tag. Point it at your registry with a versioned
-  tag, e.g. `registry.example.com/telcoin/worker-gateway:<tag>`, and pin it by
-  digest (`...:<tag>@sha256:<digest>`) so every replica runs the same build;
-  `docker buildx imagetools inspect <ref>:<tag>` prints the digest after a push.
-  Do not deploy `:latest`.
+- **Image ref** (`deployment.yaml`): `telcoin-worker-gateway:<tag>` is a placeholder.
+  Replace it with the signed release image pinned by digest: the full content of the release's `IMAGE_DIGEST-worker-gateway`, `ghcr.io/telcoin-association/tn-worker-gateway@sha256:<64 hex>`, taken once `SHA256SUMS-edge` and its signatures have verified, as the "Edge images" and "Check the edge images" steps of [Installing a release](../../../docs/src/getting-started/installing-a-release.md#edge-services-worker-gateway-and-node-record-api) show.
+  The digest keeps every replica on the one image the release's signed manifest covers; a tag, `:latest` and `:adiri` above all, can move to another image, so do not deploy one.
+  At a new release, run the same steps for its tag, put the new file's content in `image:` and apply the Deployment, which replaces one pod at a time (`maxSurge: 0`, `maxUnavailable: 1`).
+  The release images are `linux/amd64` only, so on a cluster with nodes of other architectures add a `nodeSelector` on `kubernetes.io/arch: amd64`.
+  For an image you build yourself (see the README's "Deployment" section), push it to your registry and pin it by digest the same way (`<ref>@sha256:<digest>`); `docker buildx imagetools inspect <ref>:<tag>` prints the digest after a push.
 - **Upstream worker endpoints** (`deployment.yaml`):
   `WORKER_GATEWAY_UPSTREAM_RPC_URL` and `WORKER_GATEWAY_UPSTREAM_READINESS_URL`
   are placeholders pointing at an in-cluster worker Service DNS name. Replace
@@ -36,16 +36,12 @@ A Grafana dashboard for the metrics these expose lives at
   `WORKER_GATEWAY_CONFIG` (equivalently `--config`) to a path backed by a
   ConfigMap volume. The gateway requires at least one upstream and will refuse
   to start without one.
-- **Healthcheck port** (`deployment.yaml`): the readiness URL is not on the
-  worker RPC. It is the `/health/workers` route of the node's healthcheck
-  listener, which the node opens only when started with `--healthcheck <port>`
-  (`HEALTHCHECK_TCP_PORT`); there is no default port. Replace
-  `<HEALTHCHECK_TCP_PORT>` in
-  `http://<node>:<HEALTHCHECK_TCP_PORT>/health/workers` with that port and make
-  sure the node's Service exposes it to the gateway pods. Until you do, the URL
-  does not parse and the gateway exits at startup. The listener is
-  unauthenticated and serves one connection at a time, so admit only the
-  gateways to it.
+- **Healthcheck port** (`deployment.yaml`): the readiness URL is not on the worker RPC.
+  It is the `/health/workers` route of the node's healthcheck listener, which the node opens only when started with `--healthcheck` (`HEALTHCHECK_TCP_PORT`); there is no default.
+  A bare port (`--healthcheck 8080`) binds `127.0.0.1` only, so a gateway in another pod never reaches it and never turns ready: give the node an address instead, `--healthcheck 0.0.0.0:<port>` in a pod, whose own address is not known in advance (`etc/compose.yaml` gives each validator its bridge address, `--healthcheck 10.10.0.21:8080`).
+  Replace `<HEALTHCHECK_TCP_PORT>` in `http://<node>:<HEALTHCHECK_TCP_PORT>/health/workers` with that port and make sure the node's Service exposes it to the gateway pods.
+  Until you do, the URL does not parse and the gateway exits at startup.
+  The listener is unauthenticated and serves one connection at a time, so admit only the gateways to it, with a NetworkPolicy on the node's pods since `0.0.0.0` lets every pod in the cluster reach it.
 - **Query upstream** (`deployment.yaml`): `WORKER_GATEWAY_REDIRECT_QUERIES` (equivalently `--redirect-queries`) sends every call except `eth_sendRawTransaction` and `eth_sendRawTransactionSync` to a public JSON-RPC endpoint for the same chain, so the validator's worker receives only submissions (see the README's "Query redirect" section).
   Replace `<PUBLIC_RPC_HOST>` with that endpoint, preferably over `https`; until you do, the URL does not parse and the gateway exits at startup.
   Remove the variable only for a gateway that should send every call to its worker, never in front of a validator.
@@ -112,7 +108,7 @@ In a test process that also ran the client and the upstream, 128 parallel 1 MiB 
 Each extra connection adds at most `--http1-max-buf-size`.
 Raising `--max-request-bytes` does not raise the memory bound, but it makes the budget cheaper to exhaust: a request reserves its declared length (or the whole cap when chunked) from its head and holds it until the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 45 s by default) even if no body byte arrives.
 About `--max-inflight-request-bytes` / `--max-request-bytes` such idle requests (512 at the defaults, 35 at a 15 MiB cap) make every other body-carrying request fail with `-32010`.
-On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); the per-client connection cap (`--max-connections-per-ip`) bounds how many of them one client can hold.
+On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); the per-client connection cap (`--max-connections-per-ip`) bounds how many of them one client can hold, except behind a front listed in `WORKER_GATEWAY_TRUSTED_PROXIES`, whose connections it does not count, so there the front has to bound how long a request may take to arrive (see the README's "Behind a reverse proxy" section).
 If the limit has to stay lower, lower the budget (`--max-inflight-request-bytes 268435456`, 256 MiB, needs about 352 MiB); a 256 MiB budget is exhausted by 256 idle requests, so on an internet-facing gateway lower `--max-connections` to 256 with it (about 336 MiB).
 The probe port is not counted in the formula: each open probe connection holds up to about 24 KiB of buffers for at most `--header-read-timeout`, and nothing caps how many are open, which is why it must stay unreachable from clients.
 

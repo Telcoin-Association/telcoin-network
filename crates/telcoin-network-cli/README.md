@@ -682,7 +682,7 @@ An observer forwards each transaction it accepts to the JSON-RPC endpoint the ow
 
 The check reads the host as written and never resolves DNS. It refuses IP literals in every spelling (dotted-quad, decimal, octal, hex, IPv4-mapped and NAT64/6to4 IPv6) and the names reserved to resolve locally (`localhost`, `*.localhost`, `*.local`), but a hostname that merely resolves to a private address is still dialed. Treat this as a guard against an advertised internal address, not as complete egress filtering. Operators who need the stronger property should restrict outbound traffic from observer nodes at the network layer.
 
-Set it to `true` only when every committee member is under the same operator as this node - single-host and docker-compose deployments, where validators legitimately advertise `127.0.0.1`. On a public network it re-enables dialing arbitrary internal addresses.
+Set it to `true` only when every committee member is under the same operator as this node - single-host and docker-compose deployments, where validators legitimately advertise a loopback or private address (the compose testnet's validators advertise their gateways' `10.10.0.4N` addresses). On a public network it re-enables dialing arbitrary internal addresses.
 
 `basefee_address` is the one field here without a default. It is consensus-critical: the
 EVM credits this account on every transaction, so its balance enters the state root and every node
@@ -941,28 +941,37 @@ The production image runs as a non-root user (UID 1101). The binary is installed
 
 ### Docker Compose
 
-The repository includes a compose file at `etc/compose.yaml` that runs a 4-validator local network. It orchestrates setup, genesis, and node containers on a bridge network (`10.10.0.0/16`).
+The repository includes a compose file at `etc/compose.yaml` that runs a 4-validator local network in the mainnet topology, on a bridge network (`10.10.0.0/16`).
+One-shot services generate each node's keys and the genesis; then the four validators and an observer start, each validator behind its own `worker-gateway`, and a `node-record-api` serves the validators' node records.
 
-Key environment variables for containerized deployment:
+Environment variables the compose services read (the setup services run `etc/setup_validator.sh`, the genesis service `etc/genesis.sh`):
 
-| Variable                     | Example                             | Purpose                           |
-| ---------------------------- | ----------------------------------- | --------------------------------- |
-| `PRIMARY_LISTENER_MULTIADDR` | `/ip4/10.10.0.21/udp/49590/quic-v1` | QUIC endpoint for primary network |
-| `WORKER_LISTENER_MULTIADDR`  | `/ip4/10.10.0.21/udp/49595/quic-v1` | QUIC endpoint for worker network  |
-| `EXECUTION_ADDRESS`          | `0x1111...`                         | Fee recipient                     |
-| `TN_BLS_PASSPHRASE`          | (secret)                            | BLS key passphrase                |
-| `RUST_LOG`                   | `info`                              | Log level                         |
+| Variable                     | Example                             | Purpose                                                                         |
+| ---------------------------- | ----------------------------------- | ------------------------------------------------------------------------------- |
+| `NODE_TYPE`                  | `observer`                          | `validator` (the default) or `observer`, passed to `keytool generate`           |
+| `PRIMARY_LISTENER_MULTIADDR` | `/ip4/10.10.0.21/udp/49590/quic-v1` | QUIC endpoint for primary network                                               |
+| `WORKER_LISTENER_MULTIADDR`  | `/ip4/10.10.0.21/udp/49595/quic-v1` | QUIC endpoint for worker network                                                |
+| `EXECUTION_ADDRESS`          | `0x1111...`                         | Fee recipient                                                                   |
+| `RPC_HTTP`                   | `http://10.10.0.41:8545/`           | RPC URL the node advertises (`keytool generate --rpc-http`), with new keys only |
+| `TN_BLS_PASSPHRASE`          | (secret)                            | BLS key passphrase                                                              |
+| `TN_DEV_FUNDED_ACCOUNT`      | `0x...`                             | Account the genesis funds, with a new genesis only                              |
+| `RUST_LOG`                   | `info`                              | Log level                                                                       |
 
-Running:
+Running, from the repository root:
 
 ```bash
-cd etc
-docker compose up
+make up     # start; a second run keeps the existing genesis and chain
+make down   # remove the containers and their volumes
 ```
 
-Validators are accessible on host ports 8545-8542 (mapped from container port 8545).
+Clients reach the validators through the gateways on host ports 8545-8542: a gateway sends transaction submissions to its validator and every other call to the observer.
+Each validator's own RPC is a debug port on host loopback (`127.0.0.1:18545` to `127.0.0.1:18542`), and the observer's RPC is on `127.0.0.1:8541`.
+Each validator advertises its gateway's bridge address (`RPC_HTTP`), and `genesis.sh` sets `allow_private_forward_targets: true` in the observer's own `parameters.yaml`, so a transaction sent to the observer is forwarded through a gateway.
+That setting is for this local bridge network only: never copy it into a real node's `parameters.yaml` (see [`allow_private_forward_targets`](#allow_private_forward_targets)).
 
-Health and metrics bind each validator's compose-network address (`10.10.0.2N:8080`, `10.10.0.2N:9101`) and are not published to the host. `compose.observability.yaml` adds a Prometheus scraper on that network; see [Private observability listeners](../../docs/src/getting-started/observability-listeners.md).
+Health and metrics bind each container's compose-network address (`10.10.0.x:8080` on the nodes, `10.10.0.x:9101` on every node, gateway and `node-record-api`) and are not published to the host.
+The compose `observability` profile scrapes them; see [Private observability listeners](../../docs/src/getting-started/observability-listeners.md).
+`etc/README.md` lists every endpoint, the routing a client sees through a gateway, and how to check the gateway path.
 
 ## Staking registration
 

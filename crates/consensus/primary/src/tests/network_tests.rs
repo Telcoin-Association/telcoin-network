@@ -221,6 +221,34 @@ fn test_get_bounds_rejects_decompression_bomb() {
 
 #[test]
 // for primary::network::message
+fn test_get_bounds_rejects_run_encoded_skip_rounds() {
+    // GHSA-2x6m-43m8-h548: roaring 0.10 expands each run into an array or bitmap store, so a
+    // run-encoded bitmap is rejected even when its container count and cardinality are in bounds.
+    // Honest nodes write the same rounds with the no-run cookie, which is accepted.
+    let request = |serialized: Vec<u8>| MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+    };
+
+    let mut honest = Vec::new();
+    (0..10_u32).collect::<RoaringBitmap>().serialize_into(&mut honest).expect("serialize");
+    assert!(request(honest).get_bounds(1_000, 4).is_ok());
+
+    // 1 container, flagged as a run container, holding 1 run of the rounds 0..=9.
+    const RUN_COOKIE: u32 = 12347;
+    let mut run_encoded = RUN_COOKIE.to_le_bytes().to_vec();
+    run_encoded.push(0b1);
+    run_encoded.extend_from_slice(&[0, 0, 9, 0]);
+    run_encoded.extend_from_slice(&[1, 0, 0, 0, 9, 0]);
+    assert_matches!(
+        request(run_encoded).get_bounds(1_000, 4),
+        Err(PrimaryNetworkError::InvalidRequest(_))
+    );
+}
+
+#[test]
+// for primary::network::message
 fn test_get_bounds_rejects_oversized_cardinality() {
     // A well-formed bitmap whose cardinality exceeds the limit is rejected before the
     // `O(cardinality)` collect, even though it occupies a single cheap container.

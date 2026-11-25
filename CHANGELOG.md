@@ -3,6 +3,122 @@
 Generated from commit messages by git-cliff when a release is cut (`make release-prep`); sections are never edited by hand.
 
 <!-- ANCHOR: releases -->
+## [v0.18.0-adiri] - 2026-11-24
+<!-- release-base: 8af2577489d4a220ce51693e77e466a001caf4d4 -->
+### Features
+- Runtime switch list, node switches line and bench observability ([#1862](https://github.com/Telcoin-Association/telcoin-network/pull/1862))
+- **config**: Bundled bootstrap servers per named chain ([#1848](https://github.com/Telcoin-Association/telcoin-network/pull/1848))
+### Bug fixes
+- **release**: Start the CHANGELOG section after a final release tagged on a branch ([#1897](https://github.com/Telcoin-Association/telcoin-network/pull/1897))
+- **deps**: Bump url to 2.5.9 for RUSTSEC-2026-0592 ([#1890](https://github.com/Telcoin-Association/telcoin-network/pull/1890))
+- **types**: Reject roaring run-container bitmaps on decode
+- **primary**: Skip cert-manager path on inactive CVV ([#1516](https://github.com/Telcoin-Association/telcoin-network/pull/1516)) ([#1547](https://github.com/Telcoin-Association/telcoin-network/pull/1547))
+- **deps**: Move the QUIC/libp2p stack past today's RustSec advisories; dependabot action pins ([#1847](https://github.com/Telcoin-Association/telcoin-network/pull/1847))
+- **primary**: Verify fetched certificates before handing them on, and keep checked copies ([#1846](https://github.com/Telcoin-Association/telcoin-network/pull/1846))
+- **primary**: Keep this node's cast vote cached across other decisions about its author ([#1844](https://github.com/Telcoin-Association/telcoin-network/pull/1844))
+- **primary**: Follow-ups to #1822: pending attached parents, duplicate parent verification, cancelled vote requests ([#1842](https://github.com/Telcoin-Association/telcoin-network/pull/1842))
+- **primary**: Recast a stored vote under the author lock and keep it cached ([#1839](https://github.com/Telcoin-Association/telcoin-network/pull/1839))
+- **primary**: Record every author that cites a missing parent, not only the first ([#1822](https://github.com/Telcoin-Association/telcoin-network/pull/1822))
+- Address the review notes on the benchmark observability stack (#1811-#1821) ([#1827](https://github.com/Telcoin-Association/telcoin-network/pull/1827))
+- **node**: Restart replay anchors adiri block 1 on itself instead of the default header ([#1790](https://github.com/Telcoin-Association/telcoin-network/pull/1790)) ([#1808](https://github.com/Telcoin-Association/telcoin-network/pull/1808))
+- **primary**: Budget public-tier sync holds on the opening read and every serve class
+### Tests
+- **e2e**: Keep node 2 in the process guard for all of do_restarts phase 1 ([#1837](https://github.com/Telcoin-Association/telcoin-network/pull/1837)) ([#1840](https://github.com/Telcoin-Association/telcoin-network/pull/1840))
+- Cut fixed real-time waits from the slowest unit tests ([#1833](https://github.com/Telcoin-Association/telcoin-network/pull/1833)) ([#1838](https://github.com/Telcoin-Association/telcoin-network/pull/1838))
+### Build, CI and chores
+- Bump taiki-e/install-action ([#1878](https://github.com/Telcoin-Association/telcoin-network/pull/1878))
+### Batched merges
+- Staging/mavenrain 2026 11 11 ([#1843](https://github.com/Telcoin-Association/telcoin-network/pull/1843))
+  - fix(primary): record every author that cites a missing parent, not only the first ([#1822](https://github.com/Telcoin-Association/telcoin-network/pull/1822))
+  - test: cut fixed real-time waits from the slowest unit tests ([#1833](https://github.com/Telcoin-Association/telcoin-network/pull/1833)) ([#1838](https://github.com/Telcoin-Association/telcoin-network/pull/1838))
+  - fix(network): verify certificate gossip before gossipsub Accept and bound in-flight verification per peer ([#1779](https://github.com/Telcoin-Association/telcoin-network/pull/1779))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751)) ([#1753](https://github.com/Telcoin-Association/telcoin-network/pull/1753))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751))
+  - fix(worker): cheap-first batch validation, rejected-digest set and per-peer report cap ([#1778](https://github.com/Telcoin-Association/telcoin-network/pull/1778))
+  - fix(primary): bound ConsensusResult signers to the committee window and let certified records clear a pinned tip ([#1771](https://github.com/Telcoin-Association/telcoin-network/pull/1771)) ([#1775](https://github.com/Telcoin-Association/telcoin-network/pull/1775))
+  - fix(primary): cool down forging authors, skip known certificates ([#1772](https://github.com/Telcoin-Association/telcoin-network/pull/1772))
+  - fix(worker): remember stalling batch-sync peers and cap each peer's share of a request ([#1777](https://github.com/Telcoin-Association/telcoin-network/pull/1777))
+  - primary: hold only epoch votes in the event queue gap, capped per author ([#1786](https://github.com/Telcoin-Association/telcoin-network/pull/1786))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751)) ([#1753](https://github.com/Telcoin-Association/telcoin-network/pull/1753))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751))
+  - fix(worker): cheap-first batch validation, rejected-digest set and per-peer report cap ([#1778](https://github.com/Telcoin-Association/telcoin-network/pull/1778))
+  - fix(primary): bound ConsensusResult signers to the committee window and let certified records clear a pinned tip ([#1771](https://github.com/Telcoin-Association/telcoin-network/pull/1771)) ([#1775](https://github.com/Telcoin-Association/telcoin-network/pull/1775))
+  - fix(primary): strike only on own delivery, ignore earlier-epoch certificates ([#1772](https://github.com/Telcoin-Association/telcoin-network/pull/1772))
+  - fix(primary,storage): close the preferred sync server rate gate gaps ([#1789](https://github.com/Telcoin-Association/telcoin-network/pull/1789))
+  - fix(primary): drop previous-epoch consensus results until the epoch record is certified ([#1796](https://github.com/Telcoin-Association/telcoin-network/pull/1796)) ([#1823](https://github.com/Telcoin-Association/telcoin-network/pull/1823))
+  - fix(worker): keep completed signer recoveries and refuse known bad signatures ([#1810](https://github.com/Telcoin-Association/telcoin-network/pull/1810))
+  - test: cut fixed real-time waits from the slowest unit tests ([#1833](https://github.com/Telcoin-Association/telcoin-network/pull/1833))
+  - fix(primary): recast a stored vote under the author lock and keep it cached ([#1839](https://github.com/Telcoin-Association/telcoin-network/pull/1839))
+  - test(e2e): keep node 2 in the process guard for all of do_restarts phase 1 ([#1837](https://github.com/Telcoin-Association/telcoin-network/pull/1837)) ([#1840](https://github.com/Telcoin-Association/telcoin-network/pull/1840))
+  - fix(primary): follow-ups to #1822: pending attached parents, duplicate parent verification, cancelled vote requests ([#1842](https://github.com/Telcoin-Association/telcoin-network/pull/1842))
+  - fix(primary): keep this node's cast vote cached across other decisions about its author ([#1844](https://github.com/Telcoin-Association/telcoin-network/pull/1844))
+  - fix(primary): verify fetched certificates before handing them on, and keep checked copies ([#1846](https://github.com/Telcoin-Association/telcoin-network/pull/1846))
+- Staging/mavenrain 2026 11 09 ([#1841](https://github.com/Telcoin-Association/telcoin-network/pull/1841))
+  - fix(network): verify certificate gossip before gossipsub Accept and bound in-flight verification per peer ([#1779](https://github.com/Telcoin-Association/telcoin-network/pull/1779))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751)) ([#1753](https://github.com/Telcoin-Association/telcoin-network/pull/1753))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751))
+  - fix(worker): cheap-first batch validation, rejected-digest set and per-peer report cap ([#1778](https://github.com/Telcoin-Association/telcoin-network/pull/1778))
+  - fix(primary): bound ConsensusResult signers to the committee window and let certified records clear a pinned tip ([#1771](https://github.com/Telcoin-Association/telcoin-network/pull/1771)) ([#1775](https://github.com/Telcoin-Association/telcoin-network/pull/1775))
+  - fix(primary): cool down forging authors, skip known certificates ([#1772](https://github.com/Telcoin-Association/telcoin-network/pull/1772))
+  - fix(worker): remember stalling batch-sync peers and cap each peer's share of a request ([#1777](https://github.com/Telcoin-Association/telcoin-network/pull/1777))
+  - primary: hold only epoch votes in the event queue gap, capped per author ([#1786](https://github.com/Telcoin-Association/telcoin-network/pull/1786))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751)) ([#1753](https://github.com/Telcoin-Association/telcoin-network/pull/1753))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751))
+  - fix(worker): cheap-first batch validation, rejected-digest set and per-peer report cap ([#1778](https://github.com/Telcoin-Association/telcoin-network/pull/1778))
+  - fix(primary): bound ConsensusResult signers to the committee window and let certified records clear a pinned tip ([#1771](https://github.com/Telcoin-Association/telcoin-network/pull/1771)) ([#1775](https://github.com/Telcoin-Association/telcoin-network/pull/1775))
+  - fix(primary): strike only on own delivery, ignore earlier-epoch certificates ([#1772](https://github.com/Telcoin-Association/telcoin-network/pull/1772))
+  - fix(primary,storage): close the preferred sync server rate gate gaps ([#1789](https://github.com/Telcoin-Association/telcoin-network/pull/1789))
+  - fix(primary): drop previous-epoch consensus results until the epoch record is certified ([#1796](https://github.com/Telcoin-Association/telcoin-network/pull/1796)) ([#1823](https://github.com/Telcoin-Association/telcoin-network/pull/1823))
+  - fix(worker): keep completed signer recoveries and refuse known bad signatures ([#1810](https://github.com/Telcoin-Association/telcoin-network/pull/1810))
+  - test(e2e): finish() on the success path of the three state export/import tests ([#1831](https://github.com/Telcoin-Association/telcoin-network/pull/1831)) ([#1832](https://github.com/Telcoin-Association/telcoin-network/pull/1832))
+  - test(e2e): finish() after the last assert in seven tests that stopped nodes gracefully ([#1828](https://github.com/Telcoin-Association/telcoin-network/pull/1828)) ([#1830](https://github.com/Telcoin-Association/telcoin-network/pull/1830))
+  - fix(worker): bound the uncommitted reported batches each committee reporter can store ([#1794](https://github.com/Telcoin-Association/telcoin-network/pull/1794)) ([#1815](https://github.com/Telcoin-Association/telcoin-network/pull/1815))
+  - fix(worker): bound the uncommitted reported batches each committee reporter can store ([#1794](https://github.com/Telcoin-Association/telcoin-network/pull/1794))
+  - fix(worker): cover ReporterOverQuota in the sync serve outcome match ([#1794](https://github.com/Telcoin-Association/telcoin-network/pull/1794))
+  - fix(worker): box the reporter key in ReporterOverQuota to keep the error enum small ([#1794](https://github.com/Telcoin-Association/telcoin-network/pull/1794))
+  - fix(worker): box the reporter key in the ReporterOverQuota unit test ([#1794](https://github.com/Telcoin-Association/telcoin-network/pull/1794))
+  - fix(worker): count stored batches node-wide and age them out ([#1794](https://github.com/Telcoin-Association/telcoin-network/pull/1794))
+- Staging/mavenrain 2026 11 06 ([#1809](https://github.com/Telcoin-Association/telcoin-network/pull/1809))
+  - fix(worker): remember stalling batch-sync peers and cap each peer's share of a request ([#1777](https://github.com/Telcoin-Association/telcoin-network/pull/1777))
+  - primary: hold only epoch votes in the event queue gap, capped per author ([#1786](https://github.com/Telcoin-Association/telcoin-network/pull/1786))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751)) ([#1753](https://github.com/Telcoin-Association/telcoin-network/pull/1753))
+  - fix(node-record): require the network key to co-sign the node record ([#1751](https://github.com/Telcoin-Association/telcoin-network/pull/1751))
+  - fix(worker): cheap-first batch validation, rejected-digest set and per-peer report cap ([#1778](https://github.com/Telcoin-Association/telcoin-network/pull/1778))
+  - fix(primary): bound ConsensusResult signers to the committee window and let certified records clear a pinned tip ([#1771](https://github.com/Telcoin-Association/telcoin-network/pull/1771)) ([#1775](https://github.com/Telcoin-Association/telcoin-network/pull/1775))
+  - fix(primary,storage): close the preferred sync server rate gate gaps ([#1789](https://github.com/Telcoin-Association/telcoin-network/pull/1789))
+### Merged from private forks
+- Merge commit from fork
+  - fix(types): reject roaring run-container bitmaps on decode
+- Merge commit from fork
+  - fix(primary): mark a late sync Busy as failed and rank busy peers
+  - test(primary): pass the busy set at the remaining order_probe_peers calls
+  - fix(primary): mark a sync peer that closes, resets or rejects late
+  - fix(primary): rank a late sync Busy with the marked peers instead of failing it
+  - fix(primary): write a refused sync stream's deny before its late-opening charge
+- Merge commit from fork
+  - GHSA-h352-9822-hjqg: two identities that cost nothing could cut a
+- Merge commit from fork
+  - fix(network): reserve established connections for privileged peers
+  - fix(network): scale the privileged connection reserve with the swarm total
+  - network-budget: accept the public share denial labels
+- Merge commit from fork
+  - fix(primary): budget public-tier sync holds on the opening read and every serve class
+### Other
+- Worker gateway for production: signed edge releases, keys from tn-release-signing, honest connection closes behind a reverse proxy ([#1879](https://github.com/Telcoin-Association/telcoin-network/pull/1879))
+- `db` commands: fixes from the review of #1871 (load-state, import-epoch, validate, repair, reset-execution ([#1876](https://github.com/Telcoin-Association/telcoin-network/pull/1876))
+- Small fixes: a flaky vendored RPC test, db validate's newest epoch, test-only deps, the multi-leaf differential seed ([#1875](https://github.com/Telcoin-Association/telcoin-network/pull/1875))
+- `telcoin-network db`: import-epoch, load-state --verify-only, validate --epoch/--all ([#1871](https://github.com/Telcoin-Association/telcoin-network/pull/1871))
+- Update tn-contracts for mainnet ([#1872](https://github.com/Telcoin-Association/telcoin-network/pull/1872))
+- Freeze-window fixes: clean stops, pack-damage tooling, getLogs over pointer rows, QUIC dials, v2 genesis resume ([#1861](https://github.com/Telcoin-Association/telcoin-network/pull/1861))
+- Storage and RPC: tighter resource bounds ([#1859](https://github.com/Telcoin-Association/telcoin-network/pull/1859))
+- Store each transaction once: Transactions rows point into the consensus pack (new datadirs) ([#1855](https://github.com/Telcoin-Association/telcoin-network/pull/1855))
+- Storage v2 follow-ups: crash windows, static-file and engine hardening, RPC bounds, operator doc ([#1849](https://github.com/Telcoin-Association/telcoin-network/pull/1849))
+- Storage v2: tn-lmdb by default, layout v2 without RocksDB, static-file checksums, execution cache, parallel storage roots ([#1834](https://github.com/Telcoin-Association/telcoin-network/pull/1834))
+- Mainnet chain id 731 guards: faucet refusal and --allow-faucet-on-chain, build features in --version and at startup, cleartext BLS key refusal ([#1716](https://github.com/Telcoin-Association/telcoin-network/pull/1716))
+- TN-owned storage engine for the reth execution database (behind the `tndb-b` feature) ([#1759](https://github.com/Telcoin-Association/telcoin-network/pull/1759))
+- Primary sync: lazy open, Deny(Busy), per-node hold books (review round 2)
+- Arm the sub-second timestamp fork at adiri epoch 747 ([#1791](https://github.com/Telcoin-Association/telcoin-network/pull/1791))
+
 ## [v0.16.0-adiri] - 2026-10-08
 ### Features
 - **rpc**: Make tn selectable and document every namespace ([#1593](https://github.com/Telcoin-Association/telcoin-network/pull/1593))
