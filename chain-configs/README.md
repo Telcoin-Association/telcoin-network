@@ -86,6 +86,7 @@ The final mainnet data is installed in this order, in one commit:
    Replace the arguments and keep the constants, which the final-data gate refuses to find in the genesis.
    Check the remaining arguments at the same time: the stake and minimum withdrawal stay on the CLI defaults, and the epoch duration, the epoch issuance, the Issuance contract's balance (`--issuance-balance`) and worker 0's fee config (`--worker-fee-config`) come from constants in the same file.
    These four are decided: 6-hour epochs, 136,986 TEL for each epoch, 200,000,000 TEL on the Issuance contract, and one worker with the EIP-1559 fee strategy and a gas target of 1,000,000 gas.
+   The header and batch delays are literals in the same argument list (`--max-header-delay-ms 1000`, `--min-header-delay-ms 350`, `--max-batch-delay-ms 250`), and the regeneration writes them to `parameters.yaml`.
 4. Fill `mainnet/bootstrap_servers.yaml` with the real bootstrap servers, the nodes that answer a new node's first contact, which need not be validators.
    Each entry lists the server's BLS key, its primary and worker addresses, and the `/p2p/<peer id>` of its network key.
    Every address must be a public IP address, not a DNS name, which the node does not resolve.

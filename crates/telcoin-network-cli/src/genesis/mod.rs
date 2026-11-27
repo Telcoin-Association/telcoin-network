@@ -1038,7 +1038,10 @@ mod tests {
     ///   `--issuance-balance`), the pot the epoch rewards are paid from;
     /// - worker 0 fee config `0:0:1000000` (`--worker-fee-config`): the EIP-1559 strategy with a
     ///   gas target of [`MAINNET_WORKER_GAS_TARGET`] (1,000,000 gas), and no other worker;
-    /// - 1s max/min header delays, preserving the committed parameters.yaml.
+    /// - a 1,000 ms max header delay, a 350 ms min header delay and a 250 ms max batch delay, which
+    ///   the regeneration writes into parameters.yaml (`max_header_delay`, `min_header_delay`,
+    ///   `max_batch_delay`). These are the values the benchmark fleet runs, with an idle round of
+    ///   353 ms.
     ///
     /// The test mints no keys, so two runs over the same validator files differ only in the
     /// genesis timestamp, which the ceremony takes from the wall clock. Until the collected
@@ -1094,7 +1097,9 @@ mod tests {
             "--max-header-delay-ms",
             "1000",
             "--min-header-delay-ms",
-            "1000",
+            "350",
+            "--max-batch-delay-ms",
+            "250",
         ]);
         ceremony.args.execute(shared.clone()).expect("mainnet genesis ceremony");
 
