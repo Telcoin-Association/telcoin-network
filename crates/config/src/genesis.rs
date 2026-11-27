@@ -8,6 +8,7 @@ use std::{
     fs,
     num::NonZeroUsize,
     path::Path,
+    sync::LazyLock,
 };
 use tn_types::{
     address, forks::multi_workers_fork_active, test_genesis, verify_proof_of_possession_bls,
@@ -35,6 +36,13 @@ pub const ERC1967PROXY_JSON: &str =
 /// The path to the configuration yaml for genesis accounts (tn-contracts submodule).
 pub const GENESIS_ACCOUNT_STATE_YAML: &str =
     include_str!("../../../tn-contracts/deployments/genesis/precompile-config.yaml");
+/// The genesis validator Safe addresses in validator order (tn-contracts submodule).
+///
+/// The tn-contracts genesis generator writes this list together with
+/// [`GENESIS_ACCOUNT_STATE_YAML`], which etches the same Safes into the genesis state. Read it
+/// through [`genesis_validator_safes`].
+pub const GENESIS_VALIDATOR_SAFES_YAML: &str =
+    include_str!("../../../tn-contracts/deployments/genesis/validator-safes.yaml");
 /// The default governance safe address.
 pub const GOVERNANCE_SAFE_ADDRESS: Address = address!("00000000000000000000000000000000000007a0");
 /// The default issuance address.
@@ -304,6 +312,25 @@ impl Default for NodeInfo {
     }
 }
 
+/// Returns the genesis validator Safe addresses in validator order: entry `N` is the Safe that
+/// genesis validator `N` stakes under.
+///
+/// The list serves the mainnet genesis tooling and the tests that hold the committed mainnet
+/// genesis to its validator Safes; the node does not read it at runtime. It is parsed from
+/// [`GENESIS_VALIDATOR_SAFES_YAML`] once per process.
+///
+/// # Panics
+///
+/// Panics if the embedded yaml is not a list of addresses. The file is compiled in, so the unit
+/// tests of this module catch a malformed list before a binary ships.
+pub fn genesis_validator_safes() -> Vec<Address> {
+    static SAFES: LazyLock<Vec<Address>> = LazyLock::new(|| {
+        serde_yaml::from_str(GENESIS_VALIDATOR_SAFES_YAML)
+            .expect("embedded validator-safes.yaml is a list of addresses")
+    });
+    SAFES.clone()
+}
+
 /// Fetch a file with a path relative to the CARGO MANIFEST dir and return it as a string.
 ///
 /// Note this will ONLY work in tests or during builds, otherwise the required env variable
@@ -319,13 +346,31 @@ pub fn fetch_file_content_relative_to_manifest<P: AsRef<Path>>(relative_path: P)
 
 #[cfg(test)]
 mod tests {
-    use super::NetworkGenesis;
+    use super::{
+        genesis_validator_safes, NetworkGenesis, GENESIS_VALIDATOR_SAFES_YAML,
+        GOVERNANCE_SAFE_ADDRESS,
+    };
     use crate::NodeInfo;
     use rand::{rngs::StdRng, SeedableRng};
+    use std::collections::{BTreeMap, BTreeSet};
     use tn_types::{
-        generate_proof_of_possession_bls_for_test, Address, BlsKeypair, Multiaddr, NetworkKeypair,
-        NodeP2pInfo,
+        address, generate_proof_of_possession_bls_for_test, Address, BlsKeypair, Multiaddr,
+        NetworkKeypair, NodeP2pInfo,
     };
+
+    /// The addresses assigned to the ten genesis validator Safes, in validator order.
+    const ASSIGNED_VALIDATOR_SAFES: [Address; 10] = [
+        address!("000000000000000000000000000007310005eed0"),
+        address!("000000000000000000000000000007310005eed1"),
+        address!("000000000000000000000000000007310005eed2"),
+        address!("000000000000000000000000000007310005eed3"),
+        address!("000000000000000000000000000007310005eed4"),
+        address!("000000000000000000000000000007310005eed5"),
+        address!("000000000000000000000000000007310005eed6"),
+        address!("000000000000000000000000000007310005eed7"),
+        address!("000000000000000000000000000007310005eed8"),
+        address!("000000000000000000000000000007310005eed9"),
+    ];
 
     #[test]
     fn test_validate_genesis() {
@@ -491,5 +536,52 @@ mod tests {
         let err = network_genesis.validate().expect_err("mismatched worker counts must fail");
         assert!(err.to_string().contains("same number of workers"), "{err}");
         assert!(network_genesis.create_committee().is_err());
+    }
+
+    /// The embedded validator-Safe list parses; a malformed file fails here as a parse error
+    /// rather than as the accessor's panic.
+    #[test]
+    fn embedded_validator_safes_yaml_parses() -> Result<(), serde_yaml::Error> {
+        let safes: Vec<Address> = serde_yaml::from_str(GENESIS_VALIDATOR_SAFES_YAML)?;
+        assert!(!safes.is_empty(), "validator-safes.yaml lists no Safe");
+        Ok(())
+    }
+
+    /// The list holds exactly the ten assigned Safe addresses, in validator order.
+    #[test]
+    fn genesis_validator_safes_are_the_ten_assigned_addresses_in_order() {
+        let safes = genesis_validator_safes();
+        assert_eq!(safes.len(), 10);
+        assert_eq!(safes, ASSIGNED_VALIDATOR_SAFES);
+    }
+
+    /// No two validators share a Safe.
+    #[test]
+    fn genesis_validator_safes_are_distinct() {
+        let safes = genesis_validator_safes();
+        let distinct: BTreeSet<&Address> = safes.iter().collect();
+        assert_eq!(distinct.len(), safes.len(), "a Safe is listed twice: {safes:?}");
+    }
+
+    /// The governance Safe is never a validator's Safe.
+    #[test]
+    fn genesis_validator_safes_exclude_the_governance_safe() {
+        assert!(!genesis_validator_safes().contains(&GOVERNANCE_SAFE_ADDRESS));
+    }
+
+    /// Every listed Safe is an account with code in the precompile config, so the two files the
+    /// tn-contracts generator writes agree.
+    #[test]
+    fn genesis_validator_safes_are_etched_by_the_precompile_config() -> eyre::Result<()> {
+        let accounts: BTreeMap<Address, _> =
+            NetworkGenesis::fetch_precompile_genesis_accounts()?.into_iter().collect();
+        for safe in genesis_validator_safes() {
+            let code = accounts.get(&safe).and_then(|account| account.code.as_ref());
+            assert!(
+                code.is_some_and(|code| !code.is_empty()),
+                "validator Safe {safe} has no code in precompile-config.yaml"
+            );
+        }
+        Ok(())
     }
 }

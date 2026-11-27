@@ -648,12 +648,16 @@ pub fn parse_bootstrap_servers(
 mod test {
     use super::Parameters;
     use crate::{
-        Config, ConfigFmt, ConfigTrait as _, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS,
+        genesis_validator_safes, Config, ConfigFmt, ConfigTrait as _, NetworkGenesis,
+        CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS,
     };
-    use std::time::Duration;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        time::Duration,
+    };
     use tn_types::{
-        address, Address, Bytes, Committee, Genesis, MAINNET_COMMITTEE, MAINNET_GENESIS,
-        MAINNET_PARAMETERS, TESTNET_PARAMETERS,
+        address, keccak256, Address, Bytes, Committee, Genesis, GenesisAccount, B256,
+        MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_PARAMETERS, TESTNET_PARAMETERS, U256,
     };
 
     /// The fixed mainnet deployment address of the `ConsensusRegistry` system contract.
@@ -678,7 +682,8 @@ mod test {
     /// `<datadir>/genesis/committee.yaml`, which the epoch manager later reads back via
     /// `Config::load_from_path::<Committee>` (crates/node/src/manager/node.rs). This gate
     /// drives all three files through exactly those paths, so a schema-stale committed file
-    /// fails here instead of at node startup.
+    /// fails here instead of at node startup. It also checks that the committee seats exactly
+    /// one validator under each genesis validator Safe.
     #[test]
     fn mainnet_chain_configs_load_via_the_node_paths() {
         let _genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
@@ -699,10 +704,17 @@ mod test {
                      (issue #1063) - {REGENERATION_LEVER}: {e}"
                 )
             });
+        // the ceremony keys authorities by BLS key, so compare the stake addresses as a set
+        let stake_addresses: std::collections::BTreeSet<Address> =
+            committee.authorities().iter().map(|authority| authority.execution_address()).collect();
         assert_eq!(
-            committee.size(),
-            4,
-            "mainnet placeholder committee must seat the 4 placeholder validators"
+            (committee.size(), stake_addresses),
+            (
+                crate::genesis_validator_safes().len(),
+                crate::genesis_validator_safes().into_iter().collect()
+            ),
+            "the mainnet genesis committee must seat one validator under each genesis validator \
+             Safe - {REGENERATION_LEVER}"
         );
     }
 
@@ -813,6 +825,476 @@ mod test {
             "chain-configs/mainnet/genesis.yaml ships an ALL-ZERO EIP712 immutable in the \
              ConsensusRegistry code: the ceremony spliced compile-time bytecode instead of the \
              deployed tmp-chain code (issue #1278) - {REGENERATION_LEVER}"
+        );
+    }
+
+    /// The runtime code of every Safe v1.5.0 proxy, as vendored by tn-contracts.
+    const SAFE_V150_PROXY_RUNTIME: &str = include_str!(
+        "../../../tn-contracts/deployments/genesis/canonical-bytecode/safe-v1.5.0/SafeProxy.hex"
+    );
+
+    /// The canonical Safe v1.5.0 `SafeL2` singleton that each genesis validator Safe proxies to.
+    const SAFE_V150_L2_SINGLETON: Address = address!("Edd160fEBBD92E350D4D398fb636302fccd67C7e");
+
+    /// The canonical Safe v1.5.0 `CompatibilityFallbackHandler` of each genesis validator Safe.
+    const SAFE_V150_FALLBACK_HANDLER: Address =
+        address!("3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4");
+
+    /// The sentinel that heads and ends a Safe's owner and module linked lists.
+    const SAFE_SENTINEL: Address = address!("0000000000000000000000000000000000000001");
+
+    /// Safe storage slot 0, the proxy's singleton (`SafeProxy.singleton`).
+    const SAFE_SINGLETON_SLOT: B256 = B256::ZERO;
+
+    /// Safe storage slot 1, the `ModuleManager.modules` linked list.
+    const SAFE_MODULES_MAPPING_SLOT: u8 = 1;
+
+    /// Safe storage slot 2, the `OwnerManager.owners` linked list.
+    const SAFE_OWNERS_MAPPING_SLOT: u8 = 2;
+
+    /// Safe storage slot 3, the owner count (`OwnerManager.ownerCount`).
+    const SAFE_OWNER_COUNT_SLOT: B256 = B256::with_last_byte(3);
+
+    /// Safe storage slot 4, the signature threshold (`OwnerManager.threshold`).
+    const SAFE_THRESHOLD_SLOT: B256 = B256::with_last_byte(4);
+
+    /// The owners of the mainnet governance Safe in the order of its owner list, as tn-contracts'
+    /// genesis generator sets them (`_setGovernanceSafeConfig` in
+    /// `script/GenerateGenesisPrecompileConfig.s.sol`).
+    const MAINNET_GOVERNANCE_SAFE_OWNERS: [Address; 7] = [
+        address!("2358CF87e62618663E781CE52EE7a7F777aC4e65"),
+        address!("389C4bd707FAb237578A9603F55A02554CAa034b"),
+        address!("DE5346d15Dc5e0D7b3bE7feFF5d96f548c321e88"),
+        address!("B5DfE3a88c77a885362a9616405EAAbb5e0dB280"),
+        address!("DCe4Ef7679E8A81EEE8c71917b21EbbCef45B5BA"),
+        address!("a21B09Ff93A6ffc466F9d2D979fb2268fDaff248"),
+        address!("5b9e70501a845FA8105B2f8228a0d243A98d97Fc"),
+    ];
+
+    /// The signature threshold of the mainnet governance Safe, as tn-contracts' genesis
+    /// generator sets it (see [`MAINNET_GOVERNANCE_SAFE_OWNERS`]).
+    const MAINNET_GOVERNANCE_SAFE_THRESHOLD: usize = 3;
+
+    /// The ten reserve Safes of the mainnet genesis, in order: Safes prefunded for the next ten
+    /// validators that join mainnet, which are not staked at genesis.
+    ///
+    /// tn-contracts' genesis generator puts them at `RESERVE_SAFE_BASE` plus `0` to `9` in
+    /// `script/GenerateGenesisPrecompileConfig.s.sol`. They are not in `validator-safes.yaml`,
+    /// which lists only the genesis validators' Safes, so their addresses are pinned here.
+    const MAINNET_RESERVE_SAFES: [Address; 10] = [
+        address!("000000000000000000000000000007a00005eed0"),
+        address!("000000000000000000000000000007a00005eed1"),
+        address!("000000000000000000000000000007a00005eed2"),
+        address!("000000000000000000000000000007a00005eed3"),
+        address!("000000000000000000000000000007a00005eed4"),
+        address!("000000000000000000000000000007a00005eed5"),
+        address!("000000000000000000000000000007a00005eed6"),
+        address!("000000000000000000000000000007a00005eed7"),
+        address!("000000000000000000000000000007a00005eed8"),
+        address!("000000000000000000000000000007a00005eed9"),
+    ];
+
+    /// `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`, the same in Safe v1.4.1 and v1.5.0.
+    fn safe_fallback_handler_slot() -> B256 {
+        keccak256("fallback_manager.handler.address")
+    }
+
+    /// `GuardManager.GUARD_STORAGE_SLOT`, the transaction guard.
+    fn safe_guard_slot() -> B256 {
+        keccak256("guard_manager.guard.address")
+    }
+
+    /// `ModuleManager.MODULE_GUARD_STORAGE_SLOT`, the module guard Safe v1.5.0 adds.
+    fn safe_module_guard_slot() -> B256 {
+        keccak256("module_manager.module_guard.address")
+    }
+
+    /// The slot of `owners[key]`, the entry of a Safe's owner list that points from `key` to the
+    /// next owner: `keccak256(abi.encode(key, 2))`. The list starts at `owners[SENTINEL_OWNERS]`
+    /// and its last owner points back at the sentinel.
+    fn safe_owners_slot(key: Address) -> B256 {
+        let mut preimage = [0u8; 64];
+        preimage[12..32].copy_from_slice(key.as_slice());
+        preimage[63] = SAFE_OWNERS_MAPPING_SLOT;
+        keccak256(preimage)
+    }
+
+    /// The slot of `modules[SENTINEL_MODULES]`, the head of a Safe's module list:
+    /// `keccak256(abi.encode(SENTINEL_MODULES, 1))`. The list is empty when the head points back
+    /// at the sentinel.
+    fn safe_module_list_head_slot() -> B256 {
+        let mut preimage = [0u8; 64];
+        preimage[12..32].copy_from_slice(SAFE_SENTINEL.as_slice());
+        preimage[63] = SAFE_MODULES_MAPPING_SLOT;
+        keccak256(preimage)
+    }
+
+    /// Each genesis validator Safe in the committed mainnet genesis is a Safe v1.5.0 proxy: the
+    /// vendored proxy runtime over the `SafeL2` singleton, with the v1.5.0
+    /// `CompatibilityFallbackHandler`, no module, no guard, no module guard and no balance.
+    ///
+    /// The genesis validators stake under these Safes. The slots are Safe's own storage layout,
+    /// unchanged from v1.4.1 to v1.5.0 apart from the module guard v1.5.0 adds.
+    #[test]
+    fn mainnet_genesis_validator_safes_are_safe_v150_proxies() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let proxy_runtime: Bytes = SAFE_V150_PROXY_RUNTIME
+            .trim()
+            .parse()
+            .expect("tn-contracts' vendored safe-v1.5.0/SafeProxy.hex must be hex");
+
+        for safe in genesis_validator_safes() {
+            let account = genesis.alloc.get(&safe).unwrap_or_else(|| {
+                panic!(
+                    "chain-configs/mainnet/genesis.yaml has no account for the genesis validator \
+                     Safe {safe} - {REGENERATION_LEVER}"
+                )
+            });
+            let word = |slot: B256| {
+                account.storage.as_ref().and_then(|storage| storage.get(&slot)).copied()
+            };
+            assert_eq!(
+                account.code.as_ref(),
+                Some(&proxy_runtime),
+                "chain-configs/mainnet/genesis.yaml: validator Safe {safe} does not carry the \
+                 Safe v1.5.0 proxy runtime - {REGENERATION_LEVER}"
+            );
+            assert_eq!(
+                word(SAFE_SINGLETON_SLOT),
+                Some(SAFE_V150_L2_SINGLETON.into_word()),
+                "chain-configs/mainnet/genesis.yaml: validator Safe {safe} does not proxy to the \
+                 Safe v1.5.0 SafeL2 singleton {SAFE_V150_L2_SINGLETON} - {REGENERATION_LEVER}"
+            );
+            assert_eq!(
+                word(safe_fallback_handler_slot()),
+                Some(SAFE_V150_FALLBACK_HANDLER.into_word()),
+                "chain-configs/mainnet/genesis.yaml: validator Safe {safe} does not use the Safe \
+                 v1.5.0 CompatibilityFallbackHandler {SAFE_V150_FALLBACK_HANDLER} - \
+                 {REGENERATION_LEVER}"
+            );
+            assert_eq!(
+                word(safe_module_list_head_slot()),
+                Some(SAFE_SENTINEL.into_word()),
+                "chain-configs/mainnet/genesis.yaml: validator Safe {safe} must have an empty \
+                 module list - {REGENERATION_LEVER}"
+            );
+            assert_eq!(
+                (word(safe_guard_slot()), word(safe_module_guard_slot())),
+                (None, None),
+                "chain-configs/mainnet/genesis.yaml: validator Safe {safe} must set neither a \
+                 guard nor a module guard - {REGENERATION_LEVER}"
+            );
+            assert!(
+                account.balance.is_zero(),
+                "chain-configs/mainnet/genesis.yaml: validator Safe {safe} must hold no balance \
+                 (its stake sits in the ConsensusRegistry) but holds {} wei - {REGENERATION_LEVER}",
+                account.balance
+            );
+        }
+    }
+
+    /// Each genesis validator Safe has the governance Safe's owners, in the same order, its owner
+    /// count and its threshold.
+    ///
+    /// The gate compares storage slot for slot against the governance Safe of the same genesis
+    /// file, so the owner list is never restated here. Every slot must match except the two that
+    /// name a Safe's version, the singleton and the fallback handler: the governance Safe is a
+    /// Safe v1.4.1 and the validator Safes are v1.5.0, which keep the same storage layout.
+    #[test]
+    fn mainnet_genesis_validator_safes_share_the_governance_safe_owners() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let version_slots = [SAFE_SINGLETON_SLOT, safe_fallback_handler_slot()];
+        let owner_storage = |address: &Address| -> BTreeMap<B256, B256> {
+            genesis
+                .alloc
+                .get(address)
+                .and_then(|account| account.storage.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(slot, _)| !version_slots.contains(slot))
+                .collect()
+        };
+
+        let governance = owner_storage(&GOVERNANCE_SAFE_ADDRESS);
+        // an empty governance Safe would let every comparison below pass
+        assert!(
+            governance.get(&SAFE_THRESHOLD_SLOT).is_some_and(|threshold| !threshold.is_zero()),
+            "chain-configs/mainnet/genesis.yaml: the governance Safe {GOVERNANCE_SAFE_ADDRESS} \
+             has no threshold - {REGENERATION_LEVER}"
+        );
+        for safe in genesis_validator_safes() {
+            let validator = owner_storage(&safe);
+            let differing: Vec<B256> = governance
+                .keys()
+                .chain(validator.keys())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|slot| governance.get(*slot) != validator.get(*slot))
+                .copied()
+                .collect();
+            assert!(
+                differing.is_empty(),
+                "chain-configs/mainnet/genesis.yaml: validator Safe {safe} differs from the \
+                 governance Safe {GOVERNANCE_SAFE_ADDRESS} in its owners, owner order, owner \
+                 count or threshold, at slots {differing:?} - {REGENERATION_LEVER}"
+            );
+        }
+    }
+
+    /// The governance Safe of the committed mainnet genesis has the owners
+    /// [`MAINNET_GOVERNANCE_SAFE_OWNERS`], in that order, and the threshold
+    /// [`MAINNET_GOVERNANCE_SAFE_THRESHOLD`].
+    ///
+    /// `mainnet_genesis_validator_safes_share_the_governance_safe_owners` copies these signers to
+    /// the ten validator Safes and `mainnet_genesis_reserve_safes_match_validator_safe_0` to the
+    /// ten reserve Safes, so a change to them in tn-contracts reaches every genesis Safe on the
+    /// next regeneration. The gate walks the owner list from the sentinel, as
+    /// `OwnerManager.getOwners` does, and reads the owner count and threshold slots.
+    #[test]
+    fn mainnet_governance_safe_has_the_pinned_owners_and_threshold() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let storage = genesis
+            .alloc
+            .get(&GOVERNANCE_SAFE_ADDRESS)
+            .and_then(|account| account.storage.clone())
+            .unwrap_or_default();
+        let word = |slot: B256| storage.get(&slot).copied().unwrap_or_default();
+
+        // the walk stops one entry past the pinned length, so a cycle cannot loop forever
+        let mut owners = Vec::new();
+        let mut next = Address::from_word(word(safe_owners_slot(SAFE_SENTINEL)));
+        while next != SAFE_SENTINEL
+            && !next.is_zero()
+            && owners.len() <= MAINNET_GOVERNANCE_SAFE_OWNERS.len()
+        {
+            owners.push(next);
+            next = Address::from_word(word(safe_owners_slot(next)));
+        }
+        let owner_count = U256::from_be_bytes(word(SAFE_OWNER_COUNT_SLOT).0);
+        let threshold = U256::from_be_bytes(word(SAFE_THRESHOLD_SLOT).0);
+        assert_eq!(
+            (owners, next, owner_count, threshold),
+            (
+                MAINNET_GOVERNANCE_SAFE_OWNERS.to_vec(),
+                SAFE_SENTINEL,
+                U256::from(MAINNET_GOVERNANCE_SAFE_OWNERS.len()),
+                U256::from(MAINNET_GOVERNANCE_SAFE_THRESHOLD)
+            ),
+            "chain-configs/mainnet/genesis.yaml: the governance Safe {GOVERNANCE_SAFE_ADDRESS} \
+             (left: owners in list order, the entry that ends the list, owner count, threshold) \
+             differs from the pinned signers (right). A change of signers is deliberate: it \
+             updates this pin together with `_setGovernanceSafeConfig` in tn-contracts' \
+             script/GenerateGenesisPrecompileConfig.s.sol and the regenerated genesis, in one \
+             commit"
+        );
+    }
+
+    /// Each reserve Safe of the committed mainnet genesis has the code and the whole storage of
+    /// genesis validator Safe 0, and none of them is a genesis validator Safe.
+    ///
+    /// Equal storage means the same singleton, fallback handler, owners, owner order and
+    /// threshold, so a reserve Safe is configured exactly like the Safes the genesis validators
+    /// stake under. Each holds 1,000,001 TEL (pinned in [`MAINNET_FUNDED_ACCOUNTS`]): a reserve
+    /// Safe that drifted from that configuration would be a Safe with other owners or another
+    /// singleton holding that balance.
+    #[test]
+    fn mainnet_genesis_reserve_safes_match_validator_safe_0() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let validator_safes = genesis_validator_safes();
+        let validator_safe_0 = validator_safes[0];
+        let config = |address: &Address| {
+            genesis.alloc.get(address).map(|account| (&account.code, &account.storage))
+        };
+        // a validator Safe 0 without code or storage would let reserve Safes without them pass
+        let expected = config(&validator_safe_0);
+        assert!(
+            expected.is_some_and(|(code, storage)| code.is_some() && storage.is_some()),
+            "chain-configs/mainnet/genesis.yaml has no code and storage for the genesis \
+             validator Safe {validator_safe_0} - {REGENERATION_LEVER}"
+        );
+
+        for safe in MAINNET_RESERVE_SAFES {
+            assert!(
+                !validator_safes.contains(&safe),
+                "the reserve Safe {safe} is listed as a genesis validator Safe in tn-contracts' \
+                 validator-safes.yaml"
+            );
+            assert!(
+                config(&safe) == expected,
+                "chain-configs/mainnet/genesis.yaml: the reserve Safe {safe} is missing or differs \
+                 from the genesis validator Safe {validator_safe_0} in code or storage - \
+                 {REGENERATION_LEVER}"
+            );
+        }
+    }
+
+    /// The committed mainnet genesis carries every account of tn-contracts'
+    /// `deployments/genesis/precompile-config.yaml` with identical code, storage, balance and
+    /// nonce.
+    ///
+    /// The ceremony etches these accounts after the system contracts, so a genesis regenerated
+    /// from the current submodule holds each of them unchanged. A genesis left behind by a
+    /// submodule bump, missing accounts the new generator writes or holding their old code,
+    /// storage, balance or nonce, fails here.
+    #[test]
+    fn mainnet_genesis_carries_every_precompile_config_account() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let accounts = NetworkGenesis::fetch_precompile_genesis_accounts()
+            .expect("tn-contracts' precompile-config.yaml must parse");
+        assert!(!accounts.is_empty(), "tn-contracts' precompile-config.yaml lists no account");
+
+        let code = |account: &GenesisAccount| account.code.clone().unwrap_or_default();
+        let storage = |account: &GenesisAccount| account.storage.clone().unwrap_or_default();
+        // an account without a nonce has nonce 0, and the config's nonce is checked only where
+        // the config carries one
+        let nonce_differs = |actual: &GenesisAccount, expected: &GenesisAccount| {
+            expected.nonce.is_some_and(|nonce| actual.nonce.unwrap_or_default() != nonce)
+        };
+        let mut missing = BTreeSet::new();
+        let mut differing = BTreeSet::new();
+        for (address, expected) in &accounts {
+            match genesis.alloc.get(address) {
+                None => {
+                    missing.insert(*address);
+                }
+                Some(actual)
+                    if code(actual) != code(expected)
+                        || storage(actual) != storage(expected)
+                        || actual.balance != expected.balance
+                        || nonce_differs(actual, expected) =>
+                {
+                    differing.insert(*address);
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(
+            missing.is_empty() && differing.is_empty(),
+            "chain-configs/mainnet/genesis.yaml is stale against tn-contracts' \
+             deployments/genesis/precompile-config.yaml: of its {} accounts, {} are missing \
+             {missing:?} and {} differ in code, storage, balance or nonce {differing:?} - \
+             {REGENERATION_LEVER}",
+            accounts.len(),
+            missing.len(),
+            differing.len(),
+        );
+    }
+
+    /// The accounts of the committed mainnet genesis that hold a balance, with their balances in
+    /// whole TEL.
+    ///
+    /// The governance Safe's balance comes from tn-contracts' precompile config, the
+    /// `ConsensusRegistry` holds the ten genesis stakes of 1,000,000 TEL, and
+    /// `0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a` is the placeholder dev-funded account that the
+    /// mainnet regeneration passes.
+    ///
+    /// The balances of the ten [`MAINNET_RESERVE_SAFES`] also come from tn-contracts' precompile
+    /// config (`RESERVE_SAFE_BALANCE`): 1,000,001 TEL each, the 1,000,000 TEL stake of a validator
+    /// that joins after genesis plus 1 TEL for gas.
+    ///
+    /// The Issuance contract ([`ISSUANCE_ADDRESS`]) holds 200,000,000 TEL, which the mainnet
+    /// regeneration passes as `--issuance-balance`. `Issuance.sol` pays the epoch rewards out of
+    /// its own balance, so this is the pot every epoch reward comes from: 1,460 epochs of
+    /// 136,986 TEL, the first twelve months of 6-hour epochs, pay 199,999,560 TEL of it.
+    const MAINNET_FUNDED_ACCOUNTS: [(Address, u64); 14] = [
+        (GOVERNANCE_SAFE_ADDRESS, 10),
+        (CONSENSUS_REGISTRY_ADDRESS, 10_000_000),
+        (ISSUANCE_ADDRESS, 200_000_000),
+        (address!("3DCc9a6f3A71F0A6C8C659c65558321c374E917a"), 1_000_000_000),
+        (MAINNET_RESERVE_SAFES[0], 1_000_001),
+        (MAINNET_RESERVE_SAFES[1], 1_000_001),
+        (MAINNET_RESERVE_SAFES[2], 1_000_001),
+        (MAINNET_RESERVE_SAFES[3], 1_000_001),
+        (MAINNET_RESERVE_SAFES[4], 1_000_001),
+        (MAINNET_RESERVE_SAFES[5], 1_000_001),
+        (MAINNET_RESERVE_SAFES[6], 1_000_001),
+        (MAINNET_RESERVE_SAFES[7], 1_000_001),
+        (MAINNET_RESERVE_SAFES[8], 1_000_001),
+        (MAINNET_RESERVE_SAFES[9], 1_000_001),
+    ];
+
+    /// The accounts of the committed mainnet genesis that hold a balance are exactly
+    /// [`MAINNET_FUNDED_ACCOUNTS`], with exactly those balances.
+    ///
+    /// Every TEL that exists at genesis sits in one of these accounts, so an allocation nobody
+    /// intended, from a precompile-config entry, an `--accounts` file or a changed ceremony
+    /// argument, fails here.
+    #[test]
+    fn mainnet_genesis_funds_only_the_pinned_accounts() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let funded: BTreeMap<Address, U256> = genesis
+            .alloc
+            .iter()
+            .filter(|(_, account)| !account.balance.is_zero())
+            .map(|(address, account)| (*address, account.balance))
+            .collect();
+        let wei_per_tel = U256::from(10).pow(U256::from(18));
+        let pinned: BTreeMap<Address, U256> = MAINNET_FUNDED_ACCOUNTS
+            .iter()
+            .map(|(address, tel)| (*address, U256::from(*tel) * wei_per_tel))
+            .collect();
+        assert_eq!(
+            funded, pinned,
+            "chain-configs/mainnet/genesis.yaml funds the accounts on the left (balances in wei), \
+             not the pinned ones on the right. A change to the genesis allocation is deliberate: \
+             it updates MAINNET_FUNDED_ACCOUNTS together with the regenerated genesis, in one \
+             commit"
+        );
+    }
+
+    /// The `ConsensusRegistry` code of the committed mainnet genesis caches the genesis chain id
+    /// in its EIP-712 immutables.
+    ///
+    /// The registry inherits Solady's `EIP712`, whose constructor caches `block.chainid` in an
+    /// immutable. The ceremony deploys the registry on a temporary chain with the genesis chain
+    /// id, so code that caches another chain id comes from a genesis whose `chainId` was edited
+    /// after its ceremony. The cached address is the temporary deployment's, not the registry's,
+    /// so the registry recomputes its domain separator on every use and the stale value costs
+    /// only gas, but it shows that the genesis was not regenerated. The gate reads the 32-byte
+    /// immutables at the artifact's `deployedBytecode.immutableReferences` sites and requires
+    /// one of them to hold the chain id.
+    #[test]
+    fn mainnet_genesis_registry_code_caches_the_genesis_chain_id() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let artifact: serde_json::Value = serde_json::from_str(CONSENSUS_REGISTRY_JSON)
+            .expect("embedded ConsensusRegistry artifact json must parse");
+        let code = genesis
+            .alloc
+            .get(&CONSENSUS_REGISTRY_ADDRESS)
+            .and_then(|account| account.code.clone())
+            .expect("mainnet genesis must allocate code for the ConsensusRegistry account");
+
+        let immutables: Vec<B256> = artifact
+            .pointer("/deployedBytecode/immutableReferences")
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flat_map(|refs| refs.values())
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter(|site| site.get("length").and_then(serde_json::Value::as_u64) == Some(32))
+            .filter_map(|site| site.get("start").and_then(serde_json::Value::as_u64))
+            .filter_map(|start| usize::try_from(start).ok())
+            .filter_map(|start| code.get(start..start + 32))
+            .map(B256::from_slice)
+            .collect();
+        assert!(
+            !immutables.is_empty(),
+            "the registry artifact must list 32-byte immutable sites (the Solady EIP712 cache)"
+        );
+        let chain_id = B256::from(U256::from(genesis.config.chain_id).to_be_bytes::<32>());
+        assert!(
+            immutables.contains(&chain_id),
+            "chain-configs/mainnet/genesis.yaml: the ConsensusRegistry code caches no chain id {} \
+             among its EIP-712 immutables {immutables:?}, so it was built for another chain id - \
+             {REGENERATION_LEVER}",
+            genesis.config.chain_id
         );
     }
 

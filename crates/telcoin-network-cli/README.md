@@ -250,6 +250,7 @@ telcoin-network genesis \
 | `--min-withdraw-amount`, `--min_withdraw`            | `1000`         | Minimum TEL withdrawal amount                                                             |
 | `--epoch-block-rewards`, `--block_rewards_per_epoch` | `25806`        | Total block rewards per epoch in TEL                                                      |
 | `--epoch-duration-in-secs`, `--epoch_length`         | `28800`        | Epoch duration in seconds (default: 8 hours; mainnet and testnet use `21600`, 6 hours)    |
+| `--issuance-balance`                                 | `0`            | TEL credited to the Issuance contract at genesis, the pot epoch rewards are paid from     |
 | `--max-header-delay-ms`                              | none           | Max delay between header proposals (milliseconds)                                         |
 | `--min-header-delay-ms`                              | none           | Min delay between header proposals (milliseconds)                                         |
 | `--max-batch-delay-ms`                               | none           | Max delay before a worker seals a batch of pending transactions (milliseconds)            |
