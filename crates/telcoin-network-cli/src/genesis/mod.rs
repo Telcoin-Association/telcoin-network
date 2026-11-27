@@ -10,7 +10,7 @@ use secp256k1::{
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, TelcoinDirs as _,
-    GOVERNANCE_SAFE_ADDRESS,
+    GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS,
 };
 use tn_reth::{system_calls::ConsensusRegistry, RethChainSpec, RethEnv};
 use tn_types::{keccak256, set_genesis_defaults, Address, ExecHeader, GenesisAccount, U256};
@@ -94,6 +94,19 @@ pub struct GenesisArgs {
         verbatim_doc_comment
     )]
     pub epoch_duration: u32,
+
+    /// The balance credited to the Issuance contract at genesis, in whole TEL.
+    ///
+    /// Issuance pays epoch rewards out of its own balance, so this is the pot that rewards
+    /// are drawn from. The default of 0 leaves the account unfunded.
+    #[arg(
+        long = "issuance-balance",
+        help_heading = "The TEL credited to the Issuance contract in genesis. The default is 0 TEL.",
+        value_parser = clap_u256_parser_to_18_decimals,
+        default_value = "0",
+        verbatim_doc_comment
+    )]
+    pub issuance_balance: U256,
 
     /// Used to add a funded account (by simple text string).  Use this on a dev cluster
     /// to have an account with a deterministically derived key. This is ONLY for dev
@@ -293,6 +306,13 @@ impl GenesisArgs {
         let precompiles =
             NetworkGenesis::fetch_precompile_genesis_accounts().expect("precompile fetch error");
         let mut updated_genesis = genesis_with_consensus_registry.extend_accounts(precompiles);
+        // Fund the Issuance contract, keeping its code. An `--accounts` file applied below can
+        // still replace this entry.
+        updated_genesis
+            .alloc
+            .get_mut(&ISSUANCE_ADDRESS)
+            .ok_or_else(|| eyre::eyre!("genesis has no Issuance account at {ISSUANCE_ADDRESS}"))?
+            .balance = self.issuance_balance;
         // Changed a default config setting so update and save.
         if let Some(acct_str) = &self.dev_funded_account {
             let addr = crate::genesis::account_from_word(acct_str);
@@ -466,6 +486,39 @@ mod tests {
             })
     }
 
+    /// `--issuance-balance` credits the Issuance account in whole TEL and keeps its code;
+    /// without the flag the account stays unfunded.
+    #[test]
+    fn test_genesis_issuance_balance_funds_issuance_account() -> eyre::Result<()> {
+        let issuance_account = |flags: &[&str]| -> eyre::Result<GenesisAccount> {
+            let (directory, _) = worker_count_ceremony(1, &[])?;
+            let args = CommandParser::<GenesisArgs>::try_parse_from(
+                std::iter::once("tn").chain(flags.iter().copied()),
+            )?
+            .args;
+            let data_dir = directory.path().to_path_buf();
+            args.execute(data_dir.clone())?;
+            let genesis: Genesis =
+                Config::load_from_path(data_dir.genesis_file_path(), ConfigFmt::YAML)?;
+            genesis
+                .alloc
+                .get(&ISSUANCE_ADDRESS)
+                .cloned()
+                .ok_or_else(|| eyre::eyre!("genesis has no Issuance account"))
+        };
+        let unfunded = issuance_account(&[])?;
+        let funded = issuance_account(&["--issuance-balance", "200000000"])?;
+
+        assert_eq!(unfunded.balance, U256::ZERO);
+        assert_eq!(
+            funded.balance,
+            U256::from(200_000_000_u64) * U256::from(10).pow(U256::from(18))
+        );
+        assert!(funded.code.as_ref().is_some_and(|code| !code.is_empty()));
+        assert_eq!(funded.code, unfunded.code);
+        Ok(())
+    }
+
     fn args_with_configs(configs: Vec<&str>) -> GenesisArgs {
         GenesisArgs {
             consensus_registry_owner: Address::ZERO,
@@ -474,6 +527,7 @@ mod tests {
             min_withdrawal: U256::ZERO,
             epoch_rewards: U256::ZERO,
             epoch_duration: 0,
+            issuance_balance: U256::ZERO,
             dev_funded_account: None,
             max_header_delay_ms: None,
             min_header_delay_ms: None,
