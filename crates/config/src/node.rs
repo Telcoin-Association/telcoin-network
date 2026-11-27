@@ -875,6 +875,25 @@ mod test {
     /// generator sets it (see [`MAINNET_GOVERNANCE_SAFE_OWNERS`]).
     const MAINNET_GOVERNANCE_SAFE_THRESHOLD: usize = 3;
 
+    /// The ten reserve Safes of the mainnet genesis, in order: Safes prefunded for the next ten
+    /// validators that join mainnet, which are not staked at genesis.
+    ///
+    /// tn-contracts' genesis generator puts them at `RESERVE_SAFE_BASE` plus `0` to `9` in
+    /// `script/GenerateGenesisPrecompileConfig.s.sol`. They are not in `validator-safes.yaml`,
+    /// which lists only the genesis validators' Safes, so their addresses are pinned here.
+    const MAINNET_RESERVE_SAFES: [Address; 10] = [
+        address!("000000000000000000000000000007a00005eed0"),
+        address!("000000000000000000000000000007a00005eed1"),
+        address!("000000000000000000000000000007a00005eed2"),
+        address!("000000000000000000000000000007a00005eed3"),
+        address!("000000000000000000000000000007a00005eed4"),
+        address!("000000000000000000000000000007a00005eed5"),
+        address!("000000000000000000000000000007a00005eed6"),
+        address!("000000000000000000000000000007a00005eed7"),
+        address!("000000000000000000000000000007a00005eed8"),
+        address!("000000000000000000000000000007a00005eed9"),
+    ];
+
     /// `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`, the same in Safe v1.4.1 and v1.5.0.
     fn safe_fallback_handler_slot() -> B256 {
         keccak256("fallback_manager.handler.address")
@@ -1029,8 +1048,9 @@ mod test {
     /// [`MAINNET_GOVERNANCE_SAFE_THRESHOLD`].
     ///
     /// `mainnet_genesis_validator_safes_share_the_governance_safe_owners` copies these signers to
-    /// the ten validator Safes, so a change to them in tn-contracts reaches every genesis Safe on
-    /// the next regeneration. The gate walks the owner list from the sentinel, as
+    /// the ten validator Safes and `mainnet_genesis_reserve_safes_match_validator_safe_0` to the
+    /// ten reserve Safes, so a change to them in tn-contracts reaches every genesis Safe on the
+    /// next regeneration. The gate walks the owner list from the sentinel, as
     /// `OwnerManager.getOwners` does, and reads the owner count and threshold slots.
     #[test]
     fn mainnet_governance_safe_has_the_pinned_owners_and_threshold() {
@@ -1070,6 +1090,46 @@ mod test {
              script/GenerateGenesisPrecompileConfig.s.sol and the regenerated genesis, in one \
              commit"
         );
+    }
+
+    /// Each reserve Safe of the committed mainnet genesis has the code and the whole storage of
+    /// genesis validator Safe 0, and none of them is a genesis validator Safe.
+    ///
+    /// Equal storage means the same singleton, fallback handler, owners, owner order and
+    /// threshold, so a reserve Safe is configured exactly like the Safes the genesis validators
+    /// stake under. Each holds 1,000,001 TEL (pinned in [`MAINNET_FUNDED_ACCOUNTS`]): a reserve
+    /// Safe that drifted from that configuration would be a Safe with other owners or another
+    /// singleton holding that balance.
+    #[test]
+    fn mainnet_genesis_reserve_safes_match_validator_safe_0() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let validator_safes = genesis_validator_safes();
+        let validator_safe_0 = validator_safes[0];
+        let config = |address: &Address| {
+            genesis.alloc.get(address).map(|account| (&account.code, &account.storage))
+        };
+        // a validator Safe 0 without code or storage would let reserve Safes without them pass
+        let expected = config(&validator_safe_0);
+        assert!(
+            expected.is_some_and(|(code, storage)| code.is_some() && storage.is_some()),
+            "chain-configs/mainnet/genesis.yaml has no code and storage for the genesis \
+             validator Safe {validator_safe_0} - {REGENERATION_LEVER}"
+        );
+
+        for safe in MAINNET_RESERVE_SAFES {
+            assert!(
+                !validator_safes.contains(&safe),
+                "the reserve Safe {safe} is listed as a genesis validator Safe in tn-contracts' \
+                 validator-safes.yaml"
+            );
+            assert!(
+                config(&safe) == expected,
+                "chain-configs/mainnet/genesis.yaml: the reserve Safe {safe} is missing or differs \
+                 from the genesis validator Safe {validator_safe_0} in code or storage - \
+                 {REGENERATION_LEVER}"
+            );
+        }
     }
 
     /// The committed mainnet genesis carries every account of tn-contracts'
@@ -1132,10 +1192,24 @@ mod test {
     /// `ConsensusRegistry` holds the ten genesis stakes of 1,000,000 TEL, and
     /// `0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a` is the placeholder dev-funded account that the
     /// mainnet regeneration passes.
-    const MAINNET_FUNDED_ACCOUNTS: [(Address, u64); 3] = [
+    ///
+    /// The balances of the ten [`MAINNET_RESERVE_SAFES`] also come from tn-contracts' precompile
+    /// config (`RESERVE_SAFE_BALANCE`): 1,000,001 TEL each, the 1,000,000 TEL stake of a validator
+    /// that joins after genesis plus 1 TEL for gas.
+    const MAINNET_FUNDED_ACCOUNTS: [(Address, u64); 13] = [
         (GOVERNANCE_SAFE_ADDRESS, 10),
         (CONSENSUS_REGISTRY_ADDRESS, 10_000_000),
         (address!("3DCc9a6f3A71F0A6C8C659c65558321c374E917a"), 1_000_000_000),
+        (MAINNET_RESERVE_SAFES[0], 1_000_001),
+        (MAINNET_RESERVE_SAFES[1], 1_000_001),
+        (MAINNET_RESERVE_SAFES[2], 1_000_001),
+        (MAINNET_RESERVE_SAFES[3], 1_000_001),
+        (MAINNET_RESERVE_SAFES[4], 1_000_001),
+        (MAINNET_RESERVE_SAFES[5], 1_000_001),
+        (MAINNET_RESERVE_SAFES[6], 1_000_001),
+        (MAINNET_RESERVE_SAFES[7], 1_000_001),
+        (MAINNET_RESERVE_SAFES[8], 1_000_001),
+        (MAINNET_RESERVE_SAFES[9], 1_000_001),
     ];
 
     /// The accounts of the committed mainnet genesis that hold a balance are exactly
