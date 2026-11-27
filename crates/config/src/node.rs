@@ -649,7 +649,7 @@ mod test {
     use super::Parameters;
     use crate::{
         genesis_validator_safes, Config, ConfigFmt, ConfigTrait as _, NetworkGenesis,
-        CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS,
+        CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS,
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -1196,9 +1196,15 @@ mod test {
     /// The balances of the ten [`MAINNET_RESERVE_SAFES`] also come from tn-contracts' precompile
     /// config (`RESERVE_SAFE_BALANCE`): 1,000,001 TEL each, the 1,000,000 TEL stake of a validator
     /// that joins after genesis plus 1 TEL for gas.
-    const MAINNET_FUNDED_ACCOUNTS: [(Address, u64); 13] = [
+    ///
+    /// The Issuance contract ([`ISSUANCE_ADDRESS`]) holds 200,000,000 TEL, which the mainnet
+    /// regeneration passes as `--issuance-balance`. `Issuance.sol` pays the epoch rewards out of
+    /// its own balance, so this is the pot every epoch reward comes from: 1,460 epochs of
+    /// 136,986 TEL, the first twelve months of 6-hour epochs, pay 199,999,560 TEL of it.
+    const MAINNET_FUNDED_ACCOUNTS: [(Address, u64); 14] = [
         (GOVERNANCE_SAFE_ADDRESS, 10),
         (CONSENSUS_REGISTRY_ADDRESS, 10_000_000),
+        (ISSUANCE_ADDRESS, 200_000_000),
         (address!("3DCc9a6f3A71F0A6C8C659c65558321c374E917a"), 1_000_000_000),
         (MAINNET_RESERVE_SAFES[0], 1_000_001),
         (MAINNET_RESERVE_SAFES[1], 1_000_001),

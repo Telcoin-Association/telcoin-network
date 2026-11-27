@@ -160,11 +160,11 @@ pub const MAINNET_BOOTSTRAP_SERVERS: &str =
 /// committed placeholder genesis. The commit that installs the final mainnet genesis replaces
 /// both with the final genesis's values.
 pub const MAINNET_GENESIS_HASH: B256 =
-    b256!("0xc913ad81c4455f0205ed22fd51c9da353a740bb09245edcf7e9d6bf225d3a4b0");
+    b256!("0xb75f2503684722da02d59aba632e86205661d5397379ae37cd74e4ba71d62739");
 
 /// The timestamp, in seconds since the unix epoch, of the embedded mainnet genesis
 /// [`MAINNET_GENESIS`], whose block hash is [`MAINNET_GENESIS_HASH`].
-pub const MAINNET_GENESIS_TIMESTAMP: u64 = 1_795_812_089;
+pub const MAINNET_GENESIS_TIMESTAMP: u64 = 1_795_812_900;
 
 #[cfg(test)]
 mod tests {

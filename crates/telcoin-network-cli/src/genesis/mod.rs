@@ -659,10 +659,26 @@ mod tests {
 
     /// The total reward for one mainnet epoch, in whole TEL.
     ///
-    /// This is the testnet value and the `--epoch-block-rewards` default. It is restated here
-    /// so the ceremony does not depend on the clap default. The registry pays this amount once
-    /// for each epoch, so 6-hour epochs issue 103,224 TEL for each day.
-    const MAINNET_EPOCH_ISSUANCE_TEL: u64 = 25_806;
+    /// Mainnet issues 200,000,000 TEL over its first twelve months. Twelve months of 6-hour
+    /// epochs are 1,460 epochs (365 days of 4 epochs), and 200,000,000 TEL / 1,460 rounds down
+    /// to 136,986 TEL. The 1,460 epochs pay 136,986 x 1,460 = 199,999,560 TEL, 547,944 TEL for
+    /// each day. The registry pays this amount once for each epoch.
+    const MAINNET_EPOCH_ISSUANCE_TEL: u64 = 136_986;
+
+    /// The balance of the Issuance contract at mainnet genesis, in whole TEL.
+    ///
+    /// The Issuance contract pays epoch rewards out of its own balance. 200,000,000 TEL covers
+    /// the 1,460 epochs of the first twelve months at [`MAINNET_EPOCH_ISSUANCE_TEL`], which pay
+    /// 199,999,560 TEL.
+    const MAINNET_ISSUANCE_FUNDING_TEL: u64 = 200_000_000;
+
+    /// The gas target of mainnet worker 0, the only mainnet worker, under the EIP-1559 fee
+    /// strategy (strategy 0 of `--worker-fee-config`).
+    ///
+    /// The value is gas, not TEL. At each epoch close the worker's base fee for the next epoch
+    /// rises if the epoch used more than 1,000,000 gas and falls, down to the protocol minimum,
+    /// if it used less.
+    const MAINNET_WORKER_GAS_TARGET: u64 = 1_000_000;
 
     /// The number of wei in one TEL (18 decimals), the scale `--epoch-block-rewards` applies.
     const WEI_PER_TEL: u64 = 1_000_000_000_000_000_000;
@@ -718,7 +734,7 @@ mod tests {
             "mainnet genesis must encode {MAINNET_EPOCH_DURATION_SECS} s epochs in the registry \
              StakeConfig.epochDuration slot (issue #1512) - {MAINNET_REGENERATION_LEVER}"
         );
-        // 25,806 TEL in wei fits in a U256, so the expected value is always `Some`
+        // 136,986 TEL in wei fits in a U256, so the expected value is always `Some`
         assert_eq!(
             stake_config_word(&STAKE_CONFIG_EPOCH_ISSUANCE_SLOT),
             U256::from(MAINNET_EPOCH_ISSUANCE_TEL).checked_mul(U256::from(WEI_PER_TEL)),
@@ -1015,9 +1031,13 @@ mod tests {
     /// - epoch duration [`MAINNET_EPOCH_DURATION_SECS`] (21600s, the mainnet target of issue
     ///   #1512). Do not decode this value from the committed file: that copied a stale 86400s into
     ///   each regeneration;
-    /// - epoch issuance [`MAINNET_EPOCH_ISSUANCE_TEL`] (25,806 TEL), passed explicitly (stake
+    /// - epoch issuance [`MAINNET_EPOCH_ISSUANCE_TEL`] (136,986 TEL), passed explicitly (stake
     ///   amount / min withdrawal stay on the clap defaults, which also match the committed storage:
     ///   1M TEL / 1k TEL);
+    /// - Issuance contract balance [`MAINNET_ISSUANCE_FUNDING_TEL`] (200,000,000 TEL,
+    ///   `--issuance-balance`), the pot the epoch rewards are paid from;
+    /// - worker 0 fee config `0:0:1000000` (`--worker-fee-config`): the EIP-1559 strategy with a
+    ///   gas target of [`MAINNET_WORKER_GAS_TARGET`] (1,000,000 gas), and no other worker;
     /// - 1s max/min header delays, preserving the committed parameters.yaml.
     ///
     /// The test mints no keys, so two runs over the same validator files differ only in the
@@ -1050,6 +1070,9 @@ mod tests {
         let basefee_address = MAINNET_PLACEHOLDER_BASEFEE_ADDRESS.to_string();
         let epoch_duration = MAINNET_EPOCH_DURATION_SECS.to_string();
         let epoch_issuance = MAINNET_EPOCH_ISSUANCE_TEL.to_string();
+        let issuance_funding = MAINNET_ISSUANCE_FUNDING_TEL.to_string();
+        // worker 0, strategy 0 (EIP-1559), gas target
+        let worker_fee_config = format!("0:0:{MAINNET_WORKER_GAS_TARGET}");
         let ceremony = CommandParser::<GenesisArgs>::parse_from([
             "tn",
             "--chain-id",
@@ -1064,6 +1087,10 @@ mod tests {
             epoch_duration.as_str(),
             "--epoch-block-rewards",
             epoch_issuance.as_str(),
+            "--issuance-balance",
+            issuance_funding.as_str(),
+            "--worker-fee-config",
+            worker_fee_config.as_str(),
             "--max-header-delay-ms",
             "1000",
             "--min-header-delay-ms",
@@ -1403,8 +1430,11 @@ mod tests {
     /// The owner, the dev-funded account and the basefee recipient are launch decisions, passed
     /// as arguments of [`regenerate_mainnet_chain_configs`]. The gate compares them with the
     /// placeholder constants that the regeneration passes today, so it cannot drift from what the
-    /// regeneration writes. The final-data commit also decides the funding of the Issuance
-    /// contract and the TEL total-supply slot, which this gate does not check.
+    /// regeneration writes. The funding of the Issuance contract is decided: the regeneration
+    /// passes [`MAINNET_ISSUANCE_FUNDING_TEL`], and
+    /// `mainnet_genesis_funds_only_the_pinned_accounts` in `crates/config` pins the balance.
+    /// The final-data commit also decides the TEL total-supply slot, which this gate does not
+    /// check.
     #[test]
     #[ignore = "fails until the commit that installs the final mainnet data, which removes this attribute"]
     fn mainnet_final_data_is_complete() -> eyre::Result<()> {

@@ -2014,6 +2014,30 @@ mod tests {
         Ok(())
     }
 
+    /// The `WorkerConfigs` contract of the committed mainnet genesis configures exactly one
+    /// worker, worker 0, with the EIP-1559 fee strategy and a gas target of 1,000,000 gas.
+    ///
+    /// The configs are read through the EVM with the `getAllWorkerConfigs` call the node issues,
+    /// and the returned list holds one entry for each of the contract's `numWorkers`. So the one
+    /// assertion pins the strategy, the gas target and that mainnet has one worker. The
+    /// regeneration passes `--worker-fee-config 0:0:1000000`.
+    #[tokio::test]
+    async fn mainnet_genesis_worker_configs_hold_one_eip1559_worker_at_the_gas_target(
+    ) -> eyre::Result<()> {
+        let tmp = TempDir::new()?;
+        let task_manager = TaskManager::new("mainnet genesis worker configs");
+        let (_genesis, env) = mainnet_genesis_env(&tmp, &task_manager)?;
+
+        assert_eq!(
+            env.get_worker_fee_configs()?,
+            [WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 }],
+            "chain-configs/mainnet/genesis.yaml: the WorkerConfigs contract must configure one \
+             worker, worker 0, with the EIP-1559 strategy and a gas target of 1,000,000 gas \
+             (`--worker-fee-config 0:0:1000000`) - {MAINNET_REGENERATION_LEVER}"
+        );
+        Ok(())
+    }
+
     /// An epoch-closing block publishes what each of its system calls spent.
     ///
     /// The boundary calls are submitted at `gas_price: 0`, so their gas never enters the block's

@@ -84,7 +84,8 @@ The final mainnet data is installed in this order, in one commit:
 3. Set the launch values in the ceremony arguments of `regenerate_mainnet_chain_configs`: the owner of the ConsensusRegistry and WorkerConfigs (`--consensus-registry-owner`), the dev-funded account (`--dev-funded-account`, or no flag for none) and the basefee recipient (`--basefee-address`).
    Today these arguments pass the constants `MAINNET_PLACEHOLDER_OWNER`, `MAINNET_PLACEHOLDER_DEV_FUNDED_ACCOUNT` and `MAINNET_PLACEHOLDER_BASEFEE_ADDRESS`.
    Replace the arguments and keep the constants, which the final-data gate refuses to find in the genesis.
-   Check the remaining arguments at the same time: the stake and minimum withdrawal stay on the CLI defaults, and the epoch duration and issuance come from constants in the same file.
+   Check the remaining arguments at the same time: the stake and minimum withdrawal stay on the CLI defaults, and the epoch duration, the epoch issuance, the Issuance contract's balance (`--issuance-balance`) and worker 0's fee config (`--worker-fee-config`) come from constants in the same file.
+   These four are decided: 6-hour epochs, 136,986 TEL for each epoch, 200,000,000 TEL on the Issuance contract, and one worker with the EIP-1559 fee strategy and a gas target of 1,000,000 gas.
 4. Fill `mainnet/bootstrap_servers.yaml` with the real bootstrap servers, the nodes that answer a new node's first contact, which need not be validators.
    Each entry lists the server's BLS key, its primary and worker addresses, and the `/p2p/<peer id>` of its network key.
    Every address must be a public IP address, not a DNS name, which the node does not resolve.
@@ -98,5 +99,5 @@ The final mainnet data is installed in this order, in one commit:
 
 Some of these steps cannot be done yet.
 Steps 1 and 2 wait for the operators' node-info files.
-The values of steps 3 and 4 are launch decisions that have not been made yet, so the committed files keep their placeholders.
+The owner, dev-funded account and basefee recipient of step 3 and the servers of step 4 are launch decisions that have not been made yet, so the committed files keep their placeholders.
 Step 5 waits for a ceremony option that fixes the genesis timestamp: today the ceremony stamps the wall clock, so it is run with the fixed launch timestamp once that option is available.
